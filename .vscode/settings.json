@@ -1,0 +1,6 @@
+{
+  // even-better-toml(taplo) 的 schema 校验器解析不了 schemastore cargo schema 里
+  // [lints] 的跨文件 $ref,对 [lints.rust]/[lints.clippy] 误报 —— cargo 本身完全接受
+  // (build/clippy 全绿)。关掉 schema 校验消除误报;语法高亮、格式化不受影响。
+  "evenBetterToml.schema.enabled": false
+}
