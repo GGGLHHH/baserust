@@ -29,6 +29,11 @@ lint:
 fmt:
     cargo fmt --all
 
+# 清理热更新累积的编译缓存(自己的 codegen 产物 + 增量),保留依赖缓存 → 下次只重编自己、秒级
+clean:
+    cargo clean -p xchangeai
+    rm -rf target/debug/incremental
+
 # 导出 OpenAPI 规范(服务需在跑)
 openapi-json:
     curl -s http://localhost:8137/api-docs/openapi.json
