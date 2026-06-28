@@ -29,7 +29,7 @@ ENTRYPOINT ["sh", "./migrate-all.sh"]
 # ---- runtime:精简镜像,只放二进制 ----
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -r -u 10001 app
 COPY --from=builder /app/target/release/xchangeai /usr/local/bin/xchangeai
