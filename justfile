@@ -19,9 +19,23 @@ watch:
 check:
     cargo check --all-targets
 
-# 测试
+# 测试(默认:零 DB,含内存侧仓储一致性 conformance)
 test:
     cargo test
+
+# ───── 仓储一致性测试(同一契约对内存/PG 各跑一遍,防 drift)─────
+# 一次性:给测试集群 app role 授权(只动本地 dev pg,不碰 prod):
+#   CREATEDB —— #[sqlx::test] 建临时库;CREATE ON DATABASE —— 在 base 库建 _sqlx_test 元数据 schema。
+# 没装本机 psql 可改:docker compose exec -T pg psql -U <super> -d <db> -c "<同样的 SQL>"
+pg-test-grant:
+    psql "postgres://{{env_var_or_default('POSTGRES_USER','xchangeai')}}:{{env_var_or_default('POSTGRES_PASSWORD','xchangeai')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}};"
+
+# PG conformance(连 app role,search_path=app 由 role 配置继承;先 pg-test-grant + 起 pg)
+test-pg:
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance -- --nocapture
+
+# 全量:内存层(单测/api/内存 conformance) + PG conformance
+test-all: test test-pg
 
 # ───── 数据库迁移(sqlx-cli,类似 goose;显式执行,不在 app 启动时跑)─────
 # 每个 schema 用同名 role 连接(role 的 search_path = 同名 schema),各自独立 _sqlx_migrations,
