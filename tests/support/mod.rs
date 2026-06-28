@@ -1,5 +1,9 @@
 //! conformance 测试的 PG 侧辅助:在 #[sqlx::test] 给的干净临时库里复刻 prod 的两步建库。
 //! (放 tests/support/ 子目录 → 不是独立 test target,由 conformance 测试 `#[path]` 引入。)
+//!
+//! support 被 widget/idm 两个 conformance 各 `#[path]` include 一份,每份只用其中一个
+//! bootstrap → 另一个在该 target 即 dead,故整体 allow(dead_code)。
+#![allow(dead_code)]
 
 use sqlx::migrate::Migrator;
 use sqlx::PgPool;
@@ -18,5 +22,17 @@ pub async fn bootstrap_app_schema(pool: &PgPool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     APP_MIGRATOR.run(pool).await?;
+    Ok(())
+}
+
+/// idm 侧:同理建 idm schema + 跑 migrations/idm。连接 role 的 search_path=idm,
+/// 故 idm 迁移自建的 set_updated_at_utc 与各表都落在 idm schema。
+static IDM_MIGRATOR: Migrator = sqlx::migrate!("migrations/idm");
+
+pub async fn bootstrap_idm_schema(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("create schema if not exists idm")
+        .execute(pool)
+        .await?;
+    IDM_MIGRATOR.run(pool).await?;
     Ok(())
 }
