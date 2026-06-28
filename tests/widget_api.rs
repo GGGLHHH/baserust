@@ -17,8 +17,9 @@ use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 fn test_app() -> Router {
     let state = AppState {
         widgets: WidgetService::new(Arc::new(InMemoryWidgetRepo::new())),
+        db_pool: None, // 内存模式:readyz 恒就绪
     };
-    build_router(state)
+    build_router(state, &xchangeai::infra::config::Config::default())
 }
 
 async fn body_string(resp: Response) -> String {

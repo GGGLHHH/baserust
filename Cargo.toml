@@ -10,7 +10,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 
 # Web 框架 + 中间件
 axum = "0.8"
-tower-http = { version = "0.7", features = ["trace", "timeout", "catch-panic", "request-id"] }
+tower-http = { version = "0.7", features = ["trace", "catch-panic", "request-id", "cors", "set-header"] }
 
 # OpenAPI(替 huma);yaml feature 自带 to_yaml(),绕开 2026 混乱的 serde_yaml 生态
 utoipa = { version = "5", features = ["axum_extras", "yaml", "uuid", "time"] }
@@ -30,7 +30,7 @@ garde = { version = "0.23", features = ["derive"] }
 
 # 结构化日志(替 slog)
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # 错误处理:库层 typed + 应用层 context 链
 thiserror = "2"

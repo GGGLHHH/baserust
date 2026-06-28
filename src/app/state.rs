@@ -15,25 +15,30 @@ use crate::infra::config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub widgets: WidgetService,
+    /// readyz 就绪探针用:DB 模式持 pool(ping `SELECT 1`),内存模式为 `None`(恒就绪)。
+    pub db_pool: Option<PgPool>,
 }
 
 impl AppState {
     pub async fn new(config: &Config) -> anyhow::Result<Self> {
         // 可拔插实现:设了 APP_DB_HOST 用 app role 连 Postgres,否则走内存。
         // 镜像现有 Go 服务 AUTH_BACKEND=memory|db 的取舍:同一 trait,启动时二选一。
-        let widget_repo: Arc<dyn WidgetRepo> = match config.app_database_url() {
-            Some(url) => {
-                let pool = connect_pool(&url).await?;
-                Arc::new(PgWidgetRepo::new(pool))
-            }
-            None => {
-                tracing::warn!("未设 APP_DB_HOST,widget 仓储使用内存实现(脚手架默认)");
-                Arc::new(InMemoryWidgetRepo::new())
-            }
-        };
+        let (widget_repo, db_pool): (Arc<dyn WidgetRepo>, Option<PgPool>) =
+            match config.app_database_url() {
+                Some(url) => {
+                    let pool = connect_pool(&url).await?;
+                    // pool.clone() 廉价(内部 Arc):一份给 repo,一份给 readyz 探针。
+                    (Arc::new(PgWidgetRepo::new(pool.clone())), Some(pool))
+                }
+                None => {
+                    tracing::warn!("未设 APP_DB_HOST,widget 仓储使用内存实现(脚手架默认)");
+                    (Arc::new(InMemoryWidgetRepo::new()), None)
+                }
+            };
 
         Ok(Self {
             widgets: WidgetService::new(widget_repo),
+            db_pool,
         })
     }
 }

@@ -1,18 +1,20 @@
 //! 路由装配:各业务模块贡献一个 OpenApiRouter,在此合并;OpenAPI 规范自动汇总。
 //! 加业务模块:在 build_router 里 `.nest("/api/v1", xxx::router())` 一行。
 //!
-//! 中间件栈对 **panic 与 timeout 也走统一错误契约**(`ErrorBody` JSON),
-//! 不再露出 tower 默认的纯文本 500 / 空体 408 —— 让"不泄露 {code,error}"对这两条路同样成立。
+//! 中间件栈:统一错误契约(panic/timeout 也走 `ErrorBody` JSON)+ 安全头 + CORS(按 profile)。
+//! 文档端点仅非 prod 暴露。
 
 use std::time::Duration;
 
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use utoipa::OpenApi;
@@ -21,6 +23,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::app::AppState;
 use crate::features::widget;
 use crate::health;
+use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
 use crate::infra::openapi;
 
@@ -28,17 +31,15 @@ use crate::infra::openapi;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 组装路由。各业务模块贡献一个 `OpenApiRouter`,在此合并;OpenAPI 规范自动汇总。
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, config: &Config) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .merge(health::router())
         // 业务路由统一挂到 /api/v1;nest 会同步给 OpenAPI 的 path 加上该前缀。
         .nest("/api/v1", widget::router())
         .split_for_parts();
 
-    router
-        // 中间件栈(外→内,请求时外层先执行):
-        //   SetRequestId 最外给请求打 x-request-id → Trace 把它带进 span(日志按 id 关联)
-        //   PropagateRequestId 回写响应头 → CatchPanic 兜 panic → timeout 包住 handler
+    let router = router
+        // 中间件栈(外→内,请求时外层先执行)。
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)
@@ -48,11 +49,49 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(timeout_middleware))
         // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
         .layer(CatchPanicLayer::custom(handle_panic))
+        // 安全响应头(基础 web 安全基线;HSTS 留给 nginx/TLS 终止处加)
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        ))
+        // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
+        .layer(cors_layer(config))
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        // 文档端点在中间件之后 merge → 不进访问日志(Scalar 反复拉 spec 全是噪音)。
-        .merge(openapi::doc_routes(api))
-        .with_state(state)
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+
+    // 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露,prod 收起减少攻击面。
+    let router = if config.app_env.expose_docs() {
+        router.merge(openapi::doc_routes(api))
+    } else {
+        router
+    };
+
+    router.with_state(state)
+}
+
+/// CORS 层:prod 用配置白名单(空则等于不放行任何跨源);dev/staging 走 permissive(任意源,便于联调)。
+fn cors_layer(config: &Config) -> CorsLayer {
+    if config.app_env.is_prod() {
+        let origins: Vec<HeaderValue> = config
+            .cors_origins()
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        CorsLayer::permissive()
+    }
 }
 
 /// 请求超时中间件:超过 `REQUEST_TIMEOUT` 返回 408 + 统一 `ErrorBody`(非 tower-http 默认空体)。
