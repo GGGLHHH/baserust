@@ -22,18 +22,44 @@ services:
       - "${NGINX_PORT:-80}:80"
 
   app:
-    build: .
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      pg:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info,xchangeai=info}
+      # 连 app schema(role=app);表由下面 migrate 服务先建好。去掉这些 APP_DB_* 则 app 走内存。
+      APP_DB_HOST: pg
+      APP_DB_PORT: "5432"
+      APP_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
+    ports:
+      - "${APP_PORT:-6453}:8080"
+
+  # 一次性迁移容器:pg healthy 后跑 `sqlx migrate run`,完成即退出(restart: no)。
+  # app 用 depends_on service_completed_successfully 等它跑完才起 → 表一定先于 app 就绪。
+  # 回滚/查看:`docker compose run --rm migrate revert` / `... info`(覆盖默认的 run)。
+  migrate:
+    build:
+      context: .
+      target: migrate
     depends_on:
       pg:
         condition: service_healthy
     environment:
-      BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-info,xchangeai=info}
-      # 默认走内存仓储:DB 路径还没激活(没有 migrations/widgets 表),设了反而 widget 端点 500。
-      # 等加了 migrations + sqlx::migrate! 后,取消下面这行让 app 连 pg:
-      # DATABASE_URL: postgres://${POSTGRES_USER:-xchangeai}:${POSTGRES_PASSWORD:-xchangeai}@pg:5432/${POSTGRES_DB:-xchangeai}?sslmode=disable
-    ports:
-      - "${APP_PORT:-6453}:8080"
+      PG_HOST: pg
+      POSTGRES_DB: ${POSTGRES_DB:-xchangeai}
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
+      IDM_DB_USER: ${IDM_DB_USER:-idm}
+      IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
+    restart: "no"
 
   pg:
     image: postgres:17-alpine
@@ -41,10 +67,17 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-xchangeai}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xchangeai}
       POSTGRES_DB: ${POSTGRES_DB:-xchangeai}
+      # initdb 脚本用:各 schema 的 role 名(=schema 名)与密码,各走独立变量
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
+      IDM_DB_USER: ${IDM_DB_USER:-idm}
+      IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
     ports:
       - "${PG_PORT:-5821}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # 首次初始化时建 app/idm 的 role + schema(role 的 search_path 指向自己 schema)
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xchangeai} -d ${POSTGRES_DB:-xchangeai}"]
       interval: 5s

@@ -15,6 +15,17 @@ RUN mkdir src \
 COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
+# ---- migrate:专门执行数据库迁移的镜像(sqlx-cli + migrations,跑完即退出)----
+# 放在 runtime 之前,使 runtime 仍是 Dockerfile 的默认(最后)stage。
+FROM rust:1.94-bookworm AS migrate
+RUN cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres
+WORKDIR /app
+COPY migrations ./migrations
+COPY scripts/migrate-all.sh ./migrate-all.sh
+# 入口脚本按 schema 遍历:每个 schema 用对应 role 迁移(空 schema 跳过)。role 名/密码由环境注入。
+# 回滚/查看用本地 `just migrate-app-revert` 等;容器内要单跑可覆盖 entrypoint 调 sqlx。
+ENTRYPOINT ["sh", "./migrate-all.sh"]
+
 # ---- runtime:精简镜像,只放二进制 ----
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
