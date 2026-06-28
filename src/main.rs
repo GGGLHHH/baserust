@@ -110,30 +110,32 @@ fn make_http_span(req: &Request<Body>) -> tracing::Span {
 /// 结构化日志:RUST_LOG 控制级别(如 `info,xchangeai=debug`),默认 info。
 fn init_tracing() {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-    // 开发默认全开到 debug(应用 + HTTP + 依赖细节都看得到);
-    // RUST_LOG 可覆盖:更底层用 `trace`,想收敛用 `info` 或 `info,xchangeai=debug`。
+    // 开发默认全开到 debug;RUST_LOG 可覆盖(trace 更底层 / info 收敛)。
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
 
-    // 开发日志写 logs/dev.log,truncate 每次启动覆盖 → 热更新重启即清空旧日志。
-    std::fs::create_dir_all("logs").ok();
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("logs/dev.log")
-        .expect("无法创建 logs/dev.log");
+    // 文件日志**仅在设置了 LOG_FILE 时启用**:
+    //   本地开发在 .env 里设 LOG_FILE=logs/dev.log 即可在文件观察(每次启动 truncate);
+    //   容器/生产不设 → 只输出 stdout,由 docker/k8s 收集,绝不在容器内写文件。
+    let file_layer = std::env::var("LOG_FILE").ok().map(|path| {
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("无法创建 LOG_FILE 指定的日志文件");
+        // 无色 + 放在 stdout 层之前:先把 span 字段格式化成无 ANSI,文件因此干净可 grep。
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+    });
 
     tracing_subscriber::registry()
         .with(filter)
-        // 文件层放前面且无颜色:两个 fmt 层共享 span 字段的格式化结果,谁先格式化就定调,
-        // 所以让无色的文件层先来 → 文件完全干净、可直接 grep。
-        .with(
-            fmt::layer()
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(log_file)),
-        )
-        // 终端层在后:复用上面无色的 span 字段,但 level/message 仍按 TTY 上色,开发看着舒服。
-        .with(fmt::layer())
+        .with(file_layer) // Option<Layer>:没设 LOG_FILE 时为 None,不启用
+        .with(fmt::layer()) // stdout —— 终端 / 容器日志
         .init();
 }
 
