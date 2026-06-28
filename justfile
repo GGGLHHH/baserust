@@ -29,6 +29,12 @@ lint:
 fmt:
     cargo fmt --all
 
+# 自动修复(类似 eslint --fix):clippy 机器可应用的建议自动改 + 格式化。一键修掉能自动修的。
+# --allow-dirty/--allow-staged:clippy --fix 默认要求 git 干净,开发时工作区常有改动,放开。
+fix:
+    cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features
+    cargo fmt --all
+
 # 清理热更新累积的编译缓存(自己的 codegen 产物 + 增量),保留依赖缓存 → 下次只重编自己、秒级
 clean:
     cargo clean -p xchangeai
