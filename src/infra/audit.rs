@@ -1,23 +1,32 @@
-//! 审计上下文:谁在操作。范式 —— 请求边界产 `AuditContext`(将来接 auth 的**唯一**改动点),
-//! 经 service 下传给 repo,落到 `created_by`/`updated_by`。
+//! 审计上下文 + 鉴权身份。范式 —— 请求边界产 `AuditContext`,经 service 下传给 repo,
+//! 落到 `created_by`/`updated_by`。
 //!
-//! 现状无 auth:用户请求 = `Anonymous` → 审计列写 NULL(诚实表达"当时不知道是谁",
-//! 不伪造 "system");只有真·系统链路(seeder/job/迁移)= `System` → "system"。
-//! 时间戳不在这里管:`created_at` 由 DB default、`updated_at` 由触发器自动维护。
+//! 鉴权中间件(idm)验过 JWT 后,在 `request.extensions` 塞一个 [`AuthUser`];
+//! `AuditContext` 与 `CurrentUser` 都只**读** extension —— token 校验是单一真相源(中间件),
+//! 这两个提取器不碰 JWT。`AuthUser` 定义在 infra(横切),由 idm 填充,避免 infra 依赖 features。
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use uuid::Uuid;
 
-/// 操作主体。将来接 auth 时只填充 `User` 分支,下游签名不变。
-/// System/User 是接 auth/seeder 前的预留分支,当前 extractor 只构造 Anonymous。
+use crate::infra::error::AppError;
+
+/// 鉴权中间件验过 JWT 后塞进 `request.extensions` 的已认证身份。
+#[derive(Clone, Debug)]
+pub struct AuthUser {
+    pub id: Uuid,
+    pub username: String,
+}
+
+/// 操作主体。`User` 由鉴权中间件经 extension 填充;`System` 给 seeder/job;`Anonymous` 给未认证请求。
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Actor {
     /// 真·系统操作:seeder / 后台 job / 迁移(无人类发起者)。
     System,
-    /// 未认证请求 —— 当前所有 HTTP 请求都是这个。
+    /// 未认证请求(无有效 token)。
     Anonymous,
-    /// 已认证用户(Phase 2 接 auth 后从校验过的 principal 来)。
+    /// 已认证用户(从 extension 的 `AuthUser` 来)。
     User { id: String },
 }
 
@@ -32,7 +41,7 @@ impl Actor {
     }
 }
 
-/// 请求作用域审计上下文 —— "将来接 auth 平滑替换"的接口。写操作经它取审计主体。
+/// 请求作用域审计上下文 —— 写操作经它取审计主体。
 #[derive(Clone, Debug)]
 pub struct AuditContext {
     pub actor: Actor,
@@ -42,8 +51,7 @@ pub struct AuditContext {
 }
 
 impl AuditContext {
-    /// 系统链路(无 HTTP 请求):seeder / 后台 job 用。预留接口(暂无调用方)。
-    #[allow(dead_code)]
+    /// 系统链路(无 HTTP 请求):seeder / 后台 job 用。
     pub fn system() -> Self {
         Self {
             actor: Actor::System,
@@ -64,8 +72,8 @@ impl AuditContext {
     }
 }
 
-/// extractor:现在一律产 `Anonymous` + 串上已有的 request-id(SetRequestIdLayer 设的 header)。
-/// Phase 2 接 auth 时,改这里从校验过的 token 构 `Actor::User{id}`,下游 handler 签名不变。
+/// extractor:鉴权中间件验过 JWT 会在 extensions 塞 `AuthUser`;有 → `User`,无 → `Anonymous`。
+/// 下游 handler 签名不变,审计列(created_by/updated_by)自动从这里灌入。**这是接 auth 的唯一改动点**。
 impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
     type Rejection = std::convert::Infallible;
 
@@ -75,6 +83,28 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        Ok(AuditContext::anonymous(request_id))
+        let actor = match parts.extensions.get::<AuthUser>() {
+            Some(u) => Actor::User {
+                id: u.id.to_string(),
+            },
+            None => Actor::Anonymous,
+        };
+        Ok(Self { actor, request_id })
+    }
+}
+
+/// 受保护端点提取器:**必须已认证**。读鉴权中间件塞的 `AuthUser`;无(未带/非法 token)→ 401。
+pub struct CurrentUser(pub AuthUser);
+
+impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthUser>()
+            .cloned()
+            .map(CurrentUser)
+            .ok_or(AppError::Unauthorized)
     }
 }

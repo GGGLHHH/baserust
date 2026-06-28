@@ -4,6 +4,10 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use crate::features::idm::{
+    Argon2Hasher, AuthService, InMemorySessionRepo, InMemoryUserRepo, PgSessionRepo, PgUserRepo,
+    SessionRepo, UserRepo,
+};
 use crate::features::widget::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo, WidgetService};
 use crate::infra::config::Config;
 
@@ -15,8 +19,11 @@ use crate::infra::config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub widgets: WidgetService,
+    pub auth: AuthService,
     /// readyz 就绪探针用:DB 模式持 pool(ping `SELECT 1`),内存模式为 `None`(恒就绪)。
     pub db_pool: Option<PgPool>,
+    /// 认证 cookie 是否带 `Secure`(prod=true,仅 https 发送;dev http 必须 false 否则浏览器不发)。
+    pub cookie_secure: bool,
 }
 
 impl AppState {
@@ -36,9 +43,38 @@ impl AppState {
                 }
             };
 
+        // idm 仓储:设了 IDM_DB_HOST 用 idm role 连 Postgres(读 seed 的 superadmin 等),否则内存。
+        let (idm_users, idm_sessions): (Arc<dyn UserRepo>, Arc<dyn SessionRepo>) =
+            match config.idm_database_url() {
+                Some(url) => {
+                    let pool = connect_pool(&url).await?;
+                    (
+                        Arc::new(PgUserRepo::new(pool.clone())),
+                        Arc::new(PgSessionRepo::new(pool)),
+                    )
+                }
+                None => {
+                    tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
+                    (
+                        Arc::new(InMemoryUserRepo::new()),
+                        Arc::new(InMemorySessionRepo::new()),
+                    )
+                }
+            };
+        let auth = AuthService::new(
+            idm_users,
+            idm_sessions,
+            Arc::new(Argon2Hasher),
+            &config.idm_jwt_secret,
+            config.idm_access_ttl_secs,
+            config.idm_refresh_ttl_secs,
+        );
+
         Ok(Self {
             widgets: WidgetService::new(widget_repo),
+            auth,
             db_pool,
+            cookie_secure: config.app_env.is_prod(),
         })
     }
 }

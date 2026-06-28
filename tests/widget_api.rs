@@ -11,15 +11,30 @@ use axum::Router;
 use tower::ServiceExt; // oneshot
 
 use xchangeai::app::{build_router, AppState};
+use xchangeai::features::idm::{AuthService, FakeHasher, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配。
 fn test_app() -> Router {
     let state = AppState {
         widgets: WidgetService::new(Arc::new(InMemoryWidgetRepo::new())),
+        auth: test_auth(),
         db_pool: None, // 内存模式:readyz 恒就绪
+        cookie_secure: false,
     };
     build_router(state, &xchangeai::infra::config::Config::default())
+}
+
+/// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + 固定 secret。
+fn test_auth() -> AuthService {
+    AuthService::new(
+        Arc::new(InMemoryUserRepo::new()),
+        Arc::new(InMemorySessionRepo::new()),
+        Arc::new(FakeHasher),
+        "test-secret",
+        900,
+        604_800,
+    )
 }
 
 async fn body_string(resp: Response) -> String {

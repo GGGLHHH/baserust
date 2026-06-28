@@ -21,7 +21,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::widget;
+use crate::features::{idm, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -35,7 +35,8 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .merge(health::router())
         // 业务路由统一挂到 /api/v1;nest 会同步给 OpenAPI 的 path 加上该前缀。
-        .nest("/api/v1", widget::router())
+        // 多模块:先 merge 再 nest 一次(axum 不允许重复 nest 同前缀)。
+        .nest("/api/v1", widget::router().merge(idm::router()))
         .split_for_parts();
 
     let router = router
@@ -64,6 +65,11 @@ pub fn build_router(state: AppState, config: &Config) -> Router {
         ))
         // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
         .layer(cors_layer(config))
+        // 鉴权:best-effort 解析 Bearer JWT,验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            idm::authenticate,
+        ))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 

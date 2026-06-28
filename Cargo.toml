@@ -3,6 +3,8 @@ name = "xchangeai"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
+# 有 seed bin 后,cargo run 默认跑主服务(seed 用 `just seed` / `cargo run --bin seed`)
+default-run = "xchangeai"
 
 [dependencies]
 # 异步运行时 —— 一切的地基
@@ -10,6 +12,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 
 # Web 框架 + 中间件
 axum = "0.8"
+# CookieJar:typed cookie 提取/设置(httponly 认证用)
+axum-extra = { version = "0.10", features = ["cookie"] }
 tower-http = { version = "0.7", features = ["trace", "catch-panic", "request-id", "cors", "set-header"] }
 
 # OpenAPI(替 huma);yaml feature 自带 to_yaml(),绕开 2026 混乱的 serde_yaml 生态
@@ -26,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # 输入验证(声明式,在 service 边界调用)
-garde = { version = "0.23", features = ["derive"] }
+garde = { version = "0.23", features = ["derive", "email"] }
 
 # 结构化日志(替 slog)
 tracing = "0.1"
@@ -53,6 +57,19 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde-well-known"] }
 # cursor 游标编解码(opaque base64url token)
 base64 = "0.22"
+
+# 密码哈希:argon2id。PHC 串自描述(算法 id/盐/参数都在串里),verify 天然支持多算法迁移。
+# std feature 拉入 rand + getrandom,SaltString::generate(OsRng) 才可用。
+argon2 = { version = "0.5", features = ["std"] }
+
+# JWT access token(HS256)。不解耦:唯一实现,要换 KMS/HSM 签名再抽 trait。
+jsonwebtoken = "9"
+# refresh token:sha2 算 SHA-256 hash 落库,rand 出 32B CSPRNG 明文。
+sha2 = "0.10"
+rand = "0.8"
+
+# seed 数据源:toml(避开已废弃的 serde_yaml;dtolnay 维护、与 serde 同源)
+toml = "0.8"
 
 # feature 开关:pg-conformance 开了才编译"打真库的仓储一致性测试"(需 DATABASE_URL + 跑着的 pg)。
 # 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用本地 `just test-pg` 显式触发(将来接 CI 时单列一个 job 跑它)。

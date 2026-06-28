@@ -60,6 +60,31 @@ pub struct Config {
     pub app_db_password: String,
     #[serde(default = "default_db_sslmode")]
     pub app_db_sslmode: String,
+
+    /// idm JWT 签名密钥(HS256),`IDM_JWT_SECRET`。脚手架给 dev 默认(静默启动),**生产必须覆盖**。
+    #[serde(default = "default_jwt_secret")]
+    pub idm_jwt_secret: String,
+    /// access token 有效秒数,`IDM_ACCESS_TTL_SECS`,默认 900(15min)。
+    #[serde(default = "default_access_ttl_secs")]
+    pub idm_access_ttl_secs: i64,
+    /// refresh token 有效秒数,`IDM_REFRESH_TTL_SECS`,默认 604800(7天)。
+    #[serde(default = "default_refresh_ttl_secs")]
+    pub idm_refresh_ttl_secs: i64,
+
+    /// idm schema 的数据库连接,按 role 分字段(role=idm,镜像 app_db_*)。
+    /// `IDM_DB_HOST` 的存在 = idm 走 PG(读 seed 的 superadmin 等);不设 → idm 仓储走内存。
+    #[serde(default)]
+    pub idm_db_host: Option<String>,
+    #[serde(default = "default_db_port")]
+    pub idm_db_port: u16,
+    #[serde(default = "default_db_database")]
+    pub idm_db_database: String,
+    #[serde(default = "default_idm_db_user")]
+    pub idm_db_user: String,
+    #[serde(default = "default_db_password")]
+    pub idm_db_password: String,
+    #[serde(default = "default_db_sslmode")]
+    pub idm_db_sslmode: String,
 }
 
 fn default_bind_addr() -> SocketAddr {
@@ -80,6 +105,19 @@ fn default_db_password() -> String {
 fn default_db_sslmode() -> String {
     "disable".into()
 }
+fn default_jwt_secret() -> String {
+    // dev 默认:零环境变量也能静默启动;生产**务必**用 IDM_JWT_SECRET 覆盖。
+    "dev-insecure-secret-change-me-in-prod".into()
+}
+fn default_access_ttl_secs() -> i64 {
+    900
+}
+fn default_refresh_ttl_secs() -> i64 {
+    604_800
+}
+fn default_idm_db_user() -> String {
+    "idm".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -93,6 +131,15 @@ impl Default for Config {
             app_db_user: default_app_db_user(),
             app_db_password: default_db_password(),
             app_db_sslmode: default_db_sslmode(),
+            idm_jwt_secret: default_jwt_secret(),
+            idm_access_ttl_secs: default_access_ttl_secs(),
+            idm_refresh_ttl_secs: default_refresh_ttl_secs(),
+            idm_db_host: None,
+            idm_db_port: default_db_port(),
+            idm_db_database: default_db_database(),
+            idm_db_user: default_idm_db_user(),
+            idm_db_password: default_db_password(),
+            idm_db_sslmode: default_db_sslmode(),
         }
     }
 }
@@ -117,6 +164,21 @@ impl Config {
                 self.app_db_port,
                 self.app_db_database,
                 self.app_db_sslmode,
+            )
+        })
+    }
+
+    /// idm schema 的连接串(role=idm)。`None` = 没设 `IDM_DB_HOST` → idm 走内存。
+    pub fn idm_database_url(&self) -> Option<String> {
+        self.idm_db_host.as_ref().map(|host| {
+            format!(
+                "postgres://{}:{}@{}:{}/{}?sslmode={}",
+                self.idm_db_user,
+                self.idm_db_password,
+                host,
+                self.idm_db_port,
+                self.idm_db_database,
+                self.idm_db_sslmode,
             )
         })
     }
