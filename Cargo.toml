@@ -54,6 +54,10 @@ time = { version = "0.3", features = ["serde-well-known"] }
 # cursor 游标编解码(opaque base64url token)
 base64 = "0.22"
 
+# 测试专用依赖(集成测试 tests/ 用 tower oneshot 打端点)
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 # lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明
 [lints.rust]
 unsafe_code = "forbid"
