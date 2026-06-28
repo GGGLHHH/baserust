@@ -30,13 +30,29 @@ use crate::infra::openapi;
 /// 请求处理超时上限,超过返回 408 + 统一错误契约。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 组装路由。各业务模块贡献一个 `OpenApiRouter`,在此合并;OpenAPI 规范自动汇总。
-pub fn build_router(state: AppState, config: &Config) -> Router {
+/// 路由挂载范围。本地开发单进程挂 `Both`;生产分进程各挂 `App` / `Idm`,
+/// 由 nginx 按 `/api/v1/auth` 前缀分流(→ idm 容器,其余 → app 容器)。
+#[derive(Clone, Copy, Debug)]
+pub enum Mount {
+    /// 只 app 业务(widget) —— 生产 app 进程。
+    App,
+    /// 只 idm(auth/me,端点都在 /auth 下) —— 生产 idm 进程。
+    Idm,
+    /// app + idm —— 本地开发单进程。
+    Both,
+}
+
+/// 组装路由。按 `mount` 决定挂哪些业务模块;OpenAPI 规范自动汇总。
+/// idm 端点 path 都以 `/auth` 开头(/auth/register、/auth/me...),nest /api/v1 后即 /api/v1/auth/*。
+pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
+    let business = match mount {
+        Mount::App => widget::router(),
+        Mount::Idm => idm::router(),
+        Mount::Both => widget::router().merge(idm::router()),
+    };
     let (router, api) = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .merge(health::router())
-        // 业务路由统一挂到 /api/v1;nest 会同步给 OpenAPI 的 path 加上该前缀。
-        // 多模块:先 merge 再 nest 一次(axum 不允许重复 nest 同前缀)。
-        .nest("/api/v1", widget::router().merge(idm::router()))
+        .nest("/api/v1", business)
         .split_for_parts();
 
     let router = router

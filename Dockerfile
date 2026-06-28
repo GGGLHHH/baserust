@@ -32,7 +32,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -r -u 10001 app
+# 两个进程二进制:xchangeai(app,默认 ENTRYPOINT)+ idm(分进程,compose 里 override entrypoint)。
 COPY --from=builder /app/target/release/xchangeai /usr/local/bin/xchangeai
+COPY --from=builder /app/target/release/idm /usr/local/bin/idm
 USER app
 
 # 容器内不写文件日志:不设 LOG_FILE → 只输出 stdout,由 docker/k8s 收集。

@@ -24,7 +24,11 @@ fn test_app() -> Router {
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,
     };
-    build_router(state, &xchangeai::infra::config::Config::default())
+    build_router(
+        state,
+        &xchangeai::infra::config::Config::default(),
+        xchangeai::app::Mount::Both,
+    )
 }
 
 /// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + 固定 secret。

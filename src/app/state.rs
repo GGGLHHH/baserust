@@ -4,12 +4,25 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use super::router::Mount;
 use crate::features::idm::{
     Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
     PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
 };
 use crate::features::widget::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo, WidgetService};
 use crate::infra::config::Config;
+
+/// 数据库 schema(= role = 连接归属)。每个 schema 用自己的 role 连接。
+///
+/// **跨模块访问范式**:要读别的 schema,用 [`connect_for_schema`] 起对方 schema 的连接、
+/// **走对方模块的 repo** 读 —— 严禁跨 schema join(idm/app 各自 role 的 search_path 物理上也挡着)。
+/// 富化接口时按此装配:在 `new` 里起对方 schema 的连接、建对方 repo、注入本模块 service
+/// (绝不在本模块的 SQL 里直接 `join 别的schema.表`)。
+#[derive(Clone, Copy, Debug)]
+pub enum Schema {
+    App,
+    Idm,
+}
 
 /// 应用级依赖容器。范式(替代 DI 框架):
 /// - 用 axum 的 `State` 提取器注入到每个 handler。
@@ -27,38 +40,50 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(config: &Config) -> anyhow::Result<Self> {
-        // 可拔插实现:设了 APP_DB_HOST 用 app role 连 Postgres,否则走内存。
-        // 镜像现有 Go 服务 AUTH_BACKEND=memory|db 的取舍:同一 trait,启动时二选一。
-        let (widget_repo, db_pool): (Arc<dyn WidgetRepo>, Option<PgPool>) =
-            match config.app_database_url() {
-                Some(url) => {
-                    let pool = connect_pool(&url).await?;
-                    // pool.clone() 廉价(内部 Arc):一份给 repo,一份给 readyz 探针。
-                    (Arc::new(PgWidgetRepo::new(pool.clone())), Some(pool))
-                }
-                None => {
-                    tracing::warn!("未设 APP_DB_HOST,widget 仓储使用内存实现(脚手架默认)");
-                    (Arc::new(InMemoryWidgetRepo::new()), None)
-                }
-            };
+    /// 按 `mount` 只装配本进程真正用到的库:app 进程连 app DB(widget)、idm 进程连 idm DB(auth/me),
+    /// 各自不连对方的库 —— 省掉闲置连接,也让 readyz 探针 ping 的是本进程主库。
+    /// app 进程的鉴权中间件只 decode JWT(roles 在 claim 里),不查 idm 库,故 idm 用内存占位即可。
+    pub async fn new(config: &Config, mount: Mount) -> anyhow::Result<Self> {
+        let needs_app = matches!(mount, Mount::App | Mount::Both);
+        let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
 
-        // idm 仓储:设了 IDM_DB_HOST 用 idm role 连 Postgres(读 seed 的 superadmin 等),否则内存。
+        // widget(app schema):仅 app/both 进程需要。设了 APP_DB_HOST → PG,否则内存(脚手架默认)。
+        let app_pool = if needs_app {
+            connect_for_schema(config, Schema::App).await?
+        } else {
+            None
+        };
+        let widget_repo: Arc<dyn WidgetRepo> = match &app_pool {
+            // pool.clone() 廉价(内部 Arc):一份给 repo,app_pool 留给 readyz 探针。
+            Some(pool) => Arc::new(PgWidgetRepo::new(pool.clone())),
+            None => {
+                if needs_app {
+                    tracing::warn!("未设 APP_DB_HOST,widget 仓储使用内存实现(脚手架默认)");
+                }
+                Arc::new(InMemoryWidgetRepo::new())
+            }
+        };
+
+        // idm(idm schema):仅 idm/both 进程需要。设了 IDM_DB_HOST → PG(读 seed 的 superadmin 等),否则内存。
+        let idm_pool = if needs_idm {
+            connect_for_schema(config, Schema::Idm).await?
+        } else {
+            None
+        };
         let (idm_users, idm_sessions, idm_roles): (
             Arc<dyn UserRepo>,
             Arc<dyn SessionRepo>,
             Arc<dyn RoleRepo>,
-        ) = match config.idm_database_url() {
-            Some(url) => {
-                let pool = connect_pool(&url).await?;
-                (
-                    Arc::new(PgUserRepo::new(pool.clone())),
-                    Arc::new(PgSessionRepo::new(pool.clone())),
-                    Arc::new(PgRoleRepo::new(pool)),
-                )
-            }
+        ) = match &idm_pool {
+            Some(pool) => (
+                Arc::new(PgUserRepo::new(pool.clone())),
+                Arc::new(PgSessionRepo::new(pool.clone())),
+                Arc::new(PgRoleRepo::new(pool.clone())),
+            ),
             None => {
-                tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
+                if needs_idm {
+                    tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
+                }
                 (
                     Arc::new(InMemoryUserRepo::new()),
                     Arc::new(InMemorySessionRepo::new()),
@@ -79,9 +104,25 @@ impl AppState {
         Ok(Self {
             widgets: WidgetService::new(widget_repo),
             auth,
-            db_pool,
+            // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
+            db_pool: app_pool.or(idm_pool),
             cookie_secure: config.app_env.is_prod(),
         })
+    }
+}
+
+/// 按 `schema` 起连接池(复用该 schema 自己的 role)。未配置对应 `*_DB_HOST` → `None`(走内存)。
+///
+/// **跨模块访问其他 schema 的唯一连接入口**:本进程主连接与未来的跨模块只读连接都经它,口径一致 ——
+/// 拿到对方 schema 的连接后**只走对方模块的 repo** 读,绝不跨 schema join。
+pub async fn connect_for_schema(config: &Config, schema: Schema) -> anyhow::Result<Option<PgPool>> {
+    let url = match schema {
+        Schema::App => config.app_database_url(),
+        Schema::Idm => config.idm_database_url(),
+    };
+    match url {
+        Some(url) => Ok(Some(connect_pool(&url).await?)),
+        None => Ok(None),
     }
 }
 

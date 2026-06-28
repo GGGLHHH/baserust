@@ -25,7 +25,11 @@ fn test_app() -> Router {
         db_pool: None,
         cookie_secure: false,
     };
-    build_router(state, &xchangeai::infra::config::Config::default())
+    build_router(
+        state,
+        &xchangeai::infra::config::Config::default(),
+        xchangeai::app::Mount::Both,
+    )
 }
 
 /// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + 固定 secret。
@@ -199,7 +203,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
     let via_cookie = app
         .clone()
         .oneshot(get_with_cookie(
-            "/api/v1/me",
+            "/api/v1/auth/me",
             &format!("access_token={token}"),
         ))
         .await
@@ -214,7 +218,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
 
     // Bearer 兜底(同一 token 也认)
     let via_bearer = app
-        .oneshot(get_with_bearer("/api/v1/me", &token))
+        .oneshot(get_with_bearer("/api/v1/auth/me", &token))
         .await
         .unwrap();
     assert_eq!(via_bearer.status(), StatusCode::OK);
@@ -261,7 +265,10 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
 
 #[tokio::test]
 async fn me_without_credentials_is_401() {
-    let resp = test_app().oneshot(get_plain("/api/v1/me")).await.unwrap();
+    let resp = test_app()
+        .oneshot(get_plain("/api/v1/auth/me"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -269,7 +276,7 @@ async fn me_without_credentials_is_401() {
 async fn me_with_garbage_cookie_is_401() {
     let resp = test_app()
         .oneshot(get_with_cookie(
-            "/api/v1/me",
+            "/api/v1/auth/me",
             "access_token=garbage.token.xxx",
         ))
         .await
@@ -391,7 +398,7 @@ async fn update_me_changes_username() {
     let resp = app
         .oneshot(req_with_cookie(
             "PATCH",
-            "/api/v1/me",
+            "/api/v1/auth/me",
             &cookie,
             Some(r#"{"username":"upduser2"}"#),
         ))
@@ -416,7 +423,7 @@ async fn delete_me_soft_deletes_and_blocks_login() {
         .clone()
         .oneshot(req_with_cookie(
             "DELETE",
-            "/api/v1/me",
+            "/api/v1/auth/me",
             &cookie,
             Some(r#"{"password":"password123"}"#),
         ))
@@ -447,7 +454,7 @@ async fn change_password_old_fails_new_works() {
         .clone()
         .oneshot(req_with_cookie(
             "POST",
-            "/api/v1/me/password",
+            "/api/v1/auth/me/password",
             &cookie,
             Some(r#"{"current_password":"password123","new_password":"newpass456"}"#),
         ))

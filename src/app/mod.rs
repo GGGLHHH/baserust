@@ -2,7 +2,9 @@
 //! 依赖方向与 infra 相反 —— 它 import 各业务模块的 repo/router,是唯一耦合所有模块之处。
 
 pub mod router;
+pub mod runtime;
 pub mod state;
 
-pub use router::build_router;
+pub use router::{build_router, Mount};
+pub use runtime::run;
 pub use state::AppState;

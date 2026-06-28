@@ -1,8 +1,8 @@
 //! idm 端点。认证用 **httponly cookie**:login/register 把 access/refresh 写进 `Set-Cookie`,
 //! body 只返 `UserResponse`(token 不进响应体);鉴权由中间件读 cookie(Bearer 兜底)。
 //!
-//! 已实现:register/login(发 cookie)、logout(清 cookie)、me(取当前用户)。
-//! 仍 stub(逻辑待后续块):refresh、logout-all、update/delete me、改密。
+//! 端点都在 `/auth` 前缀下:register/login/refresh/logout/logout-all + me GET/PATCH/DELETE/改密。
+//! nest /api/v1 后即 /api/v1/auth/*,nginx 按此前缀分流到独立的 idm 进程。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -171,7 +171,7 @@ async fn logout_all(
 }
 
 #[utoipa::path(
-    get, path = "/me", tag = "me",
+    get, path = "/auth/me", tag = "me",
     responses((status = 200, body = UserResponse), (status = 401, body = ErrorBody))
 )]
 async fn get_me(
@@ -183,7 +183,7 @@ async fn get_me(
 }
 
 #[utoipa::path(
-    patch, path = "/me", tag = "me",
+    patch, path = "/auth/me", tag = "me",
     request_body = UpdateMeRequest,
     responses(
         (status = 200, body = UserResponse),
@@ -202,7 +202,7 @@ async fn update_me(
 }
 
 #[utoipa::path(
-    delete, path = "/me", tag = "me",
+    delete, path = "/auth/me", tag = "me",
     request_body = DeleteMeRequest,
     responses(
         (status = 204, description = "已注销"),
@@ -221,7 +221,7 @@ async fn delete_me(
 }
 
 #[utoipa::path(
-    post, path = "/me/password", tag = "me",
+    post, path = "/auth/me/password", tag = "me",
     request_body = ChangePasswordRequest,
     responses(
         (status = 204, description = "已改密,撤销其它会话"),
