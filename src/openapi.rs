@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use utoipa::OpenApi;
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -24,8 +25,10 @@ pub struct ApiDoc;
 /// yaml 用 utoipa 自带的 `to_yaml()`(yaml feature),整条绕开 2026 混乱的 serde_yaml 生态。
 pub fn doc_routes(api: utoipa::openapi::OpenApi) -> Router<AppState> {
     let json_api = api.clone();
-    let yaml_api = api;
+    let yaml_api = api.clone();
     Router::new()
+        // Scalar UI:类似 huma 的可视化文档页,读合并后的 OpenAPI 规范
+        .merge(Scalar::with_url("/docs", api))
         .route(
             "/api-docs/openapi.json",
             get(move || {
