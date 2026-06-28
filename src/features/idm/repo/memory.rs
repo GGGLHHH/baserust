@@ -108,6 +108,17 @@ impl UserRepo for InMemoryUserRepo {
             .ok_or(AppError::NotFound)
     }
 
+    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError> {
+        let store = self.store.lock().expect("锁未中毒");
+        // 镜像 PG:只返存活行,查不到的 id 直接缺席(不报错)。
+        Ok(ids
+            .iter()
+            .filter_map(|id| store.get(id))
+            .filter(|r| r.deleted_at.is_none())
+            .map(UserRow::to_user)
+            .collect())
+    }
+
     async fn update(
         &self,
         id: Uuid,

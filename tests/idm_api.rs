@@ -20,7 +20,10 @@ use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
 fn test_app() -> Router {
     let state = AppState {
-        widgets: WidgetService::new(Arc::new(InMemoryWidgetRepo::new())),
+        widgets: WidgetService::new(
+            Arc::new(InMemoryWidgetRepo::new()),
+            Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
+        ),
         auth: test_auth(),
         db_pool: None,
         cookie_secure: false,

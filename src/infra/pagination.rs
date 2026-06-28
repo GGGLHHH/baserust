@@ -125,6 +125,15 @@ impl<T> Page<T> {
             },
         }
     }
+
+    /// 把每个 item 映射成另一类型,`page_info` 原样保留。跨模块**边缘富化**用:
+    /// `Page<Widget>` → `Page<WidgetView>`(分页元信息不变,只换 item 形状)。
+    pub fn map_items<U>(self, f: impl FnMut(T) -> U) -> Page<U> {
+        Page {
+            items: self.items.into_iter().map(f).collect(),
+            page_info: self.page_info,
+        }
+    }
 }
 
 /// cursor = 上一页最后一行的 v7 id,编成 opaque base64url(16 字节)。

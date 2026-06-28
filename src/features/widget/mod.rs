@@ -3,13 +3,17 @@
 //! 分层:`routes`(handler,薄) → `service`(业务逻辑/校验) → `repo`(trait + 实现)。
 //! `types` 放 DTO。每个新业务域照抄此结构。
 
+mod port;
 mod repo;
 mod routes;
 mod service;
 mod types;
+mod view;
 
+pub use port::{StaticUserDirectory, UserBrief, UserDirectory};
 pub use repo::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo};
 pub use service::WidgetService;
+pub use view::WidgetView;
 
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;

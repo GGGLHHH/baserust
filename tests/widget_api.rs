@@ -19,7 +19,10 @@ use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配。
 fn test_app() -> Router {
     let state = AppState {
-        widgets: WidgetService::new(Arc::new(InMemoryWidgetRepo::new())),
+        widgets: WidgetService::new(
+            Arc::new(InMemoryWidgetRepo::new()),
+            Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
+        ),
         auth: test_auth(),
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,

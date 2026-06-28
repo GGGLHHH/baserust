@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use uuid::Uuid;
 
 use super::types::{CreateWidget, UpdateWidget, Widget};
+use super::view::WidgetView;
 use crate::app::state::AppState;
 use crate::infra::audit::AuditContext;
 use crate::infra::error::{AppError, ErrorBody};
@@ -16,13 +17,13 @@ use crate::infra::pagination::{Page, PageQuery};
     path = "/widgets",
     tag = "widgets",
     params(PageQuery),
-    responses((status = 200, description = "widget 分页列表", body = Page<Widget>))
+    responses((status = 200, description = "widget 分页列表(created_by 富化为用户)", body = Page<WidgetView>))
 )]
 pub async fn list_widgets(
     State(state): State<AppState>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<Page<Widget>>, AppError> {
-    Ok(Json(state.widgets.list(query).await?))
+) -> Result<Json<Page<WidgetView>>, AppError> {
+    Ok(Json(state.widgets.list_enriched(query).await?))
 }
 
 /// 创建一个 widget。审计主体(created_by)来自 `AuditContext`。

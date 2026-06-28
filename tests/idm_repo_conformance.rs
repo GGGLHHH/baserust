@@ -6,6 +6,7 @@
 //! PG 入口:`just test-pg-idm`(需 DATABASE_URL 连 idm role + 跑着的 pg)。
 
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 use xchangeai::features::idm::{RoleRepo, SessionRepo, UserRepo};
 use xchangeai::infra::error::AppError;
 
@@ -30,6 +31,15 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
         users.password_hash(u.id).await.unwrap().as_deref(),
         Some("hash1")
     );
+
+    // ── find_by_ids:批量富化根原语,内存↔PG parity(命中 + 缺席 + 空集 + 软删过滤)──
+    let bob = users.create("bob", None, "h2", None).await.unwrap();
+    assert_eq!(users.find_by_ids(&[u.id, bob.id]).await.unwrap().len(), 2);
+    let missing = Uuid::now_v7();
+    assert_eq!(users.find_by_ids(&[u.id, missing]).await.unwrap().len(), 1); // 不存在的缺席
+    assert!(users.find_by_ids(&[]).await.unwrap().is_empty()); // 空集 → 空
+    users.soft_delete(bob.id, None).await.unwrap();
+    assert!(users.find_by_ids(&[bob.id]).await.unwrap().is_empty()); // 软删后消失(富化降级依据)
 
     // ── role:upsert 幂等 + grant 幂等 + roles_for_user ──
     let rid = roles

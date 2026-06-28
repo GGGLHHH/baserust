@@ -4,12 +4,15 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use super::adapters::InProcessUserDirectory;
 use super::router::Mount;
 use crate::features::idm::{
     Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
     PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
 };
-use crate::features::widget::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo, WidgetService};
+use crate::features::widget::{
+    InMemoryWidgetRepo, PgWidgetRepo, UserDirectory, WidgetRepo, WidgetService,
+};
 use crate::infra::config::Config;
 
 /// 数据库 schema(= role = 连接归属)。每个 schema 用自己的 role 连接。
@@ -91,6 +94,11 @@ impl AppState {
                 )
             }
         };
+        // 跨模块富化:widget 的 UserDirectory 端口由 app 注入 idm 的进程内适配器(复用 idm_users)。
+        // 单体 Both 连真 idm 库;分进程 App 时 idm_users 是内存占位 → 富化降级为空(留待 HttpUserDirectory)。
+        let user_directory: Arc<dyn UserDirectory> =
+            Arc::new(InProcessUserDirectory::new(idm_users.clone()));
+
         let auth = AuthService::new(
             idm_users,
             idm_sessions,
@@ -102,7 +110,7 @@ impl AppState {
         );
 
         Ok(Self {
-            widgets: WidgetService::new(widget_repo),
+            widgets: WidgetService::new(widget_repo, user_directory),
             auth,
             // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
             db_pool: app_pool.or(idm_pool),

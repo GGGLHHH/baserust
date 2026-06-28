@@ -103,6 +103,10 @@ pub trait UserRepo: Send + Sync {
     /// 按 id 查存活用户。不存在 / 已软删 → `NotFound`。
     async fn find_by_id(&self, id: Uuid) -> Result<User, AppError>;
 
+    /// 按 id **批量**查存活用户(跨模块富化的根原语:如 widget 列表补 created_by 的 username)。
+    /// 一条 SQL(`WHERE id IN ...`)解 N+1;查不到的 id 不在结果里(交调用方降级)。
+    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError>;
+
     /// 部分更新 username/email(各 `None`=不改)。改 email 会把 email_verified 置 false。
     /// 冲突 → `Conflict`;已软删 → `NotFound`。
     async fn update(

@@ -160,6 +160,27 @@ impl UserRepo for PgUserRepo {
             .ok_or(AppError::NotFound)
     }
 
+    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new()); // 空集省一次查询,也避开空 IN ()
+        }
+        let (sql, values) = Query::select()
+            .columns([
+                Users::Id,
+                Users::Username,
+                Users::Email,
+                Users::EmailVerified,
+            ])
+            .from(Users::Table)
+            .and_where(Expr::col(Users::Id).is_in(ids.iter().copied()))
+            .and_where(Expr::col(Users::DeletedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
     async fn update(
         &self,
         id: Uuid,
