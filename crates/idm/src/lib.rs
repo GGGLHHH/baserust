@@ -1,7 +1,8 @@
 //! idm —— 自包含的认证服务 crate(领域层 + HTTP + 自带 `IdmError`/audit/state)。
 //!
-//! 被 app 当 lib 依赖:单体 `nest(idm::router(state))` + 挂 `idm::authenticate`,widget 等用
-//! `idm::{AuditContext, CurrentUser}` 读当前用户;也能独立 oneshot 测试 / 分进程部署。
+//! 被 app 当 lib 依赖:单体 `merge(idm::router::<AppState>())` + 挂 `idm::authenticate::<AppState>`
+//! (FromRef substate 共享同一 AuthService),widget 等用 `idm::{AuditContext, CurrentUser}` 读当前
+//! 用户;也能 `idm::app(state)` 独立起完整服务 / oneshot 测试 / 分进程部署。
 //!
 //! 错误靠**约定**对齐:`IdmError` 自带,`IntoResponse` 输出与 app `AppError` 相同的
 //! `ErrorBody {code,error}`;app 侧 `From<IdmError> for AppError` 接回应用错误体系。
