@@ -1,0 +1,12 @@
+# idm 默认数据 seed。`just seed` 读取并经 repo 幂等创建(数据归数据,不写进迁移)。
+# 改这里增删默认角色/账号,不动代码。账号引用的 role 必须在 [[roles]] 里先声明。
+
+[[roles]]
+name = "superadmin"
+display_name = "超级管理员"
+
+[[accounts]]
+username = "superadmin"
+email = "superadmin@local" # 可选;登录用 username 或 email 都行
+password = "pwd"
+roles = ["superadmin"]

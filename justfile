@@ -70,6 +70,11 @@ migrate-idm-info:
 migrate-add schema name:
     sqlx migrate add -r --source migrations/{{schema}} {{name}}
 
+# seed idm 默认数据(superadmin 角色 + 账号 superadmin@local:pwd + 授予);幂等,可重复跑。
+# 先 `just migrate-idm` 建表。连 idm schema(idm role)。
+seed:
+    IDM_DATABASE_URL="{{idm_db_url}}" cargo run --bin seed
+
 # lint:格式检查 + clippy(警告即失败)
 lint:
     cargo fmt --all -- --check
