@@ -14,7 +14,7 @@ pub use service::WidgetService;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::state::AppState;
+use crate::app::state::AppState;
 
 /// 本模块的路由 + OpenAPI,挂到主 router。
 pub fn router() -> OpenApiRouter<AppState> {

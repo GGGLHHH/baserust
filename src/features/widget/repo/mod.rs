@@ -1,0 +1,55 @@
+//! widget 仓储:**契约(trait)+ 共享 Iden/列定义 + 两实现的装配点**。
+//! 范式:trait 端口与实现分文件 —— 业务方照抄时一眼看到契约,内存/PG 实现各自独立、互不淹没。
+
+mod memory;
+mod postgres;
+
+use async_trait::async_trait;
+use sea_query::Iden;
+use uuid::Uuid;
+
+use super::types::Widget;
+use crate::infra::error::AppError;
+use crate::infra::pagination::{Page, PageParams};
+
+pub use memory::InMemoryWidgetRepo;
+pub use postgres::PgWidgetRepo;
+
+/// sea-query 表/列标识符。`#[derive(Iden)]` 按 snake_case 渲染:`Widgets::Table` -> "widgets" 等。
+#[derive(Iden)]
+pub(crate) enum Widgets {
+    Table,
+    Id,
+    Name,
+    CreatedBy,
+    CreatedAt,
+    UpdatedBy,
+    UpdatedAt,
+    DeletedAt,
+}
+
+/// 读列(**不含 deleted_at**:DTO 不暴露)。列名按 name 映射到 `Widget` 的 FromRow 字段。
+pub(crate) const COLS: [Widgets; 6] = [
+    Widgets::Id,
+    Widgets::Name,
+    Widgets::CreatedBy,
+    Widgets::CreatedAt,
+    Widgets::UpdatedBy,
+    Widgets::UpdatedAt,
+];
+
+/// 仓储端口。范式:trait 定义数据访问契约,service 依赖 trait 而非实现(内存 ↔ Postgres 可拔插)。
+/// 写操作的 `by` = 审计主体(created_by/updated_by),来自 `AuditContext`;时间由 DB default/触发器管。
+#[async_trait]
+pub trait WidgetRepo: Send + Sync {
+    /// 列表分页(offset 跳页 / cursor keyset 双模式,由 `PageParams` 选)。只返回存活行。
+    async fn list(&self, page: &PageParams) -> Result<Page<Widget>, AppError>;
+    /// 按 id 取存活行;不存在/已软删 → NotFound。
+    async fn get(&self, id: Uuid) -> Result<Widget, AppError>;
+    /// 创建;created_by/updated_by 都填 `by`,created_at/updated_at 由 DB default。
+    async fn create(&self, name: String, by: Option<String>) -> Result<Widget, AppError>;
+    /// 改名;updated_by 填 `by`,updated_at 由触发器自动盖。已软删 → NotFound。
+    async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError>;
+    /// 软删除(盖 deleted_at,非物理 DELETE);幂等(已删再删 → NotFound)。
+    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError>;
+}

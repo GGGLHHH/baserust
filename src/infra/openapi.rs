@@ -5,8 +5,8 @@ use axum::Router;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
-use crate::error::AppError;
-use crate::state::AppState;
+use crate::app::state::AppState;
+use crate::infra::error::AppError;
 
 /// OpenAPI 文档根。范式:
 /// - 顶层 info/tags 在此声明;path 与 schema 由各模块的 `#[utoipa::path]` + `routes!()` 贡献。

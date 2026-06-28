@@ -3,11 +3,11 @@ use axum::http::StatusCode;
 use uuid::Uuid;
 
 use super::types::{CreateWidget, UpdateWidget, Widget};
-use crate::audit::AuditContext;
-use crate::error::{AppError, ErrorBody};
-use crate::extract::{Json, Path, Query};
-use crate::pagination::{Page, PageQuery};
-use crate::state::AppState;
+use crate::app::state::AppState;
+use crate::infra::audit::AuditContext;
+use crate::infra::error::{AppError, ErrorBody};
+use crate::infra::extract::{Json, Path, Query};
+use crate::infra::pagination::{Page, PageQuery};
 
 /// 分页列出 widget。默认 offset 第 1 页;带 `cursor` 切 keyset 高性能模式。
 /// handler 薄 —— 取 state、调 service、返回。

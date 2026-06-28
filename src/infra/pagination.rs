@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::error::AppError;
+use crate::infra::error::AppError;
 
 const DEFAULT_SIZE: u64 = 20;
 const MAX_SIZE: u64 = 100;

@@ -1,5 +1,5 @@
 //! 自定义提取器:把 axum 默认的边界拒绝(纯文本 400)统一成 AppError 的 {code, error} 契约。
-//! 业务 handler 用 `crate::extract::{Path, Json, Query}` 替代 axum 同名提取器即可。
+//! 业务 handler 用 `crate::infra::extract::{Path, Json, Query}` 替代 axum 同名提取器即可。
 //!
 //! 加新提取需求时照此包一层:调 axum 原提取器,失败分支映射进 AppError。
 
@@ -10,7 +10,7 @@ use axum::Json as AxumJson;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::error::AppError;
+use crate::infra::error::AppError;
 
 /// 路径参数提取器。失败(类型不匹配,如 `123` 不是 UUID)→ `AppError::BadRequest`(400 + 统一 JSON)。
 pub struct Path<T>(pub T);
@@ -67,7 +67,7 @@ where
 }
 
 /// 同名 `Json` 既是提取器(上面 FromRequest),也是响应体:委托 axum::Json 序列化。
-/// 这样 handler 的参数和返回值都能统一用 `crate::extract::Json`。
+/// 这样 handler 的参数和返回值都能统一用 `crate::infra::extract::Json`。
 impl<T: Serialize> IntoResponse for Json<T> {
     fn into_response(self) -> Response {
         AxumJson(self.0).into_response()

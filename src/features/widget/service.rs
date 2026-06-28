@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use super::repo::WidgetRepo;
 use super::types::{CreateWidget, UpdateWidget, Widget};
-use crate::audit::AuditContext;
-use crate::error::AppError;
-use crate::pagination::{Page, PageQuery};
+use crate::infra::audit::AuditContext;
+use crate::infra::error::AppError;
+use crate::infra::pagination::{Page, PageQuery};
 
 /// 业务逻辑层。范式:
 /// - 持 `Arc<dyn WidgetRepo>` 端口,不关心底层是内存还是 Postgres。
@@ -61,7 +61,7 @@ impl WidgetService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::widget::repo::InMemoryWidgetRepo;
+    use crate::features::widget::repo::InMemoryWidgetRepo;
 
     fn ctx() -> AuditContext {
         AuditContext::anonymous(None)

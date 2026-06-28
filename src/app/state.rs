@@ -4,8 +4,8 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-use crate::config::Config;
-use crate::widget::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo, WidgetService};
+use crate::features::widget::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo, WidgetService};
+use crate::infra::config::Config;
 
 /// 应用级依赖容器。范式(替代 DI 框架):
 /// - 用 axum 的 `State` 提取器注入到每个 handler。
