@@ -14,8 +14,8 @@ use super::types::{
     UserResponse,
 };
 use super::PwHasher;
-use crate::infra::audit::{AuditContext, AuthUser};
-use crate::infra::error::AppError;
+use crate::audit::{AuditContext, AuthUser};
+use crate::error::IdmError;
 
 /// 认证结果:用户信息 + 待写进 httponly cookie 的 token + cookie max-age(秒)。
 /// routes 层把 token 写进 `Set-Cookie`、body 返 `user`;token 不进响应体。
@@ -27,7 +27,7 @@ pub struct AuthOutcome {
     pub refresh_max_age_secs: i64,
 }
 
-/// 认证服务。`Clone` 廉价(全是 Arc),可放进 `AppState`。
+/// 认证服务。`Clone` 廉价(全是 Arc),可放进 `IdmState`。
 #[derive(Clone)]
 pub struct AuthService {
     inner: Arc<Inner>,
@@ -70,7 +70,7 @@ impl AuthService {
         &self,
         input: RegisterRequest,
         ctx: &AuditContext,
-    ) -> Result<AuthOutcome, AppError> {
+    ) -> Result<AuthOutcome, IdmError> {
         input.validate()?;
         let username = normalize(&input.username);
         let email = input.email.as_deref().map(normalize);
@@ -85,28 +85,28 @@ impl AuthService {
 
     /// 登录:校验 → 查用户(identifier=username 或 email)→ 验密 → 发会话。
     /// **防枚举**:不存在与密码错均返回同一 `Unauthorized`。
-    pub async fn login(&self, input: LoginRequest) -> Result<AuthOutcome, AppError> {
+    pub async fn login(&self, input: LoginRequest) -> Result<AuthOutcome, IdmError> {
         input.validate()?;
         let identifier = normalize(&input.identifier);
         let Some(found) = self.inner.users.find_by_identifier(&identifier).await? else {
-            return Err(AppError::Unauthorized);
+            return Err(IdmError::Unauthorized);
         };
         if !self
             .verify_password(input.password, found.password_hash)
             .await?
         {
-            return Err(AppError::Unauthorized);
+            return Err(IdmError::Unauthorized);
         }
         self.issue_session(&found.user, None).await
     }
 
     /// 验 access token → 已认证身份(含角色,供 require_role)。失败 → `Unauthorized`。
-    pub fn authenticate_token(&self, token: &str) -> Result<AuthUser, AppError> {
+    pub fn authenticate_token(&self, token: &str) -> Result<AuthUser, IdmError> {
         let claims = self.inner.jwt.decode(token)?;
         let id = claims
             .sub
             .parse::<Uuid>()
-            .map_err(|_| AppError::Unauthorized)?;
+            .map_err(|_| IdmError::Unauthorized)?;
         Ok(AuthUser {
             id,
             username: claims.username,
@@ -115,18 +115,18 @@ impl AuthService {
     }
 
     /// 当前用户资料(GET /me):查存活用户 + 角色 → `UserResponse`。已软删 → `NotFound`。
-    pub async fn me(&self, user_id: Uuid) -> Result<UserResponse, AppError> {
+    pub async fn me(&self, user_id: Uuid) -> Result<UserResponse, IdmError> {
         let user = self.inner.users.find_by_id(user_id).await?;
         let roles = self.inner.roles.roles_for_user(user_id).await?;
         Ok(to_response(&user, roles))
     }
 
     /// 刷新:验 refresh hash → 轮换(撤旧 session、发新会话)。无效/过期/已撤销 → `Unauthorized`。
-    pub async fn refresh(&self, refresh_token: &str) -> Result<AuthOutcome, AppError> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<AuthOutcome, IdmError> {
         let hash = jwt::hash_refresh(refresh_token);
         let now = OffsetDateTime::now_utc();
         let Some(session) = self.inner.sessions.find_active(&hash, now).await? else {
-            return Err(AppError::Unauthorized);
+            return Err(IdmError::Unauthorized);
         };
         // 轮换:旧 refresh 一次性,撤销后发新会话(防 refresh 重放)。
         self.inner.sessions.revoke(session.id).await?;
@@ -135,7 +135,7 @@ impl AuthService {
     }
 
     /// 登出:撤销该 refresh 对应的会话。幂等(找不到也 Ok)。
-    pub async fn logout(&self, refresh_token: &str) -> Result<(), AppError> {
+    pub async fn logout(&self, refresh_token: &str) -> Result<(), IdmError> {
         let hash = jwt::hash_refresh(refresh_token);
         if let Some(session) = self
             .inner
@@ -149,7 +149,7 @@ impl AuthService {
     }
 
     /// 登出所有设备:撤销用户全部活跃会话。
-    pub async fn logout_all(&self, user_id: Uuid) -> Result<(), AppError> {
+    pub async fn logout_all(&self, user_id: Uuid) -> Result<(), IdmError> {
         self.inner.sessions.revoke_all(user_id, None).await
     }
 
@@ -159,7 +159,7 @@ impl AuthService {
         user_id: Uuid,
         input: UpdateMeRequest,
         ctx: &AuditContext,
-    ) -> Result<UserResponse, AppError> {
+    ) -> Result<UserResponse, IdmError> {
         input.validate()?;
         let username = normalize(&input.username);
         let email = input.email.as_deref().map(normalize);
@@ -178,16 +178,16 @@ impl AuthService {
         user_id: Uuid,
         input: DeleteMeRequest,
         by: Option<String>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), IdmError> {
         input.validate()?;
         let hash = self
             .inner
             .users
             .password_hash(user_id)
             .await?
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or(IdmError::Unauthorized)?;
         if !self.verify_password(input.password, hash).await? {
-            return Err(AppError::Unauthorized);
+            return Err(IdmError::Unauthorized);
         }
         self.inner.sessions.revoke_all(user_id, None).await?;
         self.inner.users.soft_delete(user_id, by).await
@@ -198,16 +198,16 @@ impl AuthService {
         &self,
         user_id: Uuid,
         input: ChangePasswordRequest,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), IdmError> {
         input.validate()?;
         let hash = self
             .inner
             .users
             .password_hash(user_id)
             .await?
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or(IdmError::Unauthorized)?;
         if !self.verify_password(input.current_password, hash).await? {
-            return Err(AppError::Unauthorized);
+            return Err(IdmError::Unauthorized);
         }
         let new_hash = self.hash_password(input.new_password).await?;
         self.inner.users.update_password(user_id, &new_hash).await?;
@@ -220,7 +220,7 @@ impl AuthService {
         &self,
         user: &User,
         by: Option<String>,
-    ) -> Result<AuthOutcome, AppError> {
+    ) -> Result<AuthOutcome, IdmError> {
         let now = OffsetDateTime::now_utc();
         let roles = self.inner.roles.roles_for_user(user.id).await?;
         let (refresh, refresh_hash) = jwt::generate_refresh();
@@ -244,18 +244,18 @@ impl AuthService {
     }
 
     /// argon2 hash 是 CPU 密集 → `spawn_blocking`,不阻塞 tokio worker 线程。
-    async fn hash_password(&self, plain: String) -> Result<String, AppError> {
+    async fn hash_password(&self, plain: String) -> Result<String, IdmError> {
         let hasher = self.inner.hasher.clone();
         tokio::task::spawn_blocking(move || hasher.hash(&plain))
             .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("hash 任务异常: {e}")))?
+            .map_err(|e| IdmError::Internal(anyhow::anyhow!("hash 任务异常: {e}")))?
     }
 
-    async fn verify_password(&self, plain: String, phc: String) -> Result<bool, AppError> {
+    async fn verify_password(&self, plain: String, phc: String) -> Result<bool, IdmError> {
         let hasher = self.inner.hasher.clone();
         tokio::task::spawn_blocking(move || hasher.verify(&plain, &phc))
             .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("verify 任务异常: {e}")))?
+            .map_err(|e| IdmError::Internal(anyhow::anyhow!("verify 任务异常: {e}")))?
     }
 }
 

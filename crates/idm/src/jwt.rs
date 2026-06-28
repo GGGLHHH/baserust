@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::repo::User;
-use crate::infra::error::AppError;
+use crate::error::IdmError;
 
 /// JWT claims。`sub`=user_id、`jti`=session_id(可据此撤销)。roles 留待 RBAC 块加。
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,11 +46,11 @@ impl JwtCodec {
     }
 
     /// 验签 + 解 `Claims`(HS256,校验 exp)。任何失败(验签/过期/格式)→ `Unauthorized`,不泄露原因。
-    pub fn decode(&self, token: &str) -> Result<Claims, AppError> {
+    pub fn decode(&self, token: &str) -> Result<Claims, IdmError> {
         let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         jsonwebtoken::decode::<Claims>(token, &self.decoding, &validation)
             .map(|data| data.claims)
-            .map_err(|_| AppError::Unauthorized)
+            .map_err(|_| IdmError::Unauthorized)
     }
 
     /// 签发 access JWT。`exp = now + access_ttl`。
@@ -60,7 +60,7 @@ impl JwtCodec {
         session_id: Uuid,
         roles: Vec<String>,
         now: OffsetDateTime,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, IdmError> {
         let iat = now.unix_timestamp();
         let claims = Claims {
             sub: user.id.to_string(),
@@ -73,7 +73,7 @@ impl JwtCodec {
             exp: iat + self.access_ttl_secs,
         };
         jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &self.encoding)
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("JWT 签发失败: {e}")))
+            .map_err(|e| IdmError::Internal(anyhow::anyhow!("JWT 签发失败: {e}")))
     }
 }
 

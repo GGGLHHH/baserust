@@ -9,7 +9,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use uuid::Uuid;
 
-use crate::infra::error::AppError;
+use crate::error::IdmError;
 
 /// 鉴权中间件验过 JWT 后塞进 `request.extensions` 的已认证身份(含角色,供 require_role 判权)。
 #[derive(Clone, Debug)]
@@ -98,7 +98,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
 pub struct CurrentUser(pub AuthUser);
 
 impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
-    type Rejection = AppError;
+    type Rejection = IdmError;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         parts
@@ -106,6 +106,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
             .get::<AuthUser>()
             .cloned()
             .map(CurrentUser)
-            .ok_or(AppError::Unauthorized)
+            .ok_or(IdmError::Unauthorized)
     }
 }

@@ -4,14 +4,14 @@
 //! ① 测试躲开 argon2 的 ~100ms(否则每个 register/login 用例都拖慢);② 实现可换。
 //! 注:**换算法**主要靠 PHC 串自描述(verify 按串前缀选算法),trait 管的是"换实现 / 测试替身"。
 
-use crate::infra::error::AppError;
+use crate::error::IdmError;
 
 /// 密码哈希端口。命名刻意避开 `argon2::password_hash::PasswordHasher`(RustCrypto 的 trait)以防撞名。
 pub trait PwHasher: Send + Sync {
     /// 明文 → PHC 串(自带算法标识 + 盐 + 参数)。
-    fn hash(&self, plain: &str) -> Result<String, AppError>;
+    fn hash(&self, plain: &str) -> Result<String, IdmError>;
     /// 校验明文 vs PHC 串。串自描述算法 → 天然支持多算法共存(迁移)。
-    fn verify(&self, plain: &str, phc: &str) -> Result<bool, AppError>;
+    fn verify(&self, plain: &str, phc: &str) -> Result<bool, IdmError>;
 }
 
 /// 生产实现:argon2id(默认参数)。
@@ -20,22 +20,22 @@ pub trait PwHasher: Send + Sync {
 pub struct Argon2Hasher;
 
 impl PwHasher for Argon2Hasher {
-    fn hash(&self, plain: &str) -> Result<String, AppError> {
+    fn hash(&self, plain: &str) -> Result<String, IdmError> {
         use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
         use argon2::Argon2;
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
             .hash_password(plain.as_bytes(), &salt)
             .map(|h| h.to_string())
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("argon2 hash 失败: {e}")))
+            .map_err(|e| IdmError::Internal(anyhow::anyhow!("argon2 hash 失败: {e}")))
     }
 
-    fn verify(&self, plain: &str, phc: &str) -> Result<bool, AppError> {
+    fn verify(&self, plain: &str, phc: &str) -> Result<bool, IdmError> {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
         use argon2::Argon2;
         // PHC 解析失败 = 库里存了坏串 → Internal(原始措辞进日志);密码不匹配 → Ok(false)。
         let parsed = PasswordHash::new(phc)
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("PHC 串解析失败: {e}")))?;
+            .map_err(|e| IdmError::Internal(anyhow::anyhow!("PHC 串解析失败: {e}")))?;
         Ok(Argon2::default()
             .verify_password(plain.as_bytes(), &parsed)
             .is_ok())
@@ -44,17 +44,17 @@ impl PwHasher for Argon2Hasher {
 
 /// 测试实现:前缀标记 + 明文比对,不做真哈希 → 躲开 argon2 的 ~100ms。
 ///
-/// 故意**不**加 `#[cfg(test)]`:集成测试(`tests/`)是独立 crate,需要能从外部构造它注入 `AppState`。
+/// 故意**不**加 `#[cfg(test)]`:集成测试(`tests/`)是独立 crate,需要能从外部构造它注入 `IdmState`。
 /// 仅供测试装配使用,生产装配永远注入 `Argon2Hasher`。
 pub struct FakeHasher;
 
 const FAKE_PREFIX: &str = "fake$";
 
 impl PwHasher for FakeHasher {
-    fn hash(&self, plain: &str) -> Result<String, AppError> {
+    fn hash(&self, plain: &str) -> Result<String, IdmError> {
         Ok(format!("{FAKE_PREFIX}{plain}"))
     }
-    fn verify(&self, plain: &str, phc: &str) -> Result<bool, AppError> {
+    fn verify(&self, plain: &str, phc: &str) -> Result<bool, IdmError> {
         Ok(phc == format!("{FAKE_PREFIX}{plain}"))
     }
 }

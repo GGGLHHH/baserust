@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{RoleRepo, Session, SessionRepo, User, UserRepo, UserWithHash};
-use crate::infra::error::AppError;
+use crate::error::IdmError;
 
 /// 内存内部行:比 `User` 多 password_hash + deleted_at(DTO 不暴露)。
 #[derive(Clone)]
@@ -59,7 +59,7 @@ impl UserRepo for InMemoryUserRepo {
         email: Option<&str>,
         password_hash: &str,
         _by: Option<String>,
-    ) -> Result<User, AppError> {
+    ) -> Result<User, IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
         // username 唯一 + email(有则)唯一,仅对存活行:镜像两个 partial unique 索引。
         let dup = store.values().any(|r| {
@@ -67,7 +67,7 @@ impl UserRepo for InMemoryUserRepo {
                 && (r.username == username || (email.is_some() && r.email.as_deref() == email))
         });
         if dup {
-            return Err(AppError::Conflict("用户名或邮箱已被占用".to_owned()));
+            return Err(IdmError::Conflict("用户名或邮箱已被占用".to_owned()));
         }
         let row = UserRow {
             id: Uuid::now_v7(),
@@ -82,7 +82,7 @@ impl UserRepo for InMemoryUserRepo {
         Ok(user)
     }
 
-    async fn find_by_identifier(&self, identifier: &str) -> Result<Option<UserWithHash>, AppError> {
+    async fn find_by_identifier(&self, identifier: &str) -> Result<Option<UserWithHash>, IdmError> {
         Ok(self
             .store
             .lock()
@@ -98,17 +98,17 @@ impl UserRepo for InMemoryUserRepo {
             }))
     }
 
-    async fn find_by_id(&self, id: Uuid) -> Result<User, AppError> {
+    async fn find_by_id(&self, id: Uuid) -> Result<User, IdmError> {
         self.store
             .lock()
             .expect("锁未中毒")
             .get(&id)
             .filter(|r| r.deleted_at.is_none())
             .map(UserRow::to_user)
-            .ok_or(AppError::NotFound)
+            .ok_or(IdmError::NotFound)
     }
 
-    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError> {
+    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, IdmError> {
         let store = self.store.lock().expect("锁未中毒");
         // 镜像 PG:只返存活行,查不到的 id 直接缺席(不报错)。
         Ok(ids
@@ -125,7 +125,7 @@ impl UserRepo for InMemoryUserRepo {
         username: &str,
         email: Option<&str>,
         _by: Option<String>,
-    ) -> Result<User, AppError> {
+    ) -> Result<User, IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
         // 冲突检查(排除自己):username / email 撞别的存活用户
         let dup = store.values().any(|r| {
@@ -134,7 +134,7 @@ impl UserRepo for InMemoryUserRepo {
                 && (r.username == username || (email.is_some() && r.email.as_deref() == email))
         });
         if dup {
-            return Err(AppError::Conflict("用户名或邮箱已被占用".to_owned()));
+            return Err(IdmError::Conflict("用户名或邮箱已被占用".to_owned()));
         }
         match store.get_mut(&id) {
             Some(r) if r.deleted_at.is_none() => {
@@ -144,33 +144,33 @@ impl UserRepo for InMemoryUserRepo {
                 r.email_verified = false;
                 Ok(r.to_user())
             }
-            _ => Err(AppError::NotFound),
+            _ => Err(IdmError::NotFound),
         }
     }
 
-    async fn soft_delete(&self, id: Uuid, _by: Option<String>) -> Result<(), AppError> {
+    async fn soft_delete(&self, id: Uuid, _by: Option<String>) -> Result<(), IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
         match store.get_mut(&id) {
             Some(r) if r.deleted_at.is_none() => {
                 r.deleted_at = Some(OffsetDateTime::now_utc());
                 Ok(())
             }
-            _ => Err(AppError::NotFound),
+            _ => Err(IdmError::NotFound),
         }
     }
 
-    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), AppError> {
+    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
         match store.get_mut(&user_id) {
             Some(r) if r.deleted_at.is_none() => {
                 r.password_hash = password_hash.to_owned();
                 Ok(())
             }
-            _ => Err(AppError::NotFound),
+            _ => Err(IdmError::NotFound),
         }
     }
 
-    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, AppError> {
+    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, IdmError> {
         Ok(self
             .store
             .lock()
@@ -217,7 +217,7 @@ impl SessionRepo for InMemorySessionRepo {
         token_hash: &str,
         expires_at: OffsetDateTime,
         _by: Option<String>,
-    ) -> Result<Session, AppError> {
+    ) -> Result<Session, IdmError> {
         let row = SessionRow {
             id: Uuid::now_v7(),
             user_id,
@@ -237,7 +237,7 @@ impl SessionRepo for InMemorySessionRepo {
         &self,
         token_hash: &str,
         now: OffsetDateTime,
-    ) -> Result<Option<Session>, AppError> {
+    ) -> Result<Option<Session>, IdmError> {
         Ok(self
             .store
             .lock()
@@ -250,7 +250,7 @@ impl SessionRepo for InMemorySessionRepo {
             }))
     }
 
-    async fn revoke(&self, session_id: Uuid) -> Result<(), AppError> {
+    async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError> {
         let mut store = self.store.lock().expect("锁未中毒");
         if let Some(r) = store.iter_mut().find(|r| r.id == session_id) {
             r.revoked_at.get_or_insert(OffsetDateTime::now_utc());
@@ -258,7 +258,7 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(())
     }
 
-    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), AppError> {
+    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError> {
         let now = OffsetDateTime::now_utc();
         let mut store = self.store.lock().expect("锁未中毒");
         for r in store.iter_mut() {
@@ -290,7 +290,7 @@ impl RoleRepo for InMemoryRoleRepo {
         name: &str,
         _display_name: &str,
         _by: Option<String>,
-    ) -> Result<Uuid, AppError> {
+    ) -> Result<Uuid, IdmError> {
         let mut roles = self.roles.lock().expect("锁未中毒");
         if let Some((id, _)) = roles.iter().find(|(_, n)| n == name) {
             return Ok(*id);
@@ -305,7 +305,7 @@ impl RoleRepo for InMemoryRoleRepo {
         user_id: Uuid,
         role_id: Uuid,
         _by: Option<String>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), IdmError> {
         let mut grants = self.grants.lock().expect("锁未中毒");
         if !grants.contains(&(user_id, role_id)) {
             grants.push((user_id, role_id));
@@ -313,7 +313,7 @@ impl RoleRepo for InMemoryRoleRepo {
         Ok(())
     }
 
-    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, AppError> {
+    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         let grants = self.grants.lock().expect("锁未中毒");
         let roles = self.roles.lock().expect("锁未中毒");
         Ok(grants

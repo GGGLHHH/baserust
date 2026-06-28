@@ -5,10 +5,10 @@
 //! 内存入口:默认 `cargo test` 就跑(零 DB)。
 //! PG 入口:`just test-pg-idm`(需 DATABASE_URL 连 idm role + 跑着的 pg)。
 
+use idm::IdmError;
+use idm::{RoleRepo, SessionRepo, UserRepo};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-use xchangeai::features::idm::{RoleRepo, SessionRepo, UserRepo};
-use xchangeai::infra::error::AppError;
 
 /// 契约唯一真相源。三个 repo 协作(user → session → role),内存与 PG 都调它。
 /// PG 有 FK(sessions/user_roles → users),故必须先建 user 再建 session/grant。
@@ -25,7 +25,7 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
     assert_eq!(users.find_by_id(u.id).await.unwrap().username, "alice");
     assert!(matches!(
         users.create("alice", None, "h", None).await,
-        Err(AppError::Conflict(_))
+        Err(IdmError::Conflict(_))
     ));
     assert_eq!(
         users.password_hash(u.id).await.unwrap().as_deref(),
@@ -115,19 +115,19 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
     users.soft_delete(u.id, None).await.unwrap();
     assert!(matches!(
         users.find_by_id(u.id).await,
-        Err(AppError::NotFound)
+        Err(IdmError::NotFound)
     ));
     assert!(users.find_by_identifier("alice2").await.unwrap().is_none()); // 软删后查不到
     assert!(matches!(
         users.soft_delete(u.id, None).await,
-        Err(AppError::NotFound)
+        Err(IdmError::NotFound)
     )); // 二次删幂等
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
 #[tokio::test]
 async fn memory_satisfies_idm_contract() {
-    use xchangeai::features::idm::{InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
+    use idm::{InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
     idm_repo_contract(
         &InMemoryUserRepo::new(),
         &InMemorySessionRepo::new(),
@@ -137,22 +137,33 @@ async fn memory_satisfies_idm_contract() {
 }
 
 // ── 入口 2:PG(需 --features pg-conformance + DATABASE_URL 连 idm role + 跑着的 pg)──
-#[cfg(feature = "pg-conformance")]
-#[path = "support/mod.rs"]
-mod support;
-
+// bootstrap 内联在本文件(不走 #[path] include):sqlx::migrate! 在被 include 的文件里会按
+// "相对当前文件目录"解析路径(sqlx 不支持),内联后它相对 idm crate 的 CARGO_MANIFEST_DIR、稳。
 #[cfg(feature = "pg-conformance")]
 mod pg {
-    use super::{idm_repo_contract, support};
+    use super::idm_repo_contract;
+    use sqlx::migrate::Migrator;
+
+    /// 编译期内嵌 crates/idm/migrations(相对 idm crate 的 CARGO_MANIFEST_DIR)。
+    static IDM_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+    /// #[sqlx::test] 的干净临时库:建 idm schema + 跑 idm crate 自带 migrations。
+    async fn bootstrap_idm(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        sqlx::query("create schema if not exists idm")
+            .execute(pool)
+            .await?;
+        IDM_MIGRATOR.run(pool).await?;
+        Ok(())
+    }
 
     #[sqlx::test(migrations = false)]
     async fn pg_satisfies_idm_contract(pool: sqlx::PgPool) -> sqlx::Result<()> {
-        support::bootstrap_idm_schema(&pool)
+        bootstrap_idm(&pool)
             .await
-            .expect("bootstrap idm schema + 跑 migrations/idm");
-        let users = xchangeai::features::idm::PgUserRepo::new(pool.clone());
-        let sessions = xchangeai::features::idm::PgSessionRepo::new(pool.clone());
-        let roles = xchangeai::features::idm::PgRoleRepo::new(pool);
+            .expect("bootstrap idm schema + 跑 migrations");
+        let users = idm::PgUserRepo::new(pool.clone());
+        let sessions = idm::PgSessionRepo::new(pool.clone());
+        let roles = idm::PgRoleRepo::new(pool);
         idm_repo_contract(&users, &sessions, &roles).await;
         Ok(())
     }

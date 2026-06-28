@@ -11,16 +11,16 @@ use super::{
     RoleRepo, Roles, Session, SessionRepo, Sessions, User, UserPassword, UserRepo, UserRoles,
     UserWithHash, Users,
 };
-use crate::infra::error::AppError;
+use crate::error::IdmError;
 
 /// 唯一冲突(撞存活唯一索引)→ `Conflict`;其它库错误 → `Internal`(原始进日志)。
-fn map_unique(e: sqlx::Error, msg: &str) -> AppError {
+fn map_unique(e: sqlx::Error, msg: &str) -> IdmError {
     if let sqlx::Error::Database(db) = &e {
         if db.is_unique_violation() {
-            return AppError::Conflict(msg.to_owned());
+            return IdmError::Conflict(msg.to_owned());
         }
     }
-    AppError::Internal(e.into())
+    IdmError::Internal(e.into())
 }
 
 // ── 用户 ──
@@ -52,14 +52,14 @@ impl UserRepo for PgUserRepo {
         email: Option<&str>,
         password_hash: &str,
         by: Option<String>,
-    ) -> Result<User, AppError> {
+    ) -> Result<User, IdmError> {
         let id = Uuid::now_v7();
         // 同事务:users + user_password,任一失败回滚(凭据分表不会半截)。
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
 
         let (usql, uvalues) = Query::insert()
             .into_table(Users::Table)
@@ -97,15 +97,15 @@ impl UserRepo for PgUserRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(psql), pvalues)
             .execute(&mut *tx)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
 
         tx.commit()
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(user)
     }
 
-    async fn find_by_identifier(&self, identifier: &str) -> Result<Option<UserWithHash>, AppError> {
+    async fn find_by_identifier(&self, identifier: &str) -> Result<Option<UserWithHash>, IdmError> {
         // WHERE (username = $ OR email = $) AND deleted_at IS NULL
         let (sql, values) = Query::select()
             .column((Users::Table, Users::Id))
@@ -129,7 +129,7 @@ impl UserRepo for PgUserRepo {
         let row = sqlx::query_as_with::<Postgres, UserHashRow, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(row.map(|r| UserWithHash {
             user: User {
                 id: r.id,
@@ -141,7 +141,7 @@ impl UserRepo for PgUserRepo {
         }))
     }
 
-    async fn find_by_id(&self, id: Uuid) -> Result<User, AppError> {
+    async fn find_by_id(&self, id: Uuid) -> Result<User, IdmError> {
         let (sql, values) = Query::select()
             .columns([
                 Users::Id,
@@ -156,11 +156,11 @@ impl UserRepo for PgUserRepo {
         sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?
-            .ok_or(AppError::NotFound)
+            .map_err(|e| IdmError::Internal(e.into()))?
+            .ok_or(IdmError::NotFound)
     }
 
-    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError> {
+    async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, IdmError> {
         if ids.is_empty() {
             return Ok(Vec::new()); // 空集省一次查询,也避开空 IN ()
         }
@@ -178,7 +178,7 @@ impl UserRepo for PgUserRepo {
         sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))
+            .map_err(|e| IdmError::Internal(e.into()))
     }
 
     async fn update(
@@ -187,7 +187,7 @@ impl UserRepo for PgUserRepo {
         username: &str,
         email: Option<&str>,
         by: Option<String>,
-    ) -> Result<User, AppError> {
+    ) -> Result<User, IdmError> {
         // PUT 全量替换:username/email 都 set(email 含清空 null),替换 email 即重置 email_verified。
         let (sql, values) = Query::update()
             .table(Users::Table)
@@ -208,10 +208,10 @@ impl UserRepo for PgUserRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| map_unique(e, "用户名或邮箱已被占用"))?
-            .ok_or(AppError::NotFound)
+            .ok_or(IdmError::NotFound)
     }
 
-    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError> {
+    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), IdmError> {
         let (sql, values) = Query::update()
             .table(Users::Table)
             .value(Users::DeletedAt, OffsetDateTime::now_utc())
@@ -222,14 +222,14 @@ impl UserRepo for PgUserRepo {
         let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         if res.rows_affected() == 0 {
-            return Err(AppError::NotFound);
+            return Err(IdmError::NotFound);
         }
         Ok(())
     }
 
-    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), AppError> {
+    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), IdmError> {
         let (sql, values) = Query::update()
             .table(UserPassword::Table)
             .value(UserPassword::PasswordHash, password_hash.to_owned())
@@ -239,11 +239,11 @@ impl UserRepo for PgUserRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
 
-    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, AppError> {
+    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, IdmError> {
         // 仅存活用户:join users 过滤 deleted_at
         let (sql, values) = Query::select()
             .column((UserPassword::Table, UserPassword::PasswordHash))
@@ -259,7 +259,7 @@ impl UserRepo for PgUserRepo {
         sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))
+            .map_err(|e| IdmError::Internal(e.into()))
     }
 }
 
@@ -282,7 +282,7 @@ impl SessionRepo for PgSessionRepo {
         token_hash: &str,
         expires_at: OffsetDateTime,
         by: Option<String>,
-    ) -> Result<Session, AppError> {
+    ) -> Result<Session, IdmError> {
         let id = Uuid::now_v7();
         let (sql, values) = Query::insert()
             .into_table(Sessions::Table)
@@ -306,7 +306,7 @@ impl SessionRepo for PgSessionRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(Session { id, user_id })
     }
 
@@ -314,7 +314,7 @@ impl SessionRepo for PgSessionRepo {
         &self,
         token_hash: &str,
         now: OffsetDateTime,
-    ) -> Result<Option<Session>, AppError> {
+    ) -> Result<Option<Session>, IdmError> {
         let (sql, values) = Query::select()
             .columns([Sessions::Id, Sessions::UserId])
             .from(Sessions::Table)
@@ -325,10 +325,10 @@ impl SessionRepo for PgSessionRepo {
         sqlx::query_as_with::<Postgres, Session, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))
+            .map_err(|e| IdmError::Internal(e.into()))
     }
 
-    async fn revoke(&self, session_id: Uuid) -> Result<(), AppError> {
+    async fn revoke(&self, session_id: Uuid) -> Result<(), IdmError> {
         let (sql, values) = Query::update()
             .table(Sessions::Table)
             .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
@@ -338,11 +338,11 @@ impl SessionRepo for PgSessionRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
 
-    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), AppError> {
+    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), IdmError> {
         let mut q = Query::update();
         q.table(Sessions::Table)
             .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
@@ -355,7 +355,7 @@ impl SessionRepo for PgSessionRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
 }
@@ -378,7 +378,7 @@ impl RoleRepo for PgRoleRepo {
         name: &str,
         display_name: &str,
         by: Option<String>,
-    ) -> Result<Uuid, AppError> {
+    ) -> Result<Uuid, IdmError> {
         // 幂等:先查存活同名(seed 单次串行跑,并发竞态可忽略;真要强一致再加 ON CONFLICT)。
         let (ssql, svalues) = Query::select()
             .column(Roles::Id)
@@ -389,7 +389,7 @@ impl RoleRepo for PgRoleRepo {
         if let Some(id) = sqlx::query_scalar_with::<Postgres, Uuid, _>(AssertSqlSafe(ssql), svalues)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?
+            .map_err(|e| IdmError::Internal(e.into()))?
         {
             return Ok(id);
         }
@@ -423,7 +423,7 @@ impl RoleRepo for PgRoleRepo {
         user_id: Uuid,
         role_id: Uuid,
         by: Option<String>,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), IdmError> {
         let (sql, values) = Query::insert()
             .into_table(UserRoles::Table)
             .columns([UserRoles::UserId, UserRoles::RoleId, UserRoles::GrantedBy])
@@ -437,11 +437,11 @@ impl RoleRepo for PgRoleRepo {
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(|e| IdmError::Internal(e.into()))?;
         Ok(())
     }
 
-    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, AppError> {
+    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         // SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id
         //   WHERE ur.user_id = $ AND r.deleted_at IS NULL
         let (sql, values) = Query::select()
@@ -457,6 +457,6 @@ impl RoleRepo for PgRoleRepo {
         sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))
+            .map_err(|e| IdmError::Internal(e.into()))
     }
 }

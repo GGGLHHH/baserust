@@ -12,27 +12,17 @@ use axum::response::Response;
 use axum::Router;
 use tower::ServiceExt; // oneshot
 
-use xchangeai::app::{build_router, AppState};
-use xchangeai::features::idm::{
-    AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo,
+use idm::{
+    AuthService, FakeHasher, IdmState, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo,
 };
-use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
+/// idm 独立的测试 app:`idm::app`(端点 + best-effort 鉴权中间件),内存 repo、无 DB、无 app 牵连。
+/// 这正是 idm crate 自带 HTTP 的价值:oneshot 直接打它的契约、不绑 app。
 fn test_app() -> Router {
-    let state = AppState {
-        widgets: WidgetService::new(
-            Arc::new(InMemoryWidgetRepo::new()),
-            Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
-        ),
+    idm::app(IdmState {
         auth: test_auth(),
-        db_pool: None,
         cookie_secure: false,
-    };
-    build_router(
-        state,
-        &xchangeai::infra::config::Config::default(),
-        xchangeai::app::Mount::Both,
-    )
+    })
 }
 
 /// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + 固定 secret。

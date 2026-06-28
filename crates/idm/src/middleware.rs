@@ -11,12 +11,12 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum_extra::extract::CookieJar;
 
-use crate::app::state::AppState;
+use crate::state::HasAuth;
 
-/// 鉴权:**httponly cookie 优先,`Authorization: Bearer` 兜底**。
-/// 浏览器走 cookie(JS 读不到 token);curl/移动端/脚本仍可用 Bearer。token 校验是这里唯一真相源。
-pub async fn authenticate(
-    State(state): State<AppState>,
+/// 鉴权:**httponly cookie 优先,`Authorization: Bearer` 兜底**。泛型 over `S: HasAuth`,
+/// 故 idm 独立跑(IdmState)与 app 集成(AppState)共用这一份 —— state 只需能给出 `AuthService`。
+pub async fn authenticate<S: HasAuth>(
+    State(state): State<S>,
     jar: CookieJar,
     mut req: Request,
     next: Next,
@@ -26,7 +26,7 @@ pub async fn authenticate(
         .map(|c| c.value().to_owned())
         .or_else(|| bearer_token(&req).map(str::to_owned));
     if let Some(token) = token {
-        if let Ok(user) = state.auth.authenticate_token(&token) {
+        if let Ok(user) = state.auth().authenticate_token(&token) {
             req.extensions_mut().insert(user);
         }
     }
