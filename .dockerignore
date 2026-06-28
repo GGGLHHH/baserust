@@ -1,0 +1,8 @@
+# 构建上下文排除:体积大或不该进镜像的
+/target
+/logs
+.env
+.git
+.github
+.vscode
+*.md

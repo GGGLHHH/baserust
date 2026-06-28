@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dbhub": {
+      "type": "http",
+      "url": "http://localhost:3777/mcp"
+    }
+  }
+}
