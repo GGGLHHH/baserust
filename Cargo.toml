@@ -10,11 +10,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 
 # Web 框架 + 中间件
 axum = "0.8"
-tower-http = { version = "0.7", features = ["trace", "timeout", "catch-panic"] }
+tower-http = { version = "0.7", features = ["trace", "timeout", "catch-panic", "request-id"] }
 
 # OpenAPI(替 huma);yaml feature 自带 to_yaml(),绕开 2026 混乱的 serde_yaml 生态
 utoipa = { version = "5", features = ["axum_extras", "yaml", "uuid"] }
 utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 # 配置:只用环境变量(不碰 yaml 文件 → 不引入已废弃的 serde_yaml)
 figment = { version = "0.10", features = ["env"] }
