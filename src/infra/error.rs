@@ -26,6 +26,15 @@ pub enum AppError {
     #[error("请求格式错误")]
     BadRequest(String),
 
+    /// 未认证 / 凭据无效(登录失败、token 无效或过期、改密旧密码错)→ 401。
+    /// `client_message` 刻意通用,**绝不区分"用户不存在"与"密码错误"**(防账号枚举)。
+    #[error("认证失败")]
+    Unauthorized,
+
+    /// 资源冲突(注册时 email 已占用)→ 409。消息写给用户、可回传(不含内部措辞)。
+    #[error("资源冲突: {0}")]
+    Conflict(String),
+
     /// 兜底:任何 anyhow 错误(DB、IO、依赖)→ 500。原始 source chain 只进日志。
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -37,6 +46,8 @@ impl AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -47,17 +58,21 @@ impl AppError {
             AppError::NotFound => "not_found",
             AppError::Validation(_) => "validation",
             AppError::BadRequest(_) => "bad_request",
+            AppError::Unauthorized => "unauthorized",
+            AppError::Conflict(_) => "conflict",
             AppError::Internal(_) => "internal",
         }
     }
 
     /// 进响应 `error` 字段的消息 —— **永远安全、刻意写**,绝不含底层库的原始措辞。
-    /// 唯一回传"具体内容"的是 Validation(garde 校验提示本就是写给用户的)。
+    /// Validation/Conflict 回传"具体内容"(本就写给用户);Unauthorized 刻意通用(防枚举)。
     fn client_message(&self) -> String {
         match self {
             AppError::NotFound => "资源不存在".to_owned(),
             AppError::Validation(msg) => format!("请求无效: {msg}"),
             AppError::BadRequest(_) => "请求格式不正确".to_owned(),
+            AppError::Unauthorized => "认证失败".to_owned(),
+            AppError::Conflict(msg) => msg.clone(),
             AppError::Internal(_) => "内部服务器错误".to_owned(),
         }
     }
@@ -69,7 +84,10 @@ impl AppError {
         match self {
             AppError::BadRequest(detail) => Some(detail.clone()),
             AppError::Internal(err) => Some(format!("{err:?}")),
-            AppError::NotFound | AppError::Validation(_) => None,
+            AppError::NotFound
+            | AppError::Validation(_)
+            | AppError::Unauthorized
+            | AppError::Conflict(_) => None,
         }
     }
 }
@@ -77,7 +95,7 @@ impl AppError {
 /// 统一错误响应体。pub + ToSchema:让这个契约出现在 OpenAPI,前端 codegen 能看到错误形状。
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
-    /// 机器可读错误类别(not_found / validation / bad_request / internal)
+    /// 机器可读错误类别(not_found / validation / bad_request / unauthorized / conflict / internal)
     #[schema(value_type = String)]
     pub code: &'static str,
     /// 给人看的安全消息 —— 不含 SQL/解析器/路径等任何内部原始措辞
@@ -141,5 +159,21 @@ mod tests {
         assert!(v.client_message().contains("name"));
         assert!(v.log_detail().is_none());
         assert_eq!(v.code(), "validation");
+    }
+
+    #[test]
+    fn unauthorized_is_generic_to_prevent_enumeration() {
+        // 401 文案必须通用:不暴露"是用户不存在还是密码错" —— 防账号枚举
+        let e = AppError::Unauthorized;
+        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(e.code(), "unauthorized");
+        assert_eq!(e.client_message(), "认证失败");
+        assert!(e.log_detail().is_none());
+
+        // Conflict:409,消息写给用户、可回传
+        let c = AppError::Conflict("该邮箱已被注册".to_owned());
+        assert_eq!(c.status_code(), StatusCode::CONFLICT);
+        assert_eq!(c.code(), "conflict");
+        assert_eq!(c.client_message(), "该邮箱已被注册");
     }
 }
