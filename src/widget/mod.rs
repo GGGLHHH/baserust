@@ -20,5 +20,9 @@ use crate::state::AppState;
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::list_widgets, routes::create_widget))
-        .routes(routes!(routes::get_widget))
+        .routes(routes!(
+            routes::get_widget,
+            routes::update_widget,
+            routes::delete_widget
+        ))
 }

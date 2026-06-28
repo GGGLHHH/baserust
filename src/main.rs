@@ -2,11 +2,13 @@
 //!
 //! 加新业务模块:在 src/ 下照抄 widget/ 的文件结构,然后在 `build_router` 里 `.merge()` 一行。
 
+mod audit;
 mod config;
 mod error;
 mod extract;
 mod health;
 mod openapi;
+mod pagination;
 mod state;
 mod widget;
 

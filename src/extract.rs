@@ -1,9 +1,9 @@
 //! 自定义提取器:把 axum 默认的边界拒绝(纯文本 400)统一成 AppError 的 {code, error} 契约。
-//! 业务 handler 用 `crate::extract::{Path, Json}` 替代 axum 同名提取器即可。
+//! 业务 handler 用 `crate::extract::{Path, Json, Query}` 替代 axum 同名提取器即可。
 //!
 //! 加新提取需求时照此包一层:调 axum 原提取器,失败分支映射进 AppError。
 
-use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Request};
+use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Query as AxumQuery, Request};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::Json as AxumJson;
@@ -25,6 +25,24 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match AxumPath::<T>::from_request_parts(parts, state).await {
             Ok(AxumPath(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+        }
+    }
+}
+
+/// 查询参数提取器。失败(类型不匹配 / 反序列化失败)→ `AppError::BadRequest`。
+pub struct Query<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for Query<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumQuery::<T>::from_request_parts(parts, state).await {
+            Ok(AxumQuery(value)) => Ok(Self(value)),
             Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
         }
     }
