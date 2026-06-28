@@ -55,7 +55,7 @@ time = { version = "0.3", features = ["serde-well-known"] }
 base64 = "0.22"
 
 # feature 开关:pg-conformance 开了才编译"打真库的仓储一致性测试"(需 DATABASE_URL + 跑着的 pg)。
-# 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性由 CI 单列 job + 本地 `just test-pg` 显式触发。
+# 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用本地 `just test-pg` 显式触发(将来接 CI 时单列一个 job 跑它)。
 [features]
 pg-conformance = []
 
