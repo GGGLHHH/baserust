@@ -13,7 +13,7 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["trace", "timeout", "catch-panic", "request-id"] }
 
 # OpenAPI(替 huma);yaml feature 自带 to_yaml(),绕开 2026 混乱的 serde_yaml 生态
-utoipa = { version = "5", features = ["axum_extras", "yaml", "uuid"] }
+utoipa = { version = "5", features = ["axum_extras", "yaml", "uuid", "time"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
@@ -36,14 +36,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
-# SQL:连接 + 仓储范式就位(默认走内存,设 DATABASE_URL 才连)
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros"] }
+# SQL:连接 + 仓储范式就位(默认走内存,设 APP_DB_HOST 才连)
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "time"] }
+
+# SQL builder(为必然到来的动态查询铺路:可选 filter / 分页 / 多变 JOIN)。
+# 注意 crate 名是 sea-query-sqlx —— 旧名 sea-query-binder 停在 sqlx 0.8;1.0 线才接 sqlx 0.9。
+sea-query = "1.0"
+sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time"] }
 
 # trait 对象 + async fn:dyn 安全需要 async-trait 宏(原生 async-in-trait 不 object-safe)
 async-trait = "0.1"
 
 # 工具
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# 时间:timestamptz <-> OffsetDateTime(审计字段);serde-well-known 提供 RFC3339
+time = { version = "0.3", features = ["serde-well-known"] }
+# cursor 游标编解码(opaque base64url token)
+base64 = "0.22"
 
 # lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明
 [lints.rust]
