@@ -11,11 +11,12 @@ use uuid::Uuid;
 
 use crate::infra::error::AppError;
 
-/// 鉴权中间件验过 JWT 后塞进 `request.extensions` 的已认证身份。
+/// 鉴权中间件验过 JWT 后塞进 `request.extensions` 的已认证身份(含角色,供 require_role 判权)。
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub id: Uuid,
     pub username: String,
+    pub roles: Vec<String>,
 }
 
 /// 操作主体。`User` 由鉴权中间件经 extension 填充;`System` 给 seeder/job;`Anonymous` 给未认证请求。

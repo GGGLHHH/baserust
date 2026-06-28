@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::infra::error::AppError;
 
-pub use memory::{InMemorySessionRepo, InMemoryUserRepo};
+pub use memory::{InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 pub use postgres::{PgRoleRepo, PgSessionRepo, PgUserRepo};
 
 /// 用户内部实体。`FromRow` 供 PG 查映射;对外 DTO `UserResponse` 由 service 转,审计字段不进 DTO。
@@ -30,7 +30,7 @@ pub struct UserWithHash {
 }
 
 /// 会话内部实体。`id` 同时作 JWT 的 `jti`。
-#[derive(Clone)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -53,6 +53,7 @@ pub(crate) enum UserPassword {
     Table,
     UserId,
     PasswordHash,
+    PasswordUpdatedAt,
 }
 #[derive(Iden)]
 pub(crate) enum Sessions {
@@ -61,6 +62,7 @@ pub(crate) enum Sessions {
     UserId,
     TokenHash,
     ExpiresAt,
+    RevokedAt,
     CreatedBy,
     UpdatedBy,
 }
@@ -100,6 +102,25 @@ pub trait UserRepo: Send + Sync {
 
     /// 按 id 查存活用户。不存在 / 已软删 → `NotFound`。
     async fn find_by_id(&self, id: Uuid) -> Result<User, AppError>;
+
+    /// 部分更新 username/email(各 `None`=不改)。改 email 会把 email_verified 置 false。
+    /// 冲突 → `Conflict`;已软删 → `NotFound`。
+    async fn update(
+        &self,
+        id: Uuid,
+        username: Option<&str>,
+        email: Option<&str>,
+        by: Option<String>,
+    ) -> Result<User, AppError>;
+
+    /// 软删用户(注销)。幂等(已删/不存在 → NotFound)。
+    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError>;
+
+    /// 更新密码 hash(改密)。
+    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), AppError>;
+
+    /// 取存活用户的密码 hash(改密/删号验密用)。
+    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, AppError>;
 }
 
 /// 会话仓储端口。
@@ -113,6 +134,19 @@ pub trait SessionRepo: Send + Sync {
         expires_at: OffsetDateTime,
         by: Option<String>,
     ) -> Result<Session, AppError>;
+
+    /// 按 refresh token hash 查**活跃**会话(未撤销、未过期)。
+    async fn find_active(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Session>, AppError>;
+
+    /// 撤销会话(盖 revoked_at)。幂等(已撤销/不存在都 Ok)。
+    async fn revoke(&self, session_id: Uuid) -> Result<(), AppError>;
+
+    /// 撤销用户的所有活跃会话;`except` 排除某会话(改密保留当前)。
+    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), AppError>;
 }
 
 /// 角色仓储端口(seed / RBAC 用)。
@@ -129,4 +163,7 @@ pub trait RoleRepo: Send + Sync {
     /// 幂等授予用户角色(`user_roles` 复合主键冲突即跳过)。
     async fn grant(&self, user_id: Uuid, role_id: Uuid, by: Option<String>)
         -> Result<(), AppError>;
+
+    /// 查用户拥有的角色名(存活角色),供 JWT roles claim + 权限判定。
+    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, AppError>;
 }

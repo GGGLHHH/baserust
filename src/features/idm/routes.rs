@@ -37,11 +37,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(change_password))
 }
 
-/// 待实现占位:契约已定,逻辑留待后续块填充。
-fn not_impl(what: &str) -> AppError {
-    AppError::Internal(anyhow::anyhow!("idm {what} 未实现"))
-}
-
 /// 构造 httponly 认证 cookie:HttpOnly + SameSite=Lax + Secure(prod)+ Path=/ + Max-Age。
 fn auth_cookie(
     name: &'static str,
@@ -130,29 +125,49 @@ async fn login(
 #[utoipa::path(
     post, path = "/auth/refresh", tag = "auth",
     responses(
-        (status = 200, description = "刷新成功,新 token 写入 cookie"),
+        (status = 200, description = "刷新成功,新 token 写入 cookie", body = UserResponse),
         (status = 401, description = "refresh cookie 无效/过期/已撤销", body = ErrorBody),
     )
 )]
-async fn refresh(_jar: CookieJar) -> Result<StatusCode, AppError> {
-    Err(not_impl("refresh"))
+async fn refresh(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    let refresh = jar
+        .get(REFRESH_COOKIE)
+        .map(|c| c.value().to_owned())
+        .ok_or(AppError::Unauthorized)?;
+    let outcome = state.auth.refresh(&refresh).await?;
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user)))
 }
 
 #[utoipa::path(
     post, path = "/auth/logout", tag = "auth",
     responses((status = 204, description = "已登出,清除 cookie(幂等)"))
 )]
-async fn logout(jar: CookieJar) -> (StatusCode, CookieJar) {
-    // 清 cookie(前端登出)。撤销服务端 session 留待 refresh/logout 逻辑块。
-    (StatusCode::NO_CONTENT, clear_auth_cookies(jar))
+async fn logout(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等。
+    if let Some(c) = jar.get(REFRESH_COOKIE) {
+        state.auth.logout(c.value()).await?;
+    }
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
 #[utoipa::path(
     post, path = "/auth/logout-all", tag = "auth",
-    responses((status = 204), (status = 401, body = ErrorBody))
+    responses((status = 204, description = "已撤销所有会话"), (status = 401, body = ErrorBody))
 )]
-async fn logout_all() -> Result<StatusCode, AppError> {
-    Err(not_impl("logout-all"))
+async fn logout_all(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    user: CurrentUser,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    state.auth.logout_all(user.0.id).await?;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
 #[utoipa::path(
@@ -176,9 +191,14 @@ async fn get_me(
         (status = 401, body = ErrorBody),
     )
 )]
-async fn update_me(Json(req): Json<UpdateMeRequest>) -> Result<Json<UserResponse>, AppError> {
-    let _ = req;
-    Err(not_impl("update_me"))
+async fn update_me(
+    State(state): State<AppState>,
+    ctx: AuditContext,
+    user: CurrentUser,
+    Json(req): Json<UpdateMeRequest>,
+) -> Result<Json<UserResponse>, AppError> {
+    let resp = state.auth.update_me(user.0.id, req, &ctx).await?;
+    Ok(Json(resp))
 }
 
 #[utoipa::path(
@@ -189,9 +209,15 @@ async fn update_me(Json(req): Json<UpdateMeRequest>) -> Result<Json<UserResponse
         (status = 401, description = "密码错", body = ErrorBody),
     )
 )]
-async fn delete_me(Json(req): Json<DeleteMeRequest>) -> Result<StatusCode, AppError> {
-    let _ = req;
-    Err(not_impl("delete_me"))
+async fn delete_me(
+    State(state): State<AppState>,
+    ctx: AuditContext,
+    user: CurrentUser,
+    jar: CookieJar,
+    Json(req): Json<DeleteMeRequest>,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    state.auth.delete_me(user.0.id, req, ctx.audit_id()).await?;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
 #[utoipa::path(
@@ -202,7 +228,12 @@ async fn delete_me(Json(req): Json<DeleteMeRequest>) -> Result<StatusCode, AppEr
         (status = 401, description = "旧密码错", body = ErrorBody),
     )
 )]
-async fn change_password(Json(req): Json<ChangePasswordRequest>) -> Result<StatusCode, AppError> {
-    let _ = req;
-    Err(not_impl("change_password"))
+async fn change_password(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    jar: CookieJar,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    state.auth.change_password(user.0.id, req).await?;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }

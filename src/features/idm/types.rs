@@ -33,6 +33,7 @@ pub struct UserResponse {
     pub username: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    pub roles: Vec<String>,
 }
 
 /// 更新当前用户(部分更新,字段全可选)。

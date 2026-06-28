@@ -11,7 +11,9 @@ use axum::Router;
 use tower::ServiceExt; // oneshot
 
 use xchangeai::app::{build_router, AppState};
-use xchangeai::features::idm::{AuthService, FakeHasher, InMemorySessionRepo, InMemoryUserRepo};
+use xchangeai::features::idm::{
+    AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo,
+};
 use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配。
@@ -30,6 +32,7 @@ fn test_auth() -> AuthService {
     AuthService::new(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
+        Arc::new(InMemoryRoleRepo::new()),
         Arc::new(FakeHasher),
         "test-secret",
         900,

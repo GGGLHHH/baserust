@@ -14,8 +14,8 @@ pub mod types;
 pub use middleware::authenticate;
 pub use password::{Argon2Hasher, FakeHasher, PwHasher};
 pub use repo::{
-    InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo, PgSessionRepo, PgUserRepo, RoleRepo,
-    Session, SessionRepo, User, UserRepo, UserWithHash,
+    InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo, PgSessionRepo, PgUserRepo,
+    RoleRepo, Session, SessionRepo, User, UserRepo, UserWithHash,
 };
 pub use routes::router;
 pub use service::{AuthOutcome, AuthService};

@@ -18,6 +18,9 @@ pub struct Claims {
     pub username: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    /// 角色名列表。`#[serde(default)]`:旧 token(无 roles)解码不失败。
+    #[serde(default)]
+    pub roles: Vec<String>,
     pub iat: i64,
     pub exp: i64,
 }
@@ -55,6 +58,7 @@ impl JwtCodec {
         &self,
         user: &User,
         session_id: Uuid,
+        roles: Vec<String>,
         now: OffsetDateTime,
     ) -> Result<String, AppError> {
         let iat = now.unix_timestamp();
@@ -64,6 +68,7 @@ impl JwtCodec {
             username: user.username.clone(),
             email: user.email.clone(),
             email_verified: user.email_verified,
+            roles,
             iat,
             exp: iat + self.access_ttl_secs,
         };

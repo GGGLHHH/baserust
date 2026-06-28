@@ -159,6 +159,89 @@ impl UserRepo for PgUserRepo {
             .map_err(|e| AppError::Internal(e.into()))?
             .ok_or(AppError::NotFound)
     }
+
+    async fn update(
+        &self,
+        id: Uuid,
+        username: Option<&str>,
+        email: Option<&str>,
+        by: Option<String>,
+    ) -> Result<User, AppError> {
+        let mut q = Query::update();
+        q.table(Users::Table).value(Users::UpdatedBy, by);
+        if let Some(u) = username {
+            q.value(Users::Username, u.to_owned());
+        }
+        if let Some(e) = email {
+            q.value(Users::Email, e.to_owned());
+            q.value(Users::EmailVerified, false); // 改 email 需重新验证
+        }
+        q.and_where(Expr::col(Users::Id).eq(id))
+            .and_where(Expr::col(Users::DeletedAt).is_null())
+            .returning(Query::returning().columns([
+                Users::Id,
+                Users::Username,
+                Users::Email,
+                Users::EmailVerified,
+            ]));
+        let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_unique(e, "用户名或邮箱已被占用"))?
+            .ok_or(AppError::NotFound)
+    }
+
+    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError> {
+        let (sql, values) = Query::update()
+            .table(Users::Table)
+            .value(Users::DeletedAt, OffsetDateTime::now_utc())
+            .value(Users::UpdatedBy, by)
+            .and_where(Expr::col(Users::Id).eq(id))
+            .and_where(Expr::col(Users::DeletedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        let res = sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn update_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), AppError> {
+        let (sql, values) = Query::update()
+            .table(UserPassword::Table)
+            .value(UserPassword::PasswordHash, password_hash.to_owned())
+            .value(UserPassword::PasswordUpdatedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(UserPassword::UserId).eq(user_id))
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    async fn password_hash(&self, user_id: Uuid) -> Result<Option<String>, AppError> {
+        // 仅存活用户:join users 过滤 deleted_at
+        let (sql, values) = Query::select()
+            .column((UserPassword::Table, UserPassword::PasswordHash))
+            .from(UserPassword::Table)
+            .inner_join(
+                Users::Table,
+                Expr::col((Users::Table, Users::Id))
+                    .equals((UserPassword::Table, UserPassword::UserId)),
+            )
+            .and_where(Expr::col((Users::Table, Users::Id)).eq(user_id))
+            .and_where(Expr::col((Users::Table, Users::DeletedAt)).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
 }
 
 // ── 会话 ──
@@ -206,6 +289,55 @@ impl SessionRepo for PgSessionRepo {
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok(Session { id, user_id })
+    }
+
+    async fn find_active(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Session>, AppError> {
+        let (sql, values) = Query::select()
+            .columns([Sessions::Id, Sessions::UserId])
+            .from(Sessions::Table)
+            .and_where(Expr::col(Sessions::TokenHash).eq(token_hash))
+            .and_where(Expr::col(Sessions::RevokedAt).is_null())
+            .and_where(Expr::col(Sessions::ExpiresAt).gt(now))
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<Postgres, Session, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn revoke(&self, session_id: Uuid) -> Result<(), AppError> {
+        let (sql, values) = Query::update()
+            .table(Sessions::Table)
+            .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(Sessions::Id).eq(session_id))
+            .and_where(Expr::col(Sessions::RevokedAt).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    async fn revoke_all(&self, user_id: Uuid, except: Option<Uuid>) -> Result<(), AppError> {
+        let mut q = Query::update();
+        q.table(Sessions::Table)
+            .value(Sessions::RevokedAt, OffsetDateTime::now_utc())
+            .and_where(Expr::col(Sessions::UserId).eq(user_id))
+            .and_where(Expr::col(Sessions::RevokedAt).is_null());
+        if let Some(id) = except {
+            q.and_where(Expr::col(Sessions::Id).ne(id));
+        }
+        let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+        sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
     }
 }
 
@@ -288,5 +420,24 @@ impl RoleRepo for PgRoleRepo {
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok(())
+    }
+
+    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, AppError> {
+        // SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+        //   WHERE ur.user_id = $ AND r.deleted_at IS NULL
+        let (sql, values) = Query::select()
+            .column((Roles::Table, Roles::Name))
+            .from(UserRoles::Table)
+            .inner_join(
+                Roles::Table,
+                Expr::col((Roles::Table, Roles::Id)).equals((UserRoles::Table, UserRoles::RoleId)),
+            )
+            .and_where(Expr::col((UserRoles::Table, UserRoles::UserId)).eq(user_id))
+            .and_where(Expr::col((Roles::Table, Roles::DeletedAt)).is_null())
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_scalar_with::<Postgres, String, _>(AssertSqlSafe(sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
     }
 }

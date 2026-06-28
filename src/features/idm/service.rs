@@ -8,8 +8,11 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::jwt::{self, JwtCodec};
-use super::repo::{SessionRepo, User, UserRepo};
-use super::types::{LoginRequest, RegisterRequest, UserResponse};
+use super::repo::{RoleRepo, SessionRepo, User, UserRepo};
+use super::types::{
+    ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
+    UserResponse,
+};
 use super::PwHasher;
 use crate::infra::audit::{AuditContext, AuthUser};
 use crate::infra::error::AppError;
@@ -33,15 +36,18 @@ pub struct AuthService {
 struct Inner {
     users: Arc<dyn UserRepo>,
     sessions: Arc<dyn SessionRepo>,
+    roles: Arc<dyn RoleRepo>,
     hasher: Arc<dyn PwHasher>,
     jwt: JwtCodec,
     refresh_ttl_secs: i64,
 }
 
 impl AuthService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         users: Arc<dyn UserRepo>,
         sessions: Arc<dyn SessionRepo>,
+        roles: Arc<dyn RoleRepo>,
         hasher: Arc<dyn PwHasher>,
         jwt_secret: &str,
         access_ttl_secs: i64,
@@ -51,6 +57,7 @@ impl AuthService {
             inner: Arc::new(Inner {
                 users,
                 sessions,
+                roles,
                 hasher,
                 jwt: JwtCodec::new(jwt_secret, access_ttl_secs),
                 refresh_ttl_secs,
@@ -81,8 +88,6 @@ impl AuthService {
     pub async fn login(&self, input: LoginRequest) -> Result<AuthOutcome, AppError> {
         input.validate()?;
         let identifier = normalize(&input.identifier);
-        // ponytail: 第一版不做 timing 等长防护(dummy verify);响应体已逐字节不可区分,
-        // timing 防护(对不存在的用户也跑一次 hash)留待后续。
         let Some(found) = self.inner.users.find_by_identifier(&identifier).await? else {
             return Err(AppError::Unauthorized);
         };
@@ -95,7 +100,7 @@ impl AuthService {
         self.issue_session(&found.user, None).await
     }
 
-    /// 验 access token → 已认证身份(供 authenticate 中间件用)。失败(验签/过期/格式)→ `Unauthorized`。
+    /// 验 access token → 已认证身份(含角色,供 require_role)。失败 → `Unauthorized`。
     pub fn authenticate_token(&self, token: &str) -> Result<AuthUser, AppError> {
         let claims = self.inner.jwt.decode(token)?;
         let id = claims
@@ -105,22 +110,124 @@ impl AuthService {
         Ok(AuthUser {
             id,
             username: claims.username,
+            roles: claims.roles,
         })
     }
 
-    /// 当前用户资料(GET /me):查存活用户 → `UserResponse`。已软删 → `NotFound`。
+    /// 当前用户资料(GET /me):查存活用户 + 角色 → `UserResponse`。已软删 → `NotFound`。
     pub async fn me(&self, user_id: Uuid) -> Result<UserResponse, AppError> {
         let user = self.inner.users.find_by_id(user_id).await?;
-        Ok(to_response(&user))
+        let roles = self.inner.roles.roles_for_user(user_id).await?;
+        Ok(to_response(&user, roles))
     }
 
-    /// 发会话:生成 refresh(随机 + 落 hash)+ 签 access JWT,组 `AuthOutcome`。
+    /// 刷新:验 refresh hash → 轮换(撤旧 session、发新会话)。无效/过期/已撤销 → `Unauthorized`。
+    pub async fn refresh(&self, refresh_token: &str) -> Result<AuthOutcome, AppError> {
+        let hash = jwt::hash_refresh(refresh_token);
+        let now = OffsetDateTime::now_utc();
+        let Some(session) = self.inner.sessions.find_active(&hash, now).await? else {
+            return Err(AppError::Unauthorized);
+        };
+        // 轮换:旧 refresh 一次性,撤销后发新会话(防 refresh 重放)。
+        self.inner.sessions.revoke(session.id).await?;
+        let user = self.inner.users.find_by_id(session.user_id).await?;
+        self.issue_session(&user, None).await
+    }
+
+    /// 登出:撤销该 refresh 对应的会话。幂等(找不到也 Ok)。
+    pub async fn logout(&self, refresh_token: &str) -> Result<(), AppError> {
+        let hash = jwt::hash_refresh(refresh_token);
+        if let Some(session) = self
+            .inner
+            .sessions
+            .find_active(&hash, OffsetDateTime::now_utc())
+            .await?
+        {
+            self.inner.sessions.revoke(session.id).await?;
+        }
+        Ok(())
+    }
+
+    /// 登出所有设备:撤销用户全部活跃会话。
+    pub async fn logout_all(&self, user_id: Uuid) -> Result<(), AppError> {
+        self.inner.sessions.revoke_all(user_id, None).await
+    }
+
+    /// 改资料(PATCH /me):部分更新 username/email。改 email 会重置 email_verified。
+    pub async fn update_me(
+        &self,
+        user_id: Uuid,
+        input: UpdateMeRequest,
+        ctx: &AuditContext,
+    ) -> Result<UserResponse, AppError> {
+        input.validate()?;
+        let username = input.username.as_deref().map(normalize);
+        let email = input.email.as_deref().map(normalize);
+        let user = self
+            .inner
+            .users
+            .update(
+                user_id,
+                username.as_deref(),
+                email.as_deref(),
+                ctx.audit_id(),
+            )
+            .await?;
+        let roles = self.inner.roles.roles_for_user(user_id).await?;
+        Ok(to_response(&user, roles))
+    }
+
+    /// 注销(DELETE /me):验密 → 撤销所有会话 → 软删账户。密码错 → `Unauthorized`。
+    pub async fn delete_me(
+        &self,
+        user_id: Uuid,
+        input: DeleteMeRequest,
+        by: Option<String>,
+    ) -> Result<(), AppError> {
+        input.validate()?;
+        let hash = self
+            .inner
+            .users
+            .password_hash(user_id)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        if !self.verify_password(input.password, hash).await? {
+            return Err(AppError::Unauthorized);
+        }
+        self.inner.sessions.revoke_all(user_id, None).await?;
+        self.inner.users.soft_delete(user_id, by).await
+    }
+
+    /// 改密(POST /me/password):验旧密码 → 换 hash → 撤销所有会话(强制重登录)。旧密码错 → `Unauthorized`。
+    pub async fn change_password(
+        &self,
+        user_id: Uuid,
+        input: ChangePasswordRequest,
+    ) -> Result<(), AppError> {
+        input.validate()?;
+        let hash = self
+            .inner
+            .users
+            .password_hash(user_id)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        if !self.verify_password(input.current_password, hash).await? {
+            return Err(AppError::Unauthorized);
+        }
+        let new_hash = self.hash_password(input.new_password).await?;
+        self.inner.users.update_password(user_id, &new_hash).await?;
+        self.inner.sessions.revoke_all(user_id, None).await?;
+        Ok(())
+    }
+
+    /// 发会话:查角色 → 生成 refresh + 签带 roles 的 access JWT,组 `AuthOutcome`。
     async fn issue_session(
         &self,
         user: &User,
         by: Option<String>,
     ) -> Result<AuthOutcome, AppError> {
         let now = OffsetDateTime::now_utc();
+        let roles = self.inner.roles.roles_for_user(user.id).await?;
         let (refresh, refresh_hash) = jwt::generate_refresh();
         let expires_at = now + Duration::seconds(self.inner.refresh_ttl_secs);
         let session = self
@@ -128,9 +235,12 @@ impl AuthService {
             .sessions
             .create(user.id, &refresh_hash, expires_at, by)
             .await?;
-        let access = self.inner.jwt.issue_access(user, session.id, now)?;
+        let access = self
+            .inner
+            .jwt
+            .issue_access(user, session.id, roles.clone(), now)?;
         Ok(AuthOutcome {
-            user: to_response(user),
+            user: to_response(user, roles),
             access_token: access,
             refresh_token: refresh,
             access_max_age_secs: self.inner.jwt.access_ttl_secs(),
@@ -154,12 +264,13 @@ impl AuthService {
     }
 }
 
-fn to_response(user: &User) -> UserResponse {
+fn to_response(user: &User, roles: Vec<String>) -> UserResponse {
     UserResponse {
         id: user.id,
         username: user.username.clone(),
         email: user.email.clone(),
         email_verified: user.email_verified,
+        roles,
     }
 }
 

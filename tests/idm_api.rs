@@ -13,7 +13,9 @@ use axum::Router;
 use tower::ServiceExt; // oneshot
 
 use xchangeai::app::{build_router, AppState};
-use xchangeai::features::idm::{AuthService, FakeHasher, InMemorySessionRepo, InMemoryUserRepo};
+use xchangeai::features::idm::{
+    AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo,
+};
 use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
 fn test_app() -> Router {
@@ -31,6 +33,7 @@ fn test_auth() -> AuthService {
     AuthService::new(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
+        Arc::new(InMemoryRoleRepo::new()),
         Arc::new(FakeHasher),
         "test-secret",
         900,
@@ -87,6 +90,12 @@ fn get_with_cookie(uri: &str, cookie: &str) -> Request<Body> {
 fn get_with_bearer(uri: &str, token: &str) -> Request<Body> {
     Request::get(uri)
         .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+fn post_with_cookie(uri: &str, cookie: &str) -> Request<Body> {
+    Request::post(uri)
+        .header("cookie", cookie)
         .body(Body::empty())
         .unwrap()
 }
@@ -196,9 +205,12 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
         .await
         .unwrap();
     assert_eq!(via_cookie.status(), StatusCode::OK);
-    assert!(body_string(via_cookie)
-        .await
-        .contains("\"username\":\"loginuser\""));
+    let me_body = body_string(via_cookie).await;
+    assert!(me_body.contains("\"username\":\"loginuser\""));
+    assert!(
+        me_body.contains("\"roles\":[]"),
+        "新用户 roles 应为空数组: {me_body}"
+    );
 
     // Bearer 兜底(同一 token 也认)
     let via_bearer = app
@@ -288,4 +300,176 @@ async fn logout_clears_cookies_and_204() {
         cookies.contains("refresh_token="),
         "logout 应回收 refresh cookie: {cookies}"
     );
+}
+
+/// refresh 轮换:旧 refresh 一次性 —— 刷新后发新 token,旧的失效(防重放)。
+#[tokio::test]
+async fn refresh_rotates_and_old_token_is_revoked() {
+    let app = test_app();
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/auth/register",
+            r#"{"username":"refuser","password":"password123"}"#,
+        ))
+        .await
+        .unwrap();
+    let login = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/auth/login",
+            r#"{"identifier":"refuser","password":"password123"}"#,
+        ))
+        .await
+        .unwrap();
+    let old = cookie_value(&login, "refresh_token").expect("login 应发 refresh cookie");
+
+    // 带 refresh cookie 刷新 → 200 + 轮换出新 refresh
+    let resp = app
+        .clone()
+        .oneshot(post_with_cookie(
+            "/api/v1/auth/refresh",
+            &format!("refresh_token={old}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let new = cookie_value(&resp, "refresh_token").expect("refresh 应发新 refresh cookie");
+    assert_ne!(old, new, "refresh 应轮换:新旧 token 不同");
+
+    // 旧 refresh 已撤销 → 再用 → 401(防重放)
+    let reuse = app
+        .oneshot(post_with_cookie(
+            "/api/v1/auth/refresh",
+            &format!("refresh_token={old}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        reuse.status(),
+        StatusCode::UNAUTHORIZED,
+        "旧 refresh 轮换后应失效"
+    );
+}
+
+// ── me 修改 ──
+
+/// 带 cookie 的任意方法请求(PATCH/DELETE/POST + 可选 json body)。
+fn req_with_cookie(method: &str, uri: &str, cookie: &str, json: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie);
+    let body = if let Some(j) = json {
+        b = b.header("content-type", "application/json");
+        Body::from(j.to_owned())
+    } else {
+        Body::empty()
+    };
+    b.body(body).unwrap()
+}
+
+/// 注册一个用户,返回 register 响应(含 Set-Cookie)。
+async fn register_user(app: &Router, username: &str, password: &str) -> Response {
+    app.clone()
+        .oneshot(post_json(
+            "/api/v1/auth/register",
+            &format!(r#"{{"username":"{username}","password":"{password}"}}"#),
+        ))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn update_me_changes_username() {
+    let app = test_app();
+    let reg = register_user(&app, "upduser", "password123").await;
+    let cookie = format!(
+        "access_token={}",
+        cookie_value(&reg, "access_token").unwrap()
+    );
+
+    let resp = app
+        .oneshot(req_with_cookie(
+            "PATCH",
+            "/api/v1/me",
+            &cookie,
+            Some(r#"{"username":"upduser2"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp)
+        .await
+        .contains("\"username\":\"upduser2\""));
+}
+
+#[tokio::test]
+async fn delete_me_soft_deletes_and_blocks_login() {
+    let app = test_app();
+    let reg = register_user(&app, "deluser", "password123").await;
+    let cookie = format!(
+        "access_token={}",
+        cookie_value(&reg, "access_token").unwrap()
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(req_with_cookie(
+            "DELETE",
+            "/api/v1/me",
+            &cookie,
+            Some(r#"{"password":"password123"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // 软删后再登录 → 401
+    let relogin = app
+        .oneshot(post_json(
+            "/api/v1/auth/login",
+            r#"{"identifier":"deluser","password":"password123"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(relogin.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn change_password_old_fails_new_works() {
+    let app = test_app();
+    let reg = register_user(&app, "pwuser", "password123").await;
+    let cookie = format!(
+        "access_token={}",
+        cookie_value(&reg, "access_token").unwrap()
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(req_with_cookie(
+            "POST",
+            "/api/v1/me/password",
+            &cookie,
+            Some(r#"{"current_password":"password123","new_password":"newpass456"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // 旧密码 → 401,新密码 → 200
+    let old = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/auth/login",
+            r#"{"identifier":"pwuser","password":"password123"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::UNAUTHORIZED, "旧密码应失效");
+    let new = app
+        .oneshot(post_json(
+            "/api/v1/auth/login",
+            r#"{"identifier":"pwuser","password":"newpass456"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new.status(), StatusCode::OK, "新密码应可登录");
 }
