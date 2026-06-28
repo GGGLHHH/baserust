@@ -21,7 +21,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{idm, widget};
+use crate::features::widget;
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -42,18 +42,26 @@ pub enum Mount {
     Both,
 }
 
-/// 组装路由。按 `mount` 决定挂哪些业务模块;OpenAPI 规范自动汇总。
-/// idm 端点 path 都以 `/auth` 开头(/auth/register、/auth/me...),nest /api/v1 后即 /api/v1/auth/*。
+/// 组装路由。按 `mount` 决定挂哪些模块;OpenAPI 规范自动汇总。
+/// idm 是独立 crate(自带 `IdmState`),端点 path 已是 /api/v1/auth/*;app 把它的 Router + OpenApi
+/// `merge` 进来(不再 nest 加前缀)。widget 仍 nest /api/v1。
 pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
-    let business = match mount {
-        Mount::App => widget::router(),
-        Mount::Idm => idm::router(),
-        Mount::Both => widget::router().merge(idm::router()),
-    };
-    let (router, api) = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
-        .merge(health::router())
-        .nest("/api/v1", business)
-        .split_for_parts();
+    let needs_app = matches!(mount, Mount::App | Mount::Both);
+    let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
+
+    // app 自己的业务(widget,nest /api/v1)+ health → OpenApiRouter<AppState>。
+    let mut api_router =
+        OpenApiRouter::with_openapi(openapi::ApiDoc::openapi()).merge(health::router());
+    if needs_app {
+        api_router = api_router.nest("/api/v1", widget::router());
+    }
+    // idm 是独立 crate,端点已是 /api/v1/auth/*。它的 router 泛型 over 宿主 state:
+    // `IdmState: FromRef<AppState>`(见 state.rs)让 idm handler 从 AppState 派生 IdmState、
+    // 共享同一 AuthService 实例。直接 merge(端点 path 已含完整前缀,不再 nest)。
+    if needs_idm {
+        api_router = api_router.merge(idm::router::<AppState>());
+    }
+    let (router, api) = api_router.split_for_parts();
 
     let router = router
         // 中间件栈(外→内,请求时外层先执行)。
@@ -84,7 +92,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         // 鉴权:best-effort 解析 Bearer JWT,验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            idm::authenticate,
+            idm::authenticate::<AppState>,
         ))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));

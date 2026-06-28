@@ -129,6 +129,21 @@ impl From<garde::Report> for AppError {
     }
 }
 
+/// idm crate 的 `IdmError` 接进 app 错误体系。错误**契约**(JSON 形状)共享、**类型**不绑死:
+/// idm 独立跑时自出 `ErrorBody`;app 用 idm(adapter/装配里 `?`)时经此逐变体映射成 `AppError`。
+impl From<idm::IdmError> for AppError {
+    fn from(e: idm::IdmError) -> Self {
+        match e {
+            idm::IdmError::NotFound => AppError::NotFound,
+            idm::IdmError::Validation(m) => AppError::Validation(m),
+            idm::IdmError::BadRequest(m) => AppError::BadRequest(m),
+            idm::IdmError::Unauthorized => AppError::Unauthorized,
+            idm::IdmError::Conflict(m) => AppError::Conflict(m),
+            idm::IdmError::Internal(e) => AppError::Internal(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

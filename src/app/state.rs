@@ -6,14 +6,14 @@ use sqlx::PgPool;
 
 use super::adapters::InProcessUserDirectory;
 use super::router::Mount;
-use crate::features::idm::{
-    Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
-    PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
-};
 use crate::features::widget::{
     InMemoryWidgetRepo, PgWidgetRepo, UserDirectory, WidgetRepo, WidgetService,
 };
 use crate::infra::config::Config;
+use idm::{
+    Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
+    PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
+};
 
 /// 数据库 schema(= role = 连接归属)。每个 schema 用自己的 role 连接。
 ///
@@ -40,6 +40,24 @@ pub struct AppState {
     pub db_pool: Option<PgPool>,
     /// 认证 cookie 是否带 `Secure`(prod=true,仅 https 发送;dev http 必须 false 否则浏览器不发)。
     pub cookie_secure: bool,
+}
+
+/// idm 的 `HasAuth`:让 app 中间件栈能挂 `idm::authenticate::<AppState>`(逻辑在 idm crate、共享同一 AuthService)。
+impl idm::HasAuth for AppState {
+    fn auth(&self) -> &AuthService {
+        &self.auth
+    }
+}
+
+/// idm 的 `FromRef`:idm router 泛型 over 宿主 state,app 由此从 `AppState` 派生 `IdmState`
+/// (Arc clone,**共享同一个 AuthService 实例**,绝不建两个)。
+impl axum::extract::FromRef<AppState> for idm::IdmState {
+    fn from_ref(app: &AppState) -> idm::IdmState {
+        idm::IdmState {
+            auth: app.auth.clone(),
+            cookie_secure: app.cookie_secure,
+        }
+    }
 }
 
 impl AppState {

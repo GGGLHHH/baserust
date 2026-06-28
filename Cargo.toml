@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/idm"]
+
 [package]
 name = "xchangeai"
 version = "0.1.0"
@@ -7,6 +10,9 @@ rust-version = "1.88"
 default-run = "xchangeai"
 
 [dependencies]
+# idm 认证模块已抽成独立 crate(领域 + HTTP + IdmError/audit);workspace path 依赖。
+idm = { path = "crates/idm" }
+
 # 异步运行时 —— 一切的地基
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 

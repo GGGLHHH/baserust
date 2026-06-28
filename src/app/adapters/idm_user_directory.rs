@@ -7,9 +7,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::features::idm::UserRepo;
 use crate::features::widget::{UserBrief, UserDirectory};
 use crate::infra::error::AppError;
+use idm::UserRepo;
 
 pub struct InProcessUserDirectory {
     users: Arc<dyn UserRepo>,

@@ -926,6 +926,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "idm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "base64",
+ "garde",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "sea-query",
+ "sea-query-sqlx",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+ "utoipa-axum",
+ "uuid",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2533,6 +2562,7 @@ dependencies = [
  "dotenvy",
  "figment",
  "garde",
+ "idm",
  "jsonwebtoken",
  "rand 0.8.6",
  "sea-query",

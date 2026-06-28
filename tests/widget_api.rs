@@ -10,10 +10,8 @@ use axum::response::Response;
 use axum::Router;
 use tower::ServiceExt; // oneshot
 
+use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState};
-use xchangeai::features::idm::{
-    AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo,
-};
 use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配。
