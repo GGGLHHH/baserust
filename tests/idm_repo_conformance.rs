@@ -103,7 +103,7 @@ async fn idm_repo_contract(users: &dyn UserRepo, sessions: &dyn SessionRepo, rol
 
     // ── update + update_password + soft_delete(幂等)──
     let upd = users
-        .update(u.id, Some("alice2"), None, Some("sys".into()))
+        .update(u.id, "alice2", None, Some("sys".into()))
         .await
         .unwrap();
     assert_eq!(upd.username, "alice2");

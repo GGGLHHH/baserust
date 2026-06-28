@@ -183,7 +183,7 @@ async fn get_me(
 }
 
 #[utoipa::path(
-    patch, path = "/auth/me", tag = "me",
+    put, path = "/auth/me", tag = "me",
     request_body = UpdateMeRequest,
     responses(
         (status = 200, body = UserResponse),

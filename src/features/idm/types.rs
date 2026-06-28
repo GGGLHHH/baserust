@@ -36,11 +36,12 @@ pub struct UserResponse {
     pub roles: Vec<String>,
 }
 
-/// 更新当前用户(部分更新,字段全可选)。
+/// **全量更新**当前用户(PUT full update,非 PATCH)。username 必填;
+/// email 给值=设置、给 null 或缺省=清空(请求体是资源的完整表示)。替换 email 会重置 email_verified。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct UpdateMeRequest {
-    #[garde(inner(length(min = 3, max = 32)))]
-    pub username: Option<String>,
+    #[garde(length(min = 3, max = 32))]
+    pub username: String,
     #[garde(inner(email))]
     pub email: Option<String>,
 }

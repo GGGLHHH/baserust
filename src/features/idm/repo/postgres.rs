@@ -184,28 +184,26 @@ impl UserRepo for PgUserRepo {
     async fn update(
         &self,
         id: Uuid,
-        username: Option<&str>,
+        username: &str,
         email: Option<&str>,
         by: Option<String>,
     ) -> Result<User, AppError> {
-        let mut q = Query::update();
-        q.table(Users::Table).value(Users::UpdatedBy, by);
-        if let Some(u) = username {
-            q.value(Users::Username, u.to_owned());
-        }
-        if let Some(e) = email {
-            q.value(Users::Email, e.to_owned());
-            q.value(Users::EmailVerified, false); // 改 email 需重新验证
-        }
-        q.and_where(Expr::col(Users::Id).eq(id))
+        // PUT 全量替换:username/email 都 set(email 含清空 null),替换 email 即重置 email_verified。
+        let (sql, values) = Query::update()
+            .table(Users::Table)
+            .value(Users::Username, username.to_owned())
+            .value(Users::Email, email.map(str::to_owned))
+            .value(Users::EmailVerified, false)
+            .value(Users::UpdatedBy, by)
+            .and_where(Expr::col(Users::Id).eq(id))
             .and_where(Expr::col(Users::DeletedAt).is_null())
             .returning(Query::returning().columns([
                 Users::Id,
                 Users::Username,
                 Users::Email,
                 Users::EmailVerified,
-            ]));
-        let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+            ]))
+            .build_sqlx(PostgresQueryBuilder);
         sqlx::query_as_with::<Postgres, User, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await

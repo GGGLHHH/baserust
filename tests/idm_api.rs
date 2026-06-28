@@ -400,7 +400,7 @@ async fn update_me_changes_username() {
 
     let resp = app
         .oneshot(req_with_cookie(
-            "PATCH",
+            "PUT",
             "/api/v1/auth/me",
             &cookie,
             Some(r#"{"username":"upduser2"}"#),

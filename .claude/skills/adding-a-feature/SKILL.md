@@ -44,6 +44,13 @@ tests/<name>_api.rs      oneshot integration tests (optional but expected)
 | **Route path** | Write `path = "/<name>s"` — the `/api/v1` prefix is added by `nest`, don't repeat it |
 | **Reuse the pool** | In `AppState::new`'s `Some(url)` arm, `connect_pool` once and `pool.clone()` into each repo (PgPool is Arc-cheap) — don't connect per feature |
 
+## API style (project convention — NOT a per-feature choice)
+
+RESTful、资源导向,全项目统一,新端点照做、别逐 feature 重选:
+
+- **写操作用 `PUT` 全量替换,不用 `PATCH`**。更新端点收资源的**完整表示**:必填字段必传,可选字段给值=设、给 null 或缺=清空。请求 DTO 别为"部分更新"把字段全 `Option`(那是 PATCH 语义)。范例:idm `PUT /auth/me`(`UpdateMeRequest { username: String, email: Option<String> }`)→ repo `update(id, username: &str, email: Option<&str>, by)` 全量替换、替换 email 重置 email_verified。
+- 标准动词:`GET`(取/列)、`POST`(建→201)、`PUT`(全量更新)、`DELETE`(删→204)。path 用复数资源名(`/widgets`),`/api/v1` 由 nest 加、别重复。
+
 ## Decisions to make (don't default silently)
 
 - **Audit/soft-delete fields**: keep the 5 base fields (`created_by/created_at/updated_by/updated_at/deleted_at`) + `base_select()` filtering `deleted_at IS NULL`, to stay consistent with widget. Drop them only with a deliberate reason.

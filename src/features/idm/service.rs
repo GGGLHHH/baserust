@@ -153,7 +153,7 @@ impl AuthService {
         self.inner.sessions.revoke_all(user_id, None).await
     }
 
-    /// 改资料(PATCH /me):部分更新 username/email。改 email 会重置 email_verified。
+    /// 改资料(PUT /me,**全量替换**):username 必填,email 给值=设/给空=清空。替换 email 会重置 email_verified。
     pub async fn update_me(
         &self,
         user_id: Uuid,
@@ -161,17 +161,12 @@ impl AuthService {
         ctx: &AuditContext,
     ) -> Result<UserResponse, AppError> {
         input.validate()?;
-        let username = input.username.as_deref().map(normalize);
+        let username = normalize(&input.username);
         let email = input.email.as_deref().map(normalize);
         let user = self
             .inner
             .users
-            .update(
-                user_id,
-                username.as_deref(),
-                email.as_deref(),
-                ctx.audit_id(),
-            )
+            .update(user_id, &username, email.as_deref(), ctx.audit_id())
             .await?;
         let roles = self.inner.roles.roles_for_user(user_id).await?;
         Ok(to_response(&user, roles))

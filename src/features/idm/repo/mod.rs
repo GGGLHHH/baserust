@@ -107,12 +107,12 @@ pub trait UserRepo: Send + Sync {
     /// 一条 SQL(`WHERE id IN ...`)解 N+1;查不到的 id 不在结果里(交调用方降级)。
     async fn find_by_ids(&self, ids: &[Uuid]) -> Result<Vec<User>, AppError>;
 
-    /// 部分更新 username/email(各 `None`=不改)。改 email 会把 email_verified 置 false。
-    /// 冲突 → `Conflict`;已软删 → `NotFound`。
+    /// **全量更新** username/email(PUT 语义:都替换;`username` 必填,`email=None` 即清空)。
+    /// 替换 email 会把 email_verified 置 false。冲突 → `Conflict`;已软删 → `NotFound`。
     async fn update(
         &self,
         id: Uuid,
-        username: Option<&str>,
+        username: &str,
         email: Option<&str>,
         by: Option<String>,
     ) -> Result<User, AppError>;

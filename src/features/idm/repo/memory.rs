@@ -122,7 +122,7 @@ impl UserRepo for InMemoryUserRepo {
     async fn update(
         &self,
         id: Uuid,
-        username: Option<&str>,
+        username: &str,
         email: Option<&str>,
         _by: Option<String>,
     ) -> Result<User, AppError> {
@@ -131,21 +131,17 @@ impl UserRepo for InMemoryUserRepo {
         let dup = store.values().any(|r| {
             r.id != id
                 && r.deleted_at.is_none()
-                && (username == Some(r.username.as_str())
-                    || (email.is_some() && r.email.as_deref() == email))
+                && (r.username == username || (email.is_some() && r.email.as_deref() == email))
         });
         if dup {
             return Err(AppError::Conflict("用户名或邮箱已被占用".to_owned()));
         }
         match store.get_mut(&id) {
             Some(r) if r.deleted_at.is_none() => {
-                if let Some(u) = username {
-                    r.username = u.to_owned();
-                }
-                if let Some(e) = email {
-                    r.email = Some(e.to_owned());
-                    r.email_verified = false; // 改 email 需重新验证
-                }
+                // PUT 全量替换:username 必填、email 总替换(含清空),替换 email 即重置验证。
+                r.username = username.to_owned();
+                r.email = email.map(str::to_owned);
+                r.email_verified = false;
                 Ok(r.to_user())
             }
             _ => Err(AppError::NotFound),
