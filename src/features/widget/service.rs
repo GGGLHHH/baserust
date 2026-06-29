@@ -8,9 +8,9 @@ use super::port::UserDirectory;
 use super::repo::WidgetRepo;
 use super::types::{CreateWidget, UpdateWidget, Widget};
 use super::view::WidgetView;
+use crate::infra::audit::AuditContext;
 use crate::infra::error::AppError;
 use crate::infra::pagination::{Page, PageQuery};
-use idm::AuditContext;
 
 /// 业务逻辑层。范式:
 /// - 持 `Arc<dyn WidgetRepo>` 端口,不关心底层是内存还是 Postgres。

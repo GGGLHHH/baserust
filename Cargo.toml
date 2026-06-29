@@ -7,9 +7,9 @@ rust-version = "1.88"
 default-run = "xchangeai"
 
 [dependencies]
-# idm 认证模块是独立 repo(github.com/GGGLHHH/rust-idm),git tag 依赖锁版本。
-# 本地要联调 idm 时临时改回 `path = "crates/idm"`(需先 git checkout 回 crates/idm);稳定走 tag。
-idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.1.1" }
+# idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP)。
+# 联调中:走本地 path(v0.2.0 尚未 push)。稳定后改回 `git + tag = "v0.2.0"` 锁版本。
+idm = { path = "../rust-idm" }
 
 # 异步运行时 —— 一切的地基
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }

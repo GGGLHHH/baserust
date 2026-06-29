@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
-use idm::AuditContext;
 use idm::{Argon2Hasher, PgRoleRepo, PgUserRepo, PwHasher, RoleRepo, UserRepo};
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
+use xchangeai::infra::audit::AuditContext;
 
 #[derive(Deserialize)]
 struct SeedData {

@@ -24,7 +24,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::widget;
+use crate::features::{auth, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -46,24 +46,23 @@ pub enum Mount {
 }
 
 /// 组装路由。按 `mount` 决定挂哪些模块;OpenAPI 规范自动汇总。
-/// idm 是独立 crate(自带 `IdmState`),端点 path 已是 /api/v1/auth/*;app 把它的 Router + OpenApi
-/// `merge` 进来(不再 nest 加前缀)。widget 仍 nest /api/v1。
+/// widget(/widgets)与 auth(/auth/*)都是 app 拥有的 `OpenApiRouter<AppState>`,各自 path 相对,
+/// 统一 nest 到 /api/v1 下 —— 两次 nest 同前缀会 panic,故**先 merge 再 nest 一次**。
 pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let needs_app = matches!(mount, Mount::App | Mount::Both);
     let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
 
-    // app 自己的业务(widget,nest /api/v1)+ health → OpenApiRouter<AppState>。
+    // health 在根(/livez 等不带 /api/v1);业务模块按 mount 装配,统一 nest /api/v1。
     let mut api_router =
         OpenApiRouter::with_openapi(openapi::ApiDoc::openapi()).merge(health::router());
+    let mut features = OpenApiRouter::new();
     if needs_app {
-        api_router = api_router.nest("/api/v1", widget::router());
+        features = features.merge(widget::router());
     }
-    // idm 是独立 crate,端点已是 /api/v1/auth/*。它的 router 泛型 over 宿主 state:
-    // `IdmState: FromRef<AppState>`(见 state.rs)让 idm handler 从 AppState 派生 IdmState、
-    // 共享同一 AuthService 实例。直接 merge(端点 path 已含完整前缀,不再 nest)。
     if needs_idm {
-        api_router = api_router.merge(idm::router::<AppState>());
+        features = features.merge(auth::router());
     }
+    api_router = api_router.nest("/api/v1", features);
     let (router, api) = api_router.split_for_parts();
 
     let router = router
@@ -92,10 +91,10 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         ))
         // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
         .layer(cors_layer(config))
-        // 鉴权:best-effort 解析 Bearer JWT,验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
+        // 鉴权:best-effort 解析 token(cookie 优先/Bearer 兜底),验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            idm::authenticate::<AppState>,
+            auth::authenticate,
         ))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));

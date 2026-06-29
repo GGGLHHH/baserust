@@ -42,24 +42,6 @@ pub struct AppState {
     pub cookie_secure: bool,
 }
 
-/// idm 的 `HasAuth`:让 app 中间件栈能挂 `idm::authenticate::<AppState>`(逻辑在 idm crate、共享同一 AuthService)。
-impl idm::HasAuth for AppState {
-    fn auth(&self) -> &AuthService {
-        &self.auth
-    }
-}
-
-/// idm 的 `FromRef`:idm router 泛型 over 宿主 state,app 由此从 `AppState` 派生 `IdmState`
-/// (Arc clone,**共享同一个 AuthService 实例**,绝不建两个)。
-impl axum::extract::FromRef<AppState> for idm::IdmState {
-    fn from_ref(app: &AppState) -> idm::IdmState {
-        idm::IdmState {
-            auth: app.auth.clone(),
-            cookie_secure: app.cookie_secure,
-        }
-    }
-}
-
 impl AppState {
     /// 按 `mount` 只装配本进程真正用到的库:app 进程连 app DB(widget)、idm 进程连 idm DB(auth/me),
     /// 各自不连对方的库 —— 省掉闲置连接,也让 readyz 探针 ping 的是本进程主库。

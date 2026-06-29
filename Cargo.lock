@@ -1100,30 +1100,22 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.1.1"
-source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.1.1#0071dba04759db96b1877014feab3b3148ae2942"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
- "axum",
- "axum-extra",
  "base64",
- "garde",
  "jsonwebtoken",
  "rand 0.8.6",
  "sea-query",
  "sea-query-sqlx",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.18",
  "time",
  "tokio",
- "tracing",
- "utoipa",
- "utoipa-axum",
  "uuid",
 ]
 
