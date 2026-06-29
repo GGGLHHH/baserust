@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 8 位。
+/// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct RegisterRequest {
     #[garde(length(min = 3, max = 32))]
     pub username: String,
     #[garde(inner(email))]
     pub email: Option<String>,
-    #[garde(length(min = 8))]
+    #[garde(length(min = 3))]
     pub password: String,
 }
 

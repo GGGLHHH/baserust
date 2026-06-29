@@ -6,6 +6,7 @@ use sqlx::PgPool;
 
 use super::adapters::InProcessUserDirectory;
 use super::router::Mount;
+use crate::features::auth::AppTokens;
 use crate::features::widget::{
     InMemoryWidgetRepo, PgWidgetRepo, UserDirectory, WidgetRepo, WidgetService,
 };
@@ -99,15 +100,16 @@ impl AppState {
         let user_directory: Arc<dyn UserDirectory> =
             Arc::new(InProcessUserDirectory::new(idm_users.clone()));
 
-        let auth = AuthService::new(
-            idm_users,
-            idm_sessions,
-            idm_roles,
-            Arc::new(Argon2Hasher),
-            &config.idm_jwt_secret,
-            config.idm_access_ttl_secs,
-            config.idm_refresh_ttl_secs,
-        );
+        // app **显式拥有 JWT claim 形状**:注入自己的 AppTokens(实现 idm 的 TokenSigner/TokenVerifier),
+        // 经 builder 替代 AuthService::new 的默认 claim。改 claim 在 features/auth 的 AppClaims。
+        let tokens = Arc::new(AppTokens::new(&config.idm_jwt_secret));
+        let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
+            .hasher(Arc::new(Argon2Hasher))
+            .signer(tokens.clone())
+            .verifier(tokens)
+            .access_ttl_secs(config.idm_access_ttl_secs)
+            .refresh_ttl_secs(config.idm_refresh_ttl_secs)
+            .build();
 
         Ok(Self {
             widgets: WidgetService::new(widget_repo, user_directory),

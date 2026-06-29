@@ -66,7 +66,8 @@ base64 = "0.22"
 # std feature 拉入 rand + getrandom,SaltString::generate(OsRng) 才可用。
 argon2 = { version = "0.5", features = ["std"] }
 
-# JWT access token(HS256)。不解耦:唯一实现,要换 KMS/HSM 签名再抽 trait。
+# JWT access token(HS256):app 自己的 claim 形状 + 签验(features/auth/token.rs 的 AppTokens,
+# 实现 idm 的 TokenSigner/TokenVerifier 端口)。claim 由 app 显式拥有,要换 RS256/KMS 改 AppTokens。
 jsonwebtoken = "9"
 # refresh token:sha2 算 SHA-256 hash 落库,rand 出 32B CSPRNG 明文。
 sha2 = "0.10"

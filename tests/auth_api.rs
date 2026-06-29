@@ -14,6 +14,7 @@ use tower::ServiceExt; // oneshot
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState, Mount};
+use xchangeai::features::auth::AppTokens;
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
@@ -34,17 +35,20 @@ fn test_app() -> Router {
     )
 }
 
-/// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + 固定 secret。
+/// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + **生产同款 AppTokens**(app 显式 claim)。
 fn test_auth() -> AuthService {
-    AuthService::new(
+    let tokens = Arc::new(AppTokens::new("test-secret"));
+    AuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
-        Arc::new(FakeHasher),
-        "test-secret",
-        900,
-        604_800,
     )
+    .hasher(Arc::new(FakeHasher))
+    .signer(tokens.clone())
+    .verifier(tokens)
+    .access_ttl_secs(900)
+    .refresh_ttl_secs(604_800)
+    .build()
 }
 
 async fn body_string(resp: Response) -> String {
@@ -159,10 +163,11 @@ async fn register_duplicate_username_is_409() {
 
 #[tokio::test]
 async fn register_weak_password_is_422() {
+    // 低于 password 最小长度(min=3)→ 422;此处发 2 字符。
     let resp = test_app()
         .oneshot(post_json(
             "/api/v1/auth/register",
-            r#"{"username":"bob","email":"b@b.com","password":"short"}"#,
+            r#"{"username":"bob","email":"b@b.com","password":"ab"}"#,
         ))
         .await
         .unwrap();
