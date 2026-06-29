@@ -30,16 +30,14 @@ test:
 pg-test-grant:
     psql "postgres://{{env_var_or_default('POSTGRES_USER','xchangeai')}}:{{env_var_or_default('POSTGRES_PASSWORD','xchangeai')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}};"
 
-# PG conformance(连 app role,search_path=app 由 role 配置继承;先 pg-test-grant + 起 pg)
-test-pg:
+# PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
+# 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
+test-pg: pg-test-grant
     DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance -- --nocapture
 
-# idm conformance 打真 PG(idm role,search_path=idm 由 role 配置继承)
-test-pg-idm:
-    DATABASE_URL="{{idm_db_url}}" cargo test --features pg-conformance --test idm_repo_conformance -- --nocapture
-
-# 全量:内存层(单测/api/内存 conformance) + app/idm 两 schema 的 PG conformance
-test-all: test test-pg test-pg-idm
+# 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance
+# (idm 仓储 conformance 随 idm 抽成独立 rust-idm crate 后已迁出本仓)
+test-all: test test-pg
 
 # ───── 数据库迁移(sqlx-cli,类似 goose;显式执行,不在 app 启动时跑)─────
 # 每个 schema 用同名 role 连接(role 的 search_path = 同名 schema),各自独立 _sqlx_migrations,
