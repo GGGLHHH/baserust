@@ -146,8 +146,11 @@ async fn timeout_middleware(req: Request, next: Next) -> Response {
     match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
         Ok(resp) => resp,
         Err(_) => {
-            tracing::warn!(timeout_secs = REQUEST_TIMEOUT.as_secs(), "请求超时");
-            error_response(StatusCode::REQUEST_TIMEOUT, "timeout", "请求超时")
+            tracing::warn!(
+                timeout_secs = REQUEST_TIMEOUT.as_secs(),
+                "request timed out"
+            );
+            error_response(StatusCode::REQUEST_TIMEOUT, "timeout", "Request timed out")
         }
     }
 }
@@ -158,12 +161,12 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
         .downcast_ref::<String>()
         .cloned()
         .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| "未知 panic".to_owned());
-    tracing::error!(detail, "请求处理 panic,已兜底为 500");
+        .unwrap_or_else(|| "unknown panic".to_owned());
+    tracing::error!(detail, "request panicked, fell back to 500");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
-        "内部服务器错误",
+        "Internal server error",
     )
 }
 
@@ -183,18 +186,20 @@ fn rate_limit_response(err: GovernorError) -> Response {
             let mut resp = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
-                "请求过于频繁,请稍后再试",
+                "Too many requests, please try again later",
             );
             if let Some(h) = headers {
                 resp.headers_mut().extend(h);
             }
             resp
         }
-        GovernorError::UnableToExtractKey => {
-            error_response(StatusCode::BAD_REQUEST, "bad_request", "无法识别请求来源")
-        }
+        GovernorError::UnableToExtractKey => error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Could not identify request source",
+        ),
         GovernorError::Other { code, headers, .. } => {
-            let mut resp = error_response(code, "internal", "限流错误");
+            let mut resp = error_response(code, "internal", "Rate limit error");
             if let Some(h) = headers {
                 resp.headers_mut().extend(h);
             }
@@ -248,7 +253,7 @@ mod tests {
             s.contains("\"code\":\"internal\""),
             "应是 ErrorBody JSON: {s}"
         );
-        assert!(s.contains("内部服务器错误"));
+        assert!(s.contains("Internal server error"));
         assert!(!s.contains("boom-secret"), "原始 panic 信息不可泄露: {s}");
     }
 }

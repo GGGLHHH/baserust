@@ -51,7 +51,7 @@ impl PageQuery {
         match (self.page, self.cursor) {
             // page + 非空 cursor 互斥(语义冲突)
             (Some(_), Some(c)) if !c.is_empty() => Err(AppError::Validation(
-                "page 与 cursor 互斥,不能同时提供".into(),
+                "page and cursor are mutually exclusive".into(),
             )),
             // 有 cursor 参数即 cursor 模式:空字符串 = 首页(after=None),非空 = 解码锚点。
             // (空 cursor 让"cursor 模式第一页"可表达,否则首页无 cursor 就只能退回 offset)
@@ -146,8 +146,8 @@ pub fn encode_cursor(id: Uuid) -> String {
 pub fn decode_cursor(s: &str) -> Result<Uuid, AppError> {
     let raw = URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|_| AppError::BadRequest("cursor 无效".into()))?;
-    Uuid::from_slice(&raw).map_err(|_| AppError::BadRequest("cursor 无效".into()))
+        .map_err(|_| AppError::BadRequest("Invalid cursor".into()))?;
+    Uuid::from_slice(&raw).map_err(|_| AppError::BadRequest("Invalid cursor".into()))
 }
 
 #[cfg(test)]

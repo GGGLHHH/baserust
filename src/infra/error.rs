@@ -14,25 +14,25 @@ use utoipa::ToSchema;
 /// 这套契约,就天然不泄露。加错误种类 = 加变体 + 在下面四个 match 各补一行。
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("资源不存在")]
+    #[error("resource not found")]
     NotFound,
 
     /// 业务校验失败(garde)。消息是为用户写的、安全的,可回传给客户端。
-    #[error("请求无效: {0}")]
+    #[error("invalid request: {0}")]
     Validation(String),
 
     /// 请求格式错误(路径参数类型不匹配、body 非法 JSON 等)→ 400。
     /// 内含的字符串是**原始提取错误**(库措辞),只进日志、不进响应体。
-    #[error("请求格式错误")]
+    #[error("malformed request")]
     BadRequest(String),
 
     /// 未认证 / 凭据无效(登录失败、token 无效或过期、改密旧密码错)→ 401。
     /// `client_message` 刻意通用,**绝不区分"用户不存在"与"密码错误"**(防账号枚举)。
-    #[error("认证失败")]
+    #[error("authentication failed")]
     Unauthorized,
 
     /// 资源冲突(注册时 email 已占用)→ 409。消息写给用户、可回传(不含内部措辞)。
-    #[error("资源冲突: {0}")]
+    #[error("conflict: {0}")]
     Conflict(String),
 
     /// 兜底:任何 anyhow 错误(DB、IO、依赖)→ 500。原始 source chain 只进日志。
@@ -68,12 +68,12 @@ impl AppError {
     /// Validation/Conflict 回传"具体内容"(本就写给用户);Unauthorized 刻意通用(防枚举)。
     fn client_message(&self) -> String {
         match self {
-            AppError::NotFound => "资源不存在".to_owned(),
-            AppError::Validation(msg) => format!("请求无效: {msg}"),
-            AppError::BadRequest(_) => "请求格式不正确".to_owned(),
-            AppError::Unauthorized => "认证失败".to_owned(),
+            AppError::NotFound => "Resource not found".to_owned(),
+            AppError::Validation(msg) => format!("Invalid request: {msg}"),
+            AppError::BadRequest(_) => "Malformed request".to_owned(),
+            AppError::Unauthorized => "Authentication failed".to_owned(),
             AppError::Conflict(msg) => msg.clone(),
-            AppError::Internal(_) => "内部服务器错误".to_owned(),
+            AppError::Internal(_) => "Internal server error".to_owned(),
         }
     }
 
@@ -109,9 +109,9 @@ impl IntoResponse for AppError {
         // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
         if let Some(detail) = self.log_detail() {
             if status.is_server_error() {
-                tracing::error!(code = self.code(), detail, "请求处理失败");
+                tracing::error!(code = self.code(), detail, "request failed");
             } else {
-                tracing::warn!(code = self.code(), detail, "请求被拒绝");
+                tracing::warn!(code = self.code(), detail, "request rejected");
             }
         }
         let body = ErrorBody {
@@ -152,13 +152,13 @@ mod tests {
     fn raw_detail_goes_to_log_never_to_response() {
         // BadRequest:库原始措辞(uuid 解析失败)进日志,响应只给安全文案
         let e = AppError::BadRequest("Cannot parse `id`: UUID parsing failed".to_owned());
-        assert_eq!(e.client_message(), "请求格式不正确");
+        assert_eq!(e.client_message(), "Malformed request");
         assert!(!e.client_message().contains("UUID"));
         assert!(e.log_detail().unwrap().contains("UUID"));
 
         // Internal(将来 sqlx 错误同理):原始 SQL 进日志,响应只给通用文案
         let e = AppError::Internal(anyhow::anyhow!("relation \"widgets\" does not exist"));
-        assert_eq!(e.client_message(), "内部服务器错误");
+        assert_eq!(e.client_message(), "Internal server error");
         assert!(!e.client_message().contains("widgets"));
         assert!(e.log_detail().unwrap().contains("widgets"));
         assert_eq!(e.code(), "internal");
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn client_facing_errors_keep_useful_message() {
         // NotFound / Validation 是写给客户端的,可回传;且无需额外日志细节
-        assert_eq!(AppError::NotFound.client_message(), "资源不存在");
+        assert_eq!(AppError::NotFound.client_message(), "Resource not found");
         assert!(AppError::NotFound.log_detail().is_none());
 
         let v = AppError::Validation("name: length is lower than 1".to_owned());
@@ -182,13 +182,13 @@ mod tests {
         let e = AppError::Unauthorized;
         assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(e.code(), "unauthorized");
-        assert_eq!(e.client_message(), "认证失败");
+        assert_eq!(e.client_message(), "Authentication failed");
         assert!(e.log_detail().is_none());
 
         // Conflict:409,消息写给用户、可回传
-        let c = AppError::Conflict("该邮箱已被注册".to_owned());
+        let c = AppError::Conflict("This email is already registered".to_owned());
         assert_eq!(c.status_code(), StatusCode::CONFLICT);
         assert_eq!(c.code(), "conflict");
-        assert_eq!(c.client_message(), "该邮箱已被注册");
+        assert_eq!(c.client_message(), "This email is already registered");
     }
 }
