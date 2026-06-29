@@ -54,7 +54,7 @@ RESTful、资源导向,全项目统一,新端点照做、别逐 feature 重选:
 ## Decisions to make (don't default silently)
 
 - **Audit/soft-delete fields**: keep the 5 base fields (`created_by/created_at/updated_by/updated_at/deleted_at`) + `base_select()` filtering `deleted_at IS NULL`, to stay consistent with widget. Drop them only with a deliberate reason.
-- **Unique constraint**: if you add a unique index, `PgRepo::create` must catch `sqlx::Error::Database(e).is_unique_violation()` and map to `Validation`(422) — otherwise duplicates surface as `Internal`(500). A real 409 needs adding `AppError::Conflict` (one line in each of error.rs's 4 matches).
+- **Unique constraint**: if you add a unique index, `PgRepo::create` must catch `sqlx::Error::Database(e).is_unique_violation()` and map to `Validation`(422) — otherwise duplicates surface as `Internal`(500). For a real 409, map duplicates to the already-existing `AppError::Conflict` (error.rs already provides it for idm/auth — no new variant needed).
 - **Reuse infra**: pagination (`PageQuery::resolve` → `Page<T>`), `AuditContext` (`ctx.audit_id()` → created_by/updated_by), custom `extract::{Json,Path,Query}`, `AppError`. Never re-implement these per feature.
 
 ## Verify

@@ -218,7 +218,7 @@ pub async fn delete_me(
     post, path = "/auth/me/password", tag = "me",
     request_body = ChangePasswordRequest,
     responses(
-        (status = 204, description = "已改密,撤销其它会话"),
+        (status = 204, description = "已改密,撤销所有会话(需重新登录)"),
         (status = 401, description = "旧密码错", body = ErrorBody),
     )
 )]

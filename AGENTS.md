@@ -34,7 +34,7 @@ RESTful。写操作用 **PUT 全量替换、禁 PATCH**(更新 DTO 别为"部分
 |---|---|---|
 | `src/app/` | composition root:装配 / 路由 / 启动 / 跨模块适配器 | 稳定 |
 | `src/infra/` | 横切:config / error / audit / pagination / openapi / extract | 稳定 |
-| `src/features/<name>/` | 业务模块(idm 认证、widget 示例 + 富化样板) | **易变,细节看代码** |
+| `src/features/<name>/` | 业务模块(auth 认证 HTTP 边界、widget 示例 + 富化样板) | **易变,细节看代码** |
 | `src/bin/` | `idm`(分进程入口)、`seed` | 稳定 |
 | `migrations/{app,idm}/` · `tests/` | 各 schema 独立 role;`*_api` 黑盒 + `*_conformance` 内存↔PG 对拍 | — |
 
@@ -42,12 +42,12 @@ RESTful。写操作用 **PUT 全量替换、禁 PATCH**(更新 DTO 别为"部分
 
 ## 命令
 
-全集见 `justfile`。常用:`just dev`(单进程起) · `just test`(全量) · `just test-pg-idm`(PG conformance) · `just lint` · `just seed`。
+全集见 `justfile`。常用:`just dev`(单进程起) · `just test`(全量) · `just test-pg`(PG conformance) · `just lint` · `just seed`。
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **baserust** (541 symbols, 1083 relationships, 44 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **baserust** (584 symbols, 1160 relationships, 48 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

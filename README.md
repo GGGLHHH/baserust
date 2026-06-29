@@ -62,7 +62,7 @@ src/
 - **统一不泄露错误契约**:`AppError` → `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
 - **基础实体**:审计字段(created_by/at · updated_by/at)+ 软删除(`deleted_at`,`base_select` 收口);`updated_at` 由 DB 触发器维护
-- **审计上下文**:`AuditContext`(无 auth → Anonymous → created_by NULL,接 auth 改一处)
+- **审计上下文**:`AuditContext`(未认证 → Anonymous → created_by NULL;已认证 → 取鉴权中间件 `auth::authenticate` 塞的 `idm::AuthUser` 作 created_by)
 - **分页**:offset(跳页+total)/ cursor(keyset on uuid v7)双模式
 
 ## 测试
