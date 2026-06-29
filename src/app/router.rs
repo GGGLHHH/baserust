@@ -11,6 +11,9 @@ use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::SmartIpKeyExtractor;
+use tower_governor::{GovernorError, GovernorLayer};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -97,6 +100,20 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
 
+    // 限流(opt-in,RATE_LIMIT_ENABLED):按 IP 令牌桶,超限 429 + 统一 ErrorBody。
+    // 加在最外(请求最先过),IP 滥用在鉴权/业务前就挡;429 经 error_handler 出错误契约。
+    let router = if config.rate_limit_enabled {
+        let gov = GovernorConfigBuilder::default()
+            .per_second(config.rate_limit_per_sec as u64)
+            .burst_size(config.rate_limit_burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("限流配置应合法");
+        router.layer(GovernorLayer::new(gov).error_handler(rate_limit_response))
+    } else {
+        router
+    };
+
     // 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露,prod 收起减少攻击面。
     let router = if config.app_env.expose_docs() {
         router.merge(openapi::doc_routes(api))
@@ -157,6 +174,33 @@ fn error_response(status: StatusCode, code: &'static str, msg: &str) -> Response
         error: msg.to_owned(),
     };
     (status, Json(body)).into_response()
+}
+
+/// 限流超限 → 统一 `ErrorBody`,透传 governor 的 retry-after 等 header(错误契约也覆盖限流)。
+fn rate_limit_response(err: GovernorError) -> Response {
+    match err {
+        GovernorError::TooManyRequests { headers, .. } => {
+            let mut resp = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "请求过于频繁,请稍后再试",
+            );
+            if let Some(h) = headers {
+                resp.headers_mut().extend(h);
+            }
+            resp
+        }
+        GovernorError::UnableToExtractKey => {
+            error_response(StatusCode::BAD_REQUEST, "bad_request", "无法识别请求来源")
+        }
+        GovernorError::Other { code, headers, .. } => {
+            let mut resp = error_response(code, "internal", "限流错误");
+            if let Some(h) = headers {
+                resp.headers_mut().extend(h);
+            }
+            resp
+        }
+    }
 }
 
 /// 给每个请求建带 method/path/request_id 的 tracing span,日志即可按 request_id 关联。

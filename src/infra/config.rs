@@ -45,6 +45,20 @@ pub struct Config {
     #[serde(default)]
     pub cors_allowed_origins: String,
 
+    /// 限流(按 IP)。**opt-in**:`RATE_LIMIT_ENABLED=true` 才启用(零配置静默启动默认关)。
+    #[serde(default)]
+    pub rate_limit_enabled: bool,
+    /// 每 IP 每秒补充令牌数,`RATE_LIMIT_PER_SEC`,默认 10。
+    #[serde(default = "default_rate_limit_per_sec")]
+    pub rate_limit_per_sec: u32,
+    /// 每 IP 突发上限,`RATE_LIMIT_BURST`,默认 20。
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+
+    /// Prometheus metrics + `/metrics` 端点。**opt-in**:`METRICS_ENABLED=true` 才启用。
+    #[serde(default)]
+    pub metrics_enabled: bool,
+
     /// app schema 的数据库连接,按 role 分字段(镜像 Go 的 `AppDBConfig`)。
     /// 用 app role 连接,靠 role 的 search_path 落到 app schema,代码/SQL 都不写 schema 前缀。
     /// `APP_DB_HOST` 的存在 = 启用 pg;不设 → widget 仓储走内存(脚手架默认,无需数据库)。
@@ -105,6 +119,12 @@ fn default_db_password() -> String {
 fn default_db_sslmode() -> String {
     "disable".into()
 }
+fn default_rate_limit_per_sec() -> u32 {
+    10
+}
+fn default_rate_limit_burst() -> u32 {
+    20
+}
 fn default_jwt_secret() -> String {
     // dev 默认:零环境变量也能静默启动;生产**务必**用 IDM_JWT_SECRET 覆盖。
     "dev-insecure-secret-change-me-in-prod".into()
@@ -125,6 +145,10 @@ impl Default for Config {
             bind_addr: default_bind_addr(),
             app_env: Profile::default(),
             cors_allowed_origins: String::new(),
+            rate_limit_enabled: false,
+            rate_limit_per_sec: default_rate_limit_per_sec(),
+            rate_limit_burst: default_rate_limit_burst(),
+            metrics_enabled: false,
             app_db_host: None,
             app_db_port: default_db_port(),
             app_db_database: default_db_database(),

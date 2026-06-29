@@ -74,6 +74,11 @@ rand = "0.8"
 
 # seed 数据源:toml(避开已废弃的 serde_yaml;dtolnay 维护、与 serde 同源)
 toml = "0.8"
+# 限流:按 IP(SmartIp,nginx 前优先 X-Forwarded-For)令牌桶,超限 429 + ErrorBody。opt-in(RATE_LIMIT_ENABLED)。
+# 注意 crates.io 包名是下划线 tower_governor(非连字符)。
+tower_governor = "0.8.0"
+# metrics:Prometheus 请求计数/延迟直方图 + /metrics 端点。opt-in(METRICS_ENABLED)。
+axum-prometheus = "0.10.0"
 
 # feature 开关:pg-conformance 开了才编译"打真库的仓储一致性测试"(需 DATABASE_URL + 跑着的 pg)。
 # 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用本地 `just test-pg` 显式触发(将来接 CI 时单列一个 job 跑它)。

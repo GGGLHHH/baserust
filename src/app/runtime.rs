@@ -16,6 +16,22 @@ pub async fn run(mount: Mount) -> anyhow::Result<()> {
     let config = Config::load().context("加载配置失败")?;
     let state = AppState::new(&config, mount).await?;
     let app = build_router(state, &config, mount);
+    // metrics(opt-in,METRICS_ENABLED):Prometheus 请求计数/延迟直方图 + /metrics 端点。
+    // 放这(不进 build_router):prometheus 全局 recorder 只能 install 一次,oneshot 测试多次
+    // build_router 会重复 install 而 panic;放进程启动唯一路径就稳。/metrics 内部端点,不进 OpenAPI。
+    let app = if config.metrics_enabled {
+        let (layer, handle) = axum_prometheus::PrometheusMetricLayerBuilder::new()
+            .with_ignore_pattern("/metrics")
+            .with_default_metrics()
+            .build_pair();
+        app.route(
+            "/metrics",
+            axum::routing::get(move || async move { handle.render() }),
+        )
+        .layer(layer)
+    } else {
+        app
+    };
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -31,10 +47,15 @@ pub async fn run(mount: Mount) -> anyhow::Result<()> {
     tracing::info!("API 文档 (Scalar)  http://{host}:{port}/docs");
     tracing::info!("OpenAPI JSON      http://{host}:{port}/api-docs/openapi.json");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("服务器异常退出")?;
+    // into_make_service_with_connect_info:给 SmartIpKeyExtractor 的 peer-IP fallback 提供 ConnectInfo
+    // (生产 nginx 设 X-Forwarded-For 时走 header;直连/无代理时回落到对端 IP)。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("服务器异常退出")?;
     Ok(())
 }
 
