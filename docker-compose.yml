@@ -25,6 +25,9 @@ services:
       - "${NGINX_PORT:-80}:80"
 
   app:
+    # app 与 idm 共用同一镜像(runtime 阶段含 xchangeai + idm 两个二进制);只 entrypoint 不同。
+    # 同名 image + 同 build → compose 只构建一次,idm 服务直接复用,不重复 build。
+    image: baserust-runtime:latest
     build:
       context: .
       target: runtime
@@ -67,7 +70,9 @@ services:
       - "${APP_PORT:-6453}:8080"
 
   # idm 进程:同一镜像,override entrypoint 跑 idm bin,只挂 /api/v1/auth/*。连 idm schema。
+  # idm 进程:**同一镜像**(同 image+build → 复用 app 已构建的那份),只 override entrypoint 跑 idm bin。
   idm:
+    image: baserust-runtime:latest
     build:
       context: .
       target: runtime
