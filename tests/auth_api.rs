@@ -487,3 +487,30 @@ async fn change_password_old_fails_new_works() {
         .unwrap();
     assert_eq!(new.status(), StatusCode::OK, "新密码应可登录");
 }
+
+// ── 进程内 seed ──
+
+/// 走真实 `AppState::new`(非 test_app 直构)→ dev 内存模式启动时进程内 seed:
+/// seed.toml 的 superadmin/pwd 可登录、且带 superadmin 角色。覆盖 test_app 绕过的 seed 路径。
+/// 用真 Argon2(seed 与登录验密同一把),稍慢但端到端证明 seed 生效。
+#[tokio::test]
+async fn in_process_seed_lets_superadmin_log_in() {
+    let config = xchangeai::infra::config::Config::default(); // dev → seed_on_start = true
+    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let app = build_router(state, &config, Mount::Both);
+
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/auth/login",
+            r#"{"identifier":"superadmin","password":"pwd"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "seed 的 superadmin 应能登录");
+    let body = body_string(resp).await;
+    assert!(body.contains("\"username\":\"superadmin\""), "body: {body}");
+    assert!(
+        body.contains("\"roles\":[\"superadmin\"]"),
+        "superadmin 应被授予 superadmin 角色: {body}"
+    );
+}

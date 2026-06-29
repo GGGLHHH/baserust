@@ -4,6 +4,7 @@
 pub mod adapters;
 pub mod router;
 pub mod runtime;
+pub mod seed;
 pub mod state;
 
 pub use router::{build_router, Mount};

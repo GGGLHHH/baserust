@@ -95,6 +95,20 @@ impl AppState {
                 )
             }
         };
+        // 进程内 seed:idm-mounting 进程 + 开启时(默认非 prod),幂等写默认 role/账号。
+        // memory 与 PG 都生效 —— dev 内存模式也能有个 superadmin 登录。prod 默认不跑,走显式 `seed` bin。
+        if needs_idm && config.seed_on_start() {
+            let data = super::seed::SeedData::load()?;
+            super::seed::apply(
+                idm_users.as_ref(),
+                idm_roles.as_ref(),
+                &Argon2Hasher,
+                &data,
+                Some("system".to_owned()),
+            )
+            .await?;
+        }
+
         // 跨模块富化:widget 的 UserDirectory 端口由 app 注入 idm 的进程内适配器(复用 idm_users)。
         // 单体 Both 连真 idm 库;分进程 App 时 idm_users 是内存占位 → 富化降级为空(留待 HttpUserDirectory)。
         let user_directory: Arc<dyn UserDirectory> =

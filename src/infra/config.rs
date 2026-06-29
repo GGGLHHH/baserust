@@ -85,6 +85,12 @@ pub struct Config {
     #[serde(default = "default_refresh_ttl_secs")]
     pub idm_refresh_ttl_secs: i64,
 
+    /// 进程内 seed:idm-mounting 进程启动时**幂等**写默认 role/账号(memory 与 PG 都适用)。
+    /// `IDM_SEED_ON_START`(true/false)。**未设时默认 = 非 prod 才 seed**(dev 便利;prod 不自动建
+    /// superadmin/pwd,要 seed 走显式 `seed` bin)。见 [`Config::seed_on_start`]。
+    #[serde(default)]
+    pub idm_seed_on_start: Option<bool>,
+
     /// idm schema 的数据库连接,按 role 分字段(role=idm,镜像 app_db_*)。
     /// `IDM_DB_HOST` 的存在 = idm 走 PG(读 seed 的 superadmin 等);不设 → idm 仓储走内存。
     #[serde(default)]
@@ -158,6 +164,7 @@ impl Default for Config {
             idm_jwt_secret: default_jwt_secret(),
             idm_access_ttl_secs: default_access_ttl_secs(),
             idm_refresh_ttl_secs: default_refresh_ttl_secs(),
+            idm_seed_on_start: None,
             idm_db_host: None,
             idm_db_port: default_db_port(),
             idm_db_database: default_db_database(),
@@ -205,6 +212,12 @@ impl Config {
                 self.idm_db_sslmode,
             )
         })
+    }
+
+    /// 是否在进程内 seed idm 默认数据。未显式设 `IDM_SEED_ON_START` → **非 prod 才 seed**
+    /// (dev/staging 便利;prod 不自动建 superadmin/pwd,避免启动期意外写库)。
+    pub fn seed_on_start(&self) -> bool {
+        self.idm_seed_on_start.unwrap_or(!self.app_env.is_prod())
     }
 
     /// prod CORS 白名单(解析逗号分隔、去空白、去空项)。
