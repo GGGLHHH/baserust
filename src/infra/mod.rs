@@ -2,8 +2,10 @@
 //! 业务模块单向依赖此层;此层不依赖任何业务。
 
 pub mod audit;
+pub mod authz;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod op_perms;
 pub mod openapi;
 pub mod pagination;

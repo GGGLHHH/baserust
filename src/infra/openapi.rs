@@ -2,12 +2,16 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{
+    Flow, OAuth2, Password, Scopes, SecurityRequirement, SecurityScheme,
+};
 use utoipa::{Modify, OpenApi};
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::app::state::AppState;
+use crate::infra::authz::Perm;
 use crate::infra::error::AppError;
+use crate::infra::op_perms::op_authz;
 
 /// OpenAPI 文档根。范式:
 /// - 顶层 info/tags 在此声明;path 与 schema 由各模块的 `#[utoipa::path]` + `routes!()` 贡献。
@@ -25,21 +29,82 @@ use crate::infra::error::AppError;
 )]
 pub struct ApiDoc;
 
-/// 认证方式声明:**httponly cookie**(access_token)为主 + **Bearer** 兜底。
-/// 让 Scalar 文档的 Authorize 反映真实认证方式(鉴权中间件 cookie 优先、Bearer fallback)。
+/// oauth2 scheme 名 —— 端点 `security(("oauth2" = [...]))` 引用须一字不差(裸串无编译期校验,靠测试兜)。
+pub const OAUTH2_SCHEME: &str = "oauth2";
+
+/// **标准方案**:OpenAPI 规范内,唯一能结构化承载"端点需哪个权限"的位置 = **oauth2 scheme 的 scopes**
+/// (scope 只对 oauth2/oidc 有意义,apiKey/http 必须空)。把 cookie 优先 / Bearer 兜底的 JWT 登录,
+/// 文档映射成 oauth2 **password flow**(tokenUrl→/auth/login、refreshUrl→/auth/refresh,相对路径守零环境变量启动)。
+/// scopes 由 [`Perm::ALL`] 派生 —— scope key 与端点引用、与运行期 `require_scoped` 比较的 wire 串**同源**,杜绝漂移。
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = openapi.components.get_or_insert_with(Default::default);
+        let scopes = Scopes::from_iter(Perm::ALL.iter().map(|p| (perm_wire(*p), perm_doc(*p))));
         components.add_security_scheme(
-            "cookie_auth",
-            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("access_token"))),
+            OAUTH2_SCHEME,
+            SecurityScheme::OAuth2(OAuth2::with_description(
+                [Flow::Password(Password::with_refresh_url(
+                    "/api/v1/auth/login",
+                    scopes,
+                    "/api/v1/auth/refresh",
+                ))],
+                "JWT 认证。Token 由 POST /api/v1/auth/login(JSON identifier+password)签发,经 httponly \
+                 `access_token` cookie 优先、`Authorization: Bearer <token>` 兜底两种方式发送。scopes 为 \
+                 baserust 权限(由 role 授予;降权令牌有效 scope = role 权限 ∩ per-token scope)。注:本服务无独立 \
+                 OAuth2 授权服务器,此 password flow 仅为对上述登录的文档映射,交互式 Authorize 不保证可直接调通。",
+            )),
         );
-        components.add_security_scheme(
-            "bearer_auth",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
-        );
+    }
+}
+
+/// `Perm` → wire 串(`resource:action[:qualifier]`)。复用 `authz.rs` 既有投影;
+/// `perm_wire_matches_projection` 测试已钉死投影 == serde wire(JWT/TOML/`require_scoped` 同一串)→ 同源零漂移。
+fn perm_wire(p: Perm) -> String {
+    match p.qualifier() {
+        Some(q) => format!("{}:{}:{q}", p.resource(), p.action()),
+        None => format!("{}:{}", p.resource(), p.action()),
+    }
+}
+
+/// scope 人读说明:同样从投影合成,全静态、零 `seed.toml` 依赖(静态 `Modify` 本就拿不到运行时数据)。
+fn perm_doc(p: Perm) -> String {
+    match p.qualifier() {
+        Some(q) => format!("{} {} ({q})", p.action(), p.resource()),
+        None => format!("{} {}", p.action(), p.resource()),
+    }
+}
+
+/// **OpenAPI 文档授权的单一来源注入**:按 operationId 从 [`crate::infra::op_perms::OP_PERMS`] 表
+/// 写每个 operation 的 `security`。删掉了所有手敲 `security(...)` 属性 → 系统内零 scope 串、
+/// 改 `Perm` 必过编译期表 → 文档侧零漂移。`Some(p)` → `[{"oauth2":[wire]}]`;`None` → `[{"oauth2":[]}]`(仅登录);
+/// 不在表 → 不写(public)。
+///
+/// **必须在 `split_for_parts()` 之后跑**:`modifiers(&SecurityAddon)` 在 `ApiDoc::openapi()` 那一刻执行,
+/// 那时 paths 还空(utoipa-axum 在 merge/nest 后才填 operation),够不到 per-operation。
+pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
+    for (_path, item) in api.paths.paths.iter_mut() {
+        let ops = [
+            item.get.as_mut(),
+            item.put.as_mut(),
+            item.post.as_mut(),
+            item.delete.as_mut(),
+            item.patch.as_mut(),
+        ];
+        for op in ops.into_iter().flatten() {
+            let Some(id) = op.operation_id.as_deref() else {
+                continue;
+            };
+            let Some(e) = op_authz(id) else {
+                continue; // 不在表 = public,不写 security
+            };
+            op.security = Some(vec![match e.perm {
+                Some(p) => SecurityRequirement::new(OAUTH2_SCHEME, [perm_wire(p)]),
+                // 仅登录:空 scope 须 `Vec::<String>::new()` → {"oauth2":[]};**不可** `default()`(那是 {} = 无认证,语义错)。
+                None => SecurityRequirement::new(OAUTH2_SCHEME, Vec::<String>::new()),
+            }]);
+        }
     }
 }
 
@@ -72,6 +137,98 @@ fn yaml_response(api: &utoipa::openapi::OpenApi) -> Response {
         Ok(body) => ([(header::CONTENT_TYPE, "application/yaml")], body).into_response(),
         Err(e) => {
             AppError::Internal(anyhow::anyhow!("生成 OpenAPI YAML 失败: {e}")).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// 合规 + 稳定:① 声明的 oauth2 scopes == `Perm` 闭集 wire 串(catalog parity);
+    /// ② 每个端点 `security` 引用的 oauth2 scope ⊆ 声明集(used ⊆ declared)。
+    /// 任何端点 scope 拼错 / 漏声明 → 这里红;杜绝 spec 出现悬空 scope(通用校验器也会拒)。
+    #[test]
+    fn security_scopes_declared_and_within_catalog() {
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+
+        let declared: BTreeSet<String> = v["components"]["securitySchemes"][OAUTH2_SCHEME]["flows"]
+            ["password"]["scopes"]
+            .as_object()
+            .expect("oauth2 password scopes 应存在")
+            .keys()
+            .cloned()
+            .collect();
+        let catalog: BTreeSet<String> = Perm::ALL.iter().map(|p| perm_wire(*p)).collect();
+        assert_eq!(declared, catalog, "声明的 scopes 应 == Perm 闭集 wire 串");
+
+        for (_path, item) in v["paths"].as_object().expect("paths").iter() {
+            for (_method, op) in item.as_object().expect("path item").iter() {
+                let Some(reqs) = op.get("security").and_then(|s| s.as_array()) else {
+                    continue;
+                };
+                for req in reqs {
+                    let Some(scopes) = req.get(OAUTH2_SCHEME).and_then(|s| s.as_array()) else {
+                        continue;
+                    };
+                    for s in scopes {
+                        let s = s.as_str().unwrap();
+                        assert!(declared.contains(s), "端点引用了未声明的 scope `{s}`");
+                    }
+                }
+            }
+        }
+    }
+
+    /// **fail-closed**:spec 每个 operation 必在 `OP_PERMS` 或 public 白名单 —— 新端点漏授权(无 security 注入)即红。
+    #[test]
+    fn every_operation_classified() {
+        const PUBLIC: &[&str] = &[
+            "register",
+            "login",
+            "refresh",
+            "logout",
+            "livez",
+            "health",
+            "readyz",
+            "widget_stats", // 公开计数:无 CurrentUser/require_scoped
+        ];
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        for (_path, item) in v["paths"].as_object().expect("paths").iter() {
+            for (_method, op) in item.as_object().expect("path item").iter() {
+                let Some(id) = op.get("operationId").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                assert!(
+                    op_authz(id).is_some() || PUBLIC.contains(&id),
+                    "operation `{id}` 未分类:加进 OP_PERMS 或 public 白名单(fail-closed)"
+                );
+            }
+        }
+    }
+
+    /// 防表腐:`OP_PERMS` 每个 operationId 必在 spec 存在(handler 改名 / 路径漂移 → 这里红)。
+    #[test]
+    fn op_perms_entries_exist_in_spec() {
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        let ids: BTreeSet<String> = v["paths"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|item| item.as_object().unwrap().values())
+            .filter_map(|op| {
+                op.get("operationId")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        for e in crate::infra::op_perms::OP_PERMS {
+            assert!(
+                ids.contains(e.operation_id),
+                "OP_PERMS 的 `{}` 在 spec 不存在(handler 改名/路径漂移?)",
+                e.operation_id
+            );
         }
     }
 }

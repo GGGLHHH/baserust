@@ -13,6 +13,7 @@ use axum::response::Response;
 use axum_extra::extract::CookieJar;
 
 use crate::app::state::AppState;
+use crate::infra::authz::TokenScope;
 
 /// 鉴权:**httponly cookie 优先,`Authorization: Bearer` 兜底**。
 pub async fn authenticate(
@@ -28,6 +29,9 @@ pub async fn authenticate(
     if let Some(token) = token {
         if let Ok(user) = state.auth.authenticate_token(&token) {
             req.extensions_mut().insert(user);
+            // 身份验过后,把 app 自有的 scope claim 读进 extensions(idm 的 VerifiedToken 不带 scope)。
+            req.extensions_mut()
+                .insert(TokenScope(state.tokens.scope_of(&token)));
         }
     }
     next.run(req).await

@@ -27,6 +27,12 @@ pub struct WidgetView {
     pub created_by_user: Option<UserBrief>,
 }
 
+/// 计数响应(公开 stats / 我的计数 共用)。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WidgetStats {
+    pub total: u64,
+}
+
 impl WidgetView {
     /// 用一页富化结果(id→brief)把一个 `Widget` 拼成 `WidgetView`。
     pub fn enrich(w: Widget, dir: &HashMap<Uuid, UserBrief>) -> Self {

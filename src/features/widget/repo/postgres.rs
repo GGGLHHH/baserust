@@ -33,18 +33,21 @@ impl PgWidgetRepo {
 
 #[async_trait]
 impl WidgetRepo for PgWidgetRepo {
-    async fn list(&self, page: &PageParams) -> Result<Page<Widget>, AppError> {
+    async fn list(&self, page: &PageParams, owner: Option<&str>) -> Result<Page<Widget>, AppError> {
         match page {
             PageParams::Offset {
                 page,
                 size,
                 with_total,
             } => {
-                // SELECT cols FROM widgets WHERE deleted_at IS NULL
+                // SELECT cols FROM widgets WHERE deleted_at IS NULL [AND created_by = owner]
                 //   ORDER BY id DESC LIMIT size OFFSET (page-1)*size
                 let mut q = Self::base_select();
-                q.columns(COLS)
-                    .order_by(Widgets::Id, Order::Desc)
+                q.columns(COLS);
+                if let Some(o) = owner {
+                    q.and_where(Expr::col(Widgets::CreatedBy).eq(o)); // ownership 过滤
+                }
+                q.order_by(Widgets::Id, Order::Desc)
                     .limit(*size)
                     .offset((page.saturating_sub(1)) * size);
                 let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
@@ -55,9 +58,12 @@ impl WidgetRepo for PgWidgetRepo {
                         .map_err(|e| AppError::Internal(e.into()))?;
 
                 let total = if *with_total {
-                    // COUNT(id) 同 filter、去 limit/offset(id 非空 PK,等价 COUNT(*))
+                    // COUNT(id) 同 filter(含 owner)、去 limit/offset(id 非空 PK,等价 COUNT(*))
                     let mut c = Self::base_select();
                     c.expr(Func::count(Expr::col(Widgets::Id)));
+                    if let Some(o) = owner {
+                        c.and_where(Expr::col(Widgets::CreatedBy).eq(o));
+                    }
                     let (csql, cvalues) = c.build_sqlx(PostgresQueryBuilder);
                     let n: i64 = sqlx::query_scalar_with::<sqlx::Postgres, i64, _>(
                         AssertSqlSafe(csql),
@@ -76,6 +82,9 @@ impl WidgetRepo for PgWidgetRepo {
                 // keyset on id(v7 单列严格全序):取 limit+1 判 has_more
                 let mut q = Self::base_select();
                 q.columns(COLS);
+                if let Some(o) = owner {
+                    q.and_where(Expr::col(Widgets::CreatedBy).eq(o)); // ownership 过滤
+                }
                 if let Some(after) = after {
                     // v7 id 单列严格全序:id < cursor 配 ORDER BY id DESC 即正确翻页
                     q.and_where(Expr::col(Widgets::Id).lt(*after));

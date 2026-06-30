@@ -63,7 +63,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         features = features.merge(auth::router());
     }
     api_router = api_router.nest("/api/v1", features);
-    let (router, api) = api_router.split_for_parts();
+    let (router, mut api) = api_router.split_for_parts();
+    // per-operation security 由单一来源表注入(必须 split 后做,modifier 跑时 paths 还空)。
+    openapi::inject_operation_security(&mut api);
 
     let router = router
         // 中间件栈(外→内,请求时外层先执行)。
@@ -121,6 +123,23 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     };
 
     router.with_state(state)
+}
+
+/// 合并后的 OpenAPI 规范(`Both` 全量)。运行时 doc 端点与契约测试**同源**复用此装配
+/// (镜像 `build_router` 的 `Mount::Both` 分支)—— 避免测试复制装配逻辑而与运行时漂移。
+pub fn api_spec() -> utoipa::openapi::OpenApi {
+    let mut api = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
+        .merge(health::router())
+        .nest(
+            "/api/v1",
+            OpenApiRouter::new()
+                .merge(widget::router())
+                .merge(auth::router()),
+        )
+        .split_for_parts()
+        .1;
+    openapi::inject_operation_security(&mut api); // 与 build_router 同源:doc 端点与契约测试都经此注入
+    api
 }
 
 /// CORS 层:prod 用配置白名单(空则等于不放行任何跨源);dev/staging 走 permissive(任意源,便于联调)。

@@ -10,7 +10,7 @@ use super::types::{CreateWidget, UpdateWidget, Widget};
 use super::view::WidgetView;
 use crate::infra::audit::AuditContext;
 use crate::infra::error::AppError;
-use crate::infra::pagination::{Page, PageQuery};
+use crate::infra::pagination::{Page, PageInfo, PageQuery};
 
 /// 业务逻辑层。范式:
 /// - 持 `Arc<dyn WidgetRepo>` 端口,不关心底层是内存还是 Postgres。
@@ -29,16 +29,27 @@ impl WidgetService {
     }
 
     /// 分页列表(纯,不富化)。`PageQuery::resolve` 兼做互斥校验/clamp/默认,失败映射 AppError。
-    pub async fn list(&self, query: PageQuery) -> Result<Page<Widget>, AppError> {
+    /// `owner = Some(id)` → 只列该用户创建的(数据所有权:user 只看自己的);`None` → 全部(有 read:all 的角色)。
+    pub async fn list(
+        &self,
+        query: PageQuery,
+        owner: Option<Uuid>,
+    ) -> Result<Page<Widget>, AppError> {
         let params = query.resolve()?;
-        self.repo.list(&params).await
+        let owner = owner.map(|id| id.to_string());
+        self.repo.list(&params, owner.as_deref()).await
     }
 
     /// 富化列表:list 后收集 distinct created_by → **一次** batch → 内存拼成 `WidgetView`。
     /// 防 N+1 的纪律在此:一次 `batch_by_ids`、不是每行一次;脏值('system'/NULL/非 UUID)与
     /// 已删用户优雅降级成 `created_by_user: null`,绝不报错、绝不跨 schema join。
-    pub async fn list_enriched(&self, query: PageQuery) -> Result<Page<WidgetView>, AppError> {
-        let page = self.list(query).await?;
+    /// `owner` 同 [`Self::list`]:行级所有权过滤(在查询层,分页正确)。
+    pub async fn list_enriched(
+        &self,
+        query: PageQuery,
+        owner: Option<Uuid>,
+    ) -> Result<Page<WidgetView>, AppError> {
+        let page = self.list(query, owner).await?;
         // 收集 distinct + parse 过滤:'system'/NULL/历史脏值 parse 失败的不当 user 查。
         let ids: Vec<Uuid> = page
             .items
@@ -50,6 +61,21 @@ impl WidgetService {
             .collect();
         let dir = self.users.batch_by_ids(&ids).await?;
         Ok(page.map_items(|w| WidgetView::enrich(w, &dir)))
+    }
+
+    /// 计数。复用 `list` 的 offset+total(size=1 少拉行)。`owner=Some` 只数自己创建的。
+    // ponytail: demo 复用 list 取 total;真高频再加 `repo.count()`。
+    pub async fn count(&self, owner: Option<Uuid>) -> Result<u64, AppError> {
+        let q = PageQuery {
+            page: Some(1),
+            size: Some(1),
+            cursor: None,
+            with_total: Some(true),
+        };
+        match self.list(q, owner).await?.page_info {
+            PageInfo::Offset { total, .. } => Ok(total.unwrap_or(0)),
+            PageInfo::Cursor { .. } => Ok(0), // 不会发生:上面固定 offset 模式
+        }
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Widget, AppError> {
@@ -134,7 +160,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let page = svc.list(first_page()).await.unwrap();
+        let page = svc.list(first_page(), None).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].name, "alpha");
     }
@@ -156,7 +182,7 @@ mod tests {
         svc.delete(w.id, &ctx()).await.unwrap();
         // 软删后 get 404、list 不含、再删幂等 NotFound
         assert!(matches!(svc.get(w.id).await, Err(AppError::NotFound)));
-        assert_eq!(svc.list(first_page()).await.unwrap().items.len(), 0);
+        assert_eq!(svc.list(first_page(), None).await.unwrap().items.len(), 0);
         assert!(matches!(
             svc.delete(w.id, &ctx()).await,
             Err(AppError::NotFound)
@@ -184,7 +210,7 @@ mod tests {
             },
         )])));
         let svc = WidgetService::new(repo, dir);
-        let page = svc.list_enriched(first_page()).await.unwrap();
+        let page = svc.list_enriched(first_page(), None).await.unwrap();
         let by = |n: &str| page.items.iter().find(|v| v.name == n).unwrap();
         assert_eq!(
             by("known").created_by_user.as_ref().unwrap().username,

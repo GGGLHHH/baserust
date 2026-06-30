@@ -29,4 +29,8 @@ pub fn router() -> OpenApiRouter<AppState> {
             routes::update_widget,
             routes::delete_widget
         ))
+        // 授权形态样板:public / 仅登录 / superadmin-only(各自独立路径,分开 routes!)
+        .routes(routes!(routes::widget_stats))
+        .routes(routes!(routes::my_widget_count))
+        .routes(routes!(routes::admin_list_widgets))
 }

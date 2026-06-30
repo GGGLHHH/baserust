@@ -58,11 +58,13 @@ impl Default for InMemoryWidgetRepo {
 
 #[async_trait]
 impl WidgetRepo for InMemoryWidgetRepo {
-    async fn list(&self, page: &PageParams) -> Result<Page<Widget>, AppError> {
+    async fn list(&self, page: &PageParams, owner: Option<&str>) -> Result<Page<Widget>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
         let mut alive: Vec<Row> = store
             .values()
             .filter(|r| r.deleted_at.is_none())
+            // ownership 过滤:owner=Some 只留自己创建的(created_by == owner);None 不过滤。
+            .filter(|r| owner.is_none_or(|o| r.created_by.as_deref() == Some(o)))
             .cloned()
             .collect();
         // ORDER BY id DESC(v7 id 即创建序倒序,最新在前)

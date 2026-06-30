@@ -33,7 +33,7 @@ pg-test-grant:
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance -- --nocapture
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test -- --nocapture
 
 # 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance
 # (idm 仓储 conformance 随 idm 抽成独立 rust-idm crate 后已迁出本仓)
@@ -72,10 +72,10 @@ migrate-idm-info:
 migrate-add schema name:
     sqlx migrate add -r --source migrations/{{schema}} {{name}}
 
-# seed idm 默认数据(superadmin 角色 + 账号 superadmin@local:pwd + 授予);幂等,可重复跑。
-# 先 `just migrate-idm` 建表。连 idm schema(idm role)。
+# seed 默认数据:idm(role/账号/授予)+ app authz(permissions / role_permissions)。幂等,可重复跑。
+# 先 `just migrate`(建两 schema 的表)。idm 连 idm role、app 连 app role。
 seed:
-    IDM_DATABASE_URL="{{idm_db_url}}" cargo run --bin seed
+    IDM_DATABASE_URL="{{idm_db_url}}" APP_DATABASE_URL="{{app_db_url}}" cargo run --bin seed
 
 # lint:格式检查 + clippy(警告即失败)
 lint:

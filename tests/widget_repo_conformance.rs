@@ -35,11 +35,14 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 
     // ── offset:ORDER BY id DESC,with_total 计存活数 ──
     let p1 = repo
-        .list(&PageParams::Offset {
-            page: 1,
-            size: 2,
-            with_total: true,
-        })
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 2,
+                with_total: true,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -51,11 +54,14 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         PageInfo::Offset { total: Some(3), .. }
     ));
     let p2 = repo
-        .list(&PageParams::Offset {
-            page: 2,
-            size: 2,
-            with_total: false,
-        })
+        .list(
+            &PageParams::Offset {
+                page: 2,
+                size: 2,
+                with_total: false,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -65,10 +71,13 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 
     // ── cursor keyset:首页 has_more,next_cursor 解码后续翻 ──
     let cur1 = repo
-        .list(&PageParams::Cursor {
-            after: None,
-            limit: 2,
-        })
+        .list(
+            &PageParams::Cursor {
+                after: None,
+                limit: 2,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -87,10 +96,13 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         _ => panic!("应是 cursor 模式"),
     };
     let cur2 = repo
-        .list(&PageParams::Cursor {
-            after: Some(decode_cursor(&next).unwrap()),
-            limit: 2,
-        })
+        .list(
+            &PageParams::Cursor {
+                after: Some(decode_cursor(&next).unwrap()),
+                limit: 2,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -103,6 +115,27 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
             has_more: false,
             ..
         }
+    ));
+
+    // ── ownership 过滤:owner=Some 只列该 created_by 的行,total 也按 owner 算(memory↔PG parity)──
+    let mine = repo
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 50,
+                with_total: true,
+            },
+            Some("tester"), // a 的 created_by;b/c 是 None
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mine.items.iter().map(|w| w.id).collect::<Vec<_>>(),
+        vec![a.id]
+    );
+    assert!(matches!(
+        mine.page_info,
+        PageInfo::Offset { total: Some(1), .. }
     ));
 
     // ── update:改名 + updated_by + updated_at 推进;软删行不可改 ──
@@ -126,11 +159,14 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         Err(AppError::NotFound)
     )); // 改软删行
     let after = repo
-        .list(&PageParams::Offset {
-            page: 1,
-            size: 50,
-            with_total: true,
-        })
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 50,
+                with_total: true,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(after.items.iter().all(|w| w.id != a.id)); // list 不含软删行

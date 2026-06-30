@@ -10,7 +10,9 @@ use tower::ServiceExt; // oneshot
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState, Mount};
+use xchangeai::features::auth::AppTokens;
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
+use xchangeai::infra::authz::Policy;
 use xchangeai::infra::config::Config;
 
 /// 内存 app + **限流开启**(burst=2,per_sec=1)。
@@ -31,6 +33,8 @@ fn rate_limited_app() -> Router {
         ),
         db_pool: None,
         cookie_secure: false,
+        policy: Arc::new(Policy::default()),
+        tokens: Arc::new(AppTokens::new("test-secret")),
     };
     let config = Config {
         rate_limit_enabled: true,
@@ -95,6 +99,8 @@ async fn rate_limit_off_by_default_lets_all_through() {
         ),
         db_pool: None,
         cookie_secure: false,
+        policy: Arc::new(Policy::default()),
+        tokens: Arc::new(AppTokens::new("test-secret")),
     };
     let app = build_router(state, &Config::default(), Mount::Both);
     for _ in 0..10 {

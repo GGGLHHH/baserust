@@ -1,12 +1,64 @@
-# idm 默认数据 seed。`just seed` 读取并经 repo 幂等创建(数据归数据,不写进迁移)。
-# 改这里增删默认角色/账号,不动代码。账号引用的 role 必须在 [[roles]] 里先声明。
+# idm 默认数据 seed + **app 授权策略(role→permissions)唯一真相**。
+# `just seed` / 进程内 seed 读 name/display_name/accounts 写进 idm(幂等);
+# app 组合根另读 `permissions` 建内存 Policy(见 src/infra/authz.rs)——permissions **永不写进 idm 库**。
+# 改这里增删默认角色/账号/权限,不动代码。账号引用的 role 必须在 [[roles]] 里先声明。
+# permissions 取值是 src/infra/authz.rs 的 Perm 闭集;拼错的串启动即解析失败(fail-fast)。
 
+# ── 权限词表(catalog)──
+# **enum 是 enforcement 唯一真相**(src/infra/authz.rs 的 `Perm`);这里是它的**可读镜像 + 人读名**。
+# 启动期校验:声明 **== Perm 闭集**(多/漏/重复即 fail-fast),杜绝"声明了无变体兜底的死权限"或漏声明。
+# 加权限:先在 `Perm` 加变体,再来这里声明一条,`[[roles]].permissions` 才能引用。
+[[permissions]]
+key = "widgets:read"
+description = "查看自己创建的 widget"
+
+[[permissions]]
+key = "widgets:read:all"
+description = "查看所有人的 widget(而非仅自己)"
+
+[[permissions]]
+key = "widgets:write"
+description = "创建 / 修改 widget"
+
+[[permissions]]
+key = "widgets:delete"
+description = "删除 widget"
+
+[[permissions]]
+key = "users:admin"
+description = "用户管理"
+
+# 最经典的三轴数据矩阵:
+#  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin
+#  admin      —— 读写删 + 看所有人的(read:all),但无 users:admin
+#  user       —— 只读,且**只看自己创建的**(无 read:all → ownership 落到 Own;无 write → RBAC 拒写)
 [[roles]]
 name = "superadmin"
 display_name = "超级管理员"
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "users:admin"]
+
+[[roles]]
+name = "admin"
+display_name = "管理员"
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete"]
+
+[[roles]]
+name = "user"
+display_name = "普通用户"
+permissions = ["widgets:read"]
 
 [[accounts]]
 username = "superadmin"
 email = "superadmin@local" # 可选;登录用 username 或 email 都行
 password = "pwd"
 roles = ["superadmin"]
+
+[[accounts]]
+username = "admin"
+password = "pwd"
+roles = ["admin"]
+
+[[accounts]]
+username = "user"
+password = "pwd"
+roles = ["user"]

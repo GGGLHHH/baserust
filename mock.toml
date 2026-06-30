@@ -1,0 +1,16 @@
+# mock 样本 widget(**dev/demo 专用**,非 prod 种子)。幂等写入 app 的 widget 仓储。
+# owner 用 username 引用 seed.toml 里的账号(apply 时经 idm 解析成 created_by 用户 id;标识引用、非 FK)。
+# 改样本数据编辑这里,不动代码。设 MOCK_FILE 可指向外部文件覆盖。
+# 经典 ownership 矩阵:admin 拥 2 个、user 拥 1 个 —— 演示 own-vs-all。
+
+[[widgets]]
+name = "admin-w1"
+owner = "admin"
+
+[[widgets]]
+name = "admin-w2"
+owner = "admin"
+
+[[widgets]]
+name = "user-w1"
+owner = "user"

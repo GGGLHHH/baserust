@@ -1,3 +1,6 @@
 /target
 .env
 /logs
+
+# transient agent worktrees
+.claude/worktrees/

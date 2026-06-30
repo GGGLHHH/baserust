@@ -12,9 +12,10 @@ RUN mkdir src \
  && rm -rf src
 
 # 再拷真实源码编译(sqlx 用运行时 query_as,build 不需要 DATABASE_URL / 在线 DB)。
-# seed.toml:进程内 seed 用 include_str! 编译期嵌入,故 build 上下文需有它(否则编译失败)。
+# seed.toml / mock.toml:进程内 seed/mock 用 include_str! 编译期嵌入,故 build 上下文需有它们(否则编译失败)。
 COPY src ./src
 COPY seed.toml ./seed.toml
+COPY mock.toml ./mock.toml
 RUN touch src/main.rs && cargo build --release
 
 # ---- sqlx:仅用来产出 sqlx-cli 二进制(构建期 stage,不进任何运行镜像)----

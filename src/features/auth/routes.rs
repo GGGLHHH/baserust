@@ -144,8 +144,7 @@ pub async fn logout(
 }
 
 #[utoipa::path(
-    post, path = "/auth/logout-all", tag = "auth",
-    responses((status = 204, description = "已撤销所有会话"), (status = 401, body = ErrorBody))
+    post, path = "/auth/logout-all", tag = "auth",    responses((status = 204, description = "已撤销所有会话"), (status = 401, body = ErrorBody))
 )]
 pub async fn logout_all(
     State(state): State<AppState>,
@@ -157,8 +156,7 @@ pub async fn logout_all(
 }
 
 #[utoipa::path(
-    get, path = "/auth/me", tag = "me",
-    responses((status = 200, body = UserResponse), (status = 401, body = ErrorBody))
+    get, path = "/auth/me", tag = "me",    responses((status = 200, body = UserResponse), (status = 401, body = ErrorBody))
 )]
 pub async fn get_me(
     State(state): State<AppState>,
@@ -169,8 +167,7 @@ pub async fn get_me(
 }
 
 #[utoipa::path(
-    put, path = "/auth/me", tag = "me",
-    request_body = UpdateMeRequest,
+    put, path = "/auth/me", tag = "me",    request_body = UpdateMeRequest,
     responses(
         (status = 200, body = UserResponse),
         (status = 409, description = "新用户名/邮箱已占用", body = ErrorBody),
@@ -192,8 +189,7 @@ pub async fn update_me(
 }
 
 #[utoipa::path(
-    delete, path = "/auth/me", tag = "me",
-    request_body = DeleteMeRequest,
+    delete, path = "/auth/me", tag = "me",    request_body = DeleteMeRequest,
     responses(
         (status = 204, description = "已注销"),
         (status = 401, description = "密码错", body = ErrorBody),
@@ -215,8 +211,7 @@ pub async fn delete_me(
 }
 
 #[utoipa::path(
-    post, path = "/auth/me/password", tag = "me",
-    request_body = ChangePasswordRequest,
+    post, path = "/auth/me/password", tag = "me",    request_body = ChangePasswordRequest,
     responses(
         (status = 204, description = "已改密,撤销所有会话(需重新登录)"),
         (status = 401, description = "旧密码错", body = ErrorBody),

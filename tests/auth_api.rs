@@ -19,14 +19,17 @@ use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, Widge
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
 fn test_app() -> Router {
+    let tokens = Arc::new(AppTokens::new("test-secret"));
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
         ),
-        auth: test_auth(),
+        auth: test_auth(tokens.clone()),
         db_pool: None,
         cookie_secure: false,
+        policy: Arc::new(xchangeai::infra::authz::Policy::default()), // 这套契约不测授权
+        tokens,
     };
     build_router(
         state,
@@ -36,8 +39,7 @@ fn test_app() -> Router {
 }
 
 /// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + **生产同款 AppTokens**(app 显式 claim)。
-fn test_auth() -> AuthService {
-    let tokens = Arc::new(AppTokens::new("test-secret"));
+fn test_auth(tokens: Arc<AppTokens>) -> AuthService {
     AuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),

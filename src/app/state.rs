@@ -10,6 +10,7 @@ use crate::features::auth::AppTokens;
 use crate::features::widget::{
     InMemoryWidgetRepo, PgWidgetRepo, UserDirectory, WidgetRepo, WidgetService,
 };
+use crate::infra::authz::Policy;
 use crate::infra::config::Config;
 use idm::{
     Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
@@ -41,6 +42,11 @@ pub struct AppState {
     pub db_pool: Option<PgPool>,
     /// 认证 cookie 是否带 `Secure`(prod=true,仅 https 发送;dev http 必须 false 否则浏览器不发)。
     pub cookie_secure: bool,
+    /// **授权策略(归 app)**:role→权限,从 `seed.toml` 派生的内存只读 `Policy`。handler 经
+    /// `state.policy.require(_scoped)` gate 端点。**不查 idm 库**(roles 在 token 里)。
+    pub policy: Arc<Policy>,
+    /// app 自有的 JWT 签验(claim 形状 + scope)。中间件用它读 `scope` claim;也可 `mint_scoped` 降权令牌。
+    pub tokens: Arc<AppTokens>,
 }
 
 impl AppState {
@@ -95,18 +101,43 @@ impl AppState {
                 )
             }
         };
-        // 进程内 seed:idm-mounting 进程 + 开启时(默认非 prod),幂等写默认 role/账号。
-        // memory 与 PG 都生效 —— dev 内存模式也能有个 superadmin 登录。prod 默认不跑,走显式 `seed` bin。
+        // seed.toml 是 idm 默认数据 + **app 授权策略**两份真相的载体,**load 一次**:
+        let seed = super::seed::SeedData::load()?;
+        seed.assert_permission_catalog()?; // 启动期不变量:seed 权限词表 == 代码 Perm 闭集(多/漏即拒启动)
+
+        // 授权策略(归 app),**可拔插**(同 widget):设了 APP_DB_HOST → 读 app schema 的 role_permissions 表
+        // (role→权限可运行时改);否则从 seed.toml 派生内存 Policy。dev(seed_on_start)先幂等灌表。
+        // 注:prod 分进程 Idm 时 needs_app=false、app_pool=None → 走内存(idm 进程只 gate /me,够用)。
+        let policy = Arc::new(match &app_pool {
+            Some(pool) => {
+                if needs_app && config.seed_on_start() {
+                    super::policy_repo::seed_authz(pool, &seed).await?;
+                }
+                super::policy_repo::load_policy(pool).await?
+            }
+            None => seed.policy(),
+        });
+        policy.assert_roles_covered(seed.granted_roles())?; // 启动期不变量:账号引用的 role 都得有策略条目
+
+        // 进程内 seed:idm-mounting 进程 + 开启时(默认非 prod),幂等写默认 role/账号(复用 &seed)。
+        // memory 与 PG 都生效 —— dev 内存模式也能有 superadmin/admin/user 登录。prod 默认不跑,走显式 `seed` bin。
         if needs_idm && config.seed_on_start() {
-            let data = super::seed::SeedData::load()?;
             super::seed::apply(
                 idm_users.as_ref(),
                 idm_roles.as_ref(),
                 &Argon2Hasher,
-                &data,
+                &seed,
                 Some("system".to_owned()),
             )
             .await?;
+        }
+
+        // mock 样本 widget(dev/demo 专用):owner(username)经 idm 解析 → 幂等写 app widget 仓储。
+        // 需 app+idm 同进程(才能解析 owner)+ seed 开启 → 即 dev `Both`;prod 分进程不跑(无 demo 数据污染)。
+        // 跟在 idm seed 之后:此时 admin/user 已存在,owner 才解析得到。
+        if needs_app && needs_idm && config.seed_on_start() {
+            let mock = super::mock::MockData::load()?;
+            super::mock::apply(widget_repo.as_ref(), idm_users.as_ref(), &mock).await?;
         }
 
         // 跨模块富化:widget 的 UserDirectory 端口由 app 注入 idm 的进程内适配器(复用 idm_users)。
@@ -120,7 +151,7 @@ impl AppState {
         let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
             .hasher(Arc::new(Argon2Hasher))
             .signer(tokens.clone())
-            .verifier(tokens)
+            .verifier(tokens.clone())
             .access_ttl_secs(config.idm_access_ttl_secs)
             .refresh_ttl_secs(config.idm_refresh_ttl_secs)
             .build();
@@ -131,6 +162,8 @@ impl AppState {
             // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
             db_pool: app_pool.or(idm_pool),
             cookie_secure: config.app_env.is_prod(),
+            policy,
+            tokens,
         })
     }
 }

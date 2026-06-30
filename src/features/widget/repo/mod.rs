@@ -43,7 +43,9 @@ pub(crate) const COLS: [Widgets; 6] = [
 #[async_trait]
 pub trait WidgetRepo: Send + Sync {
     /// 列表分页(offset 跳页 / cursor keyset 双模式,由 `PageParams` 选)。只返回存活行。
-    async fn list(&self, page: &PageParams) -> Result<Page<Widget>, AppError>;
+    /// `owner = Some(id)` → 只列 `created_by = id` 的行(数据所有权:user 只看自己的);`None` → 全部。
+    /// **ownership 过滤在查询层**(非内存事后筛)—— 分页/total 才正确。
+    async fn list(&self, page: &PageParams, owner: Option<&str>) -> Result<Page<Widget>, AppError>;
     /// 按 id 取存活行;不存在/已软删 → NotFound。
     async fn get(&self, id: Uuid) -> Result<Widget, AppError>;
     /// 创建;created_by/updated_by 都填 `by`,created_at/updated_at 由 DB default。

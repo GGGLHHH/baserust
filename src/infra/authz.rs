@@ -1,0 +1,281 @@
+//! 授权(AuthZ)—— **归 app**。idm 只给身份事实(token 里的 roles),"role/scope 能干什么"全在这。
+//!
+//! 三份真相,各归其位:
+//! - **权限词表**(有哪些 `Perm`)= 本文件的封闭枚举,拼错=编译错;
+//! - **role→权限映射** = `seed.toml` 的 `[[roles]].permissions`(唯一真相),启动期载进 [`Policy`];
+//! - **user→role** = idm 库 → JWT claim(运行期事实,不进文件)。
+//!
+//! 判定全在 app 进程内存完成:token 带 roles,[`Policy`] 把 roles 展开成权限,**绝不查 idm 库**
+//! —— 契合"app 进程只 decode JWT"的拓扑。`scope` 是 per-token 子集(只收窄、不放大)。
+
+use std::collections::{HashMap, HashSet};
+
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::infra::error::AppError;
+use idm::AuthUser;
+
+/// 权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。
+/// wire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。
+/// 加权限 = 加一个变体 + `rename`,别处不动。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum Perm {
+    #[serde(rename = "widgets:read")]
+    WidgetRead,
+    /// 越权读:看**所有人**的 widget(否则只看自己创建的)。这是 ownership 的 mode 开关。
+    #[serde(rename = "widgets:read:all")]
+    WidgetReadAll,
+    #[serde(rename = "widgets:write")]
+    WidgetWrite,
+    #[serde(rename = "widgets:delete")]
+    WidgetDelete,
+    #[serde(rename = "users:admin")]
+    UsersAdmin,
+}
+
+impl Perm {
+    /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
+    pub const ALL: [Perm; 5] = [
+        Perm::WidgetRead,
+        Perm::WidgetReadAll,
+        Perm::WidgetWrite,
+        Perm::WidgetDelete,
+        Perm::UsersAdmin,
+    ];
+
+    /// 三段约定 `domain:verb[:qualifier]` 的**第一段**(资源)。从变体投影,**绝不运行期 split wire 串**。
+    /// 这些投影是 permission 一等概念的"字段",按需派生、零存储;wire 串与内部比较都不靠它们。
+    pub fn resource(&self) -> &'static str {
+        match self {
+            Perm::WidgetRead | Perm::WidgetReadAll | Perm::WidgetWrite | Perm::WidgetDelete => {
+                "widgets"
+            }
+            Perm::UsersAdmin => "users",
+        }
+    }
+
+    /// **第二段**(动作)。
+    pub fn action(&self) -> &'static str {
+        match self {
+            Perm::WidgetRead | Perm::WidgetReadAll => "read",
+            Perm::WidgetWrite => "write",
+            Perm::WidgetDelete => "delete",
+            Perm::UsersAdmin => "admin",
+        }
+    }
+
+    /// **第三段**(限定词,可选)。`read:all` 的 `all`;只读投影,**不是**存储字段、**不是** `read` 上的开关。
+    pub fn qualifier(&self) -> Option<&'static str> {
+        match self {
+            Perm::WidgetReadAll => Some("all"),
+            _ => None,
+        }
+    }
+
+    /// **蕴含**:持有本权限即隐含持有这些。`read:all ⇒ read`(能看全部必然能看)。
+    /// [`Policy::from_roles`] 载入期与 [`Policy::require_scoped`] scope 判定都按它展开 →
+    /// 从根消除"只给 `read:all` 漏 `read` → 顶层 `require_scoped(read)` 先 403"的配置坑。
+    /// 目前**单层**(被蕴含项自身无再蕴含);将来出现链式 A⇒B⇒C,需在展开处做传递闭包。
+    pub fn implies(&self) -> &'static [Perm] {
+        match self {
+            Perm::WidgetReadAll => &[Perm::WidgetRead],
+            _ => &[],
+        }
+    }
+}
+
+/// role → 权限集。从 `seed.toml` 的 `[[roles]].permissions` 派生(见 `app::seed::SeedData::policy`),
+/// 装进 `AppState`(`Arc`,廉价 Clone)。**不可变**:载入一次,运行期只读。
+#[derive(Default, Debug)]
+pub struct Policy {
+    by_role: HashMap<String, HashSet<Perm>>,
+}
+
+impl Policy {
+    /// 从 (role 名, 权限) 序列构建。同名 role 的权限取并集;权限为空的 role 也建条目(算"已覆盖")。
+    /// **载入期按 `implies` 展开**(`read:all ⇒ read`):配 `read:all` 即自动有 `read`,从根消除漏底权 footgun。
+    pub fn from_roles(roles: impl IntoIterator<Item = (String, Vec<Perm>)>) -> Self {
+        let mut by_role: HashMap<String, HashSet<Perm>> = HashMap::new();
+        for (role, perms) in roles {
+            let set = by_role.entry(role).or_default();
+            for p in perms {
+                set.insert(p);
+                set.extend(p.implies().iter().copied());
+            }
+        }
+        Self { by_role }
+    }
+
+    /// 用户(经其 roles)拥有的全部权限并集。
+    pub fn perms_for(&self, roles: &[String]) -> HashSet<Perm> {
+        roles
+            .iter()
+            .filter_map(|r| self.by_role.get(r))
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// **RBAC gate**:用户的 role 给了该权限 → Ok,否则 → 403。token 里的 roles 内存展开,不查库。
+    pub fn require(&self, user: &AuthUser, perm: Perm) -> Result<(), AppError> {
+        self.require_scoped(user, &[], perm)
+    }
+
+    /// **RBAC + scope gate**:有效权限 = `role 权限 ∩ scope`(`scope` 空 = 无 scope 限制,即满 role 权限)。
+    /// scope 只能收窄不能放大 —— 降权令牌(PAT/第三方)即便 role 够,scope 没给也拒。
+    pub fn require_scoped(
+        &self,
+        user: &AuthUser,
+        scope: &[Perm],
+        perm: Perm,
+    ) -> Result<(), AppError> {
+        let role_grants = self.perms_for(&user.roles).contains(&perm); // role 侧已在 from_roles 展开 implies
+                                                                       // scope 侧同样吃 implies:scope 含 `read:all` 即视为含 `read`,与 role 侧一致,降权令牌不踩漏底权坑。
+        let in_scope = scope.is_empty()
+            || scope.contains(&perm)
+            || scope.iter().any(|s| s.implies().contains(&perm));
+        if role_grants && in_scope {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+
+    /// **数据可见域(ownership mode)**:边缘的 RBAC∩scope 推出"能不能看全部"——有 `all_perm`(经
+    /// `require_scoped`,故 role 与 scope 都参与)→ [`Access::All`],否则只看自己 → [`Access::Own`]。
+    /// 这是三轴的扣点:类型级判定(RBAC∩scope)**参数化**行级 ownership;真正的过滤在查询里(见 `Access`)。
+    pub fn data_access(&self, user: &AuthUser, scope: &[Perm], all_perm: Perm) -> Access {
+        if self.require_scoped(user, scope, all_perm).is_ok() {
+            Access::All
+        } else {
+            Access::Own(user.id)
+        }
+    }
+
+    /// 启动期不变量:每个被账号引用的 role 都得有策略条目(漏配=该 role 永远拿不到权限,是 wiring 错)。
+    /// 失败即拒启动 —— 同 `AuthService::build` 缺端口即 panic 的 fail-fast 哲学。
+    pub fn assert_roles_covered<'a>(
+        &self,
+        roles: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<()> {
+        for r in roles {
+            anyhow::ensure!(
+                self.by_role.contains_key(r),
+                "角色 `{r}` 无授权策略条目(seed.toml 漏配 permissions)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// **数据可见域(行级 ownership)**。RBAC∩scope 在边缘算出它(见 [`Policy::data_access`]),
+/// 真正的过滤**在查询/service 里**执行——这是 ownership 与 RBAC/scope 的本质差异:它需要"那行的 owner"。
+/// `All` = 看全部(不加 owner 过滤);`Own(id)` = 只看 `created_by == id` 的行。
+#[derive(Clone, Copy, Debug)]
+pub enum Access {
+    All,
+    Own(Uuid),
+}
+
+impl Access {
+    /// 某行(owner = `created_by`)在本可见域内是否可见。list 用它过滤;单条不可见 → 调用方返 **404**(不泄露存在)。
+    pub fn allows(&self, owner: Uuid) -> bool {
+        match self {
+            Access::All => true,
+            Access::Own(me) => *me == owner,
+        }
+    }
+
+    /// 同 [`Access::allows`],但吃实体的 `created_by: Option<String>`(用户 id 字符串)。
+    /// 非 UUID('system'/NULL/历史脏值)→ `Own` 下一律不可见(只有 `All` 放行)。
+    pub fn allows_created_by(&self, created_by: Option<&str>) -> bool {
+        match self {
+            Access::All => true,
+            Access::Own(_) => created_by
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .is_some_and(|o| self.allows(o)),
+        }
+    }
+
+    /// **list 用的 owner 过滤**:`All` → `None`(不过滤,看全部);`Own(id)` → `Some(id)`(查询里 `created_by = id`)。
+    /// ownership 过滤落在**查询层**(repo)才对分页正确 —— 边缘只产出这个过滤,不在内存里事后筛。
+    pub fn owner_filter(&self) -> Option<Uuid> {
+        match self {
+            Access::All => None,
+            Access::Own(id) => Some(*id),
+        }
+    }
+}
+
+/// 当前请求令牌携带的 scope(per-token 权限子集)。鉴权中间件验过 token 后塞进 extensions;
+/// **空 = 无 scope 限制**(第一方满权令牌)。非空 = 降权令牌,有效权限再 ∩ 它。
+///
+/// extractor:只读 extension,无则空(未认证由 `CurrentUser` 先 401 挡掉,这里不重复判)。
+#[derive(Clone, Debug, Default)]
+pub struct TokenScope(pub Vec<Perm>);
+
+impl<S: Send + Sync> FromRequestParts<S> for TokenScope {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<TokenScope>()
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(roles: &[&str]) -> AuthUser {
+        AuthUser {
+            id: Uuid::nil(),
+            username: "u".to_owned(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// round-trip:每个变体的 wire 串(serde rename)== `resource:action[:qualifier]` 三段投影。
+    /// 守住"变体 ↔ wire ↔ 投影"不漂移 —— 加变体忘补 `ALL`/投影/`rename` 都会挂这里。
+    #[test]
+    fn perm_wire_matches_projection() {
+        for p in Perm::ALL {
+            let wire = serde_json::to_value(p).unwrap();
+            let wire = wire.as_str().unwrap();
+            let mut seg = wire.split(':');
+            assert_eq!(seg.next(), Some(p.resource()), "{wire}: resource");
+            assert_eq!(seg.next(), Some(p.action()), "{wire}: action");
+            assert_eq!(seg.next(), p.qualifier(), "{wire}: qualifier");
+            assert_eq!(seg.next(), None, "{wire}: 多余段");
+        }
+    }
+
+    /// implies:角色只配 `read:all`(漏 `read`)→ 载入期自动补 `read`,顶层 read 闸不再 403。
+    #[test]
+    fn read_all_implies_read_role_and_scope() {
+        let policy = Policy::from_roles([("mgr".to_owned(), vec![Perm::WidgetReadAll])]);
+        // role 侧:perms_for 已含被蕴含的 read
+        let perms = policy.perms_for(&["mgr".to_owned()]);
+        assert!(perms.contains(&Perm::WidgetRead), "read:all 应蕴含 read");
+        assert!(perms.contains(&Perm::WidgetReadAll));
+        let u = user(&["mgr"]);
+        assert!(
+            policy.require(&u, Perm::WidgetRead).is_ok(),
+            "顶层 read 闸不应 403"
+        );
+        assert!(matches!(
+            policy.data_access(&u, &[], Perm::WidgetReadAll),
+            Access::All
+        ));
+        // scope 侧:降权令牌 scope=[read:all] 也视为含 read
+        assert!(policy
+            .require_scoped(&u, &[Perm::WidgetReadAll], Perm::WidgetRead)
+            .is_ok());
+    }
+}

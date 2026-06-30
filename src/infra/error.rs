@@ -35,6 +35,11 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// 已认证但**无权限**(RBAC/scope gate 不通过)→ 403。与 401 区分:401=没认证/token 无效,
+    /// 403=认证了但权限不够。文案刻意通用,不暴露"缺哪个权限"。
+    #[error("forbidden")]
+    Forbidden,
+
     /// 兜底:任何 anyhow 错误(DB、IO、依赖)→ 500。原始 source chain 只进日志。
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -48,6 +53,7 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -60,6 +66,7 @@ impl AppError {
             AppError::BadRequest(_) => "bad_request",
             AppError::Unauthorized => "unauthorized",
             AppError::Conflict(_) => "conflict",
+            AppError::Forbidden => "forbidden",
             AppError::Internal(_) => "internal",
         }
     }
@@ -73,6 +80,7 @@ impl AppError {
             AppError::BadRequest(_) => "Malformed request".to_owned(),
             AppError::Unauthorized => "Authentication failed".to_owned(),
             AppError::Conflict(msg) => msg.clone(),
+            AppError::Forbidden => "Forbidden".to_owned(),
             AppError::Internal(_) => "Internal server error".to_owned(),
         }
     }
@@ -87,7 +95,8 @@ impl AppError {
             AppError::NotFound
             | AppError::Validation(_)
             | AppError::Unauthorized
-            | AppError::Conflict(_) => None,
+            | AppError::Conflict(_)
+            | AppError::Forbidden => None,
         }
     }
 }

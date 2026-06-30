@@ -33,7 +33,7 @@ RESTful。写操作用 **PUT 全量替换、禁 PATCH**(更新 DTO 别为"部分
 | 路径 | 是什么 | 稳定度 |
 |---|---|---|
 | `src/app/` | composition root:装配 / 路由 / 启动 / 跨模块适配器 | 稳定 |
-| `src/infra/` | 横切:config / error / audit / pagination / openapi / extract | 稳定 |
+| `src/infra/` | 横切:config / error / audit / **authz**(RBAC+scope)/ pagination / openapi / extract | 稳定 |
 | `src/features/<name>/` | 业务模块(auth 认证 HTTP 边界、widget 示例 + 富化样板) | **易变,细节看代码** |
 | `src/bin/` | `idm`(分进程入口)、`seed` | 稳定 |
 | `migrations/{app,idm}/` · `tests/` | 各 schema 独立 role;`*_api` 黑盒 + `*_conformance` 内存↔PG 对拍 | — |
