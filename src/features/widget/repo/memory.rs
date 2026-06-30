@@ -123,6 +123,14 @@ impl WidgetRepo for InMemoryWidgetRepo {
     }
 
     async fn create(&self, name: String, by: Option<String>) -> Result<Widget, AppError> {
+        let mut store = self.store.lock().expect("锁未中毒");
+        // name 在存活行内唯一(parity 于 PG 的部分唯一索引)→ 重名 Conflict(409)
+        if store
+            .values()
+            .any(|r| r.deleted_at.is_none() && r.name == name)
+        {
+            return Err(AppError::Conflict("widget name already exists".to_owned()));
+        }
         let now = OffsetDateTime::now_utc();
         let row = Row {
             id: Uuid::now_v7(),
@@ -133,24 +141,28 @@ impl WidgetRepo for InMemoryWidgetRepo {
             updated_at: now,
             deleted_at: None,
         };
-        self.store
-            .lock()
-            .expect("锁未中毒")
-            .insert(row.id, row.clone());
+        store.insert(row.id, row.clone());
         Ok(row.to_widget())
     }
 
     async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError> {
         let mut store = self.store.lock().expect("锁未中毒");
-        match store.get_mut(&id) {
-            Some(r) if r.deleted_at.is_none() => {
-                r.name = name;
-                r.updated_by = by;
-                r.updated_at = OffsetDateTime::now_utc();
-                Ok(r.to_widget())
-            }
-            _ => Err(AppError::NotFound),
+        // 目标须存活(parity 于 PG 的 WHERE id=? AND deleted_at IS NULL):缺 / 已删 → NotFound。
+        if store.get(&id).is_none_or(|r| r.deleted_at.is_some()) {
+            return Err(AppError::NotFound);
         }
+        // 改名撞别的存活行 → Conflict(parity 于部分唯一索引;且 NotFound 先于 Conflict,同 PG 顺序)。
+        if store
+            .values()
+            .any(|r| r.id != id && r.deleted_at.is_none() && r.name == name)
+        {
+            return Err(AppError::Conflict("widget name already exists".to_owned()));
+        }
+        let r = store.get_mut(&id).expect("上面已确认存活");
+        r.name = name;
+        r.updated_by = by;
+        r.updated_at = OffsetDateTime::now_utc();
+        Ok(r.to_widget())
     }
 
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError> {

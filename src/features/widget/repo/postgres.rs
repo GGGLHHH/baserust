@@ -137,7 +137,7 @@ impl WidgetRepo for PgWidgetRepo {
         sqlx::query_as_with::<sqlx::Postgres, Widget, _>(AssertSqlSafe(sql), values)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))
+            .map_err(map_db_err) // 重名 → 23505 → Conflict(409)
     }
 
     async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError> {
@@ -153,7 +153,7 @@ impl WidgetRepo for PgWidgetRepo {
         sqlx::query_as_with::<sqlx::Postgres, Widget, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(e.into()))?
+            .map_err(map_db_err)? // 改名撞已有名 → 23505 → Conflict(409)
             .ok_or(AppError::NotFound)
     }
 
@@ -174,5 +174,19 @@ impl WidgetRepo for PgWidgetRepo {
             return Err(AppError::NotFound);
         }
         Ok(())
+    }
+}
+
+/// sqlx 错误下钻:**unique 违例(SQLSTATE 23505)→ `Conflict`(409)**;其余 → `Internal`(500,
+/// 原始细节只进日志)。写操作(create/update)专用 —— 把 DB 约束违例翻成对客户端有意义的 409 而非裸 500。
+/// 范式:照抄者给某列加 unique 后,记得把对应写路径的 `map_err` 换成这个,别让约束违例漏成 500。
+/// 文案**通用**(本表只 name 一个唯一索引);要按列给具体文案,用 `db.constraint()` 分辨命中的是哪个索引。
+fn map_db_err(e: sqlx::Error) -> AppError {
+    if e.as_database_error()
+        .is_some_and(|db| db.is_unique_violation())
+    {
+        AppError::Conflict("resource already exists".to_owned())
+    } else {
+        AppError::Internal(e.into())
     }
 }

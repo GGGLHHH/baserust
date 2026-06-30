@@ -51,6 +51,7 @@ pub async fn list_widgets(
         (status = 201, description = "已创建", body = Widget),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 widgets:write 权限", body = ErrorBody),
+        (status = 409, description = "name 已存在(存活行内唯一)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]
@@ -111,6 +112,7 @@ pub async fn get_widget(
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 widgets:write 权限", body = ErrorBody),
         (status = 404, description = "不存在", body = ErrorBody),
+        (status = 409, description = "name 撞已有(存活行内唯一)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]

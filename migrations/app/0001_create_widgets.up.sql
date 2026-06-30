@@ -16,6 +16,12 @@ create table widgets (
 create index widgets_alive_id_idx
     on widgets (id desc) where deleted_at is null;
 
+-- name 在**存活行内全局唯一**(软删后可复用同名):演示"DB 约束违例下钻成 409 而非 500"。
+-- 部分唯一索引(WHERE deleted_at IS NULL):唯一性只管存活行,软删后名字可被新行复用。
+-- (示意性:真实业务常用 (created_by, name) 复合唯一;那需处理 created_by 为 NULL 的 NULL-distinct 语义。)
+create unique index widgets_name_unique_alive
+    on widgets (name) where deleted_at is null;
+
 -- updated_at 自动维护:任何 UPDATE 前盖成当前 UTC(对齐 Go 的 update_updated_at_column)。
 -- 函数命名通用,后续业务表可复用同一函数,只各自建触发器。
 create or replace function set_updated_at_utc()

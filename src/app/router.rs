@@ -161,13 +161,19 @@ fn cors_layer(config: &Config) -> CorsLayer {
 
 /// 请求超时中间件:超过 `REQUEST_TIMEOUT` 返回 408 + 统一 `ErrorBody`(非 tower-http 默认空体)。
 async fn timeout_middleware(req: Request, next: Next) -> Response {
-    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+    timeout_or_408(REQUEST_TIMEOUT, next.run(req)).await
+}
+
+/// 把响应 future 套超时:超时 → 408 + 统一 `ErrorBody`(非 tower-http 默认空体)。
+/// 抽出 `Duration` 形参 → 可用极短超时单测,逻辑零重复(避免测试复刻一份超时逻辑)。
+async fn timeout_or_408(
+    dur: Duration,
+    fut: impl std::future::Future<Output = Response>,
+) -> Response {
+    match tokio::time::timeout(dur, fut).await {
         Ok(resp) => resp,
         Err(_) => {
-            tracing::warn!(
-                timeout_secs = REQUEST_TIMEOUT.as_secs(),
-                "request timed out"
-            );
+            tracing::warn!(timeout_secs = dur.as_secs(), "request timed out");
             error_response(StatusCode::REQUEST_TIMEOUT, "timeout", "Request timed out")
         }
     }
@@ -273,5 +279,25 @@ mod tests {
         );
         assert!(s.contains("Internal server error"));
         assert!(!s.contains("boom-secret"), "原始 panic 信息不可泄露: {s}");
+    }
+
+    /// 横切错误契约:**超时也回统一 `ErrorBody`**(408 + `{code:"timeout"}`),不是空体。
+    /// 直测抽出的 `timeout_or_408`(极短超时 + 永不返回的慢 future),不必等真实 30s。
+    #[tokio::test]
+    async fn timeout_yields_408_errorbody() {
+        let resp = timeout_or_408(Duration::from_millis(5), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            StatusCode::OK.into_response()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            s.contains("\"code\":\"timeout\""),
+            "应是统一 ErrorBody: {s}"
+        );
     }
 }

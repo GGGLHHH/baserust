@@ -174,6 +174,43 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         after.page_info,
         PageInfo::Offset { total: Some(2), .. }
     ));
+
+    // ── name 存活行内唯一 → DB 约束违例下钻成 Conflict(409),memory↔PG parity ──
+    // 此刻存活:b(bravo)、c(charlie);a(alpha2)已软删。
+    assert!(
+        matches!(
+            repo.create("bravo".into(), None).await,
+            Err(AppError::Conflict(_))
+        ),
+        "重名 create 应 Conflict"
+    );
+    assert!(
+        matches!(
+            repo.update(c.id, "bravo".into(), None).await,
+            Err(AppError::Conflict(_))
+        ),
+        "改名撞已有存活名应 Conflict"
+    );
+    // a 此前叫 alpha2 且已软删 → 同名可被新行复用(部分唯一索引 WHERE deleted_at IS NULL)。
+    repo.create("alpha2".into(), None)
+        .await
+        .expect("软删行的名字应可复用");
+
+    // NotFound 先于 Conflict:对已软删的 a 改成**存活名**(bravo)→ NotFound,不因撞名变 Conflict。
+    // (PG 靠 WHERE deleted_at IS NULL 不命中软删行;memory 须先判存活再判唯一 —— 此用例钉死该顺序。)
+    assert!(
+        matches!(
+            repo.update(a.id, "bravo".into(), None).await,
+            Err(AppError::NotFound)
+        ),
+        "软删行 + 撞存活名应 NotFound(先判存活,再判唯一)"
+    );
+    // self-rename no-op:改成自己当前的名 → Ok 且名不变(唯一检查须排己 r.id != id,不误判 Conflict)。
+    let same = repo
+        .update(c.id, "charlie".into(), None)
+        .await
+        .expect("改成自己当前的名应 Ok(no-op rename)");
+    assert_eq!(same.name, "charlie");
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──

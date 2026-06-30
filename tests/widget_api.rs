@@ -95,6 +95,27 @@ fn post_json(uri: &str, json: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn put_json(uri: &str, json: &str, token: &str) -> Request<Body> {
+    Request::put(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(json.to_owned()))
+        .unwrap()
+}
+
+fn delete_req(uri: &str, token: &str) -> Request<Body> {
+    Request::delete(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// 建后从 201 响应体取 id(响应是 `Widget` JSON)。
+async fn created_id(resp: Response) -> String {
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    v["id"].as_str().unwrap().to_owned()
+}
+
 #[tokio::test]
 async fn health_ok() {
     let (app, tok) = test_app();
@@ -188,4 +209,77 @@ async fn missing_widget_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 重名 → **409**:name 存活行内全局唯一,重复 create → Conflict(DB 约束违例下钻,非 500)。
+#[tokio::test]
+async fn duplicate_name_is_409() {
+    let (app, tok) = test_app();
+    let first = app
+        .clone()
+        .oneshot(post_json("/api/v1/widgets", r#"{"name":"dup"}"#, &tok))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let dup = app
+        .oneshot(post_json("/api/v1/widgets", r#"{"name":"dup"}"#, &tok))
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), StatusCode::CONFLICT);
+}
+
+/// PUT **全量替换**:建后 PUT 改名 → 200,且改名生效(写动词状态码端到端契约)。
+#[tokio::test]
+async fn put_full_replace_renames_returns_200() {
+    let (app, tok) = test_app();
+    let created = app
+        .clone()
+        .oneshot(post_json("/api/v1/widgets", r#"{"name":"before"}"#, &tok))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let id = created_id(created).await;
+
+    let put = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/widgets/{id}"),
+            r#"{"name":"after"}"#,
+            &tok,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(body_string(put).await.contains("after"));
+
+    let got = app
+        .oneshot(get(&format!("/api/v1/widgets/{id}"), &tok))
+        .await
+        .unwrap();
+    assert!(body_string(got).await.contains("after"), "改名应持久");
+}
+
+/// DELETE **软删** → 204,且删后 GET → 404(204 契约 + 软删后不可见)。
+#[tokio::test]
+async fn delete_soft_deletes_returns_204_then_404() {
+    let (app, tok) = test_app();
+    let created = app
+        .clone()
+        .oneshot(post_json("/api/v1/widgets", r#"{"name":"doomed"}"#, &tok))
+        .await
+        .unwrap();
+    let id = created_id(created).await;
+
+    let del = app
+        .clone()
+        .oneshot(delete_req(&format!("/api/v1/widgets/{id}"), &tok))
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    let got = app
+        .oneshot(get(&format!("/api/v1/widgets/{id}"), &tok))
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::NOT_FOUND, "软删后应 404");
 }

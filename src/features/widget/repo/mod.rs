@@ -50,7 +50,10 @@ pub trait WidgetRepo: Send + Sync {
     async fn get(&self, id: Uuid) -> Result<Widget, AppError>;
     /// 创建;created_by/updated_by 都填 `by`,created_at/updated_at 由 DB default。
     async fn create(&self, name: String, by: Option<String>) -> Result<Widget, AppError>;
-    /// 改名;updated_by 填 `by`,updated_at 由触发器自动盖。已软删 → NotFound。
+    /// 改名(**全量替换**语义,配 PUT)。updated_by 填 `by`,updated_at 由触发器自动盖。已软删 → NotFound。
+    /// **不防丢失更新**:两个并发全量写,后写静默覆盖先写。要并发安全 —— 加 `version` 列 +
+    /// `WHERE id=? AND version=?`,命中 0 行即 `Conflict`(409),让客户端带最新版本重试。
+    /// 脚手架按 YAGNI 不实现,留此提示:照抄全量 PUT 时别忘了这是它的经典脚枪。
     async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError>;
     /// 软删除(盖 deleted_at,非物理 DELETE);幂等(已删再删 → NotFound)。
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError>;

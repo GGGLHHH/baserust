@@ -281,6 +281,20 @@ async fn ownership_get_others_widget_is_404_not_403() {
     );
 }
 
+/// 跨模块富化**成功主路径** e2e:真实 `InProcessUserDirectory`(非内存桩)把 created_by 填成用户 brief。
+/// user 列自己的 user-w1(created_by = user 的 id)→ 响应带 `created_by_user.username`。
+#[tokio::test]
+async fn enrichment_fills_created_by_user() {
+    let (state, _) = setup().await;
+    let app = real_app(&state);
+    let user = login(&state, "user").await.access_token;
+    let body = body_of(&app, "GET", "/api/v1/widgets", Some(&user)).await;
+    assert!(
+        body.contains("\"username\":\"user\""),
+        "富化应把 created_by 解析成用户 brief(username): {body}"
+    );
+}
+
 // ── 其余授权形态:public / 仅登录 / superadmin-only(打真实新增的 /api/v1/widgets 端点)──
 
 /// public:`/widgets/stats` 无 token 也 200,且统计到 mock seed 的 3 个 widget。
