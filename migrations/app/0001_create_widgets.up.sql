@@ -35,3 +35,17 @@ $$ language plpgsql;
 create trigger widgets_set_updated_at
     before update on widgets
     for each row execute function set_updated_at_utc();
+
+-- 子表(多对一挂 widgets):演示**父子双表事务**范式。
+-- `create_with_tags` 在**一个事务**里建 1 个 widget + N 个 tag;任一 tag 撞 (widget_id, label)
+-- 唯一约束 → 整笔回滚(widget 也不落库)。这是单条语句演示不出的"全有或全无"。
+create table widget_tags (
+    id          uuid        primary key,
+    widget_id   uuid        not null references widgets (id),
+    label       text        not null,
+    created_at  timestamptz not null default (now() at time zone 'utc')
+);
+
+-- 同一 widget 下 label 唯一 —— 子表的失败触发点(批内重复 → 23505 → 回滚父行)。
+create unique index widget_tags_widget_label_unique
+    on widget_tags (widget_id, label);

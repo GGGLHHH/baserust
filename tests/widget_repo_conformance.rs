@@ -211,6 +211,57 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         .await
         .expect("改成自己当前的名应 Ok(no-op rename)");
     assert_eq!(same.name, "charlie");
+
+    // ── 父子双表事务:全有或全无(单条语句演示不出的东西)──
+    // 成功:一笔里建 widget(父)+ 2 个 tag(子),回读 tag(label 升序)。
+    let p = repo
+        .create_with_tags(
+            "tx-ok".into(),
+            vec!["red".into(), "blue".into()],
+            Some("u".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.tags_of(p.id).await.unwrap(),
+        vec!["blue".to_owned(), "red".to_owned()]
+    );
+    assert_eq!(repo.get(p.id).await.unwrap().name, "tx-ok");
+
+    // **原子性**:批内重复 label → 子表 (widget_id,label) 唯一违例 → 整笔回滚,**widget 父行也不该存在**。
+    // PG:父先插、子失败 → ROLLBACK 撤掉父;memory:先校验后落盘 → 父根本没插。两者外部都是"全有或全无"。
+    let before = repo
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 50,
+                with_total: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        repo.create_with_tags("tx-rollback".into(), vec!["dup".into(), "dup".into()], None)
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    let after = repo
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 50,
+                with_total: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.items.iter().map(|w| w.id).collect::<Vec<_>>(),
+        after.items.iter().map(|w| w.id).collect::<Vec<_>>(),
+        "事务失败必须全回滚:widget 父行不该出现"
+    );
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──

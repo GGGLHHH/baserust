@@ -1,3 +1,5 @@
+-- 先删子表(有 FK 指向 widgets;否则 drop widgets 因被引用而失败)。
+drop table if exists widget_tags;
 drop index if exists widgets_name_unique_alive;
 drop trigger if exists widgets_set_updated_at on widgets;
 drop table if exists widgets;

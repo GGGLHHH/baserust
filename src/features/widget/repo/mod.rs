@@ -38,6 +38,15 @@ pub(crate) const COLS: [Widgets; 6] = [
     Widgets::UpdatedAt,
 ];
 
+/// 子表 `widget_tags` 的 sea-query 标识符(父子双表事务样板用)。
+#[derive(Iden)]
+pub(crate) enum WidgetTags {
+    Table,
+    Id,
+    WidgetId,
+    Label,
+}
+
 /// 仓储端口。范式:trait 定义数据访问契约,service 依赖 trait 而非实现(内存 ↔ Postgres 可拔插)。
 /// 写操作的 `by` = 审计主体(created_by/updated_by),来自 `AuditContext`;时间由 DB default/触发器管。
 #[async_trait]
@@ -57,4 +66,17 @@ pub trait WidgetRepo: Send + Sync {
     async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError>;
     /// 软删除(盖 deleted_at,非物理 DELETE);幂等(已删再删 → NotFound)。
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError>;
+
+    /// **父子双表事务范式**:一个原子单元里建 1 个 widget(父)+ N 个 tag(子)。
+    /// **全有或全无** —— 任一 label 撞 `(widget_id, label)` 唯一(批内重复)→ 整笔回滚,widget 也不落库。
+    /// 事务边界归实现体:PG 内部 `begin/commit`、memory 在一把锁内"先校验后落盘"。
+    /// **`sqlx::Transaction` 绝不出现在此签名**(否则泄漏 sqlx、对象安全破、memory 无 Tx 可给)。
+    async fn create_with_tags(
+        &self,
+        name: String,
+        labels: Vec<String>,
+        by: Option<String>,
+    ) -> Result<Widget, AppError>;
+    /// 取某 widget 的 tag label(label 升序);供读取/测试用。
+    async fn tags_of(&self, widget_id: Uuid) -> Result<Vec<String>, AppError>;
 }

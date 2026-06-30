@@ -7,7 +7,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{WidgetRepo, Widgets, COLS};
+use super::{WidgetRepo, WidgetTags, Widgets, COLS};
 use crate::features::widget::types::Widget;
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
@@ -174,6 +174,70 @@ impl WidgetRepo for PgWidgetRepo {
             return Err(AppError::NotFound);
         }
         Ok(())
+    }
+
+    // ── 父子双表事务范式:整个原子操作 = 一个方法;`Transaction` 只活在方法体,不进 trait 签名。──
+    async fn create_with_tags(
+        &self,
+        name: String,
+        labels: Vec<String>,
+        by: Option<String>,
+    ) -> Result<Widget, AppError> {
+        // 事务边界归实现体。任一步 `?` 提前返回 → tx drop → 自动 ROLLBACK(全有或全无)。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+
+        // 父:建 widget(撞存活名 → 23505 → Conflict)。执行器从 `&self.pool` 换成 `&mut *tx`。
+        let widget_id = Uuid::now_v7();
+        let (sql, vals) = Query::insert()
+            .into_table(Widgets::Table)
+            .columns([
+                Widgets::Id,
+                Widgets::Name,
+                Widgets::CreatedBy,
+                Widgets::UpdatedBy,
+            ])
+            .values_panic([widget_id.into(), name.into(), by.clone().into(), by.into()])
+            .returning(Query::returning().columns(COLS))
+            .build_sqlx(PostgresQueryBuilder);
+        let widget = sqlx::query_as_with::<sqlx::Postgres, Widget, _>(AssertSqlSafe(sql), vals)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+        // 子:逐个建 tag。批内/已有重复 label → (widget_id,label) 唯一违例 → 23505 → Conflict → 回滚父行。
+        for label in labels {
+            let (sql, vals) = Query::insert()
+                .into_table(WidgetTags::Table)
+                .columns([WidgetTags::Id, WidgetTags::WidgetId, WidgetTags::Label])
+                .values_panic([Uuid::now_v7().into(), widget_id.into(), label.into()])
+                .build_sqlx(PostgresQueryBuilder);
+            sqlx::query_with::<sqlx::Postgres, _>(AssertSqlSafe(sql), vals)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_db_err)?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(widget)
+    }
+
+    async fn tags_of(&self, widget_id: Uuid) -> Result<Vec<String>, AppError> {
+        let (sql, vals) = Query::select()
+            .column(WidgetTags::Label)
+            .from(WidgetTags::Table)
+            .and_where(Expr::col(WidgetTags::WidgetId).eq(widget_id))
+            .order_by(WidgetTags::Label, Order::Asc)
+            .build_sqlx(PostgresQueryBuilder);
+        sqlx::query_scalar_with::<sqlx::Postgres, String, _>(AssertSqlSafe(sql), vals)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
     }
 }
 
