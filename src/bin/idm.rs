@@ -5,5 +5,5 @@ use xchangeai::app::{run, Mount};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run(Mount::Idm).await
+    run(|_| Mount::Idm).await
 }

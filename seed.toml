@@ -25,6 +25,18 @@ key = "widgets:delete"
 description = "删除 widget"
 
 [[permissions]]
+key = "contents:read"
+description = "查看内容 / 下载 / 列对象与元数据"
+
+[[permissions]]
+key = "contents:write"
+description = "创建 / 上传 / 修改内容与元数据"
+
+[[permissions]]
+key = "contents:delete"
+description = "删除内容"
+
+[[permissions]]
 key = "users:admin"
 description = "用户管理"
 
@@ -35,17 +47,17 @@ description = "用户管理"
 [[roles]]
 name = "superadmin"
 display_name = "超级管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "users:admin"]
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "users:admin"]
 
 [[roles]]
 name = "admin"
 display_name = "管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete"]
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete"]
 
 [[roles]]
 name = "user"
 display_name = "普通用户"
-permissions = ["widgets:read"]
+permissions = ["widgets:read", "contents:read"]
 
 [[accounts]]
 username = "superadmin"

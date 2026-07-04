@@ -56,12 +56,12 @@ struct AccountSeed {
 }
 
 impl SeedData {
-    /// 载入:`SEED_FILE` 指定的外部文件优先,否则用编译期嵌入的默认。
-    pub fn load() -> anyhow::Result<Self> {
-        let content = match std::env::var("SEED_FILE") {
-            Ok(path) => std::fs::read_to_string(&path)
+    /// 载入:`path`(来自 `Config.seed_file`,即 `SEED_FILE`)指定的外部文件优先,否则用编译期嵌入的默认。
+    pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
+        let content = match path {
+            Some(path) => std::fs::read_to_string(path)
                 .with_context(|| format!("读 SEED_FILE {path} 失败"))?,
-            Err(_) => EMBEDDED_SEED.to_owned(),
+            None => EMBEDDED_SEED.to_owned(),
         };
         toml::from_str(&content).context("解析 seed 数据失败")
     }
@@ -191,7 +191,7 @@ mod tests {
     /// 嵌入的 seed.toml 权限词表必须与代码 `Perm` 闭集严格对齐(加 `Perm` 变体忘了在 seed 声明 → 这里挂)。
     #[test]
     fn embedded_seed_permission_catalog_matches_enum() {
-        SeedData::load()
+        SeedData::load(None)
             .unwrap()
             .assert_permission_catalog()
             .unwrap();

@@ -11,6 +11,13 @@ run:
 dev:
     watchexec -r -e rs -- cargo run
 
+# 起本地依赖栈(除 app/idm:这俩留给 `just dev` / `just run` 在本机进程跑)。
+# nginx 也不起 —— 它反代的就是 app/idm 容器、且 depends_on 它们 healthy,本机跑模式下用不上。
+# 含:pg + migrate(建表后退出)+ minio + minio-init(建桶后退出)+ dbhub。停栈:`docker compose down`。
+# 透传额外 flag:改了迁移/代码后 `just up --build` 重建镜像(migrate 跑的就是这镜像,确保用最新)。
+up *flags:
+    docker compose up -d {{flags}} pg migrate minio minio-init dbhub
+
 # 编译/clippy 实时反馈面板(改代码即时看红线,不跑服务;面板内按 c/l/t 切 check/clippy/test)
 watch:
     bacon clippy
@@ -28,7 +35,7 @@ test:
 #   CREATEDB —— #[sqlx::test] 建临时库;CREATE ON DATABASE —— 在 base 库建 _sqlx_test 元数据 schema。
 # 没装本机 psql 可改:docker compose exec -T pg psql -U <super> -d <db> -c "<同样的 SQL>"
 pg-test-grant:
-    psql "postgres://{{env_var_or_default('POSTGRES_USER','xchangeai')}}:{{env_var_or_default('POSTGRES_PASSWORD','xchangeai')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}};"
+    psql "postgres://{{env_var_or_default('POSTGRES_USER','xchangeai')}}:{{env_var_or_default('POSTGRES_PASSWORD','xchangeai')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}};"
 
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
@@ -48,9 +55,10 @@ pg_port := env_var_or_default("PG_PORT", "5821")
 pg_db := env_var_or_default("POSTGRES_DB", "xchangeai")
 app_db_url := env_var_or_default("APP_DATABASE_URL", "postgres://" + env_var_or_default("APP_DB_USER", "app") + ":" + env_var_or_default("APP_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 idm_db_url := env_var_or_default("IDM_DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+content_db_url := env_var_or_default("CONTENT_DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 
 # 所有 schema 迁移(聚合,像 Go Makefile 的 migrate 总目标)
-migrate: migrate-app migrate-idm
+migrate: migrate-app migrate-idm migrate-content
 
 # ── app schema(role app)──
 migrate-app:
@@ -68,14 +76,23 @@ migrate-idm-revert:
 migrate-idm-info:
     sqlx migrate info --source migrations/idm --database-url "{{idm_db_url}}"
 
+# ── content schema(role content)── 表来自 rust-content crate 的 migrations(拷进 migrations/content)
+migrate-content:
+    sqlx migrate run --source migrations/content --database-url "{{content_db_url}}"
+migrate-content-revert:
+    sqlx migrate revert --source migrations/content --database-url "{{content_db_url}}"
+migrate-content-info:
+    sqlx migrate info --source migrations/content --database-url "{{content_db_url}}"
+
 # 新建某 schema 的可回滚迁移(内部参数化,创建用):just migrate-add app create_widgets
 migrate-add schema name:
     sqlx migrate add -r --source migrations/{{schema}} {{name}}
 
 # seed 默认数据:idm(role/账号/授予)+ app authz(permissions / role_permissions)。幂等,可重复跑。
 # 先 `just migrate`(建两 schema 的表)。idm 连 idm role、app 连 app role。
+# seed bin 与 app 进程同一套 Config 字段(IDM_DB_*/APP_DB_*),此处只补齐 host/port/db 指向 compose pg。
 seed:
-    IDM_DATABASE_URL="{{idm_db_url}}" APP_DATABASE_URL="{{app_db_url}}" cargo run --bin seed
+    IDM_DB_HOST="{{pg_host}}" IDM_DB_PORT="{{pg_port}}" IDM_DB_DATABASE="{{pg_db}}" APP_DB_HOST="{{pg_host}}" APP_DB_PORT="{{pg_port}}" APP_DB_DATABASE="{{pg_db}}" cargo run --bin seed
 
 # lint:格式检查 + clippy(警告即失败)
 lint:

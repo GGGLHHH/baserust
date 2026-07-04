@@ -6,6 +6,7 @@ pub mod authz;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod objectstore;
 pub mod op_perms;
 pub mod openapi;
 pub mod pagination;

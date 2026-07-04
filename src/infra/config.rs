@@ -59,6 +59,27 @@ pub struct Config {
     #[serde(default)]
     pub metrics_enabled: bool,
 
+    /// app 进程是否内嵌 idm,`IDM_EMBEDDED`,默认 true(开发单体 `Both`)。
+    /// 生产设 `IDM_EMBEDDED=false` → 只挂 app,idm 走独立 `idm` bin(nginx 按前缀分流)。
+    #[serde(default = "default_idm_embedded")]
+    pub idm_embedded: bool,
+
+    /// 日志过滤指令,`RUST_LOG`(tracing EnvFilter 语法)。未设 → 按环境缺省(prod=info、非 prod=debug),
+    /// 见 [`Config::log_filter`]。
+    #[serde(default)]
+    pub rust_log: Option<String>,
+    /// 文件日志路径,`LOG_FILE`。设了才写文件(dev 观察用,每次启动 truncate);
+    /// 容器/生产不设 → 只 stdout,由 docker/k8s 收集。
+    #[serde(default)]
+    pub log_file: Option<String>,
+
+    /// seed 数据文件路径,`SEED_FILE`。未设 → 编译期嵌入的 `seed.toml`。
+    #[serde(default)]
+    pub seed_file: Option<String>,
+    /// mock 样本数据文件路径,`MOCK_FILE`。未设 → 编译期嵌入的 `mock.toml`。
+    #[serde(default)]
+    pub mock_file: Option<String>,
+
     /// app schema 的数据库连接,按 role 分字段(镜像 Go 的 `AppDBConfig`)。
     /// 用 app role 连接,靠 role 的 search_path 落到 app schema,代码/SQL 都不写 schema 前缀。
     /// `APP_DB_HOST` 的存在 = 启用 pg;不设 → widget 仓储走内存(脚手架默认,无需数据库)。
@@ -105,6 +126,39 @@ pub struct Config {
     pub idm_db_password: String,
     #[serde(default = "default_db_sslmode")]
     pub idm_db_sslmode: String,
+
+    /// content schema 的数据库连接,按 role 分字段(role=content,镜像 app_db_*/idm_db_*)。
+    /// `CONTENT_DB_HOST` 的存在 = content 仓储走 PG;不设 → content 走内存(脚手架默认,字节走内存 backend)。
+    #[serde(default)]
+    pub content_db_host: Option<String>,
+    #[serde(default = "default_db_port")]
+    pub content_db_port: u16,
+    #[serde(default = "default_db_database")]
+    pub content_db_database: String,
+    #[serde(default = "default_content_db_user")]
+    pub content_db_user: String,
+    #[serde(default = "default_db_password")]
+    pub content_db_password: String,
+    #[serde(default = "default_db_sslmode")]
+    pub content_db_sslmode: String,
+
+    /// S3/minio 对象存储 —— content 模块的字节后端(元数据进 PG,字节进 S3)。
+    /// **presence = use S3**:设了 `S3_ENDPOINT` → content 用 minio/S3 backend;不设 → 内存 backend
+    /// (脚手架默认,零外部依赖)。其余字段镜像 db 的「全有默认」约定。
+    #[serde(default)]
+    pub s3_endpoint: Option<String>,
+    /// 桶名,`S3_BUCKET`,默认 `content`(compose 的 minio-init 建同名桶)。
+    #[serde(default = "default_s3_bucket")]
+    pub s3_bucket: String,
+    /// 静态访问密钥,`S3_ACCESS_KEY`(minio 默认 minio)。
+    #[serde(default = "default_s3_access_key")]
+    pub s3_access_key: String,
+    /// 静态密钥,`S3_SECRET_KEY`(minio 默认 minio12345)。
+    #[serde(default = "default_s3_secret_key")]
+    pub s3_secret_key: String,
+    /// 区域,`S3_REGION`,默认 `us-east-1`(minio 不校验,但 SDK 需一个值)。
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
 }
 
 fn default_bind_addr() -> SocketAddr {
@@ -128,6 +182,9 @@ fn default_db_sslmode() -> String {
 fn default_rate_limit_per_sec() -> u32 {
     10
 }
+fn default_idm_embedded() -> bool {
+    true
+}
 fn default_rate_limit_burst() -> u32 {
     20
 }
@@ -144,6 +201,21 @@ fn default_refresh_ttl_secs() -> i64 {
 fn default_idm_db_user() -> String {
     "idm".into()
 }
+fn default_content_db_user() -> String {
+    "content".into()
+}
+fn default_s3_bucket() -> String {
+    "content".into()
+}
+fn default_s3_access_key() -> String {
+    "minio".into()
+}
+fn default_s3_secret_key() -> String {
+    "minio12345".into()
+}
+fn default_s3_region() -> String {
+    "us-east-1".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -155,6 +227,11 @@ impl Default for Config {
             rate_limit_per_sec: default_rate_limit_per_sec(),
             rate_limit_burst: default_rate_limit_burst(),
             metrics_enabled: false,
+            idm_embedded: default_idm_embedded(),
+            rust_log: None,
+            log_file: None,
+            seed_file: None,
+            mock_file: None,
             app_db_host: None,
             app_db_port: default_db_port(),
             app_db_database: default_db_database(),
@@ -171,12 +248,24 @@ impl Default for Config {
             idm_db_user: default_idm_db_user(),
             idm_db_password: default_db_password(),
             idm_db_sslmode: default_db_sslmode(),
+            content_db_host: None,
+            content_db_port: default_db_port(),
+            content_db_database: default_db_database(),
+            content_db_user: default_content_db_user(),
+            content_db_password: default_db_password(),
+            content_db_sslmode: default_db_sslmode(),
+            s3_endpoint: None,
+            s3_bucket: default_s3_bucket(),
+            s3_access_key: default_s3_access_key(),
+            s3_secret_key: default_s3_secret_key(),
+            s3_region: default_s3_region(),
         }
     }
 }
 
 impl Config {
-    /// 从环境变量加载(main 里已先 load 过 .env)。
+    /// 从环境变量加载(调用方先 load 过 .env)。**全部环境变量的读取/默认值收口在本文件**:
+    /// 加变量 = 加字段(figment 变量名转小写匹配),别在别处 `std::env::var`。
     pub fn load() -> anyhow::Result<Self> {
         Figment::new()
             .merge(Env::raw())
@@ -214,10 +303,36 @@ impl Config {
         })
     }
 
+    /// content schema 的连接串(role=content)。`None` = 没设 `CONTENT_DB_HOST` → content 走内存。
+    pub fn content_database_url(&self) -> Option<String> {
+        self.content_db_host.as_ref().map(|host| {
+            format!(
+                "postgres://{}:{}@{}:{}/{}?sslmode={}",
+                self.content_db_user,
+                self.content_db_password,
+                host,
+                self.content_db_port,
+                self.content_db_database,
+                self.content_db_sslmode,
+            )
+        })
+    }
+
     /// 是否在进程内 seed idm 默认数据。未显式设 `IDM_SEED_ON_START` → **非 prod 才 seed**
     /// (dev/staging 便利;prod 不自动建 superadmin/pwd,避免启动期意外写库)。
     pub fn seed_on_start(&self) -> bool {
         self.idm_seed_on_start.unwrap_or(!self.app_env.is_prod())
+    }
+
+    /// 日志过滤指令:`RUST_LOG` 优先;未设按环境缺省(prod=info、非 prod=debug)。
+    pub fn log_filter(&self) -> &str {
+        self.rust_log
+            .as_deref()
+            .unwrap_or(if self.app_env.is_prod() {
+                "info"
+            } else {
+                "debug"
+            })
     }
 
     /// prod CORS 白名单(解析逗号分隔、去空白、去空项)。
@@ -258,6 +373,16 @@ mod tests {
             cfg(Some("h")).app_database_url().unwrap(),
             "postgres://app:pw@h:6000/db?sslmode=require"
         );
+    }
+
+    #[test]
+    fn log_filter_prefers_rust_log_then_env_default() {
+        let mut c = Config::default();
+        assert_eq!(c.log_filter(), "debug");
+        c.app_env = Profile::Prod;
+        assert_eq!(c.log_filter(), "info");
+        c.rust_log = Some("warn".into());
+        assert_eq!(c.log_filter(), "warn");
     }
 
     #[test]

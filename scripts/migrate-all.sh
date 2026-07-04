@@ -20,3 +20,4 @@ migrate_schema() { # $1=schema目录 $2=role $3=password
 
 migrate_schema app "${APP_DB_USER:-app}" "${APP_DB_PASSWORD:-pwd}"
 migrate_schema idm "${IDM_DB_USER:-idm}" "${IDM_DB_PASSWORD:-pwd}"
+migrate_schema content "${CONTENT_DB_USER:-content}" "${CONTENT_DB_PASSWORD:-pwd}"

@@ -32,17 +32,26 @@ pub enum Perm {
     WidgetWrite,
     #[serde(rename = "widgets:delete")]
     WidgetDelete,
+    #[serde(rename = "contents:read")]
+    ContentRead,
+    #[serde(rename = "contents:write")]
+    ContentWrite,
+    #[serde(rename = "contents:delete")]
+    ContentDelete,
     #[serde(rename = "users:admin")]
     UsersAdmin,
 }
 
 impl Perm {
     /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
-    pub const ALL: [Perm; 5] = [
+    pub const ALL: [Perm; 8] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
         Perm::WidgetDelete,
+        Perm::ContentRead,
+        Perm::ContentWrite,
+        Perm::ContentDelete,
         Perm::UsersAdmin,
     ];
 
@@ -53,6 +62,7 @@ impl Perm {
             Perm::WidgetRead | Perm::WidgetReadAll | Perm::WidgetWrite | Perm::WidgetDelete => {
                 "widgets"
             }
+            Perm::ContentRead | Perm::ContentWrite | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
         }
     }
@@ -63,6 +73,9 @@ impl Perm {
             Perm::WidgetRead | Perm::WidgetReadAll => "read",
             Perm::WidgetWrite => "write",
             Perm::WidgetDelete => "delete",
+            Perm::ContentRead => "read",
+            Perm::ContentWrite => "write",
+            Perm::ContentDelete => "delete",
             Perm::UsersAdmin => "admin",
         }
     }

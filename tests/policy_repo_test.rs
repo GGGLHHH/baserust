@@ -17,7 +17,7 @@ async fn seed_authz_then_load_policy_roundtrips(pool: sqlx::PgPool) -> sqlx::Res
         .await
         .expect("bootstrap app schema + 跑 migrations/app(含 0002 authz 表)");
 
-    let seed = SeedData::load().unwrap();
+    let seed = SeedData::load(None).unwrap();
     policy_repo::seed_authz(&pool, &seed).await.unwrap();
     policy_repo::seed_authz(&pool, &seed).await.unwrap(); // 二次:幂等,不报错/不重复(PK 冲突 DO NOTHING)
 

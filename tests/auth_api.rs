@@ -25,6 +25,12 @@ fn test_app() -> Router {
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
         ),
+        contents: content::ContentService::new(
+            Arc::new(content::InMemoryContentRepo::new()),
+            Arc::new(content::InMemoryObjectRepo::new()),
+            Arc::new(content::InMemoryObjectStore::new()),
+            "memory",
+        ),
         auth: test_auth(tokens.clone()),
         db_pool: None,
         cookie_secure: false,

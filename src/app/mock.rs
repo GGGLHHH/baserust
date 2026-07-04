@@ -32,12 +32,12 @@ struct WidgetSeed {
 }
 
 impl MockData {
-    /// 载入:`MOCK_FILE` 指定的外部文件优先,否则用编译期嵌入的默认。
-    pub fn load() -> anyhow::Result<Self> {
-        let content = match std::env::var("MOCK_FILE") {
-            Ok(path) => std::fs::read_to_string(&path)
+    /// 载入:`path`(来自 `Config.mock_file`,即 `MOCK_FILE`)指定的外部文件优先,否则用编译期嵌入的默认。
+    pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
+        let content = match path {
+            Some(path) => std::fs::read_to_string(path)
                 .with_context(|| format!("读 MOCK_FILE {path} 失败"))?,
-            Err(_) => EMBEDDED_MOCK.to_owned(),
+            None => EMBEDDED_MOCK.to_owned(),
         };
         toml::from_str(&content).context("解析 mock 数据失败")
     }

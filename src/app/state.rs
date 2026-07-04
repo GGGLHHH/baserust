@@ -12,6 +12,11 @@ use crate::features::widget::{
 };
 use crate::infra::authz::Policy;
 use crate::infra::config::Config;
+use crate::infra::objectstore::S3ObjectStore;
+use content::{
+    ContentRepo, ContentService, InMemoryContentRepo, InMemoryObjectRepo, InMemoryObjectStore,
+    ObjectRepo, ObjectStore, PgContentRepo, PgObjectRepo,
+};
 use idm::{
     Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
     PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
@@ -27,6 +32,7 @@ use idm::{
 pub enum Schema {
     App,
     Idm,
+    Content,
 }
 
 /// 应用级依赖容器。范式(替代 DI 框架):
@@ -37,6 +43,8 @@ pub enum Schema {
 #[derive(Clone)]
 pub struct AppState {
     pub widgets: WidgetService,
+    /// content 内容/对象存储服务(领域来自 content 库;app 注入仓储 + minio/内存 ObjectStore)。
+    pub contents: ContentService,
     pub auth: AuthService,
     /// readyz 就绪探针用:DB 模式持 pool(ping `SELECT 1`),内存模式为 `None`(恒就绪)。
     pub db_pool: Option<PgPool>,
@@ -74,6 +82,48 @@ impl AppState {
             }
         };
 
+        // content(content schema):app 进程的模块(与 widget 同进程)。设了 CONTENT_DB_HOST → PG,否则内存。
+        // 字节后端独立于库:设了 S3_ENDPOINT → minio/S3(S3ObjectStore),否则进程内 InMemoryObjectStore。
+        let content_pool = if needs_app {
+            connect_for_schema(config, Schema::Content).await?
+        } else {
+            None
+        };
+        let content_repo: Arc<dyn ContentRepo> = match &content_pool {
+            Some(pool) => Arc::new(PgContentRepo::new(pool.clone())),
+            None => {
+                if needs_app {
+                    tracing::warn!("未设 CONTENT_DB_HOST,content 仓储使用内存实现(脚手架默认)");
+                }
+                Arc::new(InMemoryContentRepo::new())
+            }
+        };
+        let object_repo: Arc<dyn ObjectRepo> = match &content_pool {
+            Some(pool) => Arc::new(PgObjectRepo::new(pool.clone())),
+            None => Arc::new(InMemoryObjectRepo::new()),
+        };
+        let (object_store, backend_name): (Arc<dyn ObjectStore>, String) = match &config.s3_endpoint
+        {
+            Some(endpoint) => {
+                let store = S3ObjectStore::new(
+                    endpoint,
+                    &config.s3_region,
+                    &config.s3_bucket,
+                    &config.s3_access_key,
+                    &config.s3_secret_key,
+                )
+                .await;
+                (Arc::new(store), "minio".to_owned())
+            }
+            None => {
+                if needs_app {
+                    tracing::warn!("未设 S3_ENDPOINT,content 字节后端使用内存实现(脚手架默认)");
+                }
+                (Arc::new(InMemoryObjectStore::new()), "memory".to_owned())
+            }
+        };
+        let contents = ContentService::new(content_repo, object_repo, object_store, backend_name);
+
         // idm(idm schema):仅 idm/both 进程需要。设了 IDM_DB_HOST → PG(读 seed 的 superadmin 等),否则内存。
         let idm_pool = if needs_idm {
             connect_for_schema(config, Schema::Idm).await?
@@ -102,7 +152,7 @@ impl AppState {
             }
         };
         // seed.toml 是 idm 默认数据 + **app 授权策略**两份真相的载体,**load 一次**:
-        let seed = super::seed::SeedData::load()?;
+        let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
         seed.assert_permission_catalog()?; // 启动期不变量:seed 权限词表 == 代码 Perm 闭集(多/漏即拒启动)
 
         // 授权策略(归 app),**可拔插**(同 widget):设了 APP_DB_HOST → 读 app schema 的 role_permissions 表
@@ -136,7 +186,7 @@ impl AppState {
         // 需 app+idm 同进程(才能解析 owner)+ seed 开启 → 即 dev `Both`;prod 分进程不跑(无 demo 数据污染)。
         // 跟在 idm seed 之后:此时 admin/user 已存在,owner 才解析得到。
         if needs_app && needs_idm && config.seed_on_start() {
-            let mock = super::mock::MockData::load()?;
+            let mock = super::mock::MockData::load(config.mock_file.as_deref())?;
             super::mock::apply(widget_repo.as_ref(), idm_users.as_ref(), &mock).await?;
         }
 
@@ -158,6 +208,7 @@ impl AppState {
 
         Ok(Self {
             widgets: WidgetService::new(widget_repo, user_directory),
+            contents,
             auth,
             // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
             db_pool: app_pool.or(idm_pool),
@@ -176,6 +227,7 @@ pub async fn connect_for_schema(config: &Config, schema: Schema) -> anyhow::Resu
     let url = match schema {
         Schema::App => config.app_database_url(),
         Schema::Idm => config.idm_database_url(),
+        Schema::Content => config.content_database_url(),
     };
     match url {
         Some(url) => Ok(Some(connect_pool(&url).await?)),

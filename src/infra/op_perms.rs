@@ -49,6 +49,47 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "admin_list_widgets",
         perm: Some(Perm::UsersAdmin),
     },
+    // ── content:read/write/delete 三权;下载/列对象/读元数据归 read,上传/改元数据归 write ──
+    OpAuthz {
+        operation_id: "create_content",
+        perm: Some(Perm::ContentWrite),
+    },
+    OpAuthz {
+        operation_id: "upload_content",
+        perm: Some(Perm::ContentWrite),
+    },
+    OpAuthz {
+        operation_id: "list_contents",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "get_content",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "update_content",
+        perm: Some(Perm::ContentWrite),
+    },
+    OpAuthz {
+        operation_id: "delete_content",
+        perm: Some(Perm::ContentDelete),
+    },
+    OpAuthz {
+        operation_id: "download_content",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "list_content_objects",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "get_content_metadata",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "set_content_metadata",
+        perm: Some(Perm::ContentWrite),
+    },
     OpAuthz {
         operation_id: "get_me",
         perm: None,

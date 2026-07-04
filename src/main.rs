@@ -5,13 +5,13 @@ use xchangeai::app::{run, Mount};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mount = if std::env::var("IDM_EMBEDDED")
-        .map(|v| v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
-    {
-        Mount::App
-    } else {
-        Mount::Both
-    };
-    run(mount).await
+    // mount 依赖配置(Config.idm_embedded),经回调在 run 内 Config::load 之后决定。
+    run(|config| {
+        if config.idm_embedded {
+            Mount::Both
+        } else {
+            Mount::App
+        }
+    })
+    .await
 }

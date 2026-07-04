@@ -152,6 +152,23 @@ impl From<idm::IdmError> for AppError {
     }
 }
 
+/// content 库的领域错误 `ContentError` 接进 app 错误体系 —— **HTTP 状态码 / wire 形状在此边界决定**。
+/// content 是零 HTTP 的纯库,只暴露领域语义;映射对齐其文档分组(见 content::error):
+/// not-found→404;not-ready / invalid-state / conflict→409(状态/冲突类);invalid-status→422(校验);
+/// storage / internal→500(原始 source 含 key/backend,只进日志、绝不进响应体)。
+/// 校验(422)/坏请求(400)是 app 边界产物(garde / 提取器 → Validation/BadRequest),不经此映射。
+impl From<content::ContentError> for AppError {
+    fn from(e: content::ContentError) -> Self {
+        use content::ContentError as CE;
+        match e {
+            CE::NotFound => AppError::NotFound,
+            CE::NotReady(m) | CE::InvalidState(m) | CE::Conflict(m) => AppError::Conflict(m),
+            CE::InvalidStatus(m) => AppError::Validation(m),
+            CE::Storage(e) | CE::Internal(e) => AppError::Internal(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

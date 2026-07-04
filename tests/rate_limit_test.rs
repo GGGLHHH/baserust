@@ -22,6 +22,12 @@ fn rate_limited_app() -> Router {
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
         ),
+        contents: content::ContentService::new(
+            Arc::new(content::InMemoryContentRepo::new()),
+            Arc::new(content::InMemoryObjectRepo::new()),
+            Arc::new(content::InMemoryObjectStore::new()),
+            "memory",
+        ),
         auth: AuthService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
@@ -87,6 +93,12 @@ async fn rate_limit_off_by_default_lets_all_through() {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+        ),
+        contents: content::ContentService::new(
+            Arc::new(content::InMemoryContentRepo::new()),
+            Arc::new(content::InMemoryObjectRepo::new()),
+            Arc::new(content::InMemoryObjectStore::new()),
+            "memory",
         ),
         auth: AuthService::new(
             Arc::new(InMemoryUserRepo::new()),

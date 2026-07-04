@@ -11,11 +11,14 @@ default-run = "xchangeai"
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
 idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.2.0" }
 
+# content 内容/对象存储**领域/服务库**(零 HTTP):app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。
+content = { path = "../rust-content" }
+
 # 异步运行时 —— 一切的地基
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 
-# Web 框架 + 中间件
-axum = "0.8"
+# Web 框架 + 中间件(multipart:content 一次性上传走 multipart/form-data)
+axum = { version = "0.8", features = ["multipart"] }
 # CookieJar:typed cookie 提取/设置(httponly 认证用)
 axum-extra = { version = "0.10", features = ["cookie"] }
 tower-http = { version = "0.7", features = ["trace", "catch-panic", "request-id", "cors", "set-header"] }
@@ -61,6 +64,13 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde-well-known"] }
 # cursor 游标编解码(opaque base64url token)
 base64 = "0.22"
+# 字节缓冲:content 的 ObjectStore 端口收/发 owned Bytes(minio 上传/下载、multipart 解析)。
+bytes = "1"
+
+# 对象存储后端:minio/S3(content 字节落这)。app 在 infra/objectstore.rs 实现 content 的 ObjectStore 端口。
+# aws-sdk-s3 需显式 BehaviorVersion;minio 必须 force_path_style(true)。设了 S3_ENDPOINT 才接,否则走内存 backend。
+aws-config = "1"
+aws-sdk-s3 = "1"
 
 # 密码哈希:argon2id。PHC 串自描述(算法 id/盐/参数都在串里),verify 天然支持多算法迁移。
 # std feature 拉入 rand + getrandom,SaltString::generate(OsRng) 才可用。

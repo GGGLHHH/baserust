@@ -31,6 +31,7 @@ fn test_app() -> (Router, String) {
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
         ),
+        contents: test_contents(),
         auth: test_auth(tokens.clone()),
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,
@@ -43,6 +44,16 @@ fn test_app() -> (Router, String) {
         xchangeai::app::Mount::Both,
     );
     (app, admin)
+}
+
+/// 测试用 content 服务:全内存(repo + ObjectStore),不碰 DB/minio。
+fn test_contents() -> content::ContentService {
+    content::ContentService::new(
+        Arc::new(content::InMemoryContentRepo::new()),
+        Arc::new(content::InMemoryObjectRepo::new()),
+        Arc::new(content::InMemoryObjectStore::new()),
+        "memory",
+    )
 }
 
 /// 测试授权策略:admin 角色拿全部 widget 权限(含 read:all → 看全部)。

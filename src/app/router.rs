@@ -24,7 +24,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{auth, widget};
+use crate::features::{auth, content, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -57,7 +57,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         OpenApiRouter::with_openapi(openapi::ApiDoc::openapi()).merge(health::router());
     let mut features = OpenApiRouter::new();
     if needs_app {
-        features = features.merge(widget::router());
+        features = features.merge(widget::router()).merge(content::router());
     }
     if needs_idm {
         features = features.merge(auth::router());
@@ -134,6 +134,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
             "/api/v1",
             OpenApiRouter::new()
                 .merge(widget::router())
+                .merge(content::router())
                 .merge(auth::router()),
         )
         .split_for_parts()

@@ -23,6 +23,7 @@ use crate::infra::op_perms::op_authz;
     tags(
         (name = "health", description = "健康检查"),
         (name = "widgets", description = "示例资源"),
+        (name = "contents", description = "内容/对象存储:CRUD / 上传下载 / 元数据"),
         (name = "auth", description = "认证:注册/登录/刷新/登出"),
         (name = "me", description = "当前用户:资料/改密/注销")
     )
