@@ -881,8 +881,8 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "content"
-version = "0.1.0"
-source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.1.0#0bccf8e146165523dd1d5e3cb43f515faeb1228c"
+version = "0.2.0"
+source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.2.0#2207bc4db10c3dd446c5fc7c226c5871e7697947"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1904,7 +1904,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",

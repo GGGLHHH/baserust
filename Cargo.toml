@@ -13,7 +13,7 @@ idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.2.0" }
 
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`;稳定走 tag。
-content = { git = "https://github.com/GGGLHHH/rust-content", tag = "v0.1.0" }
+content = { git = "https://github.com/GGGLHHH/rust-content", tag = "v0.2.0" }
 
 # 异步运行时 —— 一切的地基
 # sync:widget 事件总线用 broadcast(勿靠 aws-sdk 的传递特性碰巧解锁)
