@@ -8,7 +8,7 @@ use uuid::Uuid;
 /// 范式:出参 DTO derive `Serialize` + `ToSchema`;`FromRow` 让 sqlx/sea-query 直接映射。
 /// `deleted_at` **不进 DTO**:可见行恒为存活(NULL),暴露无意义且会误导客户端。
 /// 时间用 `OffsetDateTime`(timestamptz),RFC3339 序列化。
-#[derive(Debug, Clone, Serialize, ToSchema, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, sqlx::FromRow)]
 pub struct Widget {
     pub id: Uuid,
     pub name: String,

@@ -3,6 +3,7 @@
 //! 分层:`routes`(handler,薄) → `service`(业务逻辑/校验) → `repo`(trait + 实现)。
 //! `types` 放 DTO。每个新业务域照抄此结构。
 
+mod events;
 mod port;
 mod repo;
 mod routes;
@@ -10,6 +11,7 @@ mod service;
 mod types;
 mod view;
 
+pub use events::{EventBus, EventSubscription, MemoryEventBus, WidgetEvent};
 pub use port::{StaticUserDirectory, UserBrief, UserDirectory};
 pub use repo::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo};
 pub use service::WidgetService;
