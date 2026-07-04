@@ -17,12 +17,15 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::list_contents, routes::create_content))
         .routes(routes!(routes::upload_content))
+        .routes(routes!(routes::prepare_upload))
+        .routes(routes!(routes::confirm_upload))
         .routes(routes!(
             routes::get_content,
             routes::update_content,
             routes::delete_content
         ))
         .routes(routes!(routes::download_content))
+        .routes(routes!(routes::preview_content))
         .routes(routes!(routes::list_content_objects))
         .routes(routes!(
             routes::get_content_metadata,

@@ -881,8 +881,8 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "content"
-version = "0.2.0"
-source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.2.0#2207bc4db10c3dd446c5fc7c226c5871e7697947"
+version = "0.3.0"
+source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.3.0#b8c4f282e6dd7f8c0686075fc047bb15a15ffa58"
 dependencies = [
  "anyhow",
  "async-trait",

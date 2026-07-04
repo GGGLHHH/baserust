@@ -63,6 +63,14 @@ pub const OP_PERMS: &[OpAuthz] = &[
         perm: Some(Perm::ContentWrite),
     },
     OpAuthz {
+        operation_id: "prepare_upload",
+        perm: Some(Perm::ContentWrite),
+    },
+    OpAuthz {
+        operation_id: "confirm_upload",
+        perm: Some(Perm::ContentWrite),
+    },
+    OpAuthz {
         operation_id: "list_contents",
         perm: Some(Perm::ContentRead),
     },
@@ -80,6 +88,10 @@ pub const OP_PERMS: &[OpAuthz] = &[
     },
     OpAuthz {
         operation_id: "download_content",
+        perm: Some(Perm::ContentRead),
+    },
+    OpAuthz {
+        operation_id: "preview_content",
         perm: Some(Perm::ContentRead),
     },
     OpAuthz {

@@ -35,7 +35,8 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
         .header("authorization", format!("Bearer {token}"));
     // 写端点 gate 在 body 提取**之后**跑 → 反向用例须发可提取的 body,否则提取器的 400/422 遮 403(假绿)。
     let body = match op_id {
-        "create_widget" | "update_widget" | "create_content" | "update_content" => {
+        "create_widget" | "update_widget" | "create_content" | "update_content"
+        | "prepare_upload" => {
             b = b.header("content-type", "application/json");
             Body::from(r#"{"name":"probe"}"#)
         }

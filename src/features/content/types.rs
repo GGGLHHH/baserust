@@ -11,7 +11,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use content::{
-    Content, ContentMetadata, Object, SetContentMetadataInput, UpdateContentInput, UploadOutcome,
+    Content, ContentMetadata, Object, PrepareUploadInput, SetContentMetadataInput,
+    UpdateContentInput, UploadOutcome,
 };
 
 /// 内容主体的对外响应(投影 `content::Content`;`status` 投影成字符串)。
@@ -212,6 +213,55 @@ impl SetContentMetadataRequest {
             checksum: self.checksum,
             checksum_algorithm: self.checksum_algorithm,
             metadata: self.metadata,
+        }
+    }
+}
+
+/// 两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体;tenant 单租户默认 nil(同 create)。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct PrepareUploadRequest {
+    #[garde(skip)]
+    pub tenant_id: Option<Uuid>,
+    #[garde(inner(length(max = 64)))]
+    pub owner_type: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub name: Option<String>,
+    #[garde(inner(length(max = 2000)))]
+    pub description: Option<String>,
+    #[garde(inner(length(max = 64)))]
+    pub document_type: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub file_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub mime_type: Option<String>,
+    #[garde(length(max = 64))]
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// 两步上传①的响应:账 + 格 + 凭证。`upload_url = null` = 后端不支持直传,
+/// **回退一步上传**(multipart /contents/upload)—— 客户端按此判别。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrepareUploadResponse {
+    pub content: ContentResponse,
+    pub object: ObjectResponse,
+    pub upload_url: Option<String>,
+}
+
+impl PrepareUploadRequest {
+    pub fn into_input(self, owner_id: Uuid) -> PrepareUploadInput {
+        PrepareUploadInput {
+            tenant_id: self.tenant_id.unwrap_or(Uuid::nil()),
+            owner_id,
+            owner_type: self.owner_type,
+            name: self.name,
+            description: self.description,
+            document_type: self.document_type,
+            object_key: None,
+            file_name: self.file_name,
+            mime_type: self.mime_type,
+            tags: self.tags,
+            custom_metadata: None,
         }
     }
 }

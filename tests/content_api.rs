@@ -19,9 +19,10 @@ use xchangeai::features::auth::AppTokens;
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use xchangeai::infra::authz::{Perm, Policy};
 
-/// 内存 app + 两枚令牌:`admin`(read+write+delete)与 `viewer`(只 read)。
-/// admin/viewer 各有独立 owner uuid(content list 按 owner 过滤,故 admin 上传 admin 才看得到)。
-fn test_app() -> (Router, String, String) {
+/// 内存 app + 两枚令牌:`admin`(read+write+delete)与 `viewer`(只 read),store 可注入
+/// (presign 用例喂覆写 URL 方法的假 store)。admin/viewer 各有独立 owner uuid(content list 按
+/// owner 过滤,故 admin 上传 admin 才看得到)。
+fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String, String) {
     let tokens = Arc::new(AppTokens::new("test-secret"));
     let admin = tokens
         .mint_scoped(
@@ -53,7 +54,7 @@ fn test_app() -> (Router, String, String) {
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
-            Arc::new(content::InMemoryObjectStore::new()),
+            store,
             "memory",
         ),
         auth: test_auth(tokens.clone()),
@@ -68,6 +69,10 @@ fn test_app() -> (Router, String, String) {
         Mount::Both,
     );
     (app, admin, viewer)
+}
+
+fn test_app() -> (Router, String, String) {
+    test_app_with_store(Arc::new(content::InMemoryObjectStore::new()))
 }
 
 /// admin → 全 content 权;viewer → 只读(用于 403 用例)。
@@ -261,4 +266,275 @@ async fn missing_content_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 代理回退路径(memory 后端,presign 不可用):preview 直接吐字节,inline + 上传时的 mime。
+#[tokio::test]
+async fn preview_proxies_bytes_inline_on_memory_backend() {
+    let (app, admin, _) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "a.png", "image/png", b"png-bytes"))
+        .await
+        .unwrap();
+    let id = uploaded_content_id(resp).await;
+    let resp = app
+        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    assert!(resp.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("inline"));
+    // inline + 用户可控 mime = XSS 面,sandbox 必须在(恶意 html/svg 拿不到 app origin)。
+    assert_eq!(resp.headers()["content-security-policy"], "sandbox");
+    assert_eq!(body_bytes(resp).await, b"png-bytes".to_vec());
+}
+
+/// presign 路径:注入覆写 URL 方法的 store → 307 + Location;download 的 Location 带 filename
+/// (上传后改名,Location 必须签新名,证伪 metadata 优先决议)。
+#[tokio::test]
+async fn preview_and_download_redirect_when_presign_available() {
+    let (app, admin, _) =
+        test_app_with_store(Arc::new(PresignStore(content::InMemoryObjectStore::new())));
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "a.png", "image/png", b"x"))
+        .await
+        .unwrap();
+    let id = uploaded_content_id(resp).await;
+
+    // 证伪"metadata 优先":把元数据里的 filename 改掉(object 行仍是 a.png),
+    // download 的签名 URL 必须用新名 —— 只读 object 行的退化实现会在这里翻车。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/api/v1/contents/{id}/metadata"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::from(
+                    r#"{"tags":[],"file_name":"renamed.pdf","mime_type":"image/png"}"#.to_owned(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    for (path, want) in [
+        (format!("/api/v1/contents/{id}/preview"), "?inline"),
+        (format!("/api/v1/contents/{id}/download"), "dl=renamed.pdf"),
+    ] {
+        let resp = app.clone().oneshot(get(&path, &admin)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+        // no-store 防错配置 CDN/代理缓存 300s 签名 URL —— 回归不可见就是白加。
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{path}");
+        assert!(
+            resp.headers()["location"].to_str().unwrap().contains(want),
+            "{path}: {:?}",
+            resp.headers()["location"]
+        );
+    }
+}
+
+/// 错误语义不变:未上传(仅 create)→ preview 409;未认证 → 401。
+#[tokio::test]
+async fn preview_guards_not_ready_and_auth() {
+    let (app, admin, _) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(post_json("/api/v1/contents", r#"{"name":"raw"}"#, &admin))
+        .await
+        .unwrap();
+    // create 响应是扁平 ContentResponse(非 upload 的 {content,object} 形状),直接取 id。
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = v["id"].as_str().unwrap().to_owned();
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT); // NotReady → 409
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/v1/contents/{id}/preview"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 覆写 URL 方法的测试 store(字节走内存):验证 handler 的 307 分支与 Location 透传。
+struct PresignStore(content::InMemoryObjectStore);
+
+#[async_trait::async_trait]
+impl content::ObjectStore for PresignStore {
+    async fn upload(
+        &self,
+        p: content::UploadParams,
+        d: bytes::Bytes,
+    ) -> Result<(), content::ContentError> {
+        self.0.upload(p, d).await
+    }
+    async fn download(&self, k: &str) -> Result<bytes::Bytes, content::ContentError> {
+        self.0.download(k).await
+    }
+    async fn delete(&self, k: &str) -> Result<(), content::ContentError> {
+        self.0.delete(k).await
+    }
+    async fn object_meta(&self, k: &str) -> Result<content::ObjectMeta, content::ContentError> {
+        self.0.object_meta(k).await
+    }
+    async fn download_url(
+        &self,
+        k: &str,
+        f: Option<&str>,
+    ) -> Result<Option<String>, content::ContentError> {
+        Ok(Some(format!(
+            "https://cdn.test/{k}?dl={}",
+            f.unwrap_or("-")
+        )))
+    }
+    async fn preview_url(&self, k: &str) -> Result<Option<String>, content::ContentError> {
+        Ok(Some(format!("https://cdn.test/{k}?inline")))
+    }
+    async fn upload_url(
+        &self,
+        k: &str,
+        mime: Option<&str>,
+    ) -> Result<Option<String>, content::ContentError> {
+        Ok(Some(format!(
+            "https://cdn.test/put/{k}?mime={}",
+            mime.unwrap_or("-")
+        )))
+    }
+}
+
+/// 两步上传(memory 全流程):prepare → 201 + upload_url null(回退信号)+ 双 Created;
+/// 模拟客户端 PUT(直写注入的 store)→ confirm → 200 uploaded → preview 可读。
+#[tokio::test]
+async fn two_step_upload_full_flow_on_memory() {
+    use content::ObjectStore as _; // store.upload(...) 是 trait 方法,须引入 trait
+    let store = Arc::new(content::InMemoryObjectStore::new());
+    let (app, admin, _) = test_app_with_store(store.clone());
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/contents/upload-url",
+            r#"{"name":"two-step","file_name":"a.txt","mime_type":"text/plain","tags":["t"]}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(v["upload_url"].is_null(), "memory 后端应给回退信号");
+    assert_eq!(v["content"]["status"], "created");
+    assert_eq!(v["object"]["status"], "created");
+    let id = v["content"]["id"].as_str().unwrap().to_owned();
+    let key = v["object"]["object_key"].as_str().unwrap().to_owned();
+
+    // 未传就销账 → 409(NotReady)
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/contents/{id}/confirm-upload"),
+            "{}",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 模拟第二步:客户端 PUT(直写同一个 store)
+    store
+        .upload(
+            content::UploadParams {
+                object_key: key,
+                mime_type: Some("text/plain".to_owned()),
+                file_name: None,
+            },
+            bytes::Bytes::from_static(b"two-step bytes"),
+        )
+        .await
+        .unwrap();
+
+    // 销账 → uploaded;preview 能读回
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/contents/{id}/confirm-upload"),
+            "{}",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["status"], "uploaded");
+
+    // 幂等重试(网络抖动重发)在 HTTP 边界也必须 200,不是 409。
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/contents/{id}/confirm-upload"),
+            "{}",
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, b"two-step bytes".to_vec());
+}
+
+/// presign 后端:upload_url 非空且 mime 透传(签进凭证的前提)。
+#[tokio::test]
+async fn prepare_returns_signed_url_when_backend_supports() {
+    let (app, admin, _) =
+        test_app_with_store(Arc::new(PresignStore(content::InMemoryObjectStore::new())));
+    let resp = app
+        .oneshot(post_json(
+            "/api/v1/contents/upload-url",
+            r#"{"file_name":"b.png","mime_type":"image/png"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let url = v["upload_url"].as_str().expect("该后端应给凭证");
+    assert!(url.contains("mime=image/png"), "{url}");
+}
+
+/// 鉴权:viewer(无 write)prepare → 403;无凭据 confirm → 401。
+#[tokio::test]
+async fn two_step_endpoints_enforce_authz() {
+    let (app, _admin, viewer) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(post_json("/api/v1/contents/upload-url", "{}", &viewer))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/contents/00000000-0000-0000-0000-000000000000/confirm-upload")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

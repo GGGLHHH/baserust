@@ -67,7 +67,12 @@ services:
       # 事件总线选择链最高优先:设了 NATS_URL → widget 事件走 NATS(去掉则回退 PG LISTEN/NOTIFY → 内存)。
       NATS_URL: nats://nats:4222
       # 对象存储:设了 S3_ENDPOINT → content 字节走 minio/S3(去掉则走内存 backend)。
-      S3_ENDPOINT: http://minio:9000
+      # **单域名方案**(presign 签名含 Host,签出的 URL 浏览器要能打):app 与浏览器用同一个
+      # `minio.localhost:主机端口` —— 浏览器按 RFC 6761 把 *.localhost 解析到 127.0.0.1;
+      # 容器靠下面 extra_hosts 的 host-gateway 解析回宿主机,再经主机端口映射进 minio。
+      # 代价(接受):容器内 app 的字节路径绕 host 网关一圈(dev 无所谓;prod 用真对象存储公网域名,读写同端点)。
+      # 主机上 curl 测它需 --resolve 或 /etc/hosts(浏览器免);host 跑 dev(just dev)直接用 localhost:9862。
+      S3_ENDPOINT: http://minio.localhost:${MINIO_PORT:-9862}
       S3_BUCKET: ${S3_BUCKET:-content}
       S3_ACCESS_KEY: ${MINIO_USER:-minio}
       S3_SECRET_KEY: ${MINIO_PASSWORD:-minio12345}
@@ -84,6 +89,9 @@ services:
       IDM_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
+    # 单域名 presign 的另一半:容器内把 minio.localhost 指回宿主机网关(配合上面 S3_ENDPOINT 注释)。
+    extra_hosts:
+      - "minio.localhost:host-gateway"
     # readiness:/readyz ping DB 通才算就绪 → nginx 等它 healthy 才放流量(curl 由 runtime 镜像装)
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
@@ -216,8 +224,12 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_USER:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minio12345}
+      # 浏览器两步上传要跨域 PUT 到 minio(页面在 app 域、凭证在 minio 域)。minio **默认全开** CORS,
+      # 这里显式化:prod 把 MINIO_CORS_ORIGIN 收紧到前端域。**curl 测不出 CORS**(不做预检),浏览器才炸。
+      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ORIGIN:-*}
     # 主机发布端口走环境变量(同其他服务);默认 9862(S3 API)/ 9863(控制台)。
-    # 容器内仍是 minio 默认 9000/9001;app 与 minio-init 走内网 http://minio:9000,不受主机端口影响。
+    # 容器内仍是 minio 默认 9000/9001;minio-init 走内网 http://minio:9000;
+    # app 走单域名 minio.localhost:主机端口(见 app.environment 的 S3_ENDPOINT 注释)——主机端口改了要联动。
     ports:
       - "${MINIO_PORT:-9862}:9000"            # S3 API
       - "${MINIO_CONSOLE_PORT:-9863}:9001"    # web 控制台

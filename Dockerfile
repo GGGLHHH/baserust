@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1
+# (不写 syntax 指令:那会强制去 Docker Hub 拉 dockerfile frontend,离线/受限网络下 build 直接挂;
+#  本文件没用 cache-mount/heredoc 等扩展特性,buildkit 内置 frontend 足够。)
 
 # ---- builder:编译 release 二进制 ----
 FROM rust:1.94-bookworm AS builder

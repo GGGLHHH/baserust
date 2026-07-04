@@ -30,6 +30,19 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | POST | `/api/v1/widgets` | 创建 |
 | GET/PUT/DELETE | `/api/v1/widgets/{id}` | 取 / 改名 / 软删除 |
 | GET | `/api/v1/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
+| POST | `/api/v1/contents/upload` | 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据 |
+| GET | `/api/v1/contents` | 列当前用户的内容(单租户) |
+| POST | `/api/v1/contents` | 建内容(仅 content 行,status=created) |
+| GET | `/api/v1/contents/{id}` | 取内容 |
+| PUT | `/api/v1/contents/{id}` | 全量更新内容可编辑字段 |
+| DELETE | `/api/v1/contents/{id}` | 软删内容 |
+| GET | `/api/v1/contents/{id}/preview` | inline 预览;presign 后端 307 跳签名 URL,内存后端代理字节 |
+| GET | `/api/v1/contents/{id}/download` | 下载内容主对象字节(presign 后端 307 跳转) |
+| POST | `/api/v1/contents/upload-url` | 两步上传①:建账+签直传凭证(`upload_url=null` 回退一步上传) |
+| POST | `/api/v1/contents/{id}/confirm-upload` | 两步上传③:核对落桶→销账(幂等;未传 409) |
+| GET | `/api/v1/contents/{id}/objects` | 列某内容的对象 |
+| GET | `/api/v1/contents/{id}/metadata` | 取内容元数据 |
+| PUT | `/api/v1/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
 | GET | `/docs` | Scalar API 文档 UI |
 | GET | `/api-docs/openapi.{json,yaml}` | OpenAPI 规范 |
 

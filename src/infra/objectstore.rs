@@ -9,12 +9,25 @@
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 use content::{ContentError, ObjectMeta, ObjectStore, UploadParams};
+
+/// presigned URL 有效期。短:URL 是临时授权(拿到即可访问),`/preview`、`/download` 每次 307 现签,
+/// 客户端从不存它 —— 稳定 URL 是 app 端点,签名 URL 只活在一次跳转里。
+const PRESIGN_TTL: Duration = Duration::from_secs(300);
+
+/// 直传(PUT)凭证有效期。比跳转凭证(300s)长得多:客户端拿到后要真传字节,
+/// 大文件/慢网络 5 分钟不够;1h 是"够传完、又不至于长期裸奔"的折中。
+/// 暴露面(教学点):凭证持有者在整个 TTL 内可**反复覆写该 key —— 包括 confirm 之后**,
+/// 届时 confirm 时记的 size/etag 变陈旧、preview/download 会吐换过的字节。
+/// 收紧路径:confirm 钉 ETag 校验 / 缩短 TTL / 一次性 key。脚手架接受现状。
+const PRESIGN_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 
 /// minio/S3 后端。`Client` 内部是 Arc(廉价 Clone),`bucket` 是落字节的桶名。
 pub struct S3ObjectStore {
@@ -48,6 +61,29 @@ impl S3ObjectStore {
             client: Client::from_conf(conf),
             bucket: bucket.to_owned(),
         }
+    }
+
+    /// 共用 presign GET:disposition 差异(inline vs attachment)就是 preview/download 的领域区别。
+    /// 纯客户端 HMAC 计算,不打网络;签名含 Host —— `S3_ENDPOINT` 必须浏览器可达(单域名前提,见 compose)。
+    /// 已知不一致(接受):presign 只 override disposition,不带 response-content-type ——
+    /// S3 用对象上传时自带的 Content-Type;后期 PUT /metadata 改 mime 只影响代理分支。
+    /// 要一致:库端口 *_url 加 mime 参数(v0.3 再说,现有用例上传时 mime 即正确)。
+    async fn presign_get(
+        &self,
+        object_key: &str,
+        disposition: String,
+    ) -> Result<Option<String>, ContentError> {
+        let cfg = PresigningConfig::expires_in(PRESIGN_TTL).map_err(store_err)?;
+        let req = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .response_content_disposition(disposition)
+            .presigned(cfg)
+            .await
+            .map_err(store_err)?;
+        Ok(Some(req.uri().to_string()))
     }
 }
 
@@ -99,6 +135,45 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
+    /// 直传凭证(presigned PUT)。`mime_type` 给了就签进凭证(S3 把 Content-Type 纳入签名,
+    /// 客户端 PUT 带不一样的头 → 403)—— 两步上传没有"写入前校验",这是唯一提前钉住的约束。
+    async fn upload_url(
+        &self,
+        object_key: &str,
+        mime_type: Option<&str>,
+    ) -> Result<Option<String>, ContentError> {
+        let cfg = PresigningConfig::expires_in(PRESIGN_UPLOAD_TTL).map_err(store_err)?;
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(object_key);
+        if let Some(mime) = mime_type {
+            req = req.content_type(mime);
+        }
+        let signed = req.presigned(cfg).await.map_err(store_err)?;
+        Ok(Some(signed.uri().to_string()))
+    }
+
+    /// 预签名下载 URL(attachment;filename 由 service 层按"metadata 优先"决议好传入)。
+    async fn download_url(
+        &self,
+        object_key: &str,
+        download_filename: Option<&str>,
+    ) -> Result<Option<String>, ContentError> {
+        let disposition = match download_filename {
+            // 引号转义防 header 注入(同 upload 侧 Content-Disposition)。
+            Some(name) => format!("attachment; filename=\"{}\"", name.replace('"', "")),
+            None => "attachment".to_owned(),
+        };
+        self.presign_get(object_key, disposition).await
+    }
+
+    /// 预签名预览 URL(inline —— 浏览器直接渲染,`<img>`/`<video>` 友好)。
+    async fn preview_url(&self, object_key: &str) -> Result<Option<String>, ContentError> {
+        self.presign_get(object_key, "inline".to_owned()).await
+    }
+
     async fn object_meta(&self, object_key: &str) -> Result<ObjectMeta, ContentError> {
         let head = self
             .client
@@ -127,4 +202,62 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     ContentError::Storage(anyhow::Error::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// presign 是纯客户端 HMAC 计算(不打网络)→ 离线断言 URL 形状:
+    /// host 来自 S3_ENDPOINT(单域名前提)、带签名参数、disposition 区分两方法。
+    #[tokio::test]
+    async fn presign_urls_carry_host_signature_and_disposition() {
+        let store = S3ObjectStore::new(
+            "http://localhost:9862",
+            "us-east-1",
+            "content",
+            "minio",
+            "minio12345",
+        )
+        .await;
+        let dl = store
+            .download_url("k1/k2", Some("报表 \"final\".pdf"))
+            .await
+            .unwrap()
+            .expect("S3 后端应支持 presign");
+        assert!(
+            dl.starts_with("http://localhost:9862/content/k1/k2?"),
+            "{dl}"
+        );
+        assert!(dl.contains("X-Amz-Signature="), "{dl}");
+        assert!(
+            dl.contains("response-content-disposition=attachment"),
+            "{dl}"
+        );
+        // 真钉转义:内部引号被 replace 删掉 → URL 不该出现 %22final%22(删了 replace 这行就红)。
+        assert!(!dl.contains("%22final%22"), "内部引号应被转义删除: {dl}");
+        assert!(dl.contains("X-Amz-Expires=300"), "TTL 应钉在 300s: {dl}");
+
+        let pv = store.preview_url("k1/k2").await.unwrap().unwrap();
+        assert!(pv.contains("response-content-disposition=inline"), "{pv}");
+
+        // 直传凭证(PUT):独立 TTL 3600s;给了 mime → content-type 签进凭证(SignedHeaders 可见),
+        // 客户端 PUT 必须带同样的头 —— 类型声明跑不掉。
+        let up = store
+            .upload_url("k1/k2", Some("image/png"))
+            .await
+            .unwrap()
+            .expect("S3 后端应支持直传凭证");
+        assert!(
+            up.starts_with("http://localhost:9862/content/k1/k2?"),
+            "{up}"
+        );
+        assert!(up.contains("X-Amz-Expires=3600"), "{up}");
+        assert!(
+            up.contains("content-type") && up.contains("X-Amz-SignedHeaders="),
+            "mime 应签进凭证: {up}"
+        );
+        // 无 mime:凭证照签,只是不钉 content-type。
+        assert!(store.upload_url("k1/k2", None).await.unwrap().is_some());
+    }
 }

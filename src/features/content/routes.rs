@@ -12,13 +12,14 @@ use axum::body::Body;
 use axum::extract::{Multipart, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
 use uuid::Uuid;
 
 use super::types::{
     ContentMetadataResponse, ContentResponse, CreateContentRequest, ObjectResponse,
-    SetContentMetadataRequest, UpdateContentRequest, UploadResponse,
+    PrepareUploadRequest, PrepareUploadResponse, SetContentMetadataRequest, UpdateContentRequest,
+    UploadResponse,
 };
 use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
@@ -282,6 +283,7 @@ pub async fn delete_content(
     tag = "contents",
     params(("id" = Uuid, Path, description = "content id")),
     responses(
+        (status = 307, description = "跳转到短时效签名 URL(presign 后端)"),
         (status = 200, description = "字节流(Content-Type/Disposition 取自元数据)", content_type = "application/octet-stream"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
@@ -298,6 +300,16 @@ pub async fn download_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    // presign 可用 → 307(字节直达存储);不可用 → 走下面的代理现状。
+    if let Some(url) = state.contents.download_url(id).await? {
+        // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
+        let mut resp = Redirect::temporary(&url).into_response();
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return Ok(resp);
+    }
     let bytes = state.contents.download_content(id).await?;
     // 元数据用于命名/类型;缺失(未同步)→ 通用兜底,不致命。
     let meta = state.contents.get_content_metadata(id).await.ok();
@@ -316,6 +328,61 @@ pub async fn download_content(
             format!("attachment; filename=\"{}\"", file_name.replace('"', "")),
         )
         .body(Body::from(bytes))
+        .map_err(|e| AppError::Internal(e.into()))
+}
+
+/// 预览内容(inline 展示,`<img src>` 即用)。需 `contents:read`。
+/// presign 可用(minio/S3)→ **307** 跳短时效签名 URL(字节直达存储,Range/大文件白送);
+/// 不可用(内存 backend)→ 代理字节。稳定 URL 是本端点 —— 每次跳转都重新过鉴权,签名 URL 只活 5 分钟。
+#[utoipa::path(
+    get,
+    path = "/contents/{id}/preview",
+    tag = "contents",
+    params(("id" = Uuid, Path, description = "content id")),
+    responses(
+        (status = 307, description = "跳转到短时效签名 URL(presign 后端)"),
+        (status = 200, description = "inline 字节(代理回退,Content-Type 取自元数据)", content_type = "application/octet-stream"),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "无 contents:read 权限", body = ErrorBody),
+        (status = 404, description = "不存在 / 无可预览对象", body = ErrorBody),
+        (status = 409, description = "内容未就绪", body = ErrorBody)
+    )
+)]
+pub async fn preview_content(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+    Path(id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    if let Some(url) = state.contents.preview_url(id).await? {
+        // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
+        let mut resp = Redirect::temporary(&url).into_response();
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return Ok(resp);
+    }
+    // 代理回退:Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
+    let p = state.contents.preview_content(id).await?;
+    let mime = p
+        .metadata
+        .as_ref()
+        .and_then(|m| m.mime_type.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    Response::builder()
+        .header(CONTENT_TYPE, mime)
+        .header(CONTENT_DISPOSITION, "inline")
+        // inline + 用户可控 mime(上传/元数据均可声明 text/html、svg)= 同源执行面。
+        // CSP sandbox:本响应里脚本/表单/同源访问全禁 —— 图片/视频照常渲染;
+        // 恶意 html/svg 拿不到 app origin 的任何东西。注意 sandbox 管不到浏览器 PDF
+        // 阅读器自带的 JS action 模型(要彻底 → mime 白名单外回退 attachment)。
+        // presign 路径天然异源,无此问题。
+        .header("content-security-policy", "sandbox")
+        .body(Body::from(p.data))
         .map_err(|e| AppError::Internal(e.into()))
 }
 
@@ -410,4 +477,72 @@ async fn read_text(field: axum::extract::multipart::Field<'_>) -> Result<String,
         .text()
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))
+}
+
+/// 两步上传①:建账 + 占格 + 签直传凭证(字节不过 app)。需 `contents:write`。
+/// `upload_url = null` → 后端不支持,回退 multipart 一步上传。传完调 confirm-upload 销账。
+#[utoipa::path(
+    post,
+    path = "/contents/upload-url",
+    tag = "contents",
+    request_body = PrepareUploadRequest,
+    responses(
+        (status = 201, description = "账已建(created);upload_url=null 时回退一步上传", body = PrepareUploadResponse),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "无 contents:write 权限", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody)
+    )
+)]
+pub async fn prepare_upload(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+    ctx: AuditContext,
+    Json(input): Json<PrepareUploadRequest>,
+) -> Result<(StatusCode, Json<PrepareUploadResponse>), AppError> {
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+    input.validate()?;
+    let out = state
+        .contents
+        .prepare_upload(input.into_input(user.0.id), ctx.audit_id())
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PrepareUploadResponse {
+            content: out.content.into(),
+            object: out.object.into(),
+            upload_url: out.upload_url,
+        }),
+    ))
+}
+
+/// 两步上传③:核对字节已落桶 → 销账(翻 uploaded + 补 size)。需 `contents:write`。
+/// 幂等(重试安全);没传就来 → 409;账不存在 → 404。
+#[utoipa::path(
+    post,
+    path = "/contents/{id}/confirm-upload",
+    tag = "contents",
+    params(("id" = Uuid, Path, description = "content id")),
+    responses(
+        (status = 200, description = "已销账(uploaded)", body = ContentResponse),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "无 contents:write 权限", body = ErrorBody),
+        (status = 404, description = "不存在", body = ErrorBody),
+        (status = 409, description = "字节未落桶(先传再销账)", body = ErrorBody)
+    )
+)]
+pub async fn confirm_upload(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+    ctx: AuditContext,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ContentResponse>, AppError> {
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+    let c = state.contents.confirm_upload(id, ctx.audit_id()).await?;
+    Ok(Json(c.into()))
 }
