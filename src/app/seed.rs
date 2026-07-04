@@ -35,14 +35,77 @@ struct PermSeed {
     description: String,
 }
 
+/// role 权限声明的原始形态:显式 `Perm` 串,或整表通配 `"*"`。
+/// untagged:先试 `Perm`,再试 `"*"`;两者都不中的未知串照样解析失败(fail-fast 保住,
+/// 代价是报错措辞从"unknown variant"退化成"did not match any variant"——可接受)。
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum PermEntry {
+    Perm(Perm),
+    Wildcard(Wildcard),
+}
+
+/// `"*"` 的类型化落点(untagged 需要一个可命中的反序列化目标)。
+#[derive(Deserialize)]
+enum Wildcard {
+    #[serde(rename = "*")]
+    Star,
+}
+
+/// 解析后的 role 声明:`permissions` 已是**展开后的具体 `Perm` 集**(`"*"` 在 [`TryFrom`] 里
+/// 展开成 `Perm::ALL`)——下游(`policy()` / PG 落库)只见具体权限,通配符不出解析层。
+#[derive(Deserialize)]
+#[serde(try_from = "RoleSeedRaw")]
 struct RoleSeed {
+    name: String,
+    display_name: String,
+    permissions: Vec<Perm>,
+}
+
+#[derive(Deserialize)]
+struct RoleSeedRaw {
     name: String,
     display_name: String,
     /// role→权限映射(app 授权策略)。`apply()` 不读它(permissions 不进 idm 库);app 组合根经
     /// [`SeedData::policy`] 读它建内存 `Policy`。省略 = 空权限(`#[serde(default)]`),seed 仍正常。
+    /// `["*"]` = 全权(随 `Perm` 闭集自动增长,消除"加权限忘补 superadmin"的漂移)。
     #[serde(default)]
-    permissions: Vec<Perm>,
+    permissions: Vec<PermEntry>,
+}
+
+impl TryFrom<RoleSeedRaw> for RoleSeed {
+    type Error = String;
+
+    fn try_from(raw: RoleSeedRaw) -> Result<Self, Self::Error> {
+        let has_star = raw
+            .permissions
+            .iter()
+            .any(|e| matches!(e, PermEntry::Wildcard(_)));
+        let permissions = if has_star {
+            // `"*"` 只许单独出现:要么 `["*"]` 全权、要么全显式列。混用是含混配置
+            // ("*都有了还列别的是什么意思"),按 fail-fast 哲学拒启动。
+            if raw.permissions.len() != 1 {
+                return Err(format!(
+                    "角色 `{}`:通配 \"*\" 不可与显式权限混用(要么 [\"*\"] 要么全显式列)",
+                    raw.name
+                ));
+            }
+            Perm::ALL.to_vec()
+        } else {
+            raw.permissions
+                .iter()
+                .map(|e| match e {
+                    PermEntry::Perm(p) => *p,
+                    PermEntry::Wildcard(_) => unreachable!("has_star 已排除"),
+                })
+                .collect()
+        };
+        Ok(Self {
+            name: raw.name,
+            display_name: raw.display_name,
+            permissions,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -195,5 +258,54 @@ mod tests {
             .unwrap()
             .assert_permission_catalog()
             .unwrap();
+    }
+
+    /// `["*"]` 载入期展开成 Perm 闭集全量 —— 加新 Perm 变体,通配角色自动持有(无需改 seed)。
+    #[test]
+    fn wildcard_expands_to_full_perm_closure() {
+        let data: SeedData = toml::from_str(
+            r#"
+            [[roles]]
+            name = "root"
+            display_name = "R"
+            permissions = ["*"]
+            "#,
+        )
+        .unwrap();
+        let policy = data.policy();
+        let perms = policy.perms_for(&["root".to_owned()]);
+        for p in Perm::ALL {
+            assert!(perms.contains(&p), "{p:?} 应随通配自动持有");
+        }
+    }
+
+    /// `"*"` 与显式权限混用 = 含混配置 → 解析期拒绝(fail-fast)。
+    #[test]
+    fn wildcard_mixed_with_explicit_is_rejected() {
+        let err = toml::from_str::<SeedData>(
+            r#"
+            [[roles]]
+            name = "root"
+            display_name = "R"
+            permissions = ["*", "widgets:read"]
+            "#,
+        )
+        .err()
+        .expect("混用应解析失败");
+        assert!(err.to_string().contains("混用"), "{err}");
+    }
+
+    /// 未知权限串:两个 untagged 分支都不中 → 解析失败(fail-fast 没被通配支持削弱)。
+    #[test]
+    fn unknown_perm_string_still_fails_fast() {
+        assert!(toml::from_str::<SeedData>(
+            r#"
+            [[roles]]
+            name = "root"
+            display_name = "R"
+            permissions = ["widgets:frobnicate"]
+            "#,
+        )
+        .is_err());
     }
 }

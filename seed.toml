@@ -59,7 +59,9 @@ description = "修改任何人的资料(而非仅自己)"
 [[roles]]
 name = "superadmin"
 display_name = "超级管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "users:admin", "profiles:read", "profiles:write", "profiles:write:all"]
+# "*" = 全权(载入期展开成 Perm 闭集,加新权限自动跟上——不用每次记得来补这行)。
+# 只许单独出现,与显式权限混用拒启动。其他角色仍显式列(最小授权要看得见)。
+permissions = ["*"]
 
 [[roles]]
 name = "admin"
