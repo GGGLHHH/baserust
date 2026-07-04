@@ -75,15 +75,23 @@ pub trait EventSubscription: Send {
   失败(连接断等)→ `tracing::warn`,不上抛。
 - `subscribe` = `sqlx::postgres::PgListener::connect_with(pool)` + `listen("widget_events")`;
   `recv` 循环:拿 notification → `serde_json::from_str`(坏 payload → warn + 跳过)。
-- **白送的正确性**:多实例扇出;`pg_notify` 在事务内 → commit 才投递,回滚不发幽灵事件
-  (当前 create/update 单语句自动提交,同样成立;将来进事务也天然对)。
+- **多实例扇出白送**。事务性投递(回滚不发幽灵事件)**不在本实现内**:publish 用独立连接 autocommit,正确性来自"写成功后才 publish";要事务性需在写事务同一连接上 NOTIFY。
 - 天花板:NOTIFY payload 上限 8000 字节(widget 事件几百字节,富余)。超限升级路径:payload 只放 id,订阅方回查。`ponytail:` 注释钉住。
+
+### 3b. NatsEventBus(2026-07-04 后补,用户决策:NATS 为多实例**默认**后端)
+
+- **选择链(IoC,组合根装配)**:`NATS_URL` 设了 → NATS;否则有 app pool → PG(LISTEN/NOTIFY,
+  "已有 PG 不加组件"的退路);都没有 → 内存(单实例最终 fallback)。三实现同一 `EventBus` 端口。
+- core NATS(非 JetStream):契约不变 —— best-effort、无回放;subject `widget.events`。
+- 启动 fail-fast 连接,之后 Client 自动重连(断线窗口丢事件,同契约);compose 加 `nats` 服务 + healthcheck。
+- 脚手架连无鉴权 NATS;跨信任域配 token/nkey + TLS(ponytail 注释钉住)。
+- 契约测试入口 3:`--features nats-conformance`(`just test-nats`)。
 
 ### 4. 发布点(`WidgetService`)
 
 - 加字段 `events: Arc<dyn EventBus>`;`new` 签名加一参(组合根 + 测试同步改,测试给 MemoryEventBus)。
 - `create` / `update` / `delete` 成功路径末尾 `self.events.publish(...).await`。
-- `create_with_tags` 也发 `Created`(同为创建)。
+- ~~`create_with_tags` 也发 `Created`~~ 实现偏差(计划已批准):它是 repo 层范式、无 service 调用方 → 不发事件。
 
 ### 5. SSE 端点(`widget/routes.rs` + `widget/mod.rs` 挂载)
 

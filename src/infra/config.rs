@@ -142,6 +142,12 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub content_db_sslmode: String,
 
+    /// NATS 地址,`NATS_URL`(如 `nats://localhost:2224`,本地 compose 主机端口)—— widget 事件总线选择链的**最高优先**:
+    /// 设了 → NatsEventBus(多实例默认);没设但有 app pool → PgEventBus(LISTEN/NOTIFY 退路);
+    /// 都没有 → 内存(单实例,最终 fallback)。装配在组合根 `AppState::new`。
+    #[serde(default)]
+    pub nats_url: Option<String>,
+
     /// S3/minio 对象存储 —— content 模块的字节后端(元数据进 PG,字节进 S3)。
     /// **presence = use S3**:设了 `S3_ENDPOINT` → content 用 minio/S3 backend;不设 → 内存 backend
     /// (脚手架默认,零外部依赖)。其余字段镜像 db 的「全有默认」约定。
@@ -254,6 +260,7 @@ impl Default for Config {
             content_db_user: default_content_db_user(),
             content_db_password: default_db_password(),
             content_db_sslmode: default_db_sslmode(),
+            nats_url: None,
             s3_endpoint: None,
             s3_bucket: default_s3_bucket(),
             s3_access_key: default_s3_access_key(),

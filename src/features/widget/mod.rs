@@ -11,7 +11,9 @@ mod service;
 mod types;
 mod view;
 
-pub use events::{EventBus, EventSubscription, MemoryEventBus, WidgetEvent};
+pub use events::{
+    EventBus, EventSubscription, MemoryEventBus, NatsEventBus, PgEventBus, WidgetEvent,
+};
 pub use port::{StaticUserDirectory, UserBrief, UserDirectory};
 pub use repo::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo};
 pub use service::WidgetService;
@@ -35,4 +37,5 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(routes::widget_stats))
         .routes(routes!(routes::my_widget_count))
         .routes(routes!(routes::admin_list_widgets))
+        .routes(routes!(routes::widget_events))
 }

@@ -26,11 +26,15 @@ fn test_app() -> (Router, String) {
     let admin = tokens
         .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
         .unwrap();
+    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
+        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
+            bus.clone(),
         ),
+        widget_events: bus,
         contents: test_contents(),
         auth: test_auth(tokens.clone()),
         db_pool: None, // 内存模式:readyz 恒就绪
@@ -293,4 +297,91 @@ async fn delete_soft_deletes_returns_204_then_404() {
         .await
         .unwrap();
     assert_eq!(got.status(), StatusCode::NOT_FOUND, "软删后应 404");
+}
+
+/// SSE:开流 → create → 第一帧就是 created 事件(keep-alive 15s 远大于测试窗口,不会先到)。
+#[tokio::test]
+async fn sse_stream_receives_created_event() {
+    use futures_util::StreamExt;
+    let (app, admin) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/widgets/events")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "text/event-stream");
+    let mut body = resp.into_body().into_data_stream();
+
+    // handler 返回时订阅已建立 → 此刻 create 必被本流看到
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/widgets")
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"sse-demo"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("5s 内应收到 SSE 帧")
+        .expect("流不应结束")
+        .unwrap();
+    let text = String::from_utf8(frame.to_vec()).unwrap();
+    assert!(text.contains("event: created"), "应是 created 帧: {text}");
+    assert!(
+        text.contains(r#""name":"sse-demo""#),
+        "应含 widget JSON: {text}"
+    );
+}
+
+/// 未认证 → 401(EventSource 只能靠 cookie/无 header,这里用无凭据模拟)。
+#[tokio::test]
+async fn sse_requires_auth() {
+    let (app, _admin) = test_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/widgets/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 降权令牌(scope 只有 write,无 read)→ 403:scope 只收窄不放大。
+#[tokio::test]
+async fn sse_requires_read_scope() {
+    let (app, _admin) = test_app();
+    let tokens = AppTokens::new("test-secret"); // 与 test_app 同 secret,验签才过
+    let scoped = tokens
+        .mint_scoped(
+            Uuid::nil(),
+            "admin",
+            vec!["admin".to_owned()],
+            vec![Perm::WidgetWrite],
+            900,
+        )
+        .unwrap();
+    let resp = app
+        .oneshot(
+            Request::get("/api/v1/widgets/events")
+                .header("authorization", format!("Bearer {scoped}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

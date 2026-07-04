@@ -8,7 +8,8 @@ use super::adapters::InProcessUserDirectory;
 use super::router::Mount;
 use crate::features::auth::AppTokens;
 use crate::features::widget::{
-    InMemoryWidgetRepo, PgWidgetRepo, UserDirectory, WidgetRepo, WidgetService,
+    EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
+    UserDirectory, WidgetRepo, WidgetService,
 };
 use crate::infra::authz::Policy;
 use crate::infra::config::Config;
@@ -43,6 +44,8 @@ pub enum Schema {
 #[derive(Clone)]
 pub struct AppState {
     pub widgets: WidgetService,
+    /// widget 变更事件总线(SSE 订阅端点用;service 持同一实例发布)。
+    pub widget_events: Arc<dyn EventBus>,
     /// content 内容/对象存储服务(领域来自 content 库;app 注入仓储 + minio/内存 ObjectStore)。
     pub contents: ContentService,
     pub auth: AuthService,
@@ -79,6 +82,19 @@ impl AppState {
                     tracing::warn!("未设 APP_DB_HOST,widget 仓储使用内存实现(脚手架默认)");
                 }
                 Arc::new(InMemoryWidgetRepo::new())
+            }
+        };
+
+        // 事件总线(SSE 范式)—— IoC 选择链:NATS_URL → NATS(多实例默认);
+        // 无则有 app pool → PG LISTEN/NOTIFY(已有 PG 不加组件的退路);都无 → 内存(单实例兜底)。
+        let widget_events: Arc<dyn EventBus> = match (&config.nats_url, &app_pool) {
+            (Some(url), _) if needs_app => Arc::new(NatsEventBus::connect(url).await?),
+            (_, Some(pool)) => Arc::new(PgEventBus::new(pool.clone())),
+            _ => {
+                if needs_app {
+                    tracing::warn!("未设 NATS_URL 且无 app pool,事件总线使用内存实现(单实例)");
+                }
+                Arc::new(MemoryEventBus::new())
             }
         };
 
@@ -207,7 +223,8 @@ impl AppState {
             .build();
 
         Ok(Self {
-            widgets: WidgetService::new(widget_repo, user_directory),
+            widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
+            widget_events,
             contents,
             auth,
             // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。

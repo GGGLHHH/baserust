@@ -17,11 +17,15 @@ use xchangeai::infra::config::Config;
 
 /// 内存 app + **限流开启**(burst=2,per_sec=1)。
 fn rate_limited_app() -> Router {
+    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
+        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+            bus.clone(),
         ),
+        widget_events: bus,
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
@@ -89,11 +93,15 @@ async fn over_burst_same_ip_gets_429_errorbody() {
 #[tokio::test]
 async fn rate_limit_off_by_default_lets_all_through() {
     // Config::default() → rate_limit_enabled=false → 不挂限流,连发不 429。
+    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
+        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+            bus.clone(),
         ),
+        widget_events: bus,
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use garde::Validate;
 use uuid::Uuid;
 
+use super::events::{EventBus, WidgetEvent};
 use super::port::UserDirectory;
 use super::repo::WidgetRepo;
 use super::types::{CreateWidget, UpdateWidget, Widget};
@@ -21,11 +22,21 @@ pub struct WidgetService {
     repo: Arc<dyn WidgetRepo>,
     /// 跨模块富化端口(按 id 批量取用户)。widget **不知道**背后是 idm 还是 HTTP —— app 装配时注入。
     users: Arc<dyn UserDirectory>,
+    /// 变更事件总线(SSE 范式)。fire-and-forget:publish 失败绝不影响写。
+    events: Arc<dyn EventBus>,
 }
 
 impl WidgetService {
-    pub fn new(repo: Arc<dyn WidgetRepo>, users: Arc<dyn UserDirectory>) -> Self {
-        Self { repo, users }
+    pub fn new(
+        repo: Arc<dyn WidgetRepo>,
+        users: Arc<dyn UserDirectory>,
+        events: Arc<dyn EventBus>,
+    ) -> Self {
+        Self {
+            repo,
+            users,
+            events,
+        }
     }
 
     /// 分页列表(纯,不富化)。`PageQuery::resolve` 兼做互斥校验/clamp/默认,失败映射 AppError。
@@ -88,7 +99,11 @@ impl WidgetService {
         ctx: &AuditContext,
     ) -> Result<Widget, AppError> {
         input.validate()?;
-        self.repo.create(input.name, ctx.audit_id()).await
+        let w = self.repo.create(input.name, ctx.audit_id()).await?;
+        self.events
+            .publish(WidgetEvent::Created { widget: w.clone() })
+            .await;
+        Ok(w)
     }
 
     pub async fn update(
@@ -98,12 +113,18 @@ impl WidgetService {
         ctx: &AuditContext,
     ) -> Result<Widget, AppError> {
         input.validate()?;
-        self.repo.update(id, input.name, ctx.audit_id()).await
+        let w = self.repo.update(id, input.name, ctx.audit_id()).await?;
+        self.events
+            .publish(WidgetEvent::Updated { widget: w.clone() })
+            .await;
+        Ok(w)
     }
 
     /// 软删除(非物理 DELETE)。
     pub async fn delete(&self, id: Uuid, ctx: &AuditContext) -> Result<(), AppError> {
-        self.repo.soft_delete(id, ctx.audit_id()).await
+        self.repo.soft_delete(id, ctx.audit_id()).await?;
+        self.events.publish(WidgetEvent::Deleted { id }).await;
+        Ok(())
     }
 }
 
@@ -113,7 +134,7 @@ mod tests {
 
     use super::*;
     use crate::features::widget::repo::InMemoryWidgetRepo;
-    use crate::features::widget::{StaticUserDirectory, UserBrief};
+    use crate::features::widget::{MemoryEventBus, StaticUserDirectory, UserBrief};
 
     fn ctx() -> AuditContext {
         AuditContext::anonymous(None)
@@ -131,6 +152,7 @@ mod tests {
         WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+            Arc::new(MemoryEventBus::new()),
         )
     }
 
@@ -209,7 +231,7 @@ mod tests {
                 email: None,
             },
         )])));
-        let svc = WidgetService::new(repo, dir);
+        let svc = WidgetService::new(repo, dir, Arc::new(MemoryEventBus::new()));
         let page = svc.list_enriched(first_page(), None).await.unwrap();
         let by = |n: &str| page.items.iter().find(|v| v.name == n).unwrap();
         assert_eq!(
@@ -217,5 +239,30 @@ mod tests {
             "alice"
         );
         assert!(by("orphan").created_by_user.is_none()); // 'system' 脏值 → 降级 null
+    }
+
+    /// create 成功后发布 Created 事件;订阅方收到的 widget 与返回值一致。
+    #[tokio::test]
+    async fn create_publishes_created_event() {
+        use crate::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
+        let bus = Arc::new(MemoryEventBus::new());
+        let svc = WidgetService::new(
+            Arc::new(InMemoryWidgetRepo::new()),
+            Arc::new(StaticUserDirectory::empty()),
+            bus.clone(),
+        );
+        let mut sub = bus.subscribe().await.unwrap();
+        let w = svc
+            .create(CreateWidget { name: "evt".into() }, &ctx())
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
+            .await
+            .expect("1s 内应收到事件")
+            .expect("总线不应关闭");
+        match got {
+            WidgetEvent::Created { widget } => assert_eq!(widget.id, w.id),
+            other => panic!("期待 Created,得到 {other:?}"),
+        }
     }
 }

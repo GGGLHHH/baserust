@@ -41,11 +41,15 @@ fn test_app() -> (Router, String, String) {
             900,
         )
         .unwrap();
+    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
+        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+            bus.clone(),
         ),
+        widget_events: bus,
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),

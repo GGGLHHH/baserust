@@ -20,11 +20,15 @@ use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, Widge
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
 fn test_app() -> Router {
     let tokens = Arc::new(AppTokens::new("test-secret"));
+    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
+        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
             Arc::new(StaticUserDirectory::empty()),
+            bus.clone(),
         ),
+        widget_events: bus,
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),

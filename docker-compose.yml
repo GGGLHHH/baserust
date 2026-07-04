@@ -6,6 +6,7 @@
 #   MINIO_USER / MINIO_PASSWORD · S3_BUCKET           minio 凭据(默认 minio/minio12345)与桶名(默认 content)
 #   NGINX_PORT(80) · APP_PORT(6453) · IDM_PORT(6454) · DBHUB_PORT(3777) · PG_PORT(5821)   主机端口
 #   MINIO_PORT(9862, S3 API) · MINIO_CONSOLE_PORT(9863, 控制台)         minio 主机端口
+#   NATS_PORT(2224)                                   nats 主机端口(widget 事件总线;容器内仍 4222)
 #   RUST_LOG                                          app 日志级别
 #
 # 用法:
@@ -42,6 +43,9 @@ services:
       # content 字节落 minio:等建桶的一次性任务跑完(桶一定先于 app 就绪)。
       minio-init:
         condition: service_completed_successfully
+      # widget 事件总线走 NATS(app 启动 fail-fast 连接,必须先 healthy)。
+      nats:
+        condition: service_healthy
     environment:
       BIND_ADDR: 0.0.0.0:8080
       RUST_LOG: ${RUST_LOG:-info,xchangeai=info}
@@ -60,6 +64,8 @@ services:
       CONTENT_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
+      # 事件总线选择链最高优先:设了 NATS_URL → widget 事件走 NATS(去掉则回退 PG LISTEN/NOTIFY → 内存)。
+      NATS_URL: nats://nats:4222
       # 对象存储:设了 S3_ENDPOINT → content 字节走 minio/S3(去掉则走内存 backend)。
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: ${S3_BUCKET:-content}
@@ -187,6 +193,20 @@ services:
     # 安全建议:dbhub 支持只读模式,确认 flag 后在上面 command 加一行(如 `--readonly`)防 MCP 误写。
     ports:
       - "${DBHUB_PORT:-3777}:8080"
+
+  # NATS:widget 事件总线的多实例扇出后端(EventBus 选择链最高优先,app 设 NATS_URL 即用)。
+  # core NATS 纯内存转发、无持久化(契约就是 best-effort);脚手架无鉴权裸跑,跨信任域配 token/TLS。
+  # -m 8222 开监控端口,healthz 供 healthcheck(app fail-fast 连接,依赖它先 healthy)。
+  nats:
+    image: nats:alpine
+    command: ["-m", "8222"]
+    ports:
+      - "${NATS_PORT:-2224}:4222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # S3 兼容对象存储:content 模块的字节落这(元数据进 PG,字节进 minio)。
   # 不设 app 的 S3_ENDPOINT 则 content 走内存 backend、本服务可不起(对齐"零外部依赖也能跑")。

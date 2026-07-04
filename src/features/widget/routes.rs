@@ -1,7 +1,13 @@
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_util::Stream;
 use uuid::Uuid;
 
+use super::events::WidgetEvent;
 use super::types::{CreateWidget, UpdateWidget, Widget};
 use super::view::{WidgetStats, WidgetView};
 use crate::app::state::AppState;
@@ -215,4 +221,40 @@ pub async fn admin_list_widgets(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     Ok(Json(state.widgets.list_enriched(query, None).await?))
+}
+
+/// 订阅 widget 变更事件流(SSE)。需登录 + `widgets:read` —— 与列表同权:能看列表就能看变更。
+/// EventSource 不能自定义 header,凭据靠 httponly cookie(Bearer 兜底给 curl/测试)。
+/// best-effort 无回放:断线期间的事件丢失,EventSource 自动重连拿新订阅。
+/// 鉴权只在开流时刻评估:流存活期间 token 过期/吊销不会断流(SSE 惯例取舍;低敏数据可接受)。
+/// 要收紧:按 claim 的 exp 到点结束流,EventSource 重连即重新鉴权。
+#[utoipa::path(
+    get,
+    path = "/widgets/events",
+    tag = "widgets",
+    responses(
+        (status = 200, description = "SSE 事件流;每帧 event = type(created/updated/deleted),data = WidgetEvent JSON", content_type = "text/event-stream", body = WidgetEvent),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "无 widgets:read 权限", body = ErrorBody)
+    )
+)]
+pub async fn widget_events(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+    let sub = state.widget_events.subscribe().await?;
+    // recv() → SSE 帧;None(总线关)→ 流结束。json_data 对我们的类型不会失败,失败即结束流(ok()?)。
+    let stream = futures_util::stream::unfold(sub, |mut sub| async move {
+        let event = sub.recv().await?;
+        let frame = Event::default()
+            .event(event.name())
+            .json_data(&event)
+            .ok()?;
+        Some((Ok::<_, Infallible>(frame), sub))
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

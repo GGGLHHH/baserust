@@ -16,7 +16,7 @@ dev:
 # 含:pg + migrate(建表后退出)+ minio + minio-init(建桶后退出)+ dbhub。停栈:`docker compose down`。
 # 透传额外 flag:改了迁移/代码后 `just up --build` 重建镜像(migrate 跑的就是这镜像,确保用最新)。
 up *flags:
-    docker compose up -d {{flags}} pg migrate minio minio-init dbhub
+    docker compose up -d {{flags}} pg migrate minio minio-init nats dbhub
 
 # 编译/clippy 实时反馈面板(改代码即时看红线,不跑服务;面板内按 c/l/t 切 check/clippy/test)
 watch:
@@ -40,11 +40,15 @@ pg-test-grant:
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test -- --nocapture
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance -- --nocapture
 
-# 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance
+# NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)
+test-nats:
+    NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features nats-conformance --test event_bus_conformance -- --nocapture
+
+# 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance + NATS 契约
 # (idm 仓储 conformance 随 idm 抽成独立 rust-idm crate 后已迁出本仓)
-test-all: test test-pg
+test-all: test test-pg test-nats
 
 # ───── 数据库迁移(sqlx-cli,类似 goose;显式执行,不在 app 启动时跑)─────
 # 每个 schema 用同名 role 连接(role 的 search_path = 同名 schema),各自独立 _sqlx_migrations,

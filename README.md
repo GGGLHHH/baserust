@@ -29,6 +29,7 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | GET | `/api/v1/widgets` | 列表,**双模式分页**(offset `?page=&size=` / cursor `?cursor=&size=`) |
 | POST | `/api/v1/widgets` | 创建 |
 | GET/PUT/DELETE | `/api/v1/widgets/{id}` | 取 / 改名 / 软删除 |
+| GET | `/api/v1/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
 | GET | `/docs` | Scalar API 文档 UI |
 | GET | `/api-docs/openapi.{json,yaml}` | OpenAPI 规范 |
 
@@ -86,4 +87,4 @@ just lint / fmt / fix / clean
 
 ## 栈
 
-axum 0.8 · sea-query 1.0 + sqlx 0.9 · utoipa 5(+ Scalar) · figment · tracing · garde · thiserror/anyhow · tokio · time · base64。版本见 `Cargo.toml`。
+axum 0.8 · sea-query 1.0 + sqlx 0.9 · utoipa 5(+ Scalar) · async-nats(事件总线) · figment · tracing · garde · thiserror/anyhow · tokio · time · base64。版本见 `Cargo.toml`。

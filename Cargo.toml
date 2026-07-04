@@ -16,7 +16,8 @@ idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.2.0" }
 content = { git = "https://github.com/GGGLHHH/rust-content", tag = "v0.1.0" }
 
 # 异步运行时 —— 一切的地基
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+# sync:widget 事件总线用 broadcast(勿靠 aws-sdk 的传递特性碰巧解锁)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
 
 # Web 框架 + 中间件(multipart:content 一次性上传走 multipart/form-data)
 axum = { version = "0.8", features = ["multipart"] }
@@ -65,6 +66,8 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde-well-known"] }
 # cursor 游标编解码(opaque base64url token)
 base64 = "0.22"
+# SSE:把 EventSubscription::recv 适配成 axum Sse 要的 Stream(unfold)。已是传递依赖,提直接零额外编译。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # 字节缓冲:content 的 ObjectStore 端口收/发 owned Bytes(minio 上传/下载、multipart 解析)。
 bytes = "1"
 
@@ -91,11 +94,15 @@ toml = "0.8"
 tower_governor = "0.8.0"
 # metrics:Prometheus 请求计数/延迟直方图 + /metrics 端点。opt-in(METRICS_ENABLED)。
 axum-prometheus = "0.10.0"
+# 事件总线的多实例默认后端(EventBus 选择链:NATS_URL → NATS;无则 PG LISTEN/NOTIFY;再无内存)。
+async-nats = "0.49"
 
 # feature 开关:pg-conformance 开了才编译"打真库的仓储一致性测试"(需 DATABASE_URL + 跑着的 pg)。
 # 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用本地 `just test-pg` 显式触发(将来接 CI 时单列一个 job 跑它)。
 [features]
 pg-conformance = []
+# 同上口径:开了才编译"打真 NATS 的事件总线一致性测试"(先 `just up` 起 nats;用 `just test-nats`)。
+nats-conformance = []
 
 # 测试专用依赖(集成测试 tests/ 用 tower oneshot 打端点)
 [dev-dependencies]

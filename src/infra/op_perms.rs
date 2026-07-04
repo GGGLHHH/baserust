@@ -49,6 +49,10 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "admin_list_widgets",
         perm: Some(Perm::UsersAdmin),
     },
+    OpAuthz {
+        operation_id: "widget_events",
+        perm: Some(Perm::WidgetRead),
+    },
     // ── content:read/write/delete 三权;下载/列对象/读元数据归 read,上传/改元数据归 write ──
     OpAuthz {
         operation_id: "create_content",
