@@ -29,6 +29,10 @@ fn test_app() -> Router {
             bus.clone(),
         ),
         widget_events: bus,
+        profiles: xchangeai::features::profile::ProfileService::new(
+            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),

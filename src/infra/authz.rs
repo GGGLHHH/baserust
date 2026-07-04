@@ -40,11 +40,19 @@ pub enum Perm {
     ContentDelete,
     #[serde(rename = "users:admin")]
     UsersAdmin,
+    #[serde(rename = "profiles:read")]
+    ProfileRead,
+    #[serde(rename = "profiles:write")]
+    ProfileWrite,
+    /// 越权写:改**任何人**的 profile(否则只能改自己)。write 侧的 ownership mode 开关,
+    /// 镜像 `widgets:read:all` 的 qualifier+implies 范式。
+    #[serde(rename = "profiles:write:all")]
+    ProfileWriteAll,
 }
 
 impl Perm {
     /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
-    pub const ALL: [Perm; 8] = [
+    pub const ALL: [Perm; 11] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
@@ -53,6 +61,9 @@ impl Perm {
         Perm::ContentWrite,
         Perm::ContentDelete,
         Perm::UsersAdmin,
+        Perm::ProfileRead,
+        Perm::ProfileWrite,
+        Perm::ProfileWriteAll,
     ];
 
     /// 三段约定 `domain:verb[:qualifier]` 的**第一段**(资源)。从变体投影,**绝不运行期 split wire 串**。
@@ -64,6 +75,7 @@ impl Perm {
             }
             Perm::ContentRead | Perm::ContentWrite | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
+            Perm::ProfileRead | Perm::ProfileWrite | Perm::ProfileWriteAll => "profiles",
         }
     }
 
@@ -77,6 +89,8 @@ impl Perm {
             Perm::ContentWrite => "write",
             Perm::ContentDelete => "delete",
             Perm::UsersAdmin => "admin",
+            Perm::ProfileRead => "read",
+            Perm::ProfileWrite | Perm::ProfileWriteAll => "write",
         }
     }
 
@@ -84,6 +98,7 @@ impl Perm {
     pub fn qualifier(&self) -> Option<&'static str> {
         match self {
             Perm::WidgetReadAll => Some("all"),
+            Perm::ProfileWriteAll => Some("all"),
             _ => None,
         }
     }
@@ -95,6 +110,7 @@ impl Perm {
     pub fn implies(&self) -> &'static [Perm] {
         match self {
             Perm::WidgetReadAll => &[Perm::WidgetRead],
+            Perm::ProfileWriteAll => &[Perm::ProfileWrite],
             _ => &[],
         }
     }
@@ -194,7 +210,8 @@ pub enum Access {
 }
 
 impl Access {
-    /// 某行(owner = `created_by`)在本可见域内是否可见。list 用它过滤;单条不可见 → 调用方返 **404**(不泄露存在)。
+    /// 某行(owner = `created_by`)在本可见域内是否可见。list 用它过滤;**读路径**单条不可见 → 调用方通常返 404
+    /// (不泄露存在);**写权型 ownership**(资源本就任意可读,如 profile PUT)可返 403,见 profile routes。
     pub fn allows(&self, owner: Uuid) -> bool {
         match self {
             Access::All => true,

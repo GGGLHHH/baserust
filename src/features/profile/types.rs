@@ -1,0 +1,74 @@
+use garde::Validate;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+/// profile 行(领域形状 = DB 行)。**无 deleted_at**:profile 无删除语义,与 user 同生死
+/// (0003 迁移注释已钉);`user_id` 即主键(1:1,天然防一人多行)。
+#[derive(Debug, Clone, Serialize, ToSchema, sqlx::FromRow)]
+pub struct Profile {
+    pub user_id: Uuid,
+    pub first_name: Option<String>,
+    pub middle_name: Option<String>,
+    pub last_name: Option<String>,
+    pub phone: Option<String>,
+    /// content 模块的引用(标识非 FK,跨模块);悬空由读侧富化降级(avatar_url=null)。
+    pub avatar_content_id: Option<Uuid>,
+    pub created_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub updated_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// PUT 入参 —— **全量替换**:字段 null/缺省 = 清空(PUT 语义;不是 PATCH 的"跳过不改")。
+/// phone 只做长度不做 E.164(刻意:格式是前端/业务关注,脚手架不猜地区)。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct PutProfileRequest {
+    #[garde(inner(length(max = 255)))]
+    pub first_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub middle_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub last_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    pub phone: Option<String>,
+    /// 绑定头像:必须指向**已 confirm** 的 image/* content(service 写前经端口三查)。
+    #[garde(skip)]
+    pub avatar_content_id: Option<Uuid>,
+}
+
+/// 出参 = 行字段 + 富化的 `avatar_url`(相对 preview 路径;悬空/未就绪/探测故障 → null)。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProfileResponse {
+    pub user_id: Uuid,
+    pub first_name: Option<String>,
+    pub middle_name: Option<String>,
+    pub last_name: Option<String>,
+    pub phone: Option<String>,
+    pub avatar_content_id: Option<Uuid>,
+    /// 相对路径 `/api/v1/contents/{id}/preview`(单域名哲学,无 base-url 变量)。
+    pub avatar_url: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+impl ProfileResponse {
+    pub fn from_profile(p: Profile, avatar_url: Option<String>) -> Self {
+        Self {
+            user_id: p.user_id,
+            first_name: p.first_name,
+            middle_name: p.middle_name,
+            last_name: p.last_name,
+            phone: p.phone,
+            avatar_content_id: p.avatar_content_id,
+            avatar_url,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+        }
+    }
+}

@@ -43,6 +43,8 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | GET | `/api/v1/contents/{id}/objects` | 列某内容的对象 |
 | GET | `/api/v1/contents/{id}/metadata` | 取内容元数据 |
 | PUT | `/api/v1/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
+| GET | `/api/v1/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
+| PUT | `/api/v1/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |
 | GET | `/docs` | Scalar API 文档 UI |
 | GET | `/api-docs/openapi.{json,yaml}` | OpenAPI 规范 |
 

@@ -4,9 +4,12 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-use super::adapters::InProcessUserDirectory;
+use super::adapters::{ContentAvatarProbe, InProcessUserDirectory};
 use super::router::Mount;
 use crate::features::auth::AppTokens;
+use crate::features::profile::{
+    AvatarProbe, InMemoryProfileRepo, PgProfileRepo, ProfileRepo, ProfileService,
+};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
     UserDirectory, WidgetRepo, WidgetService,
@@ -44,6 +47,8 @@ pub enum Schema {
 #[derive(Clone)]
 pub struct AppState {
     pub widgets: WidgetService,
+    /// 用户资料(app schema;头像经 content 富化,适配器见 app/adapters)。
+    pub profiles: ProfileService,
     /// widget 变更事件总线(SSE 订阅端点用;service 持同一实例发布)。
     pub widget_events: Arc<dyn EventBus>,
     /// content 内容/对象存储服务(领域来自 content 库;app 注入仓储 + minio/内存 ObjectStore)。
@@ -140,6 +145,15 @@ impl AppState {
         };
         let contents = ContentService::new(content_repo, object_repo, object_store, backend_name);
 
+        // profile(app schema):可拔插仓储同 widget(复用 app_pool);头像探测经进程内 content 适配器。
+        let profile_repo: Arc<dyn ProfileRepo> = match &app_pool {
+            Some(pool) => Arc::new(PgProfileRepo::new(pool.clone())),
+            None => Arc::new(InMemoryProfileRepo::new()),
+        };
+        let avatar_probe: Arc<dyn AvatarProbe> =
+            Arc::new(ContentAvatarProbe::new(contents.clone()));
+        let profiles = ProfileService::new(profile_repo, avatar_probe);
+
         // idm(idm schema):仅 idm/both 进程需要。设了 IDM_DB_HOST → PG(读 seed 的 superadmin 等),否则内存。
         let idm_pool = if needs_idm {
             connect_for_schema(config, Schema::Idm).await?
@@ -224,6 +238,7 @@ impl AppState {
 
         Ok(Self {
             widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
+            profiles,
             widget_events,
             contents,
             auth,

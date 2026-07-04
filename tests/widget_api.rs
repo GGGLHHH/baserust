@@ -35,6 +35,10 @@ fn test_app() -> (Router, String) {
             bus.clone(),
         ),
         widget_events: bus,
+        profiles: xchangeai::features::profile::ProfileService::new(
+            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        ),
         contents: test_contents(),
         auth: test_auth(tokens.clone()),
         db_pool: None, // 内存模式:readyz 恒就绪

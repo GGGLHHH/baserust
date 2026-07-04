@@ -36,7 +36,7 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
     // 写端点 gate 在 body 提取**之后**跑 → 反向用例须发可提取的 body,否则提取器的 400/422 遮 403(假绿)。
     let body = match op_id {
         "create_widget" | "update_widget" | "create_content" | "update_content"
-        | "prepare_upload" => {
+        | "prepare_upload" | "put_profile" => {
             b = b.header("content-type", "application/json");
             Body::from(r#"{"name":"probe"}"#)
         }
@@ -93,7 +93,11 @@ async fn spec_security_matches_real_enforcement() {
                 continue;
             };
             let op_id = op.get("operationId").and_then(|x| x.as_str()).unwrap_or("");
-            let uri = path.replace("{id}", &Uuid::nil().to_string());
+            // {user_id}(ownership 端点)代入**令牌主体自己的 id**:探针打"自己的"资源,
+            // 授权闸才是唯一变量(打别人的会被 ownership 403 污染正向断言)。
+            let uri = path
+                .replace("{id}", &Uuid::nil().to_string())
+                .replace("{user_id}", &su.user.id.to_string());
             // spec 广告的 oauth2 scopes
             let scopes: Vec<Perm> = sec
                 .iter()

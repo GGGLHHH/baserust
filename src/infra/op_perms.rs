@@ -106,6 +106,15 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "set_content_metadata",
         perm: Some(Perm::ContentWrite),
     },
+    // ── profile:任意登录可读(read);写走 write(write:all 越权的 ownership 在 handler)──
+    OpAuthz {
+        operation_id: "get_profile",
+        perm: Some(Perm::ProfileRead),
+    },
+    OpAuthz {
+        operation_id: "put_profile",
+        perm: Some(Perm::ProfileWrite),
+    },
     OpAuthz {
         operation_id: "get_me",
         perm: None,

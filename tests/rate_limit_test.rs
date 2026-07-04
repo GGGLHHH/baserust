@@ -26,6 +26,10 @@ fn rate_limited_app() -> Router {
             bus.clone(),
         ),
         widget_events: bus,
+        profiles: xchangeai::features::profile::ProfileService::new(
+            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
@@ -102,6 +106,10 @@ async fn rate_limit_off_by_default_lets_all_through() {
             bus.clone(),
         ),
         widget_events: bus,
+        profiles: xchangeai::features::profile::ProfileService::new(
+            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),

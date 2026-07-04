@@ -40,6 +40,18 @@ description = "删除内容"
 key = "users:admin"
 description = "用户管理"
 
+[[permissions]]
+key = "profiles:read"
+description = "查看任意用户资料"
+
+[[permissions]]
+key = "profiles:write"
+description = "修改自己的资料"
+
+[[permissions]]
+key = "profiles:write:all"
+description = "修改任何人的资料(而非仅自己)"
+
 # 最经典的三轴数据矩阵:
 #  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin
 #  admin      —— 读写删 + 看所有人的(read:all),但无 users:admin
@@ -47,17 +59,17 @@ description = "用户管理"
 [[roles]]
 name = "superadmin"
 display_name = "超级管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "users:admin"]
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "users:admin", "profiles:read", "profiles:write", "profiles:write:all"]
 
 [[roles]]
 name = "admin"
 display_name = "管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete"]
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "profiles:read", "profiles:write", "profiles:write:all"]
 
 [[roles]]
 name = "user"
 display_name = "普通用户"
-permissions = ["widgets:read", "contents:read"]
+permissions = ["widgets:read", "contents:read", "profiles:read", "profiles:write"]
 
 [[accounts]]
 username = "superadmin"

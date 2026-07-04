@@ -51,6 +51,10 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             bus.clone(),
         ),
         widget_events: bus,
+        profiles: xchangeai::features::profile::ProfileService::new(
+            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
