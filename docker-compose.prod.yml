@@ -1,0 +1,143 @@
+# 生产 compose:**纯镜像消费**(无 build、无源码上服务器)。镜像由 scripts/prod/build-and-export.sh
+# 在本机构建 + docker save 打包,服务器 import-images.sh 做 docker load 后本文件 up -d。
+#
+# 拓扑:nginx 反代 → app(Mount::App,只公钥) + idm(Mount::Idm,私钥+公钥)分进程 + pg + minio + nats。
+# SSL 由外层(LB / 面板 / certbot)终止,nginx 只服 HTTP:80;prod cookie 带 Secure,故外层必须 HTTPS。
+# 全部 secret / 端口 / 密钥路径来自同目录 .env(由 .env.prod 生成)。
+
+services:
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      app: { condition: service_healthy }
+      idm: { condition: service_healthy }
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${NGINX_PORT:-80}:80"
+
+  # app + idm 共用同一镜像(runtime 含 xchangeai + idm 两个二进制),只 entrypoint 不同。
+  app:
+    image: baserust-runtime:latest
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      pg: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+      nats: { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      APP_ENV: prod
+      IDM_EMBEDDED: "false"        # 分进程:app 只挂业务(widget+content),auth 归 idm 进程
+      # app 只 decode JWT → 只需公钥(被攻破也铸不出 token)。非 dev 公钥 → 过 prod fail-fast。
+      JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
+      APP_DB_HOST: pg
+      APP_DB_PORT: "5432"
+      CONTENT_DB_HOST: pg
+      CONTENT_DB_PORT: "5432"
+      IDM_DB_HOST: pg              # 跨模块预留(needs_idm=false 不实连,见架构文档)
+      IDM_DB_PORT: "5432"
+      NATS_URL: nats://nats:4222
+      # presign 相对 URL 拓扑(只开 80):app 用内网 host 签、返回相对 URL,浏览器经 nginx→minio。
+      # S3_ENDPOINT 指内网 minio(app 内部 HEAD/PUT 直连它 + presign 用它的 host 签);
+      # nginx /content/ 把 Host 固定回 minio:9000(= 签名 host)。minio 无需公开端口。
+      S3_ENDPOINT: http://minio:9000
+      S3_PRESIGN_RELATIVE: "true"
+    volumes:
+      - ./keys/prod-ed25519.pub.pem:/keys/prod-ed25519.pub.pem:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # 不发布主机端口:对外只经 nginx:80。要本机调试临时加 `ports: ["127.0.0.1:6453:8080"]`。
+
+  idm:
+    image: baserust-runtime:latest
+    pull_policy: never
+    entrypoint: ["idm"]
+    restart: unless-stopped
+    depends_on:
+      pg: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    env_file: [.env]
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      APP_ENV: prod
+      # idm 签发:持私钥 + 公钥(自验)。首次启动 seed superadmin(IDM_SEED_ON_START,见 .env 警示)。
+      JWT_PRIVATE_KEY_FILE: /keys/prod-ed25519.pem
+      JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
+      IDM_DB_HOST: pg
+      IDM_DB_PORT: "5432"
+    volumes:
+      - ./keys/prod-ed25519.pem:/keys/prod-ed25519.pem:ro
+      - ./keys/prod-ed25519.pub.pem:/keys/prod-ed25519.pub.pem:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # 不发布主机端口:对外只经 nginx:80。
+
+  # 一次性迁移:pg healthy 后按 schema 迁移,完成即退出。app/idm 等它 completed。
+  migrate:
+    image: baserust-migrate:latest
+    pull_policy: never
+    depends_on:
+      pg: { condition: service_healthy }
+    env_file: [.env]
+    environment:
+      PG_HOST: pg
+    restart: "no"
+
+  pg:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      # 首次(空 volume)建 app/idm/content 的 role + schema(search_path 各指自己 schema)。
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xchangeai} -d ${POSTGRES_DB:-xchangeai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - ./data/minio:/data
+    # 不发布任何主机端口:S3 API 经 nginx /content/ 反代到达,控制台如需调试临时加回环端口。
+    # 对外只开 nginx:80。
+
+  minio-init:
+    image: minio/mc
+    depends_on: [minio]
+    env_file: [.env]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_USER} $${MINIO_PASSWORD}; do echo 'waiting for minio'; sleep 1; done;
+      mc mb --ignore-existing local/$${S3_BUCKET:-content};
+      "
+    restart: "no"
+
+  nats:
+    image: nats:alpine
+    restart: unless-stopped
+    command: ["-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

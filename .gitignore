@@ -11,3 +11,6 @@
 !/keys/dev-ed25519.pem
 !/keys/dev-ed25519.pub.pem
 !/keys/README.md
+
+# 生产部署包(build-and-export.sh 产出):镜像 tar + 明文密码 .env + 私钥,绝不入库。
+/prod/
