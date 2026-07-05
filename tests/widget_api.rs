@@ -147,7 +147,11 @@ async fn health_ok() {
 async fn widgets_require_auth_401() {
     let (app, _tok) = test_app();
     let resp = app
-        .oneshot(Request::get("/api/v1/widgets").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/frontend/widgets")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -158,12 +162,19 @@ async fn create_then_list_offset() {
     let (app, tok) = test_app();
     let resp = app
         .clone()
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"alpha"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"alpha"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let resp = app.oneshot(get("/api/v1/widgets", &tok)).await.unwrap();
+    let resp = app
+        .oneshot(get("/api/v1/frontend/widgets", &tok))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("alpha"));
@@ -175,12 +186,16 @@ async fn create_then_list_offset() {
 async fn cursor_first_page_ok() {
     let (app, tok) = test_app();
     app.clone()
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"a"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"a"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     // 空 cursor = cursor 模式首页
     let resp = app
-        .oneshot(get("/api/v1/widgets?cursor=&size=2", &tok))
+        .oneshot(get("/api/v1/frontend/widgets?cursor=&size=2", &tok))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -191,7 +206,11 @@ async fn cursor_first_page_ok() {
 async fn create_empty_name_is_422() {
     let (app, tok) = test_app();
     let resp = app
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":""}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":""}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -201,7 +220,7 @@ async fn create_empty_name_is_422() {
 async fn bad_cursor_is_400() {
     let (app, tok) = test_app();
     let resp = app
-        .oneshot(get("/api/v1/widgets?cursor=!!!bad", &tok))
+        .oneshot(get("/api/v1/frontend/widgets?cursor=!!!bad", &tok))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -211,7 +230,7 @@ async fn bad_cursor_is_400() {
 async fn page_and_cursor_conflict_is_422() {
     let (app, tok) = test_app();
     let resp = app
-        .oneshot(get("/api/v1/widgets?page=1&cursor=xxx", &tok))
+        .oneshot(get("/api/v1/frontend/widgets?page=1&cursor=xxx", &tok))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -222,7 +241,7 @@ async fn missing_widget_is_404() {
     let (app, tok) = test_app();
     let resp = app
         .oneshot(get(
-            "/api/v1/widgets/00000000-0000-0000-0000-000000000000",
+            "/api/v1/frontend/widgets/00000000-0000-0000-0000-000000000000",
             &tok,
         ))
         .await
@@ -236,12 +255,20 @@ async fn duplicate_name_is_409() {
     let (app, tok) = test_app();
     let first = app
         .clone()
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"dup"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"dup"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::CREATED);
     let dup = app
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"dup"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"dup"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     assert_eq!(dup.status(), StatusCode::CONFLICT);
@@ -253,7 +280,11 @@ async fn put_full_replace_renames_returns_200() {
     let (app, tok) = test_app();
     let created = app
         .clone()
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"before"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"before"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::CREATED);
@@ -262,7 +293,7 @@ async fn put_full_replace_renames_returns_200() {
     let put = app
         .clone()
         .oneshot(put_json(
-            &format!("/api/v1/widgets/{id}"),
+            &format!("/api/v1/frontend/widgets/{id}"),
             r#"{"name":"after"}"#,
             &tok,
         ))
@@ -272,7 +303,7 @@ async fn put_full_replace_renames_returns_200() {
     assert!(body_string(put).await.contains("after"));
 
     let got = app
-        .oneshot(get(&format!("/api/v1/widgets/{id}"), &tok))
+        .oneshot(get(&format!("/api/v1/frontend/widgets/{id}"), &tok))
         .await
         .unwrap();
     assert!(body_string(got).await.contains("after"), "改名应持久");
@@ -284,20 +315,24 @@ async fn delete_soft_deletes_returns_204_then_404() {
     let (app, tok) = test_app();
     let created = app
         .clone()
-        .oneshot(post_json("/api/v1/widgets", r#"{"name":"doomed"}"#, &tok))
+        .oneshot(post_json(
+            "/api/v1/frontend/widgets",
+            r#"{"name":"doomed"}"#,
+            &tok,
+        ))
         .await
         .unwrap();
     let id = created_id(created).await;
 
     let del = app
         .clone()
-        .oneshot(delete_req(&format!("/api/v1/widgets/{id}"), &tok))
+        .oneshot(delete_req(&format!("/api/v1/frontend/widgets/{id}"), &tok))
         .await
         .unwrap();
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
 
     let got = app
-        .oneshot(get(&format!("/api/v1/widgets/{id}"), &tok))
+        .oneshot(get(&format!("/api/v1/frontend/widgets/{id}"), &tok))
         .await
         .unwrap();
     assert_eq!(got.status(), StatusCode::NOT_FOUND, "软删后应 404");
@@ -311,7 +346,7 @@ async fn sse_stream_receives_created_event() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/widgets/events")
+            Request::get("/api/v1/frontend/widgets/events")
                 .header("authorization", format!("Bearer {admin}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -326,7 +361,7 @@ async fn sse_stream_receives_created_event() {
     let created = app
         .clone()
         .oneshot(
-            Request::post("/api/v1/widgets")
+            Request::post("/api/v1/frontend/widgets")
                 .header("authorization", format!("Bearer {admin}"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"name":"sse-demo"}"#))
@@ -355,7 +390,7 @@ async fn sse_requires_auth() {
     let (app, _admin) = test_app();
     let resp = app
         .oneshot(
-            Request::get("/api/v1/widgets/events")
+            Request::get("/api/v1/frontend/widgets/events")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -380,7 +415,7 @@ async fn sse_requires_read_scope() {
         .unwrap();
     let resp = app
         .oneshot(
-            Request::get("/api/v1/widgets/events")
+            Request::get("/api/v1/frontend/widgets/events")
                 .header("authorization", format!("Bearer {scoped}"))
                 .body(Body::empty())
                 .unwrap(),

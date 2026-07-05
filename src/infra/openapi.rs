@@ -26,7 +26,8 @@ use crate::infra::op_perms::op_authz;
         (name = "contents", description = "内容/对象存储:CRUD / 上传下载 / 元数据"),
         (name = "profiles", description = "用户资料:姓名/电话/头像(头像经 content 富化)"),
         (name = "auth", description = "认证:注册/登录/刷新/登出"),
-        (name = "me", description = "当前用户:资料/改密/注销")
+        (name = "me", description = "当前用户:资料/改密/注销"),
+        (name = "admin", description = "后台:管理端登录/当前管理员")
     )
 )]
 pub struct ApiDoc;
@@ -36,7 +37,7 @@ pub const OAUTH2_SCHEME: &str = "oauth2";
 
 /// **标准方案**:OpenAPI 规范内,唯一能结构化承载"端点需哪个权限"的位置 = **oauth2 scheme 的 scopes**
 /// (scope 只对 oauth2/oidc 有意义,apiKey/http 必须空)。把 cookie 优先 / Bearer 兜底的 JWT 登录,
-/// 文档映射成 oauth2 **password flow**(tokenUrl→/auth/login、refreshUrl→/auth/refresh,相对路径守零环境变量启动)。
+/// 文档映射成 oauth2 **password flow**(tokenUrl→/public/auth/login、refreshUrl→/public/auth/refresh,相对路径守零环境变量启动)。
 /// scopes 由 [`Perm::ALL`] 派生 —— scope key 与端点引用、与运行期 `require_scoped` 比较的 wire 串**同源**,杜绝漂移。
 struct SecurityAddon;
 
@@ -48,11 +49,11 @@ impl Modify for SecurityAddon {
             OAUTH2_SCHEME,
             SecurityScheme::OAuth2(OAuth2::with_description(
                 [Flow::Password(Password::with_refresh_url(
-                    "/api/v1/auth/login",
+                    "/api/v1/public/auth/login",
                     scopes,
-                    "/api/v1/auth/refresh",
+                    "/api/v1/public/auth/refresh",
                 ))],
-                "JWT 认证。Token 由 POST /api/v1/auth/login(JSON identifier+password)签发,经 httponly \
+                "JWT 认证。Token 由 POST /api/v1/public/auth/login(JSON identifier+password)签发,经 httponly \
                  `access_token` cookie 优先、`Authorization: Bearer <token>` 兜底两种方式发送。scopes 为 \
                  baserust 权限(由 role 授予;降权令牌有效 scope = role 权限 ∩ per-token scope)。注:本服务无独立 \
                  OAuth2 授权服务器,此 password flow 仅为对上述登录的文档映射,交互式 Authorize 不保证可直接调通。",
@@ -86,7 +87,10 @@ fn perm_doc(p: Perm) -> String {
 /// **必须在 `split_for_parts()` 之后跑**:`modifiers(&SecurityAddon)` 在 `ApiDoc::openapi()` 那一刻执行,
 /// 那时 paths 还空(utoipa-axum 在 merge/nest 后才填 operation),够不到 per-operation。
 pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
-    for (_path, item) in api.paths.paths.iter_mut() {
+    for (path, item) in api.paths.paths.iter_mut() {
+        // admin 组:组闸(users:admin)并入文档 scopes —— OpenAPI 无组级 security,
+        // 组语义只能落到组内每个 operation 上(文档不骗人)。
+        let admin_group = path.starts_with("/api/v1/admin/");
         let ops = [
             item.get.as_mut(),
             item.put.as_mut(),
@@ -101,11 +105,18 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
             let Some(e) = op_authz(id) else {
                 continue; // 不在表 = public,不写 security
             };
-            op.security = Some(vec![match e.perm {
-                Some(p) => SecurityRequirement::new(OAUTH2_SCHEME, [perm_wire(p)]),
-                // 仅登录:空 scope 须 `Vec::<String>::new()` → {"oauth2":[]};**不可** `default()`(那是 {} = 无认证,语义错)。
-                None => SecurityRequirement::new(OAUTH2_SCHEME, Vec::<String>::new()),
-            }]);
+            // 仅登录:空 scopes → {"oauth2":[]};**不可** default()(那是 {} = 无认证,语义错)。
+            let mut scopes = match e.perm {
+                Some(p) => vec![perm_wire(p)],
+                None => Vec::new(),
+            };
+            if admin_group {
+                let admin = perm_wire(Perm::UsersAdmin);
+                if !scopes.contains(&admin) {
+                    scopes.push(admin); // 去重:admin_list_widgets 自身已是 users:admin
+                }
+            }
+            op.security = Some(vec![SecurityRequirement::new(OAUTH2_SCHEME, scopes)]);
         }
     }
 }
@@ -195,6 +206,7 @@ mod tests {
             "health",
             "readyz",
             "widget_stats", // 公开计数:无 CurrentUser/require_scoped
+            "admin_login",  // 验密后 handler 自查 users:admin,非表驱动
         ];
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
         for (_path, item) in v["paths"].as_object().expect("paths").iter() {
@@ -232,5 +244,39 @@ mod tests {
                 e.operation_id
             );
         }
+    }
+
+    /// admin 组注入:`/api/v1/admin/` 下**表内** op 的 scopes 必含 users:admin(组闸进文档,文档不骗人);
+    /// 不在表(admin_login)= public,无 security,跳过。
+    #[test]
+    fn admin_group_ops_carry_users_admin_scope() {
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        let admin_wire = perm_wire(Perm::UsersAdmin);
+        let mut seen = 0;
+        for (path, item) in v["paths"].as_object().expect("paths").iter() {
+            if !path.starts_with("/api/v1/admin/") {
+                continue;
+            }
+            for (_method, op) in item.as_object().expect("path item").iter() {
+                let Some(id) = op.get("operationId").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some(reqs) = op.get("security").and_then(|s| s.as_array()) else {
+                    continue; // public(admin_login)
+                };
+                let scopes: Vec<&str> = reqs[0][OAUTH2_SCHEME]
+                    .as_array()
+                    .expect("oauth2 scopes")
+                    .iter()
+                    .map(|s| s.as_str().unwrap())
+                    .collect();
+                assert!(
+                    scopes.contains(&admin_wire.as_str()),
+                    "admin 组 `{id}` scopes 应含 users:admin,got {scopes:?}"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 2, "admin 组应至少 2 个带 security 的 op,got {seen}");
     }
 }

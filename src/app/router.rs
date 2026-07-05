@@ -1,7 +1,10 @@
-//! 路由装配:各业务模块贡献一个 OpenApiRouter,在此合并;OpenAPI 规范自动汇总。
-//! 加业务模块:在 build_router 里 `.nest("/api/v1", xxx::router())` 一行。
+//! 路由装配:各业务模块贡献一个 OpenApiRouter,按 `public` / `frontend` / `admin` 三组
+//! 合并后统一 nest 到 `/api/v1` 下(auth 也按此三组分别 merge);OpenAPI 规范自动汇总。
+//! 加业务模块:在 build_router 对应组里 `.merge(xxx::router())` 一行。
 //!
 //! 中间件栈:统一错误契约(panic/timeout 也走 `ErrorBody` JSON)+ 安全头 + CORS(按 profile)。
+//! 组闸:`frontend` 组统一挂 `require_login`,`admin` 组统一挂 `require_users_admin`
+//! (粗过滤、防御纵深第一层;端点内 role/scope/字段级三轴照旧)。
 //! 文档端点仅非 prod 暴露。
 
 use std::time::Duration;
@@ -34,37 +37,57 @@ use crate::infra::openapi;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 路由挂载范围。本地开发单进程挂 `Both`;生产分进程各挂 `App` / `Idm`,
-/// 由 nginx 按 `/api/v1/auth` 前缀分流(→ idm 容器,其余 → app 容器)。
+/// 由 nginx 按 `/api/v1/{public,frontend,admin}/auth` 前缀分流(→ idm 容器,其余 → app 容器)。
 #[derive(Clone, Copy, Debug)]
 pub enum Mount {
     /// 只 app 业务(widget) —— 生产 app 进程。
     App,
-    /// 只 idm(auth/me,端点都在 /auth 下) —— 生产 idm 进程。
+    /// 只 idm(auth,端点分 public/frontend/admin 三组挂) —— 生产 idm 进程。
     Idm,
     /// app + idm —— 本地开发单进程。
     Both,
 }
 
-/// 组装路由。按 `mount` 决定挂哪些模块;OpenAPI 规范自动汇总。
-/// widget(/widgets)与 auth(/auth/*)都是 app 拥有的 `OpenApiRouter<AppState>`,各自 path 相对,
-/// 统一 nest 到 /api/v1 下 —— 两次 nest 同前缀会 panic,故**先 merge 再 nest 一次**。
+/// 组装路由。按 `mount` 决定挂哪些模块;业务模块(含 auth)按 public(无闸)/ frontend(需登录)/
+/// admin(users:admin)三组分别 merge,各组统一 nest 到 /api/v1 下再上组闸。
+/// 两次 nest 同前缀会 panic,故**先 merge 再 nest 一次**。
 pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let needs_app = matches!(mount, Mount::App | Mount::Both);
     let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
 
-    // health 在根(/livez 等不带 /api/v1);业务模块按 mount 装配,统一 nest /api/v1。
+    // health 在根(/livez 等不带 /api/v1);业务模块按 mount 装配进三组,统一 nest /api/v1。
     let mut api_router =
         OpenApiRouter::with_openapi(openapi::ApiDoc::openapi()).merge(health::router());
-    let mut features = OpenApiRouter::new();
+    let mut public = OpenApiRouter::new();
+    let mut frontend = OpenApiRouter::new();
+    let mut admin = OpenApiRouter::new();
+    let mut admin_open = OpenApiRouter::new(); // admin 组闸外(admin_login)
     if needs_app {
-        features = features
+        public = public.merge(widget::public_router());
+        frontend = frontend
             .merge(widget::router())
             .merge(content::router())
             .merge(profile::router());
+        admin = admin.merge(widget::admin_router());
     }
     if needs_idm {
-        features = features.merge(auth::router());
+        public = public.merge(auth::public_router());
+        frontend = frontend.merge(auth::me_router());
+        admin = admin.merge(auth::admin_router());
+        admin_open = admin_open.merge(auth::admin_login_router());
     }
+    // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
+    let frontend = frontend.layer(middleware::from_fn(crate::infra::authz::require_login));
+    let admin = admin
+        .layer(middleware::from_fn_with_state(
+            state.policy.clone(),
+            crate::infra::authz::require_users_admin,
+        ))
+        .merge(admin_open); // 闸后 merge:layer 只包已有路由,login 免闸
+    let features = OpenApiRouter::new()
+        .nest("/public", public)
+        .nest("/frontend", frontend)
+        .nest("/admin", admin);
     api_router = api_router.nest("/api/v1", features);
     let (router, mut api) = api_router.split_for_parts();
     // per-operation security 由单一来源表注入(必须 split 后做,modifier 跑时 paths 还空)。
@@ -136,10 +159,27 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
         .nest(
             "/api/v1",
             OpenApiRouter::new()
-                .merge(widget::router())
-                .merge(content::router())
-                .merge(profile::router())
-                .merge(auth::router()),
+                .nest(
+                    "/public",
+                    OpenApiRouter::new()
+                        .merge(widget::public_router())
+                        .merge(auth::public_router()),
+                )
+                .nest(
+                    "/frontend",
+                    OpenApiRouter::new()
+                        .merge(widget::router())
+                        .merge(content::router())
+                        .merge(profile::router())
+                        .merge(auth::me_router()),
+                )
+                .nest(
+                    "/admin",
+                    OpenApiRouter::new()
+                        .merge(widget::admin_router())
+                        .merge(auth::admin_router())
+                        .merge(auth::admin_login_router()),
+                ),
         )
         .split_for_parts()
         .1;

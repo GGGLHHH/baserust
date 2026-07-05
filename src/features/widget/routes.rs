@@ -202,7 +202,7 @@ pub async fn my_widget_count(
 /// 演示"role 限制 = gate 一个该 role 专属的 perm";注意 admin 虽有 `read:all`,无 `users:admin` 仍 403。
 #[utoipa::path(
     get,
-    path = "/widgets/admin/all",
+    path = "/widgets",
     tag = "widgets",
     params(PageQuery),
     responses(

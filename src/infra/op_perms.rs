@@ -135,6 +135,11 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "logout_all",
         perm: None,
     },
+    // ── admin 组:组闸(users:admin)在 router 层;表内 None = 仅登录,文档的 users:admin 由组注入 ──
+    OpAuthz {
+        operation_id: "admin_get_me",
+        perm: None,
+    },
 ];
 
 /// 按 operationId 查授权目录。不在表 = public。

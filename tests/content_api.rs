@@ -151,7 +151,7 @@ fn upload_req(token: &str, file_name: &str, content_type: &str, data: &[u8]) -> 
             .as_bytes(),
     );
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Request::post("/api/v1/contents/upload")
+    Request::post("/api/v1/frontend/contents/upload")
         .header("authorization", format!("Bearer {token}"))
         .header(
             "content-type",
@@ -185,7 +185,10 @@ async fn upload_then_download_round_trip() {
 
     // 下载主对象:字节原样取回,Content-Type 取自元数据。
     let down = app
-        .oneshot(get(&format!("/api/v1/contents/{id}/download"), &admin))
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/download"),
+            &admin,
+        ))
         .await
         .unwrap();
     assert_eq!(down.status(), StatusCode::OK);
@@ -220,14 +223,17 @@ async fn upload_then_get_and_list() {
     // get 单条
     let got = app
         .clone()
-        .oneshot(get(&format!("/api/v1/contents/{id}"), &admin))
+        .oneshot(get(&format!("/api/v1/frontend/contents/{id}"), &admin))
         .await
         .unwrap();
     assert_eq!(got.status(), StatusCode::OK);
     assert!(body_string(got).await.contains(&id));
 
     // list:owner=admin → 含刚建的
-    let list = app.oneshot(get("/api/v1/contents", &admin)).await.unwrap();
+    let list = app
+        .oneshot(get("/api/v1/frontend/contents", &admin))
+        .await
+        .unwrap();
     assert_eq!(list.status(), StatusCode::OK);
     assert!(body_string(list).await.contains(&id));
 }
@@ -238,7 +244,7 @@ async fn contents_require_auth_401() {
     let (app, _admin, _viewer) = test_app();
     let resp = app
         .oneshot(
-            Request::get("/api/v1/contents")
+            Request::get("/api/v1/frontend/contents")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -252,7 +258,7 @@ async fn contents_require_auth_401() {
 async fn create_without_write_perm_403() {
     let (app, _admin, viewer) = test_app();
     let resp = app
-        .oneshot(post_json("/api/v1/contents", r#"{}"#, &viewer))
+        .oneshot(post_json("/api/v1/frontend/contents", r#"{}"#, &viewer))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -264,7 +270,7 @@ async fn missing_content_is_404() {
     let (app, admin, _viewer) = test_app();
     let resp = app
         .oneshot(get(
-            "/api/v1/contents/00000000-0000-0000-0000-000000000000",
+            "/api/v1/frontend/contents/00000000-0000-0000-0000-000000000000",
             &admin,
         ))
         .await
@@ -283,7 +289,10 @@ async fn preview_proxies_bytes_inline_on_memory_backend() {
         .unwrap();
     let id = uploaded_content_id(resp).await;
     let resp = app
-        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &admin,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -315,7 +324,7 @@ async fn preview_and_download_redirect_when_presign_available() {
     let resp = app
         .clone()
         .oneshot(
-            Request::put(format!("/api/v1/contents/{id}/metadata"))
+            Request::put(format!("/api/v1/frontend/contents/{id}/metadata"))
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {admin}"))
                 .body(Body::from(
@@ -328,8 +337,11 @@ async fn preview_and_download_redirect_when_presign_available() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     for (path, want) in [
-        (format!("/api/v1/contents/{id}/preview"), "?inline"),
-        (format!("/api/v1/contents/{id}/download"), "dl=renamed.pdf"),
+        (format!("/api/v1/frontend/contents/{id}/preview"), "?inline"),
+        (
+            format!("/api/v1/frontend/contents/{id}/download"),
+            "dl=renamed.pdf",
+        ),
     ] {
         let resp = app.clone().oneshot(get(&path, &admin)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
@@ -349,7 +361,11 @@ async fn preview_guards_not_ready_and_auth() {
     let (app, admin, _) = test_app();
     let resp = app
         .clone()
-        .oneshot(post_json("/api/v1/contents", r#"{"name":"raw"}"#, &admin))
+        .oneshot(post_json(
+            "/api/v1/frontend/contents",
+            r#"{"name":"raw"}"#,
+            &admin,
+        ))
         .await
         .unwrap();
     // create 响应是扁平 ContentResponse(非 upload 的 {content,object} 形状),直接取 id。
@@ -357,14 +373,17 @@ async fn preview_guards_not_ready_and_auth() {
     let id = v["id"].as_str().unwrap().to_owned();
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &admin,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT); // NotReady → 409
 
     let resp = app
         .oneshot(
-            Request::get(format!("/api/v1/contents/{id}/preview"))
+            Request::get(format!("/api/v1/frontend/contents/{id}/preview"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -429,7 +448,7 @@ async fn two_step_upload_full_flow_on_memory() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/contents/upload-url",
+            "/api/v1/frontend/contents/upload-url",
             r#"{"name":"two-step","file_name":"a.txt","mime_type":"text/plain","tags":["t"]}"#,
             &admin,
         ))
@@ -447,7 +466,7 @@ async fn two_step_upload_full_flow_on_memory() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            &format!("/api/v1/contents/{id}/confirm-upload"),
+            &format!("/api/v1/frontend/contents/{id}/confirm-upload"),
             "{}",
             &admin,
         ))
@@ -472,7 +491,7 @@ async fn two_step_upload_full_flow_on_memory() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            &format!("/api/v1/contents/{id}/confirm-upload"),
+            &format!("/api/v1/frontend/contents/{id}/confirm-upload"),
             "{}",
             &admin,
         ))
@@ -486,7 +505,7 @@ async fn two_step_upload_full_flow_on_memory() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            &format!("/api/v1/contents/{id}/confirm-upload"),
+            &format!("/api/v1/frontend/contents/{id}/confirm-upload"),
             "{}",
             &admin,
         ))
@@ -495,7 +514,10 @@ async fn two_step_upload_full_flow_on_memory() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app
-        .oneshot(get(&format!("/api/v1/contents/{id}/preview"), &admin))
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &admin,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -509,7 +531,7 @@ async fn prepare_returns_signed_url_when_backend_supports() {
         test_app_with_store(Arc::new(PresignStore(content::InMemoryObjectStore::new())));
     let resp = app
         .oneshot(post_json(
-            "/api/v1/contents/upload-url",
+            "/api/v1/frontend/contents/upload-url",
             r#"{"file_name":"b.png","mime_type":"image/png"}"#,
             &admin,
         ))
@@ -527,16 +549,22 @@ async fn two_step_endpoints_enforce_authz() {
     let (app, _admin, viewer) = test_app();
     let resp = app
         .clone()
-        .oneshot(post_json("/api/v1/contents/upload-url", "{}", &viewer))
+        .oneshot(post_json(
+            "/api/v1/frontend/contents/upload-url",
+            "{}",
+            &viewer,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let resp = app
         .oneshot(
-            Request::post("/api/v1/contents/00000000-0000-0000-0000-000000000000/confirm-upload")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
+            Request::post(
+                "/api/v1/frontend/contents/00000000-0000-0000-0000-000000000000/confirm-upload",
+            )
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
         )
         .await
         .unwrap();

@@ -49,7 +49,7 @@ pub struct ProfileResponse {
     pub last_name: Option<String>,
     pub phone: Option<String>,
     pub avatar_content_id: Option<Uuid>,
-    /// 相对路径 `/api/v1/contents/{id}/preview`(单域名哲学,无 base-url 变量)。
+    /// 相对路径 `/api/v1/frontend/contents/{id}/preview`(单域名哲学,无 base-url 变量)。
     pub avatar_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,

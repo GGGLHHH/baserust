@@ -187,7 +187,7 @@ async fn scope_downscopes_below_role_grant() {
     );
 }
 
-// ── 数据所有权(ownership,行级):打**真实** /api/v1/widgets 端点(已 gate),数据来自 mock.toml seed ──
+// ── 数据所有权(ownership,行级):打**真实** /api/v1/frontend/widgets 端点(已 gate),数据来自 mock.toml seed ──
 //
 // 三轴扣点:RBAC∩scope 在边缘判"能不能读"+ data_access 推"看全部 or 自己",
 // 过滤在查询层按 created_by 执行(repo)。superadmin/admin 有 read:all → 全见;user 无 → 只见自己的。
@@ -238,20 +238,20 @@ async fn ownership_user_sees_own_others_see_all() {
     let superadmin = login(&state, "superadmin").await.access_token;
 
     // user(无 read:all)→ /widgets 只列自己的 user-w1
-    let u = body_of(&app, "GET", "/api/v1/widgets", Some(&user)).await;
+    let u = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&user)).await;
     assert!(u.contains("user-w1"), "user 应见自己的: {u}");
     assert!(
         !u.contains("admin-w1") && !u.contains("admin-w2"),
         "user 不该见别人的: {u}"
     );
     // admin(read:all)→ 见全部三个
-    let a = body_of(&app, "GET", "/api/v1/widgets", Some(&admin)).await;
+    let a = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&admin)).await;
     assert!(
         a.contains("admin-w1") && a.contains("admin-w2") && a.contains("user-w1"),
         "admin 应见全部: {a}"
     );
     // superadmin(read:all)→ 见全部
-    let s = body_of(&app, "GET", "/api/v1/widgets", Some(&superadmin)).await;
+    let s = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&superadmin)).await;
     assert!(
         s.contains("admin-w1") && s.contains("user-w1"),
         "superadmin 应见全部: {s}"
@@ -264,8 +264,14 @@ async fn ownership_get_others_widget_is_404_not_403() {
     let app = real_app(&state);
     let user = login(&state, "user").await.access_token;
     let admin = login(&state, "admin").await.access_token;
-    let others = format!("/api/v1/widgets/{}", widget_id(&state, "admin-w1").await); // admin 的
-    let own = format!("/api/v1/widgets/{}", widget_id(&state, "user-w1").await); // user 自己的
+    let others = format!(
+        "/api/v1/frontend/widgets/{}",
+        widget_id(&state, "admin-w1").await
+    ); // admin 的
+    let own = format!(
+        "/api/v1/frontend/widgets/{}",
+        widget_id(&state, "user-w1").await
+    ); // user 自己的
 
     // user 取别人的 → 404(不泄露"这行存在",区别于 403)
     assert_eq!(
@@ -288,14 +294,14 @@ async fn enrichment_fills_created_by_user() {
     let (state, _) = setup().await;
     let app = real_app(&state);
     let user = login(&state, "user").await.access_token;
-    let body = body_of(&app, "GET", "/api/v1/widgets", Some(&user)).await;
+    let body = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&user)).await;
     assert!(
         body.contains("\"username\":\"user\""),
         "富化应把 created_by 解析成用户 brief(username): {body}"
     );
 }
 
-// ── 其余授权形态:public / 仅登录 / superadmin-only(打真实新增的 /api/v1/widgets 端点)──
+// ── 其余授权形态:public / 仅登录 / superadmin-only(打真实新增的 /api/v1/frontend/widgets 端点)──
 
 /// public:`/widgets/stats` 无 token 也 200,且统计到 mock seed 的 3 个 widget。
 #[tokio::test]
@@ -303,10 +309,10 @@ async fn public_stats_needs_no_auth() {
     let (state, _) = setup().await;
     let app = real_app(&state);
     assert_eq!(
-        status(&app, "GET", "/api/v1/widgets/stats", None).await,
+        status(&app, "GET", "/api/v1/public/widgets/stats", None).await,
         StatusCode::OK
     );
-    let body = body_of(&app, "GET", "/api/v1/widgets/stats", None).await;
+    let body = body_of(&app, "GET", "/api/v1/public/widgets/stats", None).await;
     assert!(
         body.contains("\"total\":3"),
         "应统计 mock 的 3 个 widget: {body}"
@@ -320,17 +326,23 @@ async fn my_count_needs_login_no_perm() {
     let app = real_app(&state);
     let user = login(&state, "user").await.access_token;
     assert_eq!(
-        status(&app, "GET", "/api/v1/widgets/my-count", None).await,
+        status(&app, "GET", "/api/v1/frontend/widgets/my-count", None).await,
         StatusCode::UNAUTHORIZED
     );
-    let body = body_of(&app, "GET", "/api/v1/widgets/my-count", Some(&user)).await;
+    let body = body_of(
+        &app,
+        "GET",
+        "/api/v1/frontend/widgets/my-count",
+        Some(&user),
+    )
+    .await;
     assert!(
         body.contains("\"total\":1"),
         "user 自己有 1 个 user-w1: {body}"
     );
 }
 
-/// superadmin-only:`/widgets/admin/all` gate `users:admin`。
+/// superadmin-only:`/api/v1/admin/widgets` gate `users:admin`。
 /// **关键**:admin 虽有 read:all,但无 users:admin → 403;只有 superadmin → 200。
 #[tokio::test]
 async fn admin_list_is_superadmin_only() {
@@ -341,16 +353,16 @@ async fn admin_list_is_superadmin_only() {
     let superadmin = login(&state, "superadmin").await.access_token;
 
     assert_eq!(
-        status(&app, "GET", "/api/v1/widgets/admin/all", Some(&user)).await,
+        status(&app, "GET", "/api/v1/admin/widgets", Some(&user)).await,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        status(&app, "GET", "/api/v1/widgets/admin/all", Some(&admin)).await,
+        status(&app, "GET", "/api/v1/admin/widgets", Some(&admin)).await,
         StatusCode::FORBIDDEN,
         "admin 有 read:all 但无 users:admin → 仍 403"
     );
     assert_eq!(
-        status(&app, "GET", "/api/v1/widgets/admin/all", Some(&superadmin)).await,
+        status(&app, "GET", "/api/v1/admin/widgets", Some(&superadmin)).await,
         StatusCode::OK
     );
 }
@@ -363,7 +375,13 @@ async fn scope_without_read_all_narrows_admin_to_own() {
     let admin = login(&state, "admin").await;
 
     // admin 满权令牌(role 含 read:all)→ 见全部(含 user-w1)
-    let full = body_of(&app, "GET", "/api/v1/widgets", Some(&admin.access_token)).await;
+    let full = body_of(
+        &app,
+        "GET",
+        "/api/v1/frontend/widgets",
+        Some(&admin.access_token),
+    )
+    .await;
     assert!(full.contains("user-w1"), "满权应见全部: {full}");
 
     // admin 降权令牌:scope=[widgets:read],**不含 read:all** → 跌回 Own → 只见自己的
@@ -377,7 +395,7 @@ async fn scope_without_read_all_narrows_admin_to_own() {
             900,
         )
         .unwrap();
-    let narrowed = body_of(&app, "GET", "/api/v1/widgets", Some(&scoped)).await;
+    let narrowed = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&scoped)).await;
     assert!(narrowed.contains("admin-w1"), "降权仍见自己的: {narrowed}");
     assert!(
         !narrowed.contains("user-w1"),

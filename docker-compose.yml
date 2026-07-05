@@ -77,7 +77,8 @@ services:
       S3_ACCESS_KEY: ${MINIO_USER:-minio}
       S3_SECRET_KEY: ${MINIO_PASSWORD:-minio12345}
       S3_REGION: ${S3_REGION:-us-east-1}
-      # 生产分进程:app 只挂 app(widget + content),idm 由独立 idm 容器承载,nginx 按 /api/v1/auth 分流。
+      # 生产分进程:app 只挂 app(widget + content),idm 由独立 idm 容器承载,
+      # nginx 按 /api/v1/{public,frontend,admin}/auth 分流。
       # 经 Config 解析,只认小写 true/false。
       IDM_EMBEDDED: "false"
       # app 的鉴权中间件要 decode JWT,密钥须与 idm 一致。
@@ -102,7 +103,7 @@ services:
     ports:
       - "${APP_PORT:-6453}:8080"
 
-  # idm 进程:同一镜像,override entrypoint 跑 idm bin,只挂 /api/v1/auth/*。连 idm schema。
+  # idm 进程:同一镜像,override entrypoint 跑 idm bin,只挂 auth(分 public/frontend/admin 三组前缀)。连 idm schema。
   # idm 进程:**同一镜像**(同 image+build → 复用 app 已构建的那份),只 override entrypoint 跑 idm bin。
   idm:
     image: baserust-runtime:latest

@@ -154,7 +154,7 @@ async fn seed_content(
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/contents/upload-url",
+            "/api/v1/frontend/contents/upload-url",
             &format!(r#"{{"name":"avatar-src","file_name":"a.bin","mime_type":"{mime}"}}"#),
             token,
         ))
@@ -179,7 +179,7 @@ async fn seed_content(
         let resp = app
             .clone()
             .oneshot(post_json(
-                &format!("/api/v1/contents/{id}/confirm-upload"),
+                &format!("/api/v1/frontend/contents/{id}/confirm-upload"),
                 "{}",
                 token,
             ))
@@ -194,7 +194,7 @@ async fn seed_content(
 #[tokio::test]
 async fn put_upsert_then_anyone_can_read() {
     let (app, _store, _admin, alice, bob) = test_app();
-    let uri = format!("/api/v1/profiles/{ALICE_ID}");
+    let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
 
     let resp = app.clone().oneshot(get(&uri, &alice)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -232,7 +232,7 @@ async fn put_upsert_then_anyone_can_read() {
 #[tokio::test]
 async fn ownership_gate_and_write_all() {
     let (app, _store, admin, alice, _bob) = test_app();
-    let bob_uri = format!("/api/v1/profiles/{BOB_ID}");
+    let bob_uri = format!("/api/v1/frontend/profiles/{BOB_ID}");
 
     let resp = app
         .clone()
@@ -278,7 +278,7 @@ async fn ownership_gate_and_write_all() {
 async fn avatar_bind_enrich_and_dangling_degrade() {
     let (app, store, admin, alice, _bob) = test_app();
     let cid = seed_content(&app, &store, &alice, "image/png", true).await;
-    let uri = format!("/api/v1/profiles/{ALICE_ID}");
+    let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
 
     let resp = app
         .clone()
@@ -293,7 +293,7 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
     let v = body_json(resp).await;
     assert_eq!(
         v["avatar_url"].as_str().unwrap(),
-        format!("/api/v1/contents/{cid}/preview")
+        format!("/api/v1/frontend/contents/{cid}/preview")
     );
 
     // 删 content(admin 有 contents:delete)→ 悬空:GET 降级 avatar_url=null,不炸
@@ -302,7 +302,7 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/v1/contents/{cid}"))
+                .uri(format!("/api/v1/frontend/contents/{cid}"))
                 .header("authorization", format!("Bearer {admin}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -325,7 +325,7 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
 #[tokio::test]
 async fn avatar_bad_bindings_rejected_422() {
     let (app, store, _admin, alice, _bob) = test_app();
-    let uri = format!("/api/v1/profiles/{ALICE_ID}");
+    let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
     let unconfirmed = seed_content(&app, &store, &alice, "image/png", false).await;
     let not_image = seed_content(&app, &store, &alice, "text/plain", true).await;
     for bad in [Uuid::now_v7().to_string(), unconfirmed, not_image] {
@@ -350,7 +350,7 @@ async fn avatar_bad_bindings_rejected_422() {
 #[tokio::test]
 async fn unauthenticated_401() {
     let (app, _store, _a, _b, _c) = test_app();
-    let uri = format!("/api/v1/profiles/{ALICE_ID}");
+    let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
     let resp = app
         .clone()
         .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())

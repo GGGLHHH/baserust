@@ -23,28 +23,42 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 
 ## 端点
 
+`/api/v1` 下分三组——`/public` 免登录、`/frontend` 需登录、`/admin` 需 `users:admin`(组级闸 + 端点内细粒度双层)。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 存活探针 |
-| GET | `/api/v1/widgets` | 列表,**双模式分页**(offset `?page=&size=` / cursor `?cursor=&size=`) |
-| POST | `/api/v1/widgets` | 创建 |
-| GET/PUT/DELETE | `/api/v1/widgets/{id}` | 取 / 改名 / 软删除 |
-| GET | `/api/v1/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
-| POST | `/api/v1/contents/upload` | 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据 |
-| GET | `/api/v1/contents` | 列当前用户的内容(单租户) |
-| POST | `/api/v1/contents` | 建内容(仅 content 行,status=created) |
-| GET | `/api/v1/contents/{id}` | 取内容 |
-| PUT | `/api/v1/contents/{id}` | 全量更新内容可编辑字段 |
-| DELETE | `/api/v1/contents/{id}` | 软删内容 |
-| GET | `/api/v1/contents/{id}/preview` | inline 预览;presign 后端 307 跳签名 URL,内存后端代理字节 |
-| GET | `/api/v1/contents/{id}/download` | 下载内容主对象字节(presign 后端 307 跳转) |
-| POST | `/api/v1/contents/upload-url` | 两步上传①:建账+签直传凭证(`upload_url=null` 回退一步上传) |
-| POST | `/api/v1/contents/{id}/confirm-upload` | 两步上传③:核对落桶→销账(幂等;未传 409) |
-| GET | `/api/v1/contents/{id}/objects` | 列某内容的对象 |
-| GET | `/api/v1/contents/{id}/metadata` | 取内容元数据 |
-| PUT | `/api/v1/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
-| GET | `/api/v1/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
-| PUT | `/api/v1/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |
+| POST | `/api/v1/public/auth/register` | 注册(token 写 httponly cookie) |
+| POST | `/api/v1/public/auth/login` | 登录(401 同码同文案防枚举) |
+| POST | `/api/v1/public/auth/refresh` | 刷新会话(读 refresh cookie) |
+| POST | `/api/v1/public/auth/logout` | 登出,清 cookie(幂等) |
+| GET | `/api/v1/public/widgets/stats` | 公开计数(免登录样板) |
+| GET | `/api/v1/frontend/widgets` | 列表,**双模式分页**(offset `?page=&size=` / cursor `?cursor=&size=`) |
+| POST | `/api/v1/frontend/widgets` | 创建 |
+| GET/PUT/DELETE | `/api/v1/frontend/widgets/{id}` | 取 / 改名 / 软删除 |
+| GET | `/api/v1/frontend/widgets/my-count` | 我创建的 widget 数(仅登录样板) |
+| GET | `/api/v1/frontend/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
+| POST | `/api/v1/frontend/contents/upload` | 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据 |
+| GET | `/api/v1/frontend/contents` | 列当前用户的内容(单租户) |
+| POST | `/api/v1/frontend/contents` | 建内容(仅 content 行,status=created) |
+| GET | `/api/v1/frontend/contents/{id}` | 取内容 |
+| PUT | `/api/v1/frontend/contents/{id}` | 全量更新内容可编辑字段 |
+| DELETE | `/api/v1/frontend/contents/{id}` | 软删内容 |
+| GET | `/api/v1/frontend/contents/{id}/preview` | inline 预览;presign 后端 307 跳签名 URL,内存后端代理字节 |
+| GET | `/api/v1/frontend/contents/{id}/download` | 下载内容主对象字节(presign 后端 307 跳转) |
+| POST | `/api/v1/frontend/contents/upload-url` | 两步上传①:建账+签直传凭证(`upload_url=null` 回退一步上传) |
+| POST | `/api/v1/frontend/contents/{id}/confirm-upload` | 两步上传③:核对落桶→销账(幂等;未传 409) |
+| GET | `/api/v1/frontend/contents/{id}/objects` | 列某内容的对象 |
+| GET | `/api/v1/frontend/contents/{id}/metadata` | 取内容元数据 |
+| PUT | `/api/v1/frontend/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
+| GET | `/api/v1/frontend/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
+| PUT | `/api/v1/frontend/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |
+| GET/PUT/DELETE | `/api/v1/frontend/auth/me` | 当前用户:查 / 改资料 / 注销(注销需密码) |
+| POST | `/api/v1/frontend/auth/me/password` | 改密(撤销所有会话) |
+| POST | `/api/v1/frontend/auth/logout-all` | 撤销所有会话 |
+| POST | `/api/v1/admin/auth/login` | 后台登录:验密后需 `users:admin`,否则 403 不发 token |
+| GET | `/api/v1/admin/auth/me` | 当前管理员(组闸 `users:admin`) |
+| GET | `/api/v1/admin/widgets` | 管理端全量 widget 列表(原 `/widgets/admin/all`) |
 | GET | `/docs` | Scalar API 文档 UI |
 | GET | `/api-docs/openapi.{json,yaml}` | OpenAPI 规范 |
 

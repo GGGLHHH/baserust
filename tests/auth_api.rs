@@ -132,7 +132,7 @@ fn post_with_cookie(uri: &str, cookie: &str) -> Request<Body> {
 async fn register_sets_httponly_cookie_and_returns_user() {
     let resp = test_app()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             r#"{"username":"alice","email":"a@b.com","password":"password123"}"#,
         ))
         .await
@@ -166,11 +166,11 @@ async fn register_duplicate_username_is_409() {
     let app = test_app();
     let body = r#"{"username":"dupuser","email":"dup@b.com","password":"password123"}"#;
     app.clone()
-        .oneshot(post_json("/api/v1/auth/register", body))
+        .oneshot(post_json("/api/v1/public/auth/register", body))
         .await
         .unwrap();
     let resp = app
-        .oneshot(post_json("/api/v1/auth/register", body))
+        .oneshot(post_json("/api/v1/public/auth/register", body))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -182,7 +182,7 @@ async fn register_weak_password_is_422() {
     // 低于 password 最小长度(min=3)→ 422;此处发 2 字符。
     let resp = test_app()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             r#"{"username":"bob","email":"b@b.com","password":"ab"}"#,
         ))
         .await
@@ -193,7 +193,7 @@ async fn register_weak_password_is_422() {
 #[tokio::test]
 async fn register_malformed_json_is_400() {
     let resp = test_app()
-        .oneshot(post_json("/api/v1/auth/register", r#"{not json"#))
+        .oneshot(post_json("/api/v1/public/auth/register", r#"{not json"#))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -206,7 +206,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
     let app = test_app();
     app.clone()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             r#"{"username":"loginuser","password":"password123"}"#,
         ))
         .await
@@ -214,7 +214,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"loginuser","password":"password123"}"#,
         ))
         .await
@@ -226,7 +226,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
     let via_cookie = app
         .clone()
         .oneshot(get_with_cookie(
-            "/api/v1/auth/me",
+            "/api/v1/frontend/auth/me",
             &format!("access_token={token}"),
         ))
         .await
@@ -241,7 +241,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
 
     // Bearer 兜底(同一 token 也认)
     let via_bearer = app
-        .oneshot(get_with_bearer("/api/v1/auth/me", &token))
+        .oneshot(get_with_bearer("/api/v1/frontend/auth/me", &token))
         .await
         .unwrap();
     assert_eq!(via_bearer.status(), StatusCode::OK);
@@ -253,7 +253,7 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
     let app = test_app();
     app.clone()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             r#"{"username":"realuser","password":"password123"}"#,
         ))
         .await
@@ -262,14 +262,14 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
     let wrong_pw = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"realuser","password":"WRONGpass1"}"#,
         ))
         .await
         .unwrap();
     let unknown = app
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"nobody","password":"password123"}"#,
         ))
         .await
@@ -289,7 +289,7 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
 #[tokio::test]
 async fn me_without_credentials_is_401() {
     let resp = test_app()
-        .oneshot(get_plain("/api/v1/auth/me"))
+        .oneshot(get_plain("/api/v1/frontend/auth/me"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -299,7 +299,7 @@ async fn me_without_credentials_is_401() {
 async fn me_with_garbage_cookie_is_401() {
     let resp = test_app()
         .oneshot(get_with_cookie(
-            "/api/v1/auth/me",
+            "/api/v1/frontend/auth/me",
             "access_token=garbage.token.xxx",
         ))
         .await
@@ -313,7 +313,7 @@ async fn me_with_garbage_cookie_is_401() {
 async fn logout_clears_cookies_and_204() {
     let resp = test_app()
         .oneshot(
-            Request::post("/api/v1/auth/logout")
+            Request::post("/api/v1/public/auth/logout")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -338,7 +338,7 @@ async fn refresh_rotates_and_old_token_is_revoked() {
     let app = test_app();
     app.clone()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             r#"{"username":"refuser","password":"password123"}"#,
         ))
         .await
@@ -346,7 +346,7 @@ async fn refresh_rotates_and_old_token_is_revoked() {
     let login = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"refuser","password":"password123"}"#,
         ))
         .await
@@ -357,7 +357,7 @@ async fn refresh_rotates_and_old_token_is_revoked() {
     let resp = app
         .clone()
         .oneshot(post_with_cookie(
-            "/api/v1/auth/refresh",
+            "/api/v1/public/auth/refresh",
             &format!("refresh_token={old}"),
         ))
         .await
@@ -369,7 +369,7 @@ async fn refresh_rotates_and_old_token_is_revoked() {
     // 旧 refresh 已撤销 → 再用 → 401(防重放)
     let reuse = app
         .oneshot(post_with_cookie(
-            "/api/v1/auth/refresh",
+            "/api/v1/public/auth/refresh",
             &format!("refresh_token={old}"),
         ))
         .await
@@ -402,7 +402,7 @@ fn req_with_cookie(method: &str, uri: &str, cookie: &str, json: Option<&str>) ->
 async fn register_user(app: &Router, username: &str, password: &str) -> Response {
     app.clone()
         .oneshot(post_json(
-            "/api/v1/auth/register",
+            "/api/v1/public/auth/register",
             &format!(r#"{{"username":"{username}","password":"{password}"}}"#),
         ))
         .await
@@ -421,7 +421,7 @@ async fn update_me_changes_username() {
     let resp = app
         .oneshot(req_with_cookie(
             "PUT",
-            "/api/v1/auth/me",
+            "/api/v1/frontend/auth/me",
             &cookie,
             Some(r#"{"username":"upduser2"}"#),
         ))
@@ -446,7 +446,7 @@ async fn delete_me_soft_deletes_and_blocks_login() {
         .clone()
         .oneshot(req_with_cookie(
             "DELETE",
-            "/api/v1/auth/me",
+            "/api/v1/frontend/auth/me",
             &cookie,
             Some(r#"{"password":"password123"}"#),
         ))
@@ -456,7 +456,7 @@ async fn delete_me_soft_deletes_and_blocks_login() {
     // 软删后再登录 → 401
     let relogin = app
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"deluser","password":"password123"}"#,
         ))
         .await
@@ -477,7 +477,7 @@ async fn change_password_old_fails_new_works() {
         .clone()
         .oneshot(req_with_cookie(
             "POST",
-            "/api/v1/auth/me/password",
+            "/api/v1/frontend/auth/me/password",
             &cookie,
             Some(r#"{"current_password":"password123","new_password":"newpass456"}"#),
         ))
@@ -488,7 +488,7 @@ async fn change_password_old_fails_new_works() {
     let old = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"pwuser","password":"password123"}"#,
         ))
         .await
@@ -496,7 +496,7 @@ async fn change_password_old_fails_new_works() {
     assert_eq!(old.status(), StatusCode::UNAUTHORIZED, "旧密码应失效");
     let new = app
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"pwuser","password":"newpass456"}"#,
         ))
         .await
@@ -517,7 +517,7 @@ async fn in_process_seed_lets_superadmin_log_in() {
 
     let resp = app
         .oneshot(post_json(
-            "/api/v1/auth/login",
+            "/api/v1/public/auth/login",
             r#"{"identifier":"superadmin","password":"pwd"}"#,
         ))
         .await

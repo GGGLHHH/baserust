@@ -2,7 +2,8 @@
 //! 写进 `Set-Cookie`,body 只返 `UserResponse`(token 不进响应体);鉴权由 `authenticate` 中间件读
 //! cookie(Bearer 兜底)。业务逻辑全在 idm 库的 `AuthService` —— 这里只做校验 + cookie + DTO 翻译。
 //!
-//! 端点都在 `/auth` 前缀下;`build_router` nest `/api/v1` 后即 `/api/v1/auth/*`,nginx 按此前缀分流。
+//! 端点分三组挂载(public:register/login/refresh/logout;frontend:me*/logout-all;
+//! admin:admin_login/admin_get_me),nginx 按 `/api/v1/{public,frontend,admin}/auth/` 三前缀分流。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,6 +16,7 @@ use super::types::{
 };
 use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
+use crate::infra::authz::Perm;
 use crate::infra::error::{AppError, ErrorBody};
 use crate::infra::extract::Json;
 
@@ -226,4 +228,52 @@ pub async fn change_password(
     req.validate()?;
     state.auth.change_password(user.0.id, req.into()).await?;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+// ── admin 组(后台)。login 在组闸外(public 语义,验密后自查);me 在闸内。 ──
+
+#[utoipa::path(
+    post, path = "/auth/login", tag = "admin",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "后台登录成功,token 写入 httponly cookie", body = UserResponse),
+        (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
+        (status = 403, description = "凭据正确但无后台权限(users:admin),不发 token 不设 cookie", body = ErrorBody),
+    )
+)]
+pub async fn admin_login(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<LoginRequest>,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    req.validate()?;
+    let outcome = state.auth.login(req.into()).await?;
+    // 验密后闸:无 users:admin → 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
+    // login 已铸的 refresh 会话立即撤销,不留"验过密但没资格"的孤儿会话。
+    if !state
+        .policy
+        .perms_for(&outcome.user.roles)
+        .contains(&Perm::UsersAdmin)
+    {
+        state.auth.logout(&outcome.refresh_token).await?;
+        return Err(AppError::Forbidden);
+    }
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user.into())))
+}
+
+#[utoipa::path(
+    get, path = "/auth/me", tag = "admin",
+    responses(
+        (status = 200, body = UserResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, description = "组闸:无 users:admin", body = ErrorBody),
+    )
+)]
+pub async fn admin_get_me(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<UserResponse>, AppError> {
+    let view = state.auth.me(user.0.id).await?;
+    Ok(Json(view.into()))
 }

@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 use crate::app::state::AppState;
 
-/// 本模块的路由 + OpenAPI,挂到主 router。
+/// frontend 组(组闸「需登录」由 composition root 上):CRUD / 仅登录样板 / SSE。
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::list_widgets, routes::create_widget))
@@ -33,9 +33,16 @@ pub fn router() -> OpenApiRouter<AppState> {
             routes::update_widget,
             routes::delete_widget
         ))
-        // 授权形态样板:public / 仅登录 / superadmin-only(各自独立路径,分开 routes!)
-        .routes(routes!(routes::widget_stats))
         .routes(routes!(routes::my_widget_count))
-        .routes(routes!(routes::admin_list_widgets))
         .routes(routes!(routes::widget_events))
+}
+
+/// public 组(无闸):公开样板。
+pub fn public_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(routes::widget_stats))
+}
+
+/// admin 组(组闸「users:admin」由 composition root 上)。
+pub fn admin_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(routes::admin_list_widgets))
 }

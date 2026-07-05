@@ -9,9 +9,12 @@
 //! —— 契合"app 进程只 decode JWT"的拓扑。`scope` 是 per-token 子集(只收窄、不放大)。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -259,6 +262,38 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenScope {
     }
 }
 
+/// 组闸:需登录(`/api/v1/frontend` 组)。粗过滤:extensions 无 `AuthUser`(`auth::authenticate`
+/// 没验出人)→ 401 统一 `ErrorBody`。细粒度(perm/scope/ownership)仍归端点内三轴 ——
+/// 本闸只是防御纵深第一层。注:axum `.layer()` 只包已注册路由,组内未知路径仍走 fallback 404、不过闸。
+pub async fn require_login(req: Request, next: Next) -> Response {
+    if req.extensions().get::<AuthUser>().is_none() {
+        return AppError::Unauthorized.into_response();
+    }
+    next.run(req).await
+}
+
+/// 组闸:登录 + `users:admin`(`/api/v1/admin` 组)。**走 `require_scoped`(role ∩ scope)**,
+/// 与端点内闸、openapi_authz 探针同一评估语义 —— 降权令牌(scope 未含 users:admin)即便 role 够也挡。
+/// state 直接吃 `Arc<Policy>`(infra 不 import app 的 AppState,守分层)。
+pub async fn require_users_admin(
+    State(policy): State<Arc<Policy>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(user) = req.extensions().get::<AuthUser>().cloned() else {
+        return AppError::Unauthorized.into_response();
+    };
+    let scope = req
+        .extensions()
+        .get::<TokenScope>()
+        .cloned()
+        .unwrap_or_default();
+    if let Err(e) = policy.require_scoped(&user, &scope.0, Perm::UsersAdmin) {
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +342,82 @@ mod tests {
         assert!(policy
             .require_scoped(&u, &[Perm::WidgetReadAll], Perm::WidgetRead)
             .is_ok());
+    }
+
+    // ── 组闸中间件:小 Router + Extension 注入,黑盒断言状态码 ──
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::{middleware, Extension, Router};
+    use tower::ServiceExt;
+
+    async fn gate_status(app: Router, uri: &str) -> StatusCode {
+        app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// require_login:无 AuthUser → 401;有 → 放行。
+    #[tokio::test]
+    async fn require_login_gates_unauthenticated() {
+        let app = Router::new()
+            .route("/t", get(|| async { "ok" }))
+            .layer(middleware::from_fn(require_login));
+        assert_eq!(gate_status(app, "/t").await, StatusCode::UNAUTHORIZED);
+
+        let app = Router::new()
+            .route("/t", get(|| async { "ok" }))
+            .layer(middleware::from_fn(require_login))
+            .layer(Extension(user(&["user"]))); // 外层先跑,注入 AuthUser
+        assert_eq!(gate_status(app, "/t").await, StatusCode::OK);
+    }
+
+    /// require_users_admin:401(未登录)/ 403(role 无 perm)/ 403(role 够但 scope 收窄)/ 放行。
+    #[tokio::test]
+    async fn require_users_admin_gates_role_and_scope() {
+        let policy = Arc::new(Policy::from_roles([(
+            "root".to_owned(),
+            vec![Perm::UsersAdmin],
+        )]));
+        let mk = |u: Option<AuthUser>, scope: Option<TokenScope>| {
+            let mut app = Router::new().route("/t", get(|| async { "ok" })).layer(
+                middleware::from_fn_with_state(policy.clone(), require_users_admin),
+            );
+            if let Some(u) = u {
+                app = app.layer(Extension(u));
+            }
+            if let Some(s) = scope {
+                app = app.layer(Extension(s));
+            }
+            app
+        };
+        // 未登录 → 401
+        assert_eq!(
+            gate_status(mk(None, None), "/t").await,
+            StatusCode::UNAUTHORIZED
+        );
+        // role 无 users:admin → 403
+        assert_eq!(
+            gate_status(mk(Some(user(&["user"])), None), "/t").await,
+            StatusCode::FORBIDDEN
+        );
+        // role 够、scope 收窄(未含 users:admin)→ 403(降权令牌不得穿闸)
+        assert_eq!(
+            gate_status(
+                mk(
+                    Some(user(&["root"])),
+                    Some(TokenScope(vec![Perm::WidgetRead]))
+                ),
+                "/t"
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // role 够、scope 空(满权令牌)→ 放行
+        assert_eq!(
+            gate_status(mk(Some(user(&["root"])), None), "/t").await,
+            StatusCode::OK
+        );
     }
 }

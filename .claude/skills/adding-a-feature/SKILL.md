@@ -36,12 +36,12 @@ tests/<name>_api.rs      oneshot integration tests (optional but expected)
 
 | Gotcha | Do this |
 |---|---|
-| **Two `.nest("/api/v1", ...)` panics** (axum rejects duplicate prefix) | `.nest("/api/v1", widget::router().merge(<name>::router()))` — merge first, nest once |
+| **Two `.nest(...)` on the same prefix panics** (axum rejects duplicate prefix) | merge your router into its **group** router in `router.rs` (`public`/`frontend`/`admin` — see "Route path" below for which); each group is still nested exactly once |
 | **Adding an AppState field breaks every test** | `AppState` is built by-struct in each `tests/*_api.rs` `test_app()`; add the new field there too, or the whole crate fails to compile |
 | **`just migrate-add` makes a timestamp prefix** | Hand-write `000N_create_<name>s.{up,down}.sql` to keep the sequential `000N` convention |
 | **`set_updated_at_utc()` is shared** | It's created by `0001`. New migration only `create trigger ... execute function set_updated_at_utc();`. down: drop the trigger, **never** drop the function |
 | **`COLS` order / no `deleted_at`** | Column order must match the `<Name>` FromRow field order; `COLS` excludes `deleted_at` (DTO never exposes it) |
-| **Route path** | Write `path = "/<name>s"` — the `/api/v1` prefix is added by `nest`, don't repeat it |
+| **Route path** | Write `path = "/<name>s"` — the `/api/v1/<group>` prefix is added by `nest` (group = public/frontend/admin, see `router.rs`; default business CRUD belongs in `frontend`), don't repeat it |
 | **Reuse the pool** | In `AppState::new`'s `Some(url)` arm, `connect_pool` once and `pool.clone()` into each repo (PgPool is Arc-cheap) — don't connect per feature |
 
 ## API style (project convention — NOT a per-feature choice)
@@ -49,7 +49,7 @@ tests/<name>_api.rs      oneshot integration tests (optional but expected)
 RESTful、资源导向,全项目统一,新端点照做、别逐 feature 重选:
 
 - **写操作用 `PUT` 全量替换,不用 `PATCH`**。更新端点收资源的**完整表示**:必填字段必传,可选字段给值=设、给 null 或缺=清空。请求 DTO 别为"部分更新"把字段全 `Option`(那是 PATCH 语义)。范例:idm `PUT /auth/me`(`UpdateMeRequest { username: String, email: Option<String> }`)→ repo `update(id, username: &str, email: Option<&str>, by)` 全量替换、替换 email 重置 email_verified。
-- 标准动词:`GET`(取/列)、`POST`(建→201)、`PUT`(全量更新)、`DELETE`(删→204)。path 用复数资源名(`/widgets`),`/api/v1` 由 nest 加、别重复。
+- 标准动词:`GET`(取/列)、`POST`(建→201)、`PUT`(全量更新)、`DELETE`(删→204)。path 用复数资源名(`/widgets`),`/api/v1/<group>` 由 nest 加(组见 `router.rs`;默认业务 CRUD 归 `frontend` 组)、别重复。
 
 ## Decisions to make (don't default silently)
 

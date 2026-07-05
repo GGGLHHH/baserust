@@ -76,7 +76,9 @@ impl ProfileService {
         let avatar_url = match p.avatar_content_id {
             None => None,
             Some(cid) => match self.avatars.probe(cid).await {
-                Ok(Some(info)) if info.ready => Some(format!("/api/v1/contents/{cid}/preview")),
+                Ok(Some(info)) if info.ready => {
+                    Some(format!("/api/v1/frontend/contents/{cid}/preview"))
+                }
                 Ok(_) => None,
                 Err(e) => {
                     tracing::warn!(error = %e, content_id = %cid, "avatar 富化探测失败,降级 null");
@@ -196,7 +198,7 @@ mod tests {
         let (_, r) = svc.put(uid, req(Some(ok_id)), &ctx()).await.unwrap();
         assert_eq!(
             r.avatar_url.as_deref(),
-            Some(format!("/api/v1/contents/{ok_id}/preview").as_str())
+            Some(format!("/api/v1/frontend/contents/{ok_id}/preview").as_str())
         );
     }
 

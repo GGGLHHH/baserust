@@ -18,13 +18,18 @@ use utoipa_axum::routes;
 
 use crate::app::state::AppState;
 
-/// auth 路由 + OpenAPI。端点 path 已含 `/auth/*`,由 `build_router` nest `/api/v1` → `/api/v1/auth/*`。
-pub fn router() -> OpenApiRouter<AppState> {
+/// public 组(无闸):注册/登录/刷新/登出。
+pub fn public_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::register))
         .routes(routes!(routes::login))
         .routes(routes!(routes::refresh))
         .routes(routes!(routes::logout))
+}
+
+/// frontend 组(闸:登录):当前用户资料/改密/全登出。
+pub fn me_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
         .routes(routes!(routes::logout_all))
         .routes(routes!(
             routes::get_me,
@@ -32,4 +37,14 @@ pub fn router() -> OpenApiRouter<AppState> {
             routes::delete_me
         ))
         .routes(routes!(routes::change_password))
+}
+
+/// admin 组闸内:当前管理员。
+pub fn admin_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(routes::admin_get_me))
+}
+
+/// admin 组闸外:后台登录(public 语义 —— 未认证请求闸挡不了,验密后 handler 自查 users:admin)。
+pub fn admin_login_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(routes::admin_login))
 }
