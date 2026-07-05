@@ -12,17 +12,17 @@ use axum::response::Response;
 use axum::Router;
 use tower::ServiceExt; // oneshot
 
+use baserust::app::{build_router, AppState, Mount};
+use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
+use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
-use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
-use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
 fn test_app() -> Router {
     let signer = Arc::new(AppTokenSigner::dev());
     let verifier = Arc::new(AppTokenVerifier::dev());
-    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
-        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
+    let bus: Arc<dyn baserust::features::widget::EventBus> =
+        Arc::new(baserust::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
@@ -30,9 +30,9 @@ fn test_app() -> Router {
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: xchangeai::features::profile::ProfileService::new(
-            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        profiles: baserust::features::profile::ProfileService::new(
+            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
         ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
@@ -43,13 +43,13 @@ fn test_app() -> Router {
         auth: test_auth(signer.clone(), verifier.clone()),
         db_pool: None,
         cookie_secure: false,
-        policy: Arc::new(xchangeai::infra::authz::Policy::default()), // 这套契约不测授权
+        policy: Arc::new(baserust::infra::authz::Policy::default()), // 这套契约不测授权
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
     };
     build_router(
         state,
-        &xchangeai::infra::config::Config::default(),
+        &baserust::infra::config::Config::default(),
         Mount::Both,
     )
 }
@@ -513,7 +513,7 @@ async fn change_password_old_fails_new_works() {
 /// 用真 Argon2(seed 与登录验密同一把),稍慢但端到端证明 seed 生效。
 #[tokio::test]
 async fn in_process_seed_lets_superadmin_log_in() {
-    let config = xchangeai::infra::config::Config::default(); // dev → seed_on_start = true
+    let config = baserust::infra::config::Config::default(); // dev → seed_on_start = true
     let state = AppState::new(&config, Mount::Both).await.unwrap();
     let app = build_router(state, &config, Mount::Both);
 

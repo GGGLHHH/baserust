@@ -6,8 +6,8 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::ServiceExt;
 
-use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::infra::config::Config;
+use baserust::app::{build_router, AppState, Mount};
+use baserust::infra::config::Config;
 
 async fn setup() -> (Router, AppState) {
     let config = Config::default();

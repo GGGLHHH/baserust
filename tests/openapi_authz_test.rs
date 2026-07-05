@@ -19,12 +19,12 @@ use serde_json::Value;
 use tower::ServiceExt; // oneshot
 use uuid::Uuid;
 
+use baserust::app::router::api_spec;
+use baserust::app::{build_router, AppState, Mount};
+use baserust::features::auth::AppTokenSigner;
+use baserust::infra::authz::Perm;
+use baserust::infra::config::Config;
 use idm::LoginInput;
-use xchangeai::app::router::api_spec;
-use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::AppTokenSigner;
-use xchangeai::infra::authz::Perm;
-use xchangeai::infra::config::Config;
 
 /// spec 里的 scope 串 → `Perm`(经 serde rename;非法即 panic,本就该是合法 Perm)。
 fn str_to_perm(s: &str) -> Perm {

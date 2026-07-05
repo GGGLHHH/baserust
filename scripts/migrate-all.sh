@@ -6,7 +6,7 @@
 set -eu
 host="${PG_HOST:-pg}"
 port="${PG_PORT:-5432}"
-db="${POSTGRES_DB:-xchangeai}"
+db="${POSTGRES_DB:-baserust}"
 
 migrate_schema() { # $1=schema目录 $2=role $3=password
   if ! ls "migrations/$1"/*.sql >/dev/null 2>&1; then

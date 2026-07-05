@@ -13,11 +13,11 @@ use tower::ServiceExt; // oneshot
 
 use uuid::Uuid;
 
+use baserust::app::{build_router, AppState, Mount};
+use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
+use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
+use baserust::infra::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
-use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
-use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
-use xchangeai::infra::authz::{Perm, Policy};
 
 /// 内存 app + 两枚令牌:`admin`(read+write+delete)与 `viewer`(只 read),store 可注入
 /// (presign 用例喂覆写 URL 方法的假 store)。admin/viewer 各有独立 owner uuid(content list 按
@@ -43,8 +43,8 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             900,
         )
         .unwrap();
-    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
-        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
+    let bus: Arc<dyn baserust::features::widget::EventBus> =
+        Arc::new(baserust::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
@@ -52,9 +52,9 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: xchangeai::features::profile::ProfileService::new(
-            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        profiles: baserust::features::profile::ProfileService::new(
+            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
         ),
         contents: content::ContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
@@ -71,7 +71,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
     };
     let app = build_router(
         state,
-        &xchangeai::infra::config::Config::default(),
+        &baserust::infra::config::Config::default(),
         Mount::Both,
     );
     (app, admin, viewer)

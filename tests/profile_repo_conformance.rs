@@ -4,8 +4,8 @@
 //!
 //! 内存入口:默认 `cargo test`。PG 入口:`just test-pg`(--features pg-conformance)。
 
+use baserust::features::profile::{ProfileFields, ProfileRepo};
 use uuid::Uuid;
-use xchangeai::features::profile::{ProfileFields, ProfileRepo};
 
 async fn profile_repo_contract(repo: &dyn ProfileRepo) {
     let uid = Uuid::now_v7();
@@ -57,7 +57,7 @@ async fn profile_repo_contract(repo: &dyn ProfileRepo) {
 
 #[tokio::test]
 async fn memory_satisfies_profile_contract() {
-    let repo = xchangeai::features::profile::InMemoryProfileRepo::new();
+    let repo = baserust::features::profile::InMemoryProfileRepo::new();
     profile_repo_contract(&repo).await;
 }
 
@@ -75,7 +75,7 @@ mod pg {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let repo = xchangeai::features::profile::PgProfileRepo::new(pool);
+        let repo = baserust::features::profile::PgProfileRepo::new(pool);
         profile_repo_contract(&repo).await;
         Ok(())
     }

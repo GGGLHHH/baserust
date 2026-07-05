@@ -15,14 +15,14 @@ use axum::Router;
 use tower::ServiceExt; // oneshot
 use uuid::Uuid;
 
+use baserust::app::{build_router, AppState, Mount};
+use baserust::features::auth::{authenticate, AppTokenSigner};
+use baserust::infra::audit::CurrentUser;
+use baserust::infra::authz::{Perm, TokenScope};
+use baserust::infra::config::Config;
+use baserust::infra::error::AppError;
+use baserust::infra::pagination::PageQuery;
 use idm::{AuthOutcome, LoginInput};
-use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::{authenticate, AppTokenSigner};
-use xchangeai::infra::audit::CurrentUser;
-use xchangeai::infra::authz::{Perm, TokenScope};
-use xchangeai::infra::config::Config;
-use xchangeai::infra::error::AppError;
-use xchangeai::infra::pagination::PageQuery;
 
 // ── mock 端点:每个 gate 在一个 Perm 上(范式:require_scoped 同时管 RBAC 与 scope)──
 

@@ -17,7 +17,7 @@ services:
     ports:
       - "${NGINX_PORT:-80}:80"
 
-  # app + idm 共用同一镜像(runtime 含 xchangeai + idm 两个二进制),只 entrypoint 不同。
+  # app + idm 共用同一镜像(runtime 含 baserust + idm 两个二进制),只 entrypoint 不同。
   app:
     image: baserust-runtime:latest
     pull_policy: never
@@ -104,7 +104,7 @@ services:
       # 首次(空 volume)建 app/idm/content 的 role + schema(search_path 各指自己 schema)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xchangeai} -d ${POSTGRES_DB:-xchangeai}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]
       interval: 5s
       timeout: 3s
       retries: 10

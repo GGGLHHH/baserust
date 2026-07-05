@@ -18,7 +18,7 @@ use crate::infra::op_perms::{op_authz, PermReq};
 /// - `split_for_parts()` 把所有模块的规范合并成一份。
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "xchangeai API", version = "0.1.0", description = "Rust 脚手架"),
+    info(title = "baserust API", version = "0.1.0", description = "Rust 脚手架"),
     modifiers(&SecurityAddon),
     tags(
         (name = "health", description = "健康检查"),

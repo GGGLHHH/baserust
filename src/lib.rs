@@ -1,4 +1,4 @@
-//! xchangeai 库根 —— 挂模块,供 bin(main.rs)与集成测试(tests/)共用。
+//! baserust 库根 —— 挂模块,供 bin(main.rs)与集成测试(tests/)共用。
 //!
 //! 分层:
 //! - `infra`  框架管线 + 领域无关共享(config/error/extract/openapi/audit/pagination)

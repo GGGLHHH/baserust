@@ -1,10 +1,10 @@
 [package]
-name = "xchangeai"
+name = "baserust"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 # 有 seed bin 后,cargo run 默认跑主服务(seed 用 `just seed` / `cargo run --bin seed`)
-default-run = "xchangeai"
+default-run = "baserust"
 
 [dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。

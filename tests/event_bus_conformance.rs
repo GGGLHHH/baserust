@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
+use baserust::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
 use tokio::time::timeout;
 use uuid::Uuid;
-use xchangeai::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
 
 /// 5s 内必须收到一条事件,且是 `Deleted{expected}`(契约用 Deleted:payload 最小,断言只看 id)。
 async fn expect_deleted(
-    sub: &mut Box<dyn xchangeai::features::widget::EventSubscription>,
+    sub: &mut Box<dyn baserust::features::widget::EventSubscription>,
     expected: Uuid,
 ) {
     let got = timeout(Duration::from_secs(5), sub.recv())
@@ -83,7 +83,7 @@ async fn memory_lagged_subscriber_skips_and_continues() {
 #[cfg(feature = "pg-conformance")]
 mod pg {
     use super::*;
-    use xchangeai::features::widget::PgEventBus;
+    use baserust::features::widget::PgEventBus;
 
     /// pg_notify 不碰任何表 → 免迁移;`#[sqlx::test]` 的临时库即可。
     #[sqlx::test(migrations = false)]
@@ -96,7 +96,7 @@ mod pg {
 #[cfg(feature = "nats-conformance")]
 mod nats {
     use super::*;
-    use xchangeai::features::widget::NatsEventBus;
+    use baserust::features::widget::NatsEventBus;
 
     /// core NATS 契约同一份;`NATS_URL` 可覆盖(默认本地 compose 的主机端口 2224)。
     #[tokio::test]

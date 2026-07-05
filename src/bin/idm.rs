@@ -2,7 +2,7 @@
 //! nginx 按 `/api/v1/{public,frontend,admin}/auth` 前缀分流到此。
 //! 本地开发用 app 进程(Both 已含 idm)即可,不必单跑它。对应 Go 的 cmd/realestate-login。
 
-use xchangeai::app::{run, Mount};
+use baserust::app::{run, Mount};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

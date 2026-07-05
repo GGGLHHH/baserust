@@ -5,10 +5,10 @@
 //! 内存入口:默认 `cargo test` 就跑(零 DB)。
 //! PG 入口:`cargo test --features pg-conformance`(需 DATABASE_URL 连 app role + 跑着的 pg),用 `just test-pg`。
 
+use baserust::features::widget::WidgetRepo;
+use baserust::infra::error::AppError;
+use baserust::infra::pagination::{decode_cursor, PageInfo, PageParams};
 use uuid::Uuid;
-use xchangeai::features::widget::WidgetRepo;
-use xchangeai::infra::error::AppError;
-use xchangeai::infra::pagination::{decode_cursor, PageInfo, PageParams};
 
 /// 契约唯一真相源。内存与 PG 都调它 —— 加实现/加断言只改这一处。
 /// 只断言顺序·相对关系(updated_at >= created_at)·可见性,绝不断言绝对时间戳
@@ -267,7 +267,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
 #[tokio::test]
 async fn memory_satisfies_widget_contract() {
-    use xchangeai::features::widget::InMemoryWidgetRepo;
+    use baserust::features::widget::InMemoryWidgetRepo;
     widget_repo_contract(&InMemoryWidgetRepo::new()).await;
 }
 
@@ -287,7 +287,7 @@ mod pg {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let repo = xchangeai::features::widget::PgWidgetRepo::new(pool);
+        let repo = baserust::features::widget::PgWidgetRepo::new(pool);
         widget_repo_contract(&repo).await;
         Ok(())
     }

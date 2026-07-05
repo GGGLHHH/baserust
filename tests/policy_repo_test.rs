@@ -7,9 +7,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use xchangeai::app::policy_repo;
-use xchangeai::app::seed::SeedData;
-use xchangeai::infra::authz::Perm;
+use baserust::app::policy_repo;
+use baserust::app::seed::SeedData;
+use baserust::infra::authz::Perm;
 
 #[sqlx::test(migrations = false)]
 async fn seed_authz_then_load_policy_roundtrips(pool: sqlx::PgPool) -> sqlx::Result<()> {

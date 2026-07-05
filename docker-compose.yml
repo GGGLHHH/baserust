@@ -1,7 +1,7 @@
 # baserust 本地容器栈:nginx(反代) → app(Rust 服务) + pg(Postgres) + dbhub(数据库 MCP)。
 #
 # 环境变量(都有默认值、可在同目录 .env 覆盖):
-#   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 xchangeai)
+#   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 baserust)
 #   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
 #   MINIO_USER / MINIO_PASSWORD · S3_BUCKET           minio 凭据(默认 minio/minio12345)与桶名(默认 content)
 #   NGINX_PORT(80) · APP_PORT(6453) · IDM_PORT(6454) · DBHUB_PORT(3777) · PG_PORT(5821)   主机端口
@@ -29,7 +29,7 @@ services:
       - "${NGINX_PORT:-80}:80"
 
   app:
-    # app 与 idm 共用同一镜像(runtime 阶段含 xchangeai + idm 两个二进制);只 entrypoint 不同。
+    # app 与 idm 共用同一镜像(runtime 阶段含 baserust + idm 两个二进制);只 entrypoint 不同。
     # 同名 image + 同 build → compose 只构建一次,idm 服务直接复用,不重复 build。
     image: baserust-runtime:latest
     build:
@@ -48,20 +48,20 @@ services:
         condition: service_healthy
     environment:
       BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-info,xchangeai=info}
+      RUST_LOG: ${RUST_LOG:-info,baserust=info}
       # 运行环境:dev(默认)→彩色日志+挂/docs+CORS宽松;prod→JSON日志+不挂/docs+CORS白名单
       APP_ENV: ${APP_ENV:-dev}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       # 连 app schema(role=app);表由下面 migrate 服务先建好。去掉这些 APP_DB_* 则 app 走内存。
       APP_DB_HOST: pg
       APP_DB_PORT: "5432"
-      APP_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
+      APP_DB_DATABASE: ${POSTGRES_DB:-baserust}
       APP_DB_USER: ${APP_DB_USER:-app}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
       # 连 content schema(role=content):content/object 元数据进 PG(字节进下面的 minio)。
       CONTENT_DB_HOST: pg
       CONTENT_DB_PORT: "5432"
-      CONTENT_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
+      CONTENT_DB_DATABASE: ${POSTGRES_DB:-baserust}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
       # 事件总线选择链最高优先:设了 NATS_URL → widget 事件走 NATS(去掉则回退 PG LISTEN/NOTIFY → 内存)。
@@ -88,7 +88,7 @@ services:
       # 拿到连接后走 idm 模块的 repo 读、绝不跨 schema join。当前主连接按 mount(needs_idm=false)不连,纯预留。
       IDM_DB_HOST: pg
       IDM_DB_PORT: "5432"
-      IDM_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
+      IDM_DB_DATABASE: ${POSTGRES_DB:-baserust}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
     # 单域名 presign 的另一半:容器内把 minio.localhost 指回宿主机网关(配合上面 S3_ENDPOINT 注释)。
@@ -119,13 +119,13 @@ services:
         condition: service_completed_successfully
     environment:
       BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-info,xchangeai=info}
+      RUST_LOG: ${RUST_LOG:-info,baserust=info}
       APP_ENV: ${APP_ENV:-dev}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       # 连 idm schema(role=idm):me 查 user / roles、会话 revoke 等。
       IDM_DB_HOST: pg
       IDM_DB_PORT: "5432"
-      IDM_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
+      IDM_DB_DATABASE: ${POSTGRES_DB:-baserust}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
       # idm 签发 JWT:非对称 Ed25519,持私钥签发 + 公钥(与 app 同一把)。默认内嵌 dev 对;
@@ -153,7 +153,7 @@ services:
         condition: service_healthy
     environment:
       PG_HOST: pg
-      POSTGRES_DB: ${POSTGRES_DB:-xchangeai}
+      POSTGRES_DB: ${POSTGRES_DB:-baserust}
       APP_DB_USER: ${APP_DB_USER:-app}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
@@ -166,9 +166,9 @@ services:
   pg:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-xchangeai}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xchangeai}
-      POSTGRES_DB: ${POSTGRES_DB:-xchangeai}
+      POSTGRES_USER: ${POSTGRES_USER:-baserust}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-baserust}
+      POSTGRES_DB: ${POSTGRES_DB:-baserust}
       # initdb 脚本用:各 schema 的 role 名(=schema 名)与密码,各走独立变量
       APP_DB_USER: ${APP_DB_USER:-app}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
@@ -184,7 +184,7 @@ services:
       # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建(或手建 role)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xchangeai} -d ${POSTGRES_DB:-xchangeai}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -201,7 +201,7 @@ services:
       - --port
       - "8080"
       - --dsn
-      - postgres://${POSTGRES_USER:-xchangeai}:${POSTGRES_PASSWORD:-xchangeai}@pg:5432/${POSTGRES_DB:-xchangeai}?sslmode=disable
+      - postgres://${POSTGRES_USER:-baserust}:${POSTGRES_PASSWORD:-baserust}@pg:5432/${POSTGRES_DB:-baserust}?sslmode=disable
     # 安全建议:dbhub 支持只读模式,确认 flag 后在上面 command 加一行(如 `--readonly`)防 MCP 误写。
     ports:
       - "${DBHUB_PORT:-3777}:8080"

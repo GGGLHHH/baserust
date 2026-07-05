@@ -719,6 +719,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "baserust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "async-nats",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "axum",
+ "axum-extra",
+ "axum-prometheus",
+ "base64",
+ "bytes",
+ "content",
+ "dotenvy",
+ "figment",
+ "futures-util",
+ "garde",
+ "idm",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "sea-query",
+ "sea-query-sqlx",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "toml",
+ "tower",
+ "tower-http 0.7.0",
+ "tower_governor",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-scalar",
+ "uuid",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4392,50 +4436,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xchangeai"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "async-nats",
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "axum",
- "axum-extra",
- "axum-prometheus",
- "base64",
- "bytes",
- "content",
- "dotenvy",
- "figment",
- "futures-util",
- "garde",
- "idm",
- "jsonwebtoken",
- "rand 0.8.6",
- "sea-query",
- "sea-query-sqlx",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "toml",
- "tower",
- "tower-http 0.7.0",
- "tower_governor",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "utoipa-axum",
- "utoipa-scalar",
- "uuid",
-]
 
 [[package]]
 name = "xmlparser"

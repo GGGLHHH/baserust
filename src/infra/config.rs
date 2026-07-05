@@ -193,7 +193,7 @@ fn default_db_port() -> u16 {
     5432
 }
 fn default_db_database() -> String {
-    "xchangeai".into()
+    "baserust".into()
 }
 fn default_app_db_user() -> String {
     "app".into()

@@ -35,7 +35,7 @@ test:
 #   CREATEDB —— #[sqlx::test] 建临时库;CREATE ON DATABASE —— 在 base 库建 _sqlx_test 元数据 schema。
 # 没装本机 psql 可改:docker compose exec -T pg psql -U <super> -d <db> -c "<同样的 SQL>"
 pg-test-grant:
-    psql "postgres://{{env_var_or_default('POSTGRES_USER','xchangeai')}}:{{env_var_or_default('POSTGRES_PASSWORD','xchangeai')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}};"
+    psql "postgres://{{env_var_or_default('POSTGRES_USER','baserust')}}:{{env_var_or_default('POSTGRES_PASSWORD','baserust')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}};"
 
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
@@ -56,7 +56,7 @@ test-all: test test-pg test-nats
 # pg 的 host/port/db 也从 env 读(和 compose 同一套:PG_PORT 等),默认连本地 compose pg。
 pg_host := env_var_or_default("PG_HOST", "localhost")
 pg_port := env_var_or_default("PG_PORT", "5821")
-pg_db := env_var_or_default("POSTGRES_DB", "xchangeai")
+pg_db := env_var_or_default("POSTGRES_DB", "baserust")
 app_db_url := env_var_or_default("APP_DATABASE_URL", "postgres://" + env_var_or_default("APP_DB_USER", "app") + ":" + env_var_or_default("APP_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 idm_db_url := env_var_or_default("IDM_DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 content_db_url := env_var_or_default("CONTENT_DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
@@ -122,7 +122,7 @@ fix:
 
 # 清理热更新累积的编译缓存(自己的 codegen 产物 + 增量),保留依赖缓存 → 下次只重编自己、秒级
 clean:
-    cargo clean -p xchangeai
+    cargo clean -p baserust
     rm -rf target/debug/incremental
 
 # 导出 OpenAPI 规范(服务需在跑)

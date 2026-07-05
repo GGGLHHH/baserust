@@ -2,7 +2,7 @@
 //! idm 由 `idm` bin 独立进程承载(nginx 按 `/api/v1/{public,frontend,admin}/auth` 前缀分流)。
 //! 业务逻辑都在 lib(见 lib.rs)。
 
-use xchangeai::app::{run, Mount};
+use baserust::app::{run, Mount};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

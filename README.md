@@ -1,7 +1,15 @@
 # baserust (Rust 后端脚手架)
 
 Go → Rust 迁移的基础脚手架:只含**生产级地基 + 代码范式**,无业务逻辑。
-crate 名 `xchangeai`;示例域 `features/widget/` 是范式样板,加真实业务照抄它。
+crate 名 `baserust`;示例域 `features/widget/` 是范式样板,加真实业务照抄它。
+
+## 拿脚手架
+
+新项目照这份起,不要 git history:
+
+```bash
+npx degit GGGLHHH/baserust my-app    # 只拉当前快照,无 .git;进去再 git init
+```
 
 ## 跑起来
 

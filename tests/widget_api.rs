@@ -12,11 +12,11 @@ use tower::ServiceExt; // oneshot
 
 use uuid::Uuid;
 
+use baserust::app::{build_router, AppState};
+use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
+use baserust::features::widget::{InMemoryWidgetRepo, WidgetService};
+use baserust::infra::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
-use xchangeai::app::{build_router, AppState};
-use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
-use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
-use xchangeai::infra::authz::{Perm, Policy};
 
 /// 内存仓储的测试 app(无 DB)+ **admin 令牌**(widget 端点现需登录 + RBAC + ownership)。
 /// admin 有 read:all → 看全部,故沿用原有"建后即见"断言;struct 直建不跑 mock seed,repo 空、不受干扰。
@@ -27,18 +27,18 @@ fn test_app() -> (Router, String) {
     let admin = signer
         .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
         .unwrap();
-    let bus: Arc<dyn xchangeai::features::widget::EventBus> =
-        Arc::new(xchangeai::features::widget::MemoryEventBus::new());
+    let bus: Arc<dyn baserust::features::widget::EventBus> =
+        Arc::new(baserust::features::widget::MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
-            Arc::new(xchangeai::features::widget::StaticUserDirectory::empty()),
+            Arc::new(baserust::features::widget::StaticUserDirectory::empty()),
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: xchangeai::features::profile::ProfileService::new(
-            std::sync::Arc::new(xchangeai::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
+        profiles: baserust::features::profile::ProfileService::new(
+            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
+            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
         ),
         contents: test_contents(),
         auth: test_auth(signer.clone(), verifier.clone()),
@@ -50,8 +50,8 @@ fn test_app() -> (Router, String) {
     };
     let app = build_router(
         state,
-        &xchangeai::infra::config::Config::default(),
-        xchangeai::app::Mount::Both,
+        &baserust::infra::config::Config::default(),
+        baserust::app::Mount::Both,
     );
     (app, admin)
 }
