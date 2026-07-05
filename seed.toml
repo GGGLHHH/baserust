@@ -38,7 +38,11 @@ description = "删除内容"
 
 [[permissions]]
 key = "users:admin"
-description = "用户管理"
+description = "用户管理(superadmin 专属)"
+
+[[permissions]]
+key = "admin:login"
+description = "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)"
 
 [[permissions]]
 key = "profiles:read"
@@ -53,8 +57,8 @@ key = "profiles:write:all"
 description = "修改任何人的资料(而非仅自己)"
 
 # 最经典的三轴数据矩阵:
-#  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin
-#  admin      —— 读写删 + 看所有人的(read:all),但无 users:admin
+#  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin(用户管理)+ admin:login(后台准入)
+#  admin      —— 读写删 + 看所有人的(read:all)+ admin:login(能登后台);**无 users:admin**(够不到 superadmin 专属端点,如跨用户列全 widget)
 #  user       —— widget 只读且**只看自己创建的**(无 read:all → ownership 落到 Own;无 write → RBAC 拒写);
 #               content 可读写**自己的**(contents:write 是头像两步上传的前提——profiles:write 没有它,
 #               avatar 流第一步 prepare 就 403,资料可写头像不可传是配漏),无 delete。
@@ -68,7 +72,7 @@ permissions = ["*"]
 [[roles]]
 name = "admin"
 display_name = "管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "profiles:read", "profiles:write", "profiles:write:all"]
+permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "profiles:read", "profiles:write", "profiles:write:all", "admin:login"]
 
 [[roles]]
 name = "user"

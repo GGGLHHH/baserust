@@ -156,7 +156,7 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "logout_all",
         perm: PermReq::LoginOnly,
     },
-    // ── admin 组:组闸(users:admin)在 router 层;表内 LoginOnly = 仅登录,文档的 users:admin 由组注入 ──
+    // ── admin 组:组闸(admin:login 准入)在 router 层;表内 LoginOnly = 仅登录,文档的 admin:login 由组注入 ──
     OpAuthz {
         operation_id: "admin_get_me",
         perm: PermReq::LoginOnly,

@@ -44,7 +44,7 @@ pub fn admin_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(routes::admin_get_me))
 }
 
-/// admin 组闸外:后台登录(public 语义 —— 未认证请求闸挡不了,验密后 handler 自查 users:admin)。
+/// admin 组闸外:后台登录(public 语义 —— 未认证请求闸挡不了,验密后 handler 自查 admin:login)。
 pub fn admin_login_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(routes::admin_login))
 }

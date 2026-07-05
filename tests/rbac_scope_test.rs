@@ -444,7 +444,7 @@ async fn my_permissions_reflect_role_and_scope() {
         }
     };
 
-    // 满权令牌:admin 全部 10 权(无 users:admin),含 implies 展开;排序稳定
+    // 满权令牌:admin 全部 11 权(含 admin:login 后台准入,**无** users:admin),含 implies 展开;排序稳定
     let v = fetch(admin.access_token.clone()).await;
     assert_eq!(v["roles"], serde_json::json!(["admin"]));
     let perms: Vec<&str> = v["permissions"]
@@ -453,9 +453,13 @@ async fn my_permissions_reflect_role_and_scope() {
         .iter()
         .map(|s| s.as_str().unwrap())
         .collect();
-    assert_eq!(perms.len(), 10, "admin 应 10 权,got {perms:?}");
+    assert_eq!(perms.len(), 11, "admin 应 11 权,got {perms:?}");
     assert!(perms.contains(&"widgets:read:all"));
-    assert!(!perms.contains(&"users:admin"));
+    assert!(perms.contains(&"admin:login"), "admin 应有后台准入");
+    assert!(
+        !perms.contains(&"users:admin"),
+        "admin 无 users:admin(superadmin 专属)"
+    );
     let mut sorted = perms.clone();
     sorted.sort_unstable();
     assert_eq!(perms, sorted, "应已排序");

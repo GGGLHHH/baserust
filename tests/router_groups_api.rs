@@ -1,4 +1,4 @@
-//! 组闸行为契约:public 免登录可达 / frontend 需登录(401)/ admin 需 users:admin(401/403)/
+//! 组闸行为契约:public 免登录可达 / frontend 需登录(401)/ admin 需 admin:login 后台准入(401/403)/
 //! admin_login 验密后自查。细粒度授权契约在 openapi_authz_test;这里只钉"防御纵深第一层"。
 
 use axum::body::Body;
@@ -90,7 +90,7 @@ async fn frontend_unknown_path_is_404_not_gated() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
-/// admin 组闸:401(未登录)/ 403(登录但无 users:admin)/ 200(superadmin)。
+/// admin 组闸:401(未登录)/ 403(user 无 admin:login)/ 200(admin + superadmin 皆有后台准入)。
 /// 用 admin_get_me 探——它端点内 perm 为 None,403 只能来自组闸(闸的独立证据)。
 #[tokio::test]
 async fn admin_group_gate_401_403_200() {
@@ -103,21 +103,29 @@ async fn admin_group_gate_401_403_200() {
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert!(body.contains("\"code\""), "应是统一 ErrorBody: {body}");
 
+    // admin(有 admin:login,但无 users:admin)也过后台准入闸 —— 拆分后的核心行为
+    let t = bearer(&state, "admin").await;
+    let (s, _) = get(&app, "/api/v1/admin/auth/me", Some(&t)).await;
+    assert_eq!(s, StatusCode::OK, "admin 有 admin:login → 过组闸");
+
     let t = bearer(&state, "superadmin").await;
     let (s, body) = get(&app, "/api/v1/admin/auth/me", Some(&t)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(body.contains("superadmin"), "应返回当前管理员: {body}");
 }
 
-/// admin_login:superadmin → 200 + 双 cookie;user 凭据对但无 users:admin → 403 且**零 Set-Cookie**。
+/// admin_login:admin + superadmin(皆有 admin:login)→ 200 + 双 cookie;
+/// user 凭据对但无 admin:login → 403 且**零 Set-Cookie**。
 #[tokio::test]
 async fn admin_login_rejects_non_admin_without_tokens() {
     let (app, _state) = setup().await;
 
-    let resp = post_login(&app, "/api/v1/admin/auth/login", "superadmin").await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
-    assert_eq!(cookies.len(), 2, "access + refresh cookie");
+    for who in ["superadmin", "admin"] {
+        let resp = post_login(&app, "/api/v1/admin/auth/login", who).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{who} 应能登后台");
+        let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2, "{who}: access + refresh cookie");
+    }
 
     let resp = post_login(&app, "/api/v1/admin/auth/login", "user").await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);

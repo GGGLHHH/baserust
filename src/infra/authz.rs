@@ -43,6 +43,11 @@ pub enum Perm {
     ContentDelete,
     #[serde(rename = "users:admin")]
     UsersAdmin,
+    /// 后台准入(backend gate)。`/api/v1/admin` 组闸 + admin_login 自查用它。
+    /// 与 `users:admin` **拆开**:admin+superadmin 皆持(能进后台);`users:admin` 仍 superadmin 专属
+    /// (用户管理 + 跨用户列全 widget 等真·超管操作)。故名为 admin 的账号能登后台,但仍够不到 superadmin 专属端点。
+    #[serde(rename = "admin:login")]
+    AdminLogin,
     #[serde(rename = "profiles:read")]
     ProfileRead,
     #[serde(rename = "profiles:write")]
@@ -55,7 +60,7 @@ pub enum Perm {
 
 impl Perm {
     /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
-    pub const ALL: [Perm; 11] = [
+    pub const ALL: [Perm; 12] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
@@ -64,6 +69,7 @@ impl Perm {
         Perm::ContentWrite,
         Perm::ContentDelete,
         Perm::UsersAdmin,
+        Perm::AdminLogin,
         Perm::ProfileRead,
         Perm::ProfileWrite,
         Perm::ProfileWriteAll,
@@ -78,6 +84,7 @@ impl Perm {
             }
             Perm::ContentRead | Perm::ContentWrite | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
+            Perm::AdminLogin => "admin",
             Perm::ProfileRead | Perm::ProfileWrite | Perm::ProfileWriteAll => "profiles",
         }
     }
@@ -92,6 +99,7 @@ impl Perm {
             Perm::ContentWrite => "write",
             Perm::ContentDelete => "delete",
             Perm::UsersAdmin => "admin",
+            Perm::AdminLogin => "login",
             Perm::ProfileRead => "read",
             Perm::ProfileWrite | Perm::ProfileWriteAll => "write",
         }
@@ -311,10 +319,11 @@ pub async fn require_login(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// 组闸:登录 + `users:admin`(`/api/v1/admin` 组)。**走 `require_scoped`(role ∩ scope)**,
-/// 与端点内闸、openapi_authz 探针同一评估语义 —— 降权令牌(scope 未含 users:admin)即便 role 够也挡。
+/// 组闸:登录 + `admin:login`(`/api/v1/admin` 组 = 后台准入)。**走 `require_scoped`(role ∩ scope)**,
+/// 与端点内闸、openapi_authz 探针同一评估语义 —— 降权令牌(scope 未含 admin:login)即便 role 够也挡。
+/// 闸的是**准入**(admin+superadmin 皆过);组内 superadmin 专属端点(如列全 widget)再各自 gate `users:admin`。
 /// state 直接吃 `Arc<Policy>`(infra 不 import app 的 AppState,守分层)。
-pub async fn require_users_admin(
+pub async fn require_admin_login(
     State(policy): State<Arc<Policy>>,
     req: Request,
     next: Next,
@@ -327,7 +336,7 @@ pub async fn require_users_admin(
         .get::<TokenScope>()
         .cloned()
         .unwrap_or_default();
-    if let Err(e) = policy.require_scoped(&user, &scope.0, Perm::UsersAdmin) {
+    if let Err(e) = policy.require_scoped(&user, &scope.0, Perm::AdminLogin) {
         return e.into_response();
     }
     next.run(req).await
@@ -500,16 +509,16 @@ mod tests {
         assert_eq!(gate_status(app, "/t").await, StatusCode::OK);
     }
 
-    /// require_users_admin:401(未登录)/ 403(role 无 perm)/ 403(role 够但 scope 收窄)/ 放行。
+    /// require_admin_login:401(未登录)/ 403(role 无 perm)/ 403(role 够但 scope 收窄)/ 放行。
     #[tokio::test]
-    async fn require_users_admin_gates_role_and_scope() {
+    async fn require_admin_login_gates_role_and_scope() {
         let policy = Arc::new(Policy::from_roles([(
             "root".to_owned(),
-            vec![Perm::UsersAdmin],
+            vec![Perm::AdminLogin],
         )]));
         let mk = |u: Option<AuthUser>, scope: Option<TokenScope>| {
             let mut app = Router::new().route("/t", get(|| async { "ok" })).layer(
-                middleware::from_fn_with_state(policy.clone(), require_users_admin),
+                middleware::from_fn_with_state(policy.clone(), require_admin_login),
             );
             if let Some(u) = u {
                 app = app.layer(Extension(u));
@@ -524,12 +533,12 @@ mod tests {
             gate_status(mk(None, None), "/t").await,
             StatusCode::UNAUTHORIZED
         );
-        // role 无 users:admin → 403
+        // role 无 admin:login → 403
         assert_eq!(
             gate_status(mk(Some(user(&["user"])), None), "/t").await,
             StatusCode::FORBIDDEN
         );
-        // role 够、scope 收窄(未含 users:admin)→ 403(降权令牌不得穿闸)
+        // role 够、scope 收窄(未含 admin:login)→ 403(降权令牌不得穿闸)
         assert_eq!(
             gate_status(
                 mk(

@@ -3,7 +3,7 @@
 //! 加业务模块:在 build_router 对应组里 `.merge(xxx::router())` 一行。
 //!
 //! 中间件栈:统一错误契约(panic/timeout 也走 `ErrorBody` JSON)+ 安全头 + CORS(按 profile)。
-//! 组闸:`frontend` 组统一挂 `require_login`,`admin` 组统一挂 `require_users_admin`
+//! 组闸:`frontend` 组统一挂 `require_login`,`admin` 组统一挂 `require_admin_login`
 //! (粗过滤、防御纵深第一层;端点内 role/scope/字段级三轴照旧)。
 //! 文档端点仅非 prod 暴露。
 
@@ -49,7 +49,7 @@ pub enum Mount {
 }
 
 /// 组装路由。按 `mount` 决定挂哪些模块;业务模块(含 auth)按 public(无闸)/ frontend(需登录)/
-/// admin(users:admin)三组分别 merge,各组统一 nest 到 /api/v1 下再上组闸。
+/// admin(admin:login 准入)三组分别 merge,各组统一 nest 到 /api/v1 下再上组闸。
 /// 两次 nest 同前缀会 panic,故**先 merge 再 nest 一次**。
 pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let needs_app = matches!(mount, Mount::App | Mount::Both);
@@ -83,7 +83,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let admin = admin
         .layer(middleware::from_fn_with_state(
             state.policy.clone(),
-            crate::infra::authz::require_users_admin,
+            crate::infra::authz::require_admin_login,
         ))
         .merge(admin_open); // 闸后 merge:layer 只包已有路由,login 免闸
     let features = OpenApiRouter::new()

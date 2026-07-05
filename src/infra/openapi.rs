@@ -86,7 +86,7 @@ fn perm_doc(p: Perm) -> String {
 /// 那时 paths 还空(utoipa-axum 在 merge/nest 后才填 operation),够不到 per-operation。
 pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
     for (path, item) in api.paths.paths.iter_mut() {
-        // admin 组:组闸(users:admin)并入文档 —— OpenAPI 无组级 security,组语义只能落在每个 operation 上。
+        // admin 组:组闸(admin:login 准入)并入文档 —— OpenAPI 无组级 security,组语义只能落在每个 operation 上。
         let admin_group = path.starts_with("/api/v1/admin/");
         let ops = [
             item.get.as_mut(),
@@ -110,8 +110,8 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
                 PermReq::Any(ps) => ps.iter().map(|&p| vec![perm_wire(p)]).collect(),
             };
             if admin_group {
-                // 组闸拦**所有**分支 → OR 的每支都并入 users:admin(去重),少写任何一支文档就是骗人。
-                let admin = perm_wire(Perm::UsersAdmin);
+                // 组闸拦**所有**分支 → OR 的每支都并入 admin:login(去重),少写任何一支文档就是骗人。
+                let admin = perm_wire(Perm::AdminLogin);
                 for r in &mut reqs {
                     if !r.contains(&admin) {
                         r.push(admin.clone());
@@ -212,7 +212,7 @@ mod tests {
             "health",
             "readyz",
             "widget_stats", // 公开计数:无 CurrentUser/require_scoped
-            "admin_login",  // 验密后 handler 自查 users:admin,非表驱动
+            "admin_login",  // 验密后 handler 自查 admin:login,非表驱动
         ];
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
         for (_path, item) in v["paths"].as_object().expect("paths").iter() {
@@ -252,12 +252,12 @@ mod tests {
         }
     }
 
-    /// admin 组注入:`/api/v1/admin/` 下**表内** op 的 scopes 必含 users:admin(组闸进文档,文档不骗人);
+    /// admin 组注入:`/api/v1/admin/` 下**表内** op 的 scopes 必含 admin:login(组闸=后台准入进文档,文档不骗人);
     /// 不在表(admin_login)= public,无 security,跳过。
     #[test]
-    fn admin_group_ops_carry_users_admin_scope() {
+    fn admin_group_ops_carry_admin_login_scope() {
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
-        let admin_wire = perm_wire(Perm::UsersAdmin);
+        let admin_wire = perm_wire(Perm::AdminLogin);
         let mut seen = 0;
         for (path, item) in v["paths"].as_object().expect("paths").iter() {
             if !path.starts_with("/api/v1/admin/") {
@@ -279,7 +279,7 @@ mod tests {
                         .collect();
                     assert!(
                         scopes.contains(&admin_wire.as_str()),
-                        "admin 组 `{id}` 每个 requirement 都应含 users:admin,got {scopes:?}"
+                        "admin 组 `{id}` 每个 requirement 都应含 admin:login,got {scopes:?}"
                     );
                 }
                 seen += 1;

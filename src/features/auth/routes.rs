@@ -238,7 +238,7 @@ pub async fn change_password(
     responses(
         (status = 200, description = "后台登录成功,token 写入 httponly cookie", body = UserResponse),
         (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
-        (status = 403, description = "凭据正确但无后台权限(users:admin),不发 token 不设 cookie", body = ErrorBody),
+        (status = 403, description = "凭据正确但无后台准入(admin:login),不发 token 不设 cookie", body = ErrorBody),
     )
 )]
 pub async fn admin_login(
@@ -248,12 +248,12 @@ pub async fn admin_login(
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
     req.validate()?;
     let outcome = state.auth.login(req.into()).await?;
-    // 验密后闸:无 users:admin → 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
+    // 验密后闸:无 admin:login(后台准入)→ 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
     // login 已铸的 refresh 会话立即撤销,不留"验过密但没资格"的孤儿会话。
     if !state
         .policy
         .perms_for(&outcome.user.roles)
-        .contains(&Perm::UsersAdmin)
+        .contains(&Perm::AdminLogin)
     {
         state.auth.logout(&outcome.refresh_token).await?;
         return Err(AppError::Forbidden);
@@ -267,7 +267,7 @@ pub async fn admin_login(
     responses(
         (status = 200, body = UserResponse),
         (status = 401, body = ErrorBody),
-        (status = 403, description = "组闸:无 users:admin", body = ErrorBody),
+        (status = 403, description = "组闸:无 admin:login(后台准入)", body = ErrorBody),
     )
 )]
 pub async fn admin_get_me(
