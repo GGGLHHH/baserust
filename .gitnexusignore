@@ -1,0 +1,3 @@
+# GitNexus 索引排除。prod/ 是 build-and-export.sh 产出的部署包(app 源码整份拷贝 + 运行时 pg/minio data),
+# 索引它会造重复符号、污染 impact 分析。骨架真相在 src/,不在部署产物里。
+prod/
