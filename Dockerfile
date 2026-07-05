@@ -17,6 +17,9 @@ RUN mkdir src \
 COPY src ./src
 COPY seed.toml ./seed.toml
 COPY mock.toml ./mock.toml
+# keys/:config.rs 用 include_str! 编译期嵌入 dev 密钥对(零配置启动的默认 JWT 钥),故 build 上下文需有它们。
+# 只嵌入 dev 对(prod 钥永不入库、运行期经 JWT_*_KEY_FILE 挂卷);.dockerignore 别把 keys/ 整个排掉。
+COPY keys ./keys
 RUN touch src/main.rs && cargo build --release
 
 # ---- sqlx:仅用来产出 sqlx-cli 二进制(构建期 stage,不进任何运行镜像)----

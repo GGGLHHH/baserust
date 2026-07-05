@@ -4,3 +4,10 @@
 
 # transient agent worktrees
 .claude/worktrees/
+
+# JWT 密钥:默认拒(私钥绝不入库)。只放行入库的 dev 对 + README —— 任意命名的
+# 生成钥(just gen-keys 的 prod-ed25519.* 等)自动被挡,不靠记得改规则(fail-safe)。
+/keys/*
+!/keys/dev-ed25519.pem
+!/keys/dev-ed25519.pub.pem
+!/keys/README.md
