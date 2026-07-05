@@ -1,7 +1,7 @@
-# mock 样本 widget(**dev/demo 专用**,非 prod 种子)。幂等写入 app 的 widget 仓储。
-# owner 用 username 引用 seed.toml 里的账号(apply 时经 idm 解析成 created_by 用户 id;标识引用、非 FK)。
+# mock 样本数据(**dev/demo 专用**,非 prod 种子)。幂等写入 app 的 widget / profile 仓储。
+# owner 用 username 引用 seed.toml 里的账号(apply 时经 idm 解析成用户 id;标识引用、非 FK)。
 # 改样本数据编辑这里,不动代码。设 MOCK_FILE 可指向外部文件覆盖。
-# 经典 ownership 矩阵:admin 拥 2 个、user 拥 1 个 —— 演示 own-vs-all。
+# 经典 ownership 矩阵:admin 拥 2 个 widget、user 拥 1 个 —— 演示 own-vs-all。
 
 [[widgets]]
 name = "admin-w1"
@@ -14,3 +14,19 @@ owner = "admin"
 [[widgets]]
 name = "user-w1"
 owner = "user"
+
+# 样本 profile(1:1 user)。三账号皆有 → 登录即 /profiles/me 200(不撞 404)。
+[[profiles]]
+owner = "superadmin"
+display_name = "Sam Superadmin"
+phone = "13800000000"
+
+[[profiles]]
+owner = "admin"
+display_name = "Ada Admin"
+phone = "13800000001"
+
+[[profiles]]
+owner = "user"
+display_name = "Uma User"
+phone = "13800000002"

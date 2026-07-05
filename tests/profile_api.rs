@@ -205,25 +205,25 @@ async fn put_upsert_then_anyone_can_read() {
         .clone()
         .oneshot(put_json(
             &uri,
-            r#"{"first_name":"San","phone":"138"}"#,
+            r#"{"display_name":"San","phone":"138"}"#,
             &alice,
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v = body_json(resp).await;
-    assert_eq!(v["first_name"], "San");
+    assert_eq!(v["display_name"], "San");
     assert!(v["avatar_url"].is_null());
 
     let resp = app
         .clone()
-        .oneshot(put_json(&uri, r#"{"last_name":"Zhang"}"#, &alice))
+        .oneshot(put_json(&uri, r#"{"phone":"999"}"#, &alice))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
-    assert!(v["first_name"].is_null(), "全量替换:未给字段清空");
-    assert_eq!(v["last_name"], "Zhang");
+    assert!(v["display_name"].is_null(), "全量替换:未给字段清空");
+    assert_eq!(v["phone"], "999");
 
     // bob(无 write:all)读 alice → 200(任意登录可读)
     let resp = app.clone().oneshot(get(&uri, &bob)).await.unwrap();
@@ -238,7 +238,7 @@ async fn ownership_gate_and_write_all() {
 
     let resp = app
         .clone()
-        .oneshot(put_json(&bob_uri, r#"{"first_name":"X"}"#, &alice))
+        .oneshot(put_json(&bob_uri, r#"{"display_name":"X"}"#, &alice))
         .await
         .unwrap();
     assert_eq!(
@@ -249,7 +249,7 @@ async fn ownership_gate_and_write_all() {
 
     let resp = app
         .clone()
-        .oneshot(put_json(&bob_uri, r#"{"first_name":"ByAdmin"}"#, &admin))
+        .oneshot(put_json(&bob_uri, r#"{"display_name":"ByAdmin"}"#, &admin))
         .await
         .unwrap();
     assert_eq!(
@@ -263,7 +263,7 @@ async fn ownership_gate_and_write_all() {
         .clone()
         .oneshot(put_json(
             &bob_uri,
-            r#"{"first_name":"ByAdminAgain"}"#,
+            r#"{"display_name":"ByAdminAgain"}"#,
             &admin,
         ))
         .await
@@ -375,7 +375,7 @@ async fn my_profile_me_alias() {
     let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
     let resp = app
         .clone()
-        .oneshot(put_json(&uri, r#"{"first_name":"Alice"}"#, &alice))
+        .oneshot(put_json(&uri, r#"{"display_name":"Alice"}"#, &alice))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -389,5 +389,5 @@ async fn my_profile_me_alias() {
     .await;
     let by_id = body_json(app.clone().oneshot(get(&uri, &alice)).await.unwrap()).await;
     assert_eq!(me, by_id, "me 应与按 id 读等值");
-    assert_eq!(me["first_name"], "Alice");
+    assert_eq!(me["display_name"], "Alice");
 }

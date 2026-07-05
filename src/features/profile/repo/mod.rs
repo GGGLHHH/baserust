@@ -17,9 +17,7 @@ pub use postgres::PgProfileRepo;
 /// 写入的业务字段(全量替换单元)。审计 `by` 单独传:实现体在"建"时落 created_*、"替"时**保留**。
 #[derive(Debug, Clone, Default)]
 pub struct ProfileFields {
-    pub first_name: Option<String>,
-    pub middle_name: Option<String>,
-    pub last_name: Option<String>,
+    pub display_name: Option<String>,
     pub phone: Option<String>,
     pub avatar_content_id: Option<Uuid>,
 }

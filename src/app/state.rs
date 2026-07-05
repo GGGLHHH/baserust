@@ -170,7 +170,7 @@ impl AppState {
         };
         let avatar_probe: Arc<dyn AvatarProbe> =
             Arc::new(ContentAvatarProbe::new(contents.clone()));
-        let profiles = ProfileService::new(profile_repo, avatar_probe);
+        let profiles = ProfileService::new(profile_repo.clone(), avatar_probe);
 
         // idm(idm schema):仅 idm/both 进程需要。设了 IDM_DB_HOST → PG(读 seed 的 superadmin 等),否则内存。
         let idm_pool = if needs_idm {
@@ -230,12 +230,18 @@ impl AppState {
             .await?;
         }
 
-        // mock 样本 widget(dev/demo 专用):owner(username)经 idm 解析 → 幂等写 app widget 仓储。
+        // mock 样本数据(dev/demo 专用):owner(username)经 idm 解析 → 幂等写 app widget/profile 仓储。
         // 需 app+idm 同进程(才能解析 owner)+ seed 开启 → 即 dev `Both`;prod 分进程不跑(无 demo 数据污染)。
         // 跟在 idm seed 之后:此时 admin/user 已存在,owner 才解析得到。
         if needs_app && needs_idm && config.seed_on_start() {
             let mock = super::mock::MockData::load(config.mock_file.as_deref())?;
-            super::mock::apply(widget_repo.as_ref(), idm_users.as_ref(), &mock).await?;
+            super::mock::apply(
+                widget_repo.as_ref(),
+                profile_repo.as_ref(),
+                idm_users.as_ref(),
+                &mock,
+            )
+            .await?;
         }
 
         // 跨模块富化:widget 的 UserDirectory 端口由 app 注入 idm 的进程内适配器(复用 idm_users)。

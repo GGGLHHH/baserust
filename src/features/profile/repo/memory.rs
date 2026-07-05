@@ -48,9 +48,7 @@ impl ProfileRepo for InMemoryProfileRepo {
             Entry::Occupied(mut e) => {
                 // 替换:业务字段全量覆盖 + updated_*;created_* 保留(镜像 PG 的 excluded 集)。
                 let p = e.get_mut();
-                p.first_name = f.first_name;
-                p.middle_name = f.middle_name;
-                p.last_name = f.last_name;
+                p.display_name = f.display_name;
                 p.phone = f.phone;
                 p.avatar_content_id = f.avatar_content_id;
                 p.updated_by = by;
@@ -60,9 +58,7 @@ impl ProfileRepo for InMemoryProfileRepo {
             Entry::Vacant(v) => {
                 let p = Profile {
                     user_id,
-                    first_name: f.first_name,
-                    middle_name: f.middle_name,
-                    last_name: f.last_name,
+                    display_name: f.display_name,
                     phone: f.phone,
                     avatar_content_id: f.avatar_content_id,
                     created_by: by.clone(),

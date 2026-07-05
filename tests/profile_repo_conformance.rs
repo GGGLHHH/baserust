@@ -15,9 +15,7 @@ async fn profile_repo_contract(repo: &dyn ProfileRepo) {
     // 建:created=true,审计双落
     let avatar = Uuid::now_v7();
     let f1 = ProfileFields {
-        first_name: Some("A".into()),
-        middle_name: None,
-        last_name: Some("Z".into()),
+        display_name: Some("A Z".into()),
         phone: Some("110".into()),
         avatar_content_id: Some(avatar),
     };
@@ -30,9 +28,7 @@ async fn profile_repo_contract(repo: &dyn ProfileRepo) {
 
     // 替:created=false;业务字段**全量覆盖**(未给=清空,含 avatar);created_* 保留;updated_* 推进
     let f2 = ProfileFields {
-        first_name: None,
-        middle_name: Some("M".into()),
-        last_name: None,
+        display_name: Some("M".into()),
         phone: None,
         avatar_content_id: None,
     };
@@ -46,16 +42,16 @@ async fn profile_repo_contract(repo: &dyn ProfileRepo) {
     assert_eq!(p2.created_at, p1.created_at, "created_at 必须保留");
     assert_eq!(p2.updated_by.as_deref(), Some("other"));
     assert!(p2.updated_at >= p1.updated_at);
-    assert!(p2.first_name.is_none(), "全量替换:未给字段清空");
+    assert!(p2.phone.is_none(), "全量替换:未给字段清空");
     assert!(
         p2.avatar_content_id.is_none(),
         "avatar 同受全量替换管辖(null 即解绑)"
     );
-    assert_eq!(p2.middle_name.as_deref(), Some("M"));
+    assert_eq!(p2.display_name.as_deref(), Some("M"));
 
     // get 回环
     let g = repo.get(uid).await.unwrap().expect("已建应可读");
-    assert_eq!(g.middle_name.as_deref(), Some("M"));
+    assert_eq!(g.display_name.as_deref(), Some("M"));
     assert_eq!(g.created_by.as_deref(), Some("tester"));
 }
 

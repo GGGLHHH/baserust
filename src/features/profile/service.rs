@@ -60,9 +60,7 @@ impl ProfileService {
             }
         }
         let fields = ProfileFields {
-            first_name: input.first_name,
-            middle_name: input.middle_name,
-            last_name: input.last_name,
+            display_name: input.display_name,
             phone: input.phone,
             avatar_content_id: input.avatar_content_id,
         };
@@ -110,9 +108,7 @@ mod tests {
 
     fn req(avatar: Option<Uuid>) -> PutProfileRequest {
         PutProfileRequest {
-            first_name: Some("San".into()),
-            middle_name: None,
-            last_name: Some("Zhang".into()),
+            display_name: Some("San Zhang".into()),
             phone: Some("13800000000".into()),
             avatar_content_id: avatar,
         }
@@ -125,15 +121,13 @@ mod tests {
         let uid = Uuid::now_v7();
         let (created, r) = svc.put(uid, req(None), &ctx()).await.unwrap();
         assert!(created);
-        assert_eq!(r.first_name.as_deref(), Some("San"));
+        assert_eq!(r.display_name.as_deref(), Some("San Zhang"));
         let (created, r) = svc
             .put(
                 uid,
                 PutProfileRequest {
-                    first_name: None,
-                    middle_name: Some("Q".into()),
-                    last_name: None,
-                    phone: None,
+                    display_name: None,
+                    phone: Some("139".into()),
                     avatar_content_id: None,
                 },
                 &ctx(),
@@ -141,8 +135,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!created);
-        assert!(r.first_name.is_none(), "全量替换:未给字段必须清空");
-        assert_eq!(r.middle_name.as_deref(), Some("Q"));
+        assert!(r.display_name.is_none(), "全量替换:未给字段必须清空");
+        assert_eq!(r.phone.as_deref(), Some("139"));
     }
 
     #[tokio::test]

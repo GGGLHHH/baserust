@@ -1,4 +1,4 @@
-//! 用户资料模块:姓名三段 / 电话 / 头像(头像经 content,富化为相对 preview 路径)。
+//! 用户资料模块:显示名 / 电话 / 头像(头像经 content,富化为相对 preview 路径)。
 //! 分层照 widget;头像跨模块经 `AvatarProbe` 端口(适配在 app/adapters)。
 
 mod port;

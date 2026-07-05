@@ -18,7 +18,7 @@ impl PgProfileRepo {
     }
 }
 
-const GET_SQL: &str = "select user_id, first_name, middle_name, last_name, phone, \
+const GET_SQL: &str = "select user_id, display_name, phone, \
      avatar_content_id, created_by, created_at, updated_by, updated_at \
      from profiles where user_id = $1";
 
@@ -26,16 +26,14 @@ const GET_SQL: &str = "select user_id, first_name, middle_name, last_name, phone
 /// `(xmax = 0)` ⇔ 本行由这条语句 INSERT(未走 UPDATE 分支)—— PG 惯用的"建 or 替"单语句判别,
 /// 免二次查询/竞态。
 const UPSERT_SQL: &str = "insert into profiles \
-     (user_id, first_name, middle_name, last_name, phone, avatar_content_id, created_by, updated_by) \
-     values ($1, $2, $3, $4, $5, $6, $7, $7) \
+     (user_id, display_name, phone, avatar_content_id, created_by, updated_by) \
+     values ($1, $2, $3, $4, $5, $5) \
      on conflict (user_id) do update set \
-       first_name = excluded.first_name, \
-       middle_name = excluded.middle_name, \
-       last_name = excluded.last_name, \
+       display_name = excluded.display_name, \
        phone = excluded.phone, \
        avatar_content_id = excluded.avatar_content_id, \
        updated_by = excluded.updated_by \
-     returning user_id, first_name, middle_name, last_name, phone, avatar_content_id, \
+     returning user_id, display_name, phone, avatar_content_id, \
        created_by, created_at, updated_by, updated_at, (xmax = 0) as inserted";
 
 /// upsert 返回行 = Profile 平铺 + inserted 判别列。
@@ -64,9 +62,7 @@ impl ProfileRepo for PgProfileRepo {
     ) -> Result<(Profile, bool), AppError> {
         let row = sqlx::query_as::<_, UpsertRow>(UPSERT_SQL)
             .bind(user_id)
-            .bind(f.first_name)
-            .bind(f.middle_name)
-            .bind(f.last_name)
+            .bind(f.display_name)
             .bind(f.phone)
             .bind(f.avatar_content_id)
             .bind(by)

@@ -9,9 +9,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, ToSchema, sqlx::FromRow)]
 pub struct Profile {
     pub user_id: Uuid,
-    pub first_name: Option<String>,
-    pub middle_name: Option<String>,
-    pub last_name: Option<String>,
+    pub display_name: Option<String>,
     pub phone: Option<String>,
     /// content 模块的引用(标识非 FK,跨模块);悬空由读侧富化降级(avatar_url=null)。
     pub avatar_content_id: Option<Uuid>,
@@ -28,11 +26,7 @@ pub struct Profile {
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct PutProfileRequest {
     #[garde(inner(length(max = 255)))]
-    pub first_name: Option<String>,
-    #[garde(inner(length(max = 255)))]
-    pub middle_name: Option<String>,
-    #[garde(inner(length(max = 255)))]
-    pub last_name: Option<String>,
+    pub display_name: Option<String>,
     #[garde(inner(length(max = 255)))]
     pub phone: Option<String>,
     /// 绑定头像:必须指向**已 confirm** 的 image/* content(service 写前经端口三查)。
@@ -44,9 +38,7 @@ pub struct PutProfileRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
-    pub first_name: Option<String>,
-    pub middle_name: Option<String>,
-    pub last_name: Option<String>,
+    pub display_name: Option<String>,
     pub phone: Option<String>,
     pub avatar_content_id: Option<Uuid>,
     /// 相对路径 `/api/v1/frontend/contents/{id}/preview`(单域名哲学,无 base-url 变量)。
@@ -61,9 +53,7 @@ impl ProfileResponse {
     pub fn from_profile(p: Profile, avatar_url: Option<String>) -> Self {
         Self {
             user_id: p.user_id,
-            first_name: p.first_name,
-            middle_name: p.middle_name,
-            last_name: p.last_name,
+            display_name: p.display_name,
             phone: p.phone,
             avatar_content_id: p.avatar_content_id,
             avatar_url,

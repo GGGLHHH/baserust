@@ -7,9 +7,8 @@ create table profiles (
     -- idm user 的 id。**跨 schema 引用用标识、禁 FK**(app/idm 物理隔离,见 CLAUDE.md):
     -- user 是否存在由 app 层经 UserDirectory 端口裁决,不靠库约束。
     user_id     uuid        primary key,
-    first_name  text,
-    middle_name text,
-    last_name   text,
+    -- 显示名(单字段,不拆姓/中/名):脚手架不猜文化姓名结构,展示与排序统一用它。
+    display_name text,
     phone       text,
     -- content 模块的 content id。同为跨模块引用 → 标识非 FK(content 在独立 schema);
     -- 悬空(content 被删)由读侧富化降级处理(avatar_url = null),不炸列表。

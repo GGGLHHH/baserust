@@ -1,6 +1,6 @@
-//! mock 样本数据(**dev/demo 专用**)—— 幂等写入 **app schema 的 widget**。同 [`crate::app::seed`] 范式,
-//! 但跨模块:widget 的 `owner` 在 `mock.toml` 里是 **username**(标识引用、非 FK),apply 时经 idm
-//! `UserRepo` 解析成 `created_by` 用户 id(组合根跨模块只读,绝不跨 schema join)。
+//! mock 样本数据(**dev/demo 专用**)—— 幂等写入 **app schema 的 widget / profile**。同 [`crate::app::seed`]
+//! 范式,但跨模块:`mock.toml` 里的 `owner` 是 **username**(标识引用、非 FK),apply 时经 idm
+//! `UserRepo` 解析成用户 id(组合根跨模块只读,绝不跨 schema join)。
 //!
 //! 默认来自仓库根 `mock.toml`(编译期 `include_str!` 嵌入),设 `MOCK_FILE` 读外部覆盖。
 //! 只在 dev(app+idm 同进程 + seed 开启)跑,**绝不进 prod**(无 demo 数据污染)——见 `AppState::new` 的 gate。
@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::features::profile::{ProfileFields, ProfileRepo};
 use crate::features::widget::WidgetRepo;
 use crate::infra::pagination::PageParams;
 use idm::UserRepo;
@@ -22,6 +23,8 @@ const EMBEDDED_MOCK: &str = include_str!("../../mock.toml");
 pub struct MockData {
     #[serde(default)]
     widgets: Vec<WidgetSeed>,
+    #[serde(default)]
+    profiles: Vec<ProfileSeed>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +32,17 @@ struct WidgetSeed {
     name: String,
     /// owner 的 **username**(标识引用,非 FK);apply 时解析成 `created_by` 用户 id。
     owner: String,
+}
+
+/// 样本 profile(1:1 user)。`owner` 是属主 **username**,apply 时解析成 user_id 主键。
+/// 字段全可选(profile 各段本就 nullable);头像刻意不放 —— 那要先造 confirmed content,demo 不值。
+#[derive(Deserialize)]
+struct ProfileSeed {
+    owner: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    phone: Option<String>,
 }
 
 impl MockData {
@@ -43,10 +57,12 @@ impl MockData {
     }
 }
 
-/// 幂等写 mock widget:owner(username)经 idm 解析成 `created_by` id → 按 `(created_by, name)` 去重后创建。
-/// **跨模块**:owner 解析读 idm `UserRepo`,widget 写 app `WidgetRepo`(标识引用、不跨 schema join)。
+/// 幂等写 mock widget + profile:owner(username)经 idm 解析成用户 id。
+/// widget 按 `(created_by, name)` 去重后创建;profile 主键即 user_id → upsert 天然幂等(无需去重集)。
+/// **跨模块**:owner 解析读 idm `UserRepo`,数据写 app `WidgetRepo`/`ProfileRepo`(标识引用、不跨 schema join)。
 pub async fn apply(
     widgets: &dyn WidgetRepo,
+    profiles: &dyn ProfileRepo,
     users: &dyn UserRepo,
     data: &MockData,
 ) -> anyhow::Result<()> {
@@ -87,10 +103,33 @@ pub async fn apply(
         created += 1;
     }
 
+    // profile:owner(username)解析成 user_id 主键 → upsert(主键即去重,天然幂等,无需 seen 集)。
+    for p in &data.profiles {
+        let owner = p.owner.trim().to_lowercase();
+        let user = users
+            .find_by_identifier(&owner)
+            .await?
+            .with_context(|| format!("mock profile 的 owner `{owner}` 在 idm 不存在"))?;
+        let by = Some(user.user.id.to_string());
+        profiles
+            .upsert(
+                user.user.id,
+                ProfileFields {
+                    display_name: p.display_name.clone(),
+                    phone: p.phone.clone(),
+                    ..Default::default()
+                },
+                by,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("建 mock profile(owner `{owner}`)失败: {e:?}"))?;
+    }
+
     tracing::info!(
-        declared = data.widgets.len(),
-        created,
-        "mock widget 已应用(幂等)"
+        widgets = data.widgets.len(),
+        widgets_created = created,
+        profiles = data.profiles.len(),
+        "mock 数据已应用(幂等)"
     );
     Ok(())
 }
@@ -98,16 +137,18 @@ pub async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::profile::InMemoryProfileRepo;
     use crate::features::widget::InMemoryWidgetRepo;
     use idm::{InMemoryUserRepo, UserRepo};
 
-    /// 幂等:同一份 mock 跑两遍,widget 不重复创建。
+    /// 幂等:同一份 mock 跑两遍,widget 不重复创建、profile 值稳定。
     #[tokio::test]
     async fn apply_is_idempotent() {
         let users = InMemoryUserRepo::new();
         users.create("admin", None, "h", None).await.unwrap();
-        users.create("user", None, "h", None).await.unwrap();
+        let user = users.create("user", None, "h", None).await.unwrap();
         let widgets = InMemoryWidgetRepo::new();
+        let profiles = InMemoryProfileRepo::new();
         let data = MockData {
             widgets: vec![
                 WidgetSeed {
@@ -119,10 +160,15 @@ mod tests {
                     owner: "user".into(),
                 },
             ],
+            profiles: vec![ProfileSeed {
+                owner: "user".into(),
+                display_name: Some("Uma".into()),
+                phone: None,
+            }],
         };
 
-        apply(&widgets, &users, &data).await.unwrap();
-        apply(&widgets, &users, &data).await.unwrap(); // 二次:幂等,不重复
+        apply(&widgets, &profiles, &users, &data).await.unwrap();
+        apply(&widgets, &profiles, &users, &data).await.unwrap(); // 二次:幂等,不重复
 
         let page = widgets
             .list(
@@ -135,6 +181,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(page.items.len(), 2, "二次 apply 不应重复创建");
+        assert_eq!(page.items.len(), 2, "二次 apply 不应重复创建 widget");
+
+        let p = profiles
+            .get(user.id)
+            .await
+            .unwrap()
+            .expect("profile 应已建");
+        assert_eq!(p.display_name.as_deref(), Some("Uma"), "profile 值应稳定");
     }
 }
