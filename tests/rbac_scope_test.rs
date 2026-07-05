@@ -402,3 +402,73 @@ async fn scope_without_read_all_narrows_admin_to_own() {
         "降权(无 read:all)应只见自己的: {narrowed}"
     );
 }
+
+/// `GET /permissions/me`:有效权限 = role 展开(含 implies)∩ scope,wire 串排序;
+/// 降权令牌拿到收窄集;零权限令牌可达(仅登录)且集合为空。打真实 build_router 路由。
+#[tokio::test]
+async fn my_permissions_reflect_role_and_scope() {
+    let config = Config::default();
+    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let app = build_router(state.clone(), &config, Mount::Both);
+    let admin = state
+        .auth
+        .login(LoginInput {
+            identifier: "admin".to_owned(),
+            password: "pwd".to_owned(),
+        })
+        .await
+        .unwrap();
+    let mint = |roles: Vec<String>, scope: Vec<Perm>| {
+        state
+            .tokens
+            .mint_scoped(admin.user.id, "probe", roles, scope, 900)
+            .unwrap()
+    };
+    let fetch = |token: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::get("/api/v1/frontend/permissions/me")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+
+    // 满权令牌:admin 全部 10 权(无 users:admin),含 implies 展开;排序稳定
+    let v = fetch(admin.access_token.clone()).await;
+    assert_eq!(v["roles"], serde_json::json!(["admin"]));
+    let perms: Vec<&str> = v["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(perms.len(), 10, "admin 应 10 权,got {perms:?}");
+    assert!(perms.contains(&"widgets:read:all"));
+    assert!(!perms.contains(&"users:admin"));
+    let mut sorted = perms.clone();
+    sorted.sort_unstable();
+    assert_eq!(perms, sorted, "应已排序");
+
+    // 降权令牌 scope=[widgets:read:all]:implies 展开 → 恰好 read + read:all
+    let v = fetch(mint(vec!["admin".to_owned()], vec![Perm::WidgetReadAll])).await;
+    assert_eq!(
+        v["permissions"],
+        serde_json::json!(["widgets:read", "widgets:read:all"]),
+        "scope 收窄集应精确"
+    );
+
+    // 零权限令牌(roles+scope 皆空):可达(仅登录),集合为空
+    let v = fetch(mint(vec![], vec![])).await;
+    assert_eq!(v["permissions"], serde_json::json!([]));
+}

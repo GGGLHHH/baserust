@@ -106,6 +106,15 @@ impl Perm {
         }
     }
 
+    /// wire 串 `resource:action[:qualifier]`(从投影合成)。与 serde rename 同源 ——
+    /// `perm_wire_matches_projection` 测试钉死两者不漂移。
+    pub fn wire(&self) -> String {
+        match self.qualifier() {
+            Some(q) => format!("{}:{}:{q}", self.resource(), self.action()),
+            None => format!("{}:{}", self.resource(), self.action()),
+        }
+    }
+
     /// **蕴含**:持有本权限即隐含持有这些。`read:all ⇒ read`(能看全部必然能看)。
     /// [`Policy::from_roles`] 载入期与 [`Policy::require_scoped`] scope 判定都按它展开 →
     /// 从根消除"只给 `read:all` 漏 `read` → 顶层 `require_scoped(read)` 先 403"的配置坑。
@@ -322,6 +331,56 @@ pub async fn require_users_admin(
         return e.into_response();
     }
     next.run(req).await
+}
+
+// ── 端点:当前令牌的有效权限。"能干什么"归 app(authz 拥有此概念,端点就住这;
+//    infra 引 AppState 有 openapi::doc_routes 先例)。idm 的 /auth/me 只给身份事实,不回答权限
+//    —— idm 进程的 policy 是 seed 嵌入副本,PG 模式下与 app 会漂,放那边文档会说谎。 ──
+
+/// `GET /permissions/me` 响应。`roles` 来自 token claim;`permissions` 是**有效**集:
+/// role 展开(含 implies)∩ scope 收窄,wire 串排序输出。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct MyPermissionsResponse {
+    /// token claim 里的角色名。
+    pub roles: Vec<String>,
+    /// 有效权限 wire 串(排序)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。
+    pub permissions: Vec<String>,
+}
+
+/// 当前令牌能干什么(仅登录零 perm —— 自我操作范式;问"能干什么"本身不需要先有权限)。
+/// 逐 perm 走 [`Policy::require_scoped`] 过滤:与所有闸同一评估路径,零漂移;
+/// 降权令牌得到 scope 收窄后的真实集。
+#[utoipa::path(
+    get,
+    path = "/permissions/me",
+    tag = "me",
+    responses(
+        (status = 200, description = "当前令牌的角色与有效权限(role ∩ scope,排序)", body = MyPermissionsResponse),
+        (status = 401, description = "未认证", body = crate::infra::error::ErrorBody)
+    )
+)]
+pub async fn get_my_permissions(
+    State(state): State<crate::app::state::AppState>,
+    user: crate::infra::audit::CurrentUser,
+    scope: TokenScope,
+) -> crate::infra::extract::Json<MyPermissionsResponse> {
+    let mut permissions: Vec<String> = state
+        .policy
+        .perms_for(&user.0.roles)
+        .into_iter()
+        .filter(|&p| state.policy.require_scoped(&user.0, &scope.0, p).is_ok())
+        .map(|p| p.wire())
+        .collect();
+    permissions.sort();
+    crate::infra::extract::Json(MyPermissionsResponse {
+        roles: user.0.roles.clone(),
+        permissions,
+    })
+}
+
+/// 本端点的 router,composition root 挂 frontend 组(app 进程,policy 权威侧)。
+pub fn router() -> utoipa_axum::router::OpenApiRouter<crate::app::state::AppState> {
+    utoipa_axum::router::OpenApiRouter::new().routes(utoipa_axum::routes!(get_my_permissions))
 }
 
 #[cfg(test)]

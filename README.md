@@ -53,6 +53,7 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | GET | `/api/v1/frontend/contents/{id}/objects` | 列某内容的对象 |
 | GET | `/api/v1/frontend/contents/{id}/metadata` | 取内容元数据 |
 | PUT | `/api/v1/frontend/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
+| GET | `/api/v1/frontend/permissions/me` | 当前令牌的角色 + 有效权限(role ∩ scope,排序;仅登录) |
 | GET | `/api/v1/frontend/profiles/me` | 请求者自己的资料(仅登录零 perm;未建 404 引导建资料) |
 | GET | `/api/v1/frontend/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
 | PUT | `/api/v1/frontend/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |

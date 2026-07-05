@@ -67,7 +67,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         frontend = frontend
             .merge(widget::router())
             .merge(content::router())
-            .merge(profile::router());
+            .merge(profile::router())
+            // permissions/me:app 侧回答"能干什么"(policy 权威;idm 的 /auth/me 只给身份事实)
+            .merge(crate::infra::authz::router());
         admin = admin.merge(widget::admin_router());
     }
     if needs_idm {
@@ -171,6 +173,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                         .merge(widget::router())
                         .merge(content::router())
                         .merge(profile::router())
+                        .merge(crate::infra::authz::router())
                         .merge(auth::me_router()),
                 )
                 .nest(

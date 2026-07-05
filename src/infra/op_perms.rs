@@ -127,6 +127,11 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "get_my_profile",
         perm: PermReq::LoginOnly,
     },
+    // 有效权限查询:仅登录(问"能干什么"本身不需要先有权限)
+    OpAuthz {
+        operation_id: "get_my_permissions",
+        perm: PermReq::LoginOnly,
+    },
     OpAuthz {
         operation_id: "put_profile",
         perm: PermReq::All(&[Perm::ProfileWrite]),

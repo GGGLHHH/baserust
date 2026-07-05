@@ -62,13 +62,10 @@ impl Modify for SecurityAddon {
     }
 }
 
-/// `Perm` → wire 串(`resource:action[:qualifier]`)。复用 `authz.rs` 既有投影;
-/// `perm_wire_matches_projection` 测试已钉死投影 == serde wire(JWT/TOML/`require_scoped` 同一串)→ 同源零漂移。
+/// `Perm` → wire 串。委托 [`Perm::wire`](单一实现;`perm_wire_matches_projection` 钉死
+/// 投影 == serde wire,JWT/TOML/`require_scoped`/`permissions/me` 同一串,零漂移)。
 fn perm_wire(p: Perm) -> String {
-    match p.qualifier() {
-        Some(q) => format!("{}:{}:{q}", p.resource(), p.action()),
-        None => format!("{}:{}", p.resource(), p.action()),
-    }
+    p.wire()
 }
 
 /// scope 人读说明:同样从投影合成,全静态、零 `seed.toml` 依赖(静态 `Modify` 本就拿不到运行时数据)。
