@@ -34,6 +34,8 @@ pub fn router() -> OpenApiRouter<AppState> {
             routes::delete_widget
         ))
         .routes(routes!(routes::my_widget_count))
+        .routes(routes!(routes::purge_preview))
+        .routes(routes!(routes::widget_overview))
         .routes(routes!(routes::widget_events))
 }
 

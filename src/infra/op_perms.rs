@@ -1,7 +1,7 @@
 //! **API 端点 → 所需权限的唯一真相表**(文档侧)。从 `authz` 抽出独立成文件,**一眼可定位/审计**。
 //!
-//! `operationId → Option<Perm>`:`Some(p)` = 需该 perm;`None` = 仅登录(无特定 perm);不在表 = public。
-//! operationId == handler 函数名(utoipa 默认回填)。
+//! `operationId → PermReq`:`LoginOnly` = 仅登录(无特定 perm);`All` = 需全部(AND);
+//! `Any` = 任一即可(OR);不在表 = public。operationId == handler 函数名(utoipa 默认回填)。
 //!
 //! **故意只存 operationId + perm,不存 method/path**:路由的真相是 spec(utoipa 从 `#[utoipa::path]` + nest
 //! 派生),重复存会引第二个路由源、自造漂移。行为测试的 method/path 一律从 `api_spec()` 取,不从本表。
@@ -12,133 +12,158 @@
 
 use crate::infra::authz::Perm;
 
+/// 端点授权要求。单权限就是 `All` 的单元素特例,不设单独变体(少一形态少一漂移面)。
+#[derive(Clone, Copy, Debug)]
+pub enum PermReq {
+    /// 仅登录,无特定 perm → 文档 `[{"oauth2":[]}]`。
+    LoginOnly,
+    /// 全部要(AND)→ 文档:单 requirement 多 scope。
+    All(&'static [Perm]),
+    /// 任一即可(OR)→ 文档:多 requirement 各一 scope。
+    Any(&'static [Perm]),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpAuthz {
     pub operation_id: &'static str,
-    pub perm: Option<Perm>,
+    pub perm: PermReq,
 }
 
 pub const OP_PERMS: &[OpAuthz] = &[
     OpAuthz {
         operation_id: "list_widgets",
-        perm: Some(Perm::WidgetRead),
+        perm: PermReq::All(&[Perm::WidgetRead]),
     },
     OpAuthz {
         operation_id: "create_widget",
-        perm: Some(Perm::WidgetWrite),
+        perm: PermReq::All(&[Perm::WidgetWrite]),
     },
     OpAuthz {
         operation_id: "get_widget",
-        perm: Some(Perm::WidgetRead),
+        perm: PermReq::All(&[Perm::WidgetRead]),
     },
     OpAuthz {
         operation_id: "update_widget",
-        perm: Some(Perm::WidgetWrite),
+        perm: PermReq::All(&[Perm::WidgetWrite]),
     },
     OpAuthz {
         operation_id: "delete_widget",
-        perm: Some(Perm::WidgetDelete),
+        perm: PermReq::All(&[Perm::WidgetDelete]),
     },
     // 仅登录(无特定 perm);widget_stats 是 public → 不在表
     OpAuthz {
         operation_id: "my_widget_count",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
     // superadmin-only:gate 一个只 superadmin 持有的 perm(users:admin)
     OpAuthz {
         operation_id: "admin_list_widgets",
-        perm: Some(Perm::UsersAdmin),
+        perm: PermReq::All(&[Perm::UsersAdmin]),
     },
     OpAuthz {
         operation_id: "widget_events",
-        perm: Some(Perm::WidgetRead),
+        perm: PermReq::All(&[Perm::WidgetRead]),
     },
     // ── content:read/write/delete 三权;下载/列对象/读元数据归 read,上传/改元数据归 write ──
     OpAuthz {
         operation_id: "create_content",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     OpAuthz {
         operation_id: "upload_content",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     OpAuthz {
         operation_id: "prepare_upload",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     OpAuthz {
         operation_id: "confirm_upload",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     OpAuthz {
         operation_id: "list_contents",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "get_content",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "update_content",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     OpAuthz {
         operation_id: "delete_content",
-        perm: Some(Perm::ContentDelete),
+        perm: PermReq::All(&[Perm::ContentDelete]),
     },
     OpAuthz {
         operation_id: "download_content",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "preview_content",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "list_content_objects",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "get_content_metadata",
-        perm: Some(Perm::ContentRead),
+        perm: PermReq::All(&[Perm::ContentRead]),
     },
     OpAuthz {
         operation_id: "set_content_metadata",
-        perm: Some(Perm::ContentWrite),
+        perm: PermReq::All(&[Perm::ContentWrite]),
     },
     // ── profile:任意登录可读(read);写走 write(write:all 越权的 ownership 在 handler)──
     OpAuthz {
         operation_id: "get_profile",
-        perm: Some(Perm::ProfileRead),
+        perm: PermReq::All(&[Perm::ProfileRead]),
+    },
+    // 读自己:仅登录("自己"是身份事实非授权决策,对齐 get_me/my_widget_count 自我操作范式)
+    OpAuthz {
+        operation_id: "get_my_profile",
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "put_profile",
-        perm: Some(Perm::ProfileWrite),
+        perm: PermReq::All(&[Perm::ProfileWrite]),
     },
     OpAuthz {
         operation_id: "get_me",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "update_me",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "delete_me",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "change_password",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "logout_all",
-        perm: None,
+        perm: PermReq::LoginOnly,
     },
-    // ── admin 组:组闸(users:admin)在 router 层;表内 None = 仅登录,文档的 users:admin 由组注入 ──
+    // ── admin 组:组闸(users:admin)在 router 层;表内 LoginOnly = 仅登录,文档的 users:admin 由组注入 ──
     OpAuthz {
         operation_id: "admin_get_me",
-        perm: None,
+        perm: PermReq::LoginOnly,
+    },
+    // ── 多权限范式样板:AND(单 requirement 多 scope)/ OR(多 requirement 各一 scope)──
+    OpAuthz {
+        operation_id: "purge_preview",
+        perm: PermReq::All(&[Perm::WidgetRead, Perm::WidgetDelete]),
+    },
+    OpAuthz {
+        operation_id: "widget_overview",
+        perm: PermReq::Any(&[Perm::WidgetRead, Perm::UsersAdmin]),
     },
 ];
 

@@ -358,3 +358,34 @@ async fn unauthenticated_401() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `/profiles/me`:未建 404(引导建资料);建后与按 id 读**逐字节等值**(同一 service 路径,me 只是身份别名)。
+#[tokio::test]
+async fn my_profile_me_alias() {
+    let (app, _store, _admin, alice, _bob) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/frontend/profiles/me", &alice))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未建资料应 404");
+
+    let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
+    let resp = app
+        .clone()
+        .oneshot(put_json(&uri, r#"{"first_name":"Alice"}"#, &alice))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let me = body_json(
+        app.clone()
+            .oneshot(get("/api/v1/frontend/profiles/me", &alice))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let by_id = body_json(app.clone().oneshot(get(&uri, &alice)).await.unwrap()).await;
+    assert_eq!(me, by_id, "me 应与按 id 读等值");
+    assert_eq!(me["first_name"], "Alice");
+}

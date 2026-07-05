@@ -19,5 +19,7 @@ pub use types::{Profile, ProfileResponse, PutProfileRequest};
 
 /// 本模块路由 + OpenAPI,挂到主 router(/api/v1 由 nest 加)。
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(routes::get_profile, routes::put_profile))
+    OpenApiRouter::new()
+        .routes(routes!(routes::get_my_profile))
+        .routes(routes!(routes::get_profile, routes::put_profile))
 }

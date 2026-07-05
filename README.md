@@ -37,6 +37,8 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | POST | `/api/v1/frontend/widgets` | 创建 |
 | GET/PUT/DELETE | `/api/v1/frontend/widgets/{id}` | 取 / 改名 / 软删除 |
 | GET | `/api/v1/frontend/widgets/my-count` | 我创建的 widget 数(仅登录样板) |
+| GET | `/api/v1/frontend/widgets/purge-preview` | 删除预检(多权限 **AND** 样板:`widgets:read`+`widgets:delete`) |
+| GET | `/api/v1/frontend/widgets/overview` | 概览(多权限 **OR** 样板:`widgets:read` 或 `users:admin`) |
 | GET | `/api/v1/frontend/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
 | POST | `/api/v1/frontend/contents/upload` | 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据 |
 | GET | `/api/v1/frontend/contents` | 列当前用户的内容(单租户) |
@@ -51,6 +53,7 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | GET | `/api/v1/frontend/contents/{id}/objects` | 列某内容的对象 |
 | GET | `/api/v1/frontend/contents/{id}/metadata` | 取内容元数据 |
 | PUT | `/api/v1/frontend/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
+| GET | `/api/v1/frontend/profiles/me` | 请求者自己的资料(仅登录零 perm;未建 404 引导建资料) |
 | GET | `/api/v1/frontend/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
 | PUT | `/api/v1/frontend/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |
 | GET/PUT/DELETE | `/api/v1/frontend/auth/me` | 当前用户:查 / 改资料 / 注销(注销需密码) |

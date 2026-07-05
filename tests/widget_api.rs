@@ -424,3 +424,53 @@ async fn sse_requires_read_scope() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// 多权限样板行为:AND 缺一 403、全有 200;OR 任一支 200、两支皆无 403。
+/// (users:admin 支与 AND 逐成员钉力由 openapi_authz 探针覆盖,这里钉用户可感行为。)
+#[tokio::test]
+async fn multi_perm_and_or_endpoints() {
+    let (app, admin) = test_app();
+    let tokens = AppTokens::new("test-secret"); // 与 fixture 同 secret,可自铸降权令牌
+    let narrowed = |scope: Vec<Perm>| {
+        tokens
+            .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], scope, 900)
+            .unwrap()
+    };
+
+    // AND:admin 满权(read+delete)→ 200
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/frontend/widgets/purge-preview", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // AND:scope 收窄掉 delete → 403
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/frontend/widgets/purge-preview",
+            &narrowed(vec![Perm::WidgetRead]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // OR:只有 read 支 → 200
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/frontend/widgets/overview",
+            &narrowed(vec![Perm::WidgetRead]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // OR:两支皆无(scope=[widgets:write])→ 403
+    let resp = app
+        .oneshot(get(
+            "/api/v1/frontend/widgets/overview",
+            &narrowed(vec![Perm::WidgetWrite]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

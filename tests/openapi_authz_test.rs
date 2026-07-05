@@ -7,6 +7,9 @@
 //! - 广告 scope 非空:`scope=[广告的]` → 穿过授权闸(非 401/403);`scope=[不蕴含它的 perm]` → 403。
 //! - 广告 scope 空(仅登录):**零权限**令牌 → 非 403(无暗藏 `require_scoped`)。
 //!
+//! **AND/OR 结构化探测**:security 的每个 requirement 视作一支(单支多 scope = AND;多支各一 scope = OR)。
+//! AND 支额外钉逐成员去一必 403;OR 支额外钉每支单独必过 —— 不再只测并集,连接组合语义都行为钉死。
+//!
 //! handler 改了 enforce 的 Perm 但 spec 广告没跟上(或反之)→ 这里红。
 
 use axum::body::Body;
@@ -98,17 +101,21 @@ async fn spec_security_matches_real_enforcement() {
             let uri = path
                 .replace("{id}", &Uuid::nil().to_string())
                 .replace("{user_id}", &su.user.id.to_string());
-            // spec 广告的 oauth2 scopes
-            let scopes: Vec<Perm> = sec
+            // 结构化读取:每个 requirement 一支(单支多 scope = AND;多支 = OR)
+            let branches: Vec<Vec<Perm>> = sec
                 .iter()
                 .filter_map(|r| r.get("oauth2"))
                 .filter_map(|v| v.as_array())
-                .flatten()
-                .map(|s| str_to_perm(s.as_str().unwrap()))
+                .map(|arr| {
+                    arr.iter()
+                        .map(|s| str_to_perm(s.as_str().unwrap()))
+                        .collect()
+                })
                 .collect();
             checked += 1;
 
-            if scopes.is_empty() {
+            let union: Vec<Perm> = branches.iter().flatten().copied().collect();
+            if union.is_empty() {
                 // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
                 let zero = state
                     .tokens
@@ -120,17 +127,11 @@ async fn spec_security_matches_real_enforcement() {
                     "{op_id} 仅登录端点不应 403,got {s}"
                 );
             } else {
-                // 正向:广告的 scope → 穿过授权闸(下游 200/201/404/422 都算非 401/403)
-                let s = hit(&app, method, &uri, op_id, &mint(scopes.clone())).await;
-                assert!(
-                    s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
-                    "{op_id} 正向 scope={scopes:?} 不应被拒,got {s}"
-                );
-                // 反向:不在广告集、且不蕴含其中任一的 perm → 403(证明 handler enforce 的就是广告的)
+                // 反向(AND/OR 通用):并集外且不蕴含任一的 perm → 403
                 let neg = Perm::ALL
                     .into_iter()
                     .find(|&q| {
-                        !scopes.contains(&q) && !scopes.iter().any(|t| q.implies().contains(t))
+                        !union.contains(&q) && !union.iter().any(|t| q.implies().contains(t))
                     })
                     .expect("应有一个不蕴含目标的负权限");
                 let s = hit(&app, method, &uri, op_id, &mint(vec![neg])).await;
@@ -139,6 +140,45 @@ async fn spec_security_matches_real_enforcement() {
                     StatusCode::FORBIDDEN,
                     "{op_id} 反向 scope=[{neg:?}] 应 403,got {s}"
                 );
+                if branches.len() == 1 {
+                    let set = &branches[0];
+                    // 正向:全集 → 穿过授权闸(下游 200/201/404/422 都算非 401/403)
+                    let s = hit(&app, method, &uri, op_id, &mint(set.clone())).await;
+                    assert!(
+                        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+                        "{op_id} 正向 scope={set:?} 不应被拒,got {s}"
+                    );
+                    // AND 钉力:去掉任一成员 → 403(剩余集合经 implies 蕴含被去者则跳过,防假红)
+                    if set.len() > 1 {
+                        for (i, &dropped) in set.iter().enumerate() {
+                            let rest: Vec<Perm> = set
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .filter(|&(j, _)| j != i)
+                                .map(|(_, p)| p)
+                                .collect();
+                            if rest.iter().any(|r| r.implies().contains(&dropped)) {
+                                continue;
+                            }
+                            let s = hit(&app, method, &uri, op_id, &mint(rest)).await;
+                            assert_eq!(
+                                s,
+                                StatusCode::FORBIDDEN,
+                                "{op_id} AND 缺 {dropped:?} 应 403,got {s}"
+                            );
+                        }
+                    }
+                } else {
+                    // OR:每支单独 mint → 都能穿过(文档广告的每条来路都真实可走)
+                    for b in &branches {
+                        let s = hit(&app, method, &uri, op_id, &mint(b.clone())).await;
+                        assert!(
+                            s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+                            "{op_id} OR 支 {b:?} 应可过,got {s}"
+                        );
+                    }
+                }
             }
         }
     }

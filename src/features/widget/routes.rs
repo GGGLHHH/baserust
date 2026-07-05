@@ -198,6 +198,56 @@ pub async fn my_widget_count(
     }))
 }
 
+/// **多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看"可删多少"。
+/// `require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OP_PERMS` 的 `PermReq::All`)。
+#[utoipa::path(
+    get,
+    path = "/widgets/purge-preview",
+    tag = "widgets",
+    responses(
+        (status = 200, description = "本人可见域内可删 widget 计数", body = WidgetStats),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "缺 widgets:read 或 widgets:delete 任一", body = ErrorBody)
+    )
+)]
+pub async fn purge_preview(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+) -> Result<Json<WidgetStats>, AppError> {
+    state
+        .policy
+        .require_all(&user.0, &scope.0, &[Perm::WidgetRead, Perm::WidgetDelete])?;
+    Ok(Json(WidgetStats {
+        total: state.widgets.count(Some(user.0.id)).await?,
+    }))
+}
+
+/// **多权限 OR 样板**:概览 —— 普通读权**或**管理员任一即可。
+/// `require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。
+#[utoipa::path(
+    get,
+    path = "/widgets/overview",
+    tag = "widgets",
+    responses(
+        (status = 200, description = "全站 widget 计数(读权或管理员)", body = WidgetStats),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "widgets:read 与 users:admin 皆无", body = ErrorBody)
+    )
+)]
+pub async fn widget_overview(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    scope: TokenScope,
+) -> Result<Json<WidgetStats>, AppError> {
+    state
+        .policy
+        .require_any(&user.0, &scope.0, &[Perm::WidgetRead, Perm::UsersAdmin])?;
+    Ok(Json(WidgetStats {
+        total: state.widgets.count(None).await?,
+    }))
+}
+
 /// **superadmin-only**:跨所有人列出全部 widget。gate 在 `users:admin`(seed 里只 superadmin 持有)。
 /// 演示"role 限制 = gate 一个该 role 专属的 perm";注意 admin 虽有 `read:all`,无 `users:admin` 仍 403。
 #[utoipa::path(

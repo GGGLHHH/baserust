@@ -46,3 +46,11 @@ Doc `security` is **injected from `op_perms`** after `split_for_parts` — **nev
 - 403 for "not yours" → should be 404
 - hand-written `security(("oauth2"=...))` in a path macro → add an `op_perms` row
 - ownership rule going into OpenAPI `security` → it can't live there
+
+## 多权限(AND / OR)
+
+- enforcement:`policy.require_all(&user.0, &scope.0, &[A, B])`(缺一 403)/ `require_any(...)`(任一过,全败 403)——都经 `require_scoped`,role ∩ scope 与 implies 语义不变
+- 文档:`OP_PERMS` 用 `PermReq::All(&[A, B])`(单 requirement 多 scope = OpenAPI AND)/ `PermReq::Any(&[A, B])`(多 requirement 各一 scope = OR);单权限 = `All` 单元素特例
+- 探针免写:openapi_authz 自动钉 AND(去任一成员必 403)与 OR(每支单独必过)——加多权限端点只需表条目 + handler 同步
+- 何时用:AND = 复合能力操作(样板 `purge_preview`:读+删的删除预检);OR = 多来路(样板 `widget_overview`:普通读权或管理员)
+- admin 组注意:组注入会把 `users:admin` 并进**每个** requirement(含 OR 每支)

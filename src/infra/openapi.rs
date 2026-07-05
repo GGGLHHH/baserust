@@ -11,7 +11,7 @@ use utoipa_scalar::{Scalar, Servable};
 use crate::app::state::AppState;
 use crate::infra::authz::Perm;
 use crate::infra::error::AppError;
-use crate::infra::op_perms::op_authz;
+use crate::infra::op_perms::{op_authz, PermReq};
 
 /// OpenAPI 文档根。范式:
 /// - 顶层 info/tags 在此声明;path 与 schema 由各模块的 `#[utoipa::path]` + `routes!()` 贡献。
@@ -81,15 +81,15 @@ fn perm_doc(p: Perm) -> String {
 
 /// **OpenAPI 文档授权的单一来源注入**:按 operationId 从 [`crate::infra::op_perms::OP_PERMS`] 表
 /// 写每个 operation 的 `security`。删掉了所有手敲 `security(...)` 属性 → 系统内零 scope 串、
-/// 改 `Perm` 必过编译期表 → 文档侧零漂移。`Some(p)` → `[{"oauth2":[wire]}]`;`None` → `[{"oauth2":[]}]`(仅登录);
+/// 改 `Perm` 必过编译期表 → 文档侧零漂移。`PermReq::LoginOnly` → `[{"oauth2":[]}]`(仅登录);
+/// `All` → 单 requirement 多 scope(AND);`Any` → 多 requirement 各一 scope(OR);
 /// 不在表 → 不写(public)。
 ///
 /// **必须在 `split_for_parts()` 之后跑**:`modifiers(&SecurityAddon)` 在 `ApiDoc::openapi()` 那一刻执行,
 /// 那时 paths 还空(utoipa-axum 在 merge/nest 后才填 operation),够不到 per-operation。
 pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
     for (path, item) in api.paths.paths.iter_mut() {
-        // admin 组:组闸(users:admin)并入文档 scopes —— OpenAPI 无组级 security,
-        // 组语义只能落到组内每个 operation 上(文档不骗人)。
+        // admin 组:组闸(users:admin)并入文档 —— OpenAPI 无组级 security,组语义只能落在每个 operation 上。
         let admin_group = path.starts_with("/api/v1/admin/");
         let ops = [
             item.get.as_mut(),
@@ -105,18 +105,27 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
             let Some(e) = op_authz(id) else {
                 continue; // 不在表 = public,不写 security
             };
-            // 仅登录:空 scopes → {"oauth2":[]};**不可** default()(那是 {} = 无认证,语义错)。
-            let mut scopes = match e.perm {
-                Some(p) => vec![perm_wire(p)],
-                None => Vec::new(),
+            // PermReq → OpenAPI:All = 单 requirement 多 scope(AND);Any = 多 requirement 各一 scope(OR);
+            // LoginOnly = 单 requirement 空 scopes(**不可** `default()` —— 那是 {} = 无认证,语义错)。
+            let mut reqs: Vec<Vec<String>> = match e.perm {
+                PermReq::LoginOnly => vec![Vec::new()],
+                PermReq::All(ps) => vec![ps.iter().map(|&p| perm_wire(p)).collect()],
+                PermReq::Any(ps) => ps.iter().map(|&p| vec![perm_wire(p)]).collect(),
             };
             if admin_group {
+                // 组闸拦**所有**分支 → OR 的每支都并入 users:admin(去重),少写任何一支文档就是骗人。
                 let admin = perm_wire(Perm::UsersAdmin);
-                if !scopes.contains(&admin) {
-                    scopes.push(admin); // 去重:admin_list_widgets 自身已是 users:admin
+                for r in &mut reqs {
+                    if !r.contains(&admin) {
+                        r.push(admin.clone());
+                    }
                 }
             }
-            op.security = Some(vec![SecurityRequirement::new(OAUTH2_SCHEME, scopes)]);
+            op.security = Some(
+                reqs.into_iter()
+                    .map(|scopes| SecurityRequirement::new(OAUTH2_SCHEME, scopes))
+                    .collect(),
+            );
         }
     }
 }
@@ -264,19 +273,63 @@ mod tests {
                 let Some(reqs) = op.get("security").and_then(|s| s.as_array()) else {
                     continue; // public(admin_login)
                 };
-                let scopes: Vec<&str> = reqs[0][OAUTH2_SCHEME]
-                    .as_array()
-                    .expect("oauth2 scopes")
-                    .iter()
-                    .map(|s| s.as_str().unwrap())
-                    .collect();
-                assert!(
-                    scopes.contains(&admin_wire.as_str()),
-                    "admin 组 `{id}` scopes 应含 users:admin,got {scopes:?}"
-                );
+                for req in reqs {
+                    let scopes: Vec<&str> = req[OAUTH2_SCHEME]
+                        .as_array()
+                        .expect("oauth2 scopes")
+                        .iter()
+                        .map(|s| s.as_str().unwrap())
+                        .collect();
+                    assert!(
+                        scopes.contains(&admin_wire.as_str()),
+                        "admin 组 `{id}` 每个 requirement 都应含 users:admin,got {scopes:?}"
+                    );
+                }
                 seen += 1;
             }
         }
         assert!(seen >= 2, "admin 组应至少 2 个带 security 的 op,got {seen}");
+    }
+
+    /// 多权限文档形状:AND = 单 requirement 多 scope;OR = 多 requirement 各一 scope。
+    /// 断言含顺序(= 表内数组顺序)—— 形状即契约。
+    #[test]
+    fn multi_perm_doc_shapes() {
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        let find = |target: &str| -> Vec<Vec<String>> {
+            for (_p, item) in v["paths"].as_object().unwrap() {
+                for (_m, op) in item.as_object().unwrap() {
+                    if op.get("operationId").and_then(|x| x.as_str()) == Some(target) {
+                        return op["security"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|r| {
+                                r["oauth2"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|s| s.as_str().unwrap().to_owned())
+                                    .collect()
+                            })
+                            .collect();
+                    }
+                }
+            }
+            panic!("spec 缺 operation `{target}`");
+        };
+        assert_eq!(
+            find("purge_preview"),
+            vec![vec!["widgets:read".to_owned(), "widgets:delete".to_owned()]],
+            "AND 应是单 requirement 双 scope"
+        );
+        assert_eq!(
+            find("widget_overview"),
+            vec![
+                vec!["widgets:read".to_owned()],
+                vec!["users:admin".to_owned()]
+            ],
+            "OR 应是双 requirement 各单 scope"
+        );
     }
 }

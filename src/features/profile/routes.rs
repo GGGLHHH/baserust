@@ -40,6 +40,26 @@ pub async fn get_profile(
     Ok(Json(state.profiles.get(user_id).await?))
 }
 
+/// 读**请求者自己**的资料(仅登录,零 perm —— "自己"是身份事实不是授权决策,
+/// 对齐 `get_me`/`my_widget_count` 的自我操作范式;`profiles:read` 留给"读任意人")。
+/// 静态段 `/profiles/me` 与参数段 `/profiles/{user_id}` 共存,axum 静态优先。
+#[utoipa::path(
+    get,
+    path = "/profiles/me",
+    tag = "profiles",
+    responses(
+        (status = 200, description = "自己的资料(avatar_url 为相对 preview 路径)", body = ProfileResponse),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 404, description = "尚未建资料(前端以此引导建资料)", body = ErrorBody)
+    )
+)]
+pub async fn get_my_profile(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<ProfileResponse>, AppError> {
+    Ok(Json(state.profiles.get(user.0.id).await?))
+}
+
 /// 全量替换 upsert 自己的资料(`profiles:write`);带 `profiles:write:all` 可替任何人。
 /// 未建 → 201,已有 → 200(PUT 即建即替,RFC 7231 本义;profile 无独立 POST)。
 #[utoipa::path(

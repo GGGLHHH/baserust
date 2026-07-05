@@ -176,6 +176,36 @@ impl Policy {
         }
     }
 
+    /// **多权限 AND**:全部通过才放行(逐个 [`Self::require_scoped`],role ∩ scope 语义不变)。
+    /// 空切片 = 恒 Ok(无要求);调用方别拿空表当"禁止"用。
+    pub fn require_all(
+        &self,
+        user: &AuthUser,
+        scope: &[Perm],
+        perms: &[Perm],
+    ) -> Result<(), AppError> {
+        perms
+            .iter()
+            .try_for_each(|&p| self.require_scoped(user, scope, p))
+    }
+
+    /// **多权限 OR**:任一通过即放行,全败 → 403。空切片 = 恒 403(无可满足支)。
+    pub fn require_any(
+        &self,
+        user: &AuthUser,
+        scope: &[Perm],
+        perms: &[Perm],
+    ) -> Result<(), AppError> {
+        if perms
+            .iter()
+            .any(|&p| self.require_scoped(user, scope, p).is_ok())
+        {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+
     /// **数据可见域(ownership mode)**:边缘的 RBAC∩scope 推出"能不能看全部"——有 `all_perm`(经
     /// `require_scoped`,故 role 与 scope 都参与)→ [`Access::All`],否则只看自己 → [`Access::Own`]。
     /// 这是三轴的扣点:类型级判定(RBAC∩scope)**参数化**行级 ownership;真正的过滤在查询里(见 `Access`)。
@@ -342,6 +372,44 @@ mod tests {
         assert!(policy
             .require_scoped(&u, &[Perm::WidgetReadAll], Perm::WidgetRead)
             .is_ok());
+    }
+
+    /// 多权限组合子:AND 缺一即拒、OR 任一即过;scope 收窄与 implies 语义同 require_scoped。
+    #[test]
+    fn require_all_and_any_combinators() {
+        let policy = Policy::from_roles([
+            ("ops".to_owned(), vec![Perm::WidgetRead, Perm::WidgetDelete]),
+            ("aud".to_owned(), vec![Perm::UsersAdmin]),
+        ]);
+        let both = user(&["ops"]);
+        let admin_only = user(&["aud"]);
+        let need = [Perm::WidgetRead, Perm::WidgetDelete];
+        // AND:全有 → Ok;role 缺(aud 无 read/delete)→ Err
+        assert!(policy.require_all(&both, &[], &need).is_ok());
+        assert!(policy.require_all(&admin_only, &[], &need).is_err());
+        // AND:scope 收窄掉 delete → Err(role 够也不行)
+        assert!(policy
+            .require_all(&both, &[Perm::WidgetRead], &need)
+            .is_err());
+        // OR:任一支过即 Ok(aud 走 users:admin 支)
+        let either = [Perm::WidgetRead, Perm::UsersAdmin];
+        assert!(policy.require_any(&admin_only, &[], &either).is_ok());
+        assert!(policy.require_any(&both, &[], &either).is_ok());
+        // OR:两支全无 → Err
+        assert!(policy
+            .require_any(&user(&["nobody"]), &[], &either)
+            .is_err());
+        // OR + scope 收窄:scope 只给 users:admin → read 支被收窄,靠 admin 支过
+        assert!(policy
+            .require_any(&admin_only, &[Perm::UsersAdmin], &either)
+            .is_ok());
+        // OR + scope 收窄:scope 与两支皆不交 → 全败
+        assert!(policy
+            .require_any(&both, &[Perm::UsersAdmin], &either)
+            .is_err());
+        // OR:implies 经由生效(read:all 蕴含 read → read 支过)
+        let p2 = Policy::from_roles([("mgr".to_owned(), vec![Perm::WidgetReadAll])]);
+        assert!(p2.require_any(&user(&["mgr"]), &[], &either).is_ok());
     }
 
     // ── 组闸中间件:小 Router + Extension 注入,黑盒断言状态码 ──
