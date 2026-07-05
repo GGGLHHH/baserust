@@ -4,12 +4,13 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-use super::adapters::{ContentAvatarProbe, InProcessUserDirectory};
+use super::adapters::{ContentAvatarProbe, InProcessProfileDirectory, InProcessUserDirectory};
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgProfileRepo, ProfileRepo, ProfileService,
 };
+use crate::features::users::{self, UserAdminService};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
     UserDirectory, WidgetRepo, WidgetService,
@@ -54,6 +55,8 @@ pub struct AppState {
     /// content 内容/对象存储服务(领域来自 content 库;app 注入仓储 + minio/内存 ObjectStore)。
     pub contents: ContentService,
     pub auth: AuthService,
+    /// 后台用户管理(idm 身份原语 + app.profiles 富化)。仅 needs_idm 进程装真实现。
+    pub user_admin: UserAdminService,
     /// readyz 就绪探针用:DB 模式持 pool(ping `SELECT 1`),内存模式为 `None`(恒就绪)。
     pub db_pool: Option<PgPool>,
     /// 认证 cookie 是否带 `Secure`(prod=true,仅 https 发送;dev http 必须 false 否则浏览器不发)。
@@ -192,10 +195,14 @@ impl AppState {
                 if needs_idm {
                     tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
                 }
+                // user 与 role repo **共享** RoleStore —— 否则 create_with_roles/set_roles 的授予对
+                // roles_for_user/list 不可见(PG 侧靠共表天然一致,内存侧需显式 sharing_with)。
+                let mem_users = InMemoryUserRepo::new();
+                let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
                 (
-                    Arc::new(InMemoryUserRepo::new()),
+                    Arc::new(mem_users) as Arc<dyn UserRepo>,
                     Arc::new(InMemorySessionRepo::new()),
-                    Arc::new(InMemoryRoleRepo::new()),
+                    Arc::new(mem_roles) as Arc<dyn RoleRepo>,
                 )
             }
         };
@@ -266,6 +273,20 @@ impl AppState {
             Some(s) => s.clone(),
             None => Arc::new(NoopSigner),
         };
+        // 后台用户管理:富化端口**恒**包 profile_repo —— 单体(内存/PG)profile_repo 有数据 → 富化;
+        // 分进程 idm(needs_app=false)profile_repo 是空内存占位 → 批量查空 → display_name/avatar 自然降级 null。
+        // (勿按 app_pool 的 Some/None 选:内存 Both 也 None 但 profile_repo 有数据,那样会误降级。)
+        // idm repos 被 AuthService::builder move 走 —— user_admin 先 clone(Arc,廉价)。
+        let profile_directory: Arc<dyn users::ProfileDirectory> =
+            Arc::new(InProcessProfileDirectory::new(profile_repo.clone()));
+        let user_admin = UserAdminService::new(
+            idm_users.clone(),
+            idm_roles.clone(),
+            idm_sessions.clone(),
+            Arc::new(Argon2Hasher),
+            profile_directory,
+        );
+
         let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
             .hasher(Arc::new(Argon2Hasher))
             .signer(signer_port)
@@ -280,6 +301,7 @@ impl AppState {
             widget_events,
             contents,
             auth,
+            user_admin,
             // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
             db_pool: app_pool.or(idm_pool),
             cookie_secure: config.app_env.is_prod(),

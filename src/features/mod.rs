@@ -4,4 +4,5 @@
 pub mod auth;
 pub mod content;
 pub mod profile;
+pub mod users;
 pub mod widget;

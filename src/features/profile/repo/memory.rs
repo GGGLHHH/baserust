@@ -36,6 +36,14 @@ impl ProfileRepo for InMemoryProfileRepo {
         Ok(self.store.lock().expect("锁未中毒").get(&user_id).cloned())
     }
 
+    async fn find_by_ids(&self, user_ids: &[Uuid]) -> Result<Vec<Profile>, AppError> {
+        let store = self.store.lock().expect("锁未中毒");
+        Ok(user_ids
+            .iter()
+            .filter_map(|id| store.get(id).cloned())
+            .collect())
+    }
+
     async fn upsert(
         &self,
         user_id: Uuid,

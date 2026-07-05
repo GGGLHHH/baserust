@@ -41,6 +41,13 @@ fn test_app() -> Router {
             "memory",
         ),
         auth: test_auth(signer.clone(), verifier.clone()),
+        user_admin: baserust::features::users::UserAdminService::new(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+        ),
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(baserust::infra::authz::Policy::default()), // 这套契约不测授权

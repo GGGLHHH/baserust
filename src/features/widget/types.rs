@@ -33,3 +33,23 @@ pub struct UpdateWidget {
     #[garde(length(min = 1, max = 100))]
     pub name: String,
 }
+
+/// 列表排序字段(**白名单** —— 只暴露可排的列,防注入)。默认 `created_at`(配 `SortOrder::Desc` = 最新在前)。
+/// 范式:排序方向共享(`infra::sort::SortOrder`),可排字段各 feature 自己圈定。
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetSortField {
+    #[default]
+    CreatedAt,
+    Name,
+}
+
+impl WidgetSortField {
+    /// 映射到 sea-query 列标识符(cursor 分支不用它 —— keyset 恒按 id)。
+    pub(crate) fn column(&self) -> super::repo::Widgets {
+        match self {
+            Self::CreatedAt => super::repo::Widgets::CreatedAt,
+            Self::Name => super::repo::Widgets::Name,
+        }
+    }
+}

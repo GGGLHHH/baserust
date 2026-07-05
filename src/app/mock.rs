@@ -76,6 +76,8 @@ pub async fn apply(
                 with_total: false,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("列 widget 失败: {e:?}"))?;
@@ -178,6 +180,8 @@ mod tests {
                     with_total: false,
                 },
                 None,
+                Default::default(),
+                Default::default(),
             )
             .await
             .unwrap();

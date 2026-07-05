@@ -10,3 +10,4 @@ pub mod objectstore;
 pub mod op_perms;
 pub mod openapi;
 pub mod pagination;
+pub mod sort;

@@ -42,6 +42,13 @@ fn test_app() -> (Router, String) {
         ),
         contents: test_contents(),
         auth: test_auth(signer.clone(), verifier.clone()),
+        user_admin: baserust::features::users::UserAdminService::new(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+        ),
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,
         policy: Arc::new(test_policy()),
@@ -475,4 +482,60 @@ async fn multi_perm_and_or_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// list 排序(offset):`sort_by=name&order=asc` → 首个 "a";`order=desc` → 首个 "b"。
+/// cursor + 非默认 `sort_by` → 422(keyset 恒按 id,排序仅 offset 支持)。
+#[tokio::test]
+async fn list_sort_by_name_offset_and_cursor_rejects() {
+    let (app, tok) = test_app();
+    // 建 b、再建 a(创建序 b<a);按 name 排序应与创建序解耦。
+    for name in ["b", "a"] {
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/frontend/widgets",
+                &format!(r#"{{"name":"{name}"}}"#),
+                &tok,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let first_name = |body: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["items"][0]["name"].as_str().unwrap().to_owned()
+    };
+
+    // name asc → "a" 在前
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/frontend/widgets?sort_by=name&order=asc&page=1",
+            &tok,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(first_name(&body_string(resp).await), "a");
+
+    // name desc → "b" 在前
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/api/v1/frontend/widgets?sort_by=name&order=desc&page=1",
+            &tok,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(first_name(&body_string(resp).await), "b");
+
+    // cursor 模式(空 cursor = 首页)+ 非默认 sort_by → 422
+    let resp = app
+        .oneshot(get("/api/v1/frontend/widgets?cursor=&sort_by=name", &tok))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

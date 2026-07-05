@@ -8,14 +8,37 @@ use futures_util::Stream;
 use uuid::Uuid;
 
 use super::events::WidgetEvent;
-use super::types::{CreateWidget, UpdateWidget, Widget};
+use super::types::{CreateWidget, UpdateWidget, Widget, WidgetSortField};
 use super::view::{WidgetStats, WidgetView};
 use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
 use crate::infra::extract::{Json, Path, Query};
-use crate::infra::pagination::{Page, PageQuery};
+use crate::infra::pagination::{Page, PageParams, PageQuery};
+use crate::infra::sort::SortOrder;
+
+/// 列表排序 query(**第二个 `Query` 提取器**,避免把 sort 塞进共享 `PageQuery`)。
+/// `#[serde(default)]`:两参都缺时回落默认(否则 serde_urlencoded 对必填字段缺失即 400)。
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[serde(default)]
+#[into_params(parameter_in = Query)]
+pub struct WidgetSort {
+    pub sort_by: WidgetSortField,
+    pub order: SortOrder,
+}
+
+/// cursor keyset 恒按 id;非默认 sort 只能配 offset。cursor + 非默认 sort → 422(而非静默忽略)。
+fn ensure_sort_pagination(params: &PageParams, sort: &WidgetSort) -> Result<(), AppError> {
+    let is_default_sort =
+        matches!(sort.sort_by, WidgetSortField::CreatedAt) && matches!(sort.order, SortOrder::Desc);
+    if matches!(params, PageParams::Cursor { .. }) && !is_default_sort {
+        return Err(AppError::Validation(
+            "sort_by requires offset/page pagination".into(),
+        ));
+    }
+    Ok(())
+}
 
 // 三轴授权(详见 `authorization` skill):**必须登录**(`CurrentUser` → 401);RBAC(`require_scoped` → 403);
 // 数据所有权(`data_access` → `owner_filter`/`allows_created_by`:`user` 只看/取自己创建的,有 `read:all` 的看全部)。
@@ -24,11 +47,12 @@ use crate::infra::pagination::{Page, PageQuery};
 #[utoipa::path(
     get,
     path = "/widgets",
-    tag = "widgets",    params(PageQuery),
+    tag = "widgets",    params(PageQuery, WidgetSort),
     responses(
         (status = 200, description = "widget 分页列表(按所有权过滤,created_by 富化为用户)", body = Page<WidgetView>),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:read 权限", body = ErrorBody)
+        (status = 403, description = "无 widgets:read 权限", body = ErrorBody),
+        (status = 422, description = "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)", body = ErrorBody)
     )
 )]
 pub async fn list_widgets(
@@ -36,6 +60,7 @@ pub async fn list_widgets(
     user: CurrentUser,
     scope: TokenScope,
     Query(query): Query<PageQuery>,
+    Query(sort): Query<WidgetSort>,
 ) -> Result<Json<Page<WidgetView>>, AppError> {
     state
         .policy
@@ -45,7 +70,14 @@ pub async fn list_widgets(
         .policy
         .data_access(&user.0, &scope.0, Perm::WidgetReadAll)
         .owner_filter();
-    Ok(Json(state.widgets.list_enriched(query, owner).await?))
+    let params = query.resolve()?;
+    ensure_sort_pagination(&params, &sort)?;
+    Ok(Json(
+        state
+            .widgets
+            .list_enriched(params, owner, sort.sort_by, sort.order)
+            .await?,
+    ))
 }
 
 /// 创建一个 widget(需 `widgets:write`)。审计主体(created_by)= 当前登录用户,来自 `AuditContext`。
@@ -254,11 +286,12 @@ pub async fn widget_overview(
     get,
     path = "/widgets",
     tag = "widgets",
-    params(PageQuery),
+    params(PageQuery, WidgetSort),
     responses(
         (status = 200, description = "全部 widget(跨所有人,富化)", body = Page<WidgetView>),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限(仅 superadmin)", body = ErrorBody)
+        (status = 403, description = "无 users:admin 权限(仅 superadmin)", body = ErrorBody),
+        (status = 422, description = "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)", body = ErrorBody)
     )
 )]
 pub async fn admin_list_widgets(
@@ -266,11 +299,19 @@ pub async fn admin_list_widgets(
     user: CurrentUser,
     scope: TokenScope,
     Query(query): Query<PageQuery>,
+    Query(sort): Query<WidgetSort>,
 ) -> Result<Json<Page<WidgetView>>, AppError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    Ok(Json(state.widgets.list_enriched(query, None).await?))
+    let params = query.resolve()?;
+    ensure_sort_pagination(&params, &sort)?;
+    Ok(Json(
+        state
+            .widgets
+            .list_enriched(params, None, sort.sort_by, sort.order)
+            .await?,
+    ))
 }
 
 /// 订阅 widget 变更事件流(SSE)。需登录 + `widgets:read` —— 与列表同权:能看列表就能看变更。

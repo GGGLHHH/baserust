@@ -48,6 +48,13 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
             b = b.header("content-type", "application/json");
             Body::from(r#"{"tags":[]}"#)
         }
+        // users 写端点:一份含各 DTO 必填字段的 body(serde 忽略多余键)→ 四端点共用,触达 gate。
+        "create_user" | "update_user" | "set_user_roles" | "reset_user_password" => {
+            b = b.header("content-type", "application/json");
+            Body::from(
+                r#"{"username":"probe","password":"probe123","roles":[],"new_password":"probe123"}"#,
+            )
+        }
         // multipart 端点:require_scoped 在 Multipart 提取后、读字段前跑 → 只需 content-type 合法即可触达 gate。
         "upload_content" => {
             b = b.header("content-type", "multipart/form-data; boundary=X");

@@ -9,9 +9,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::WidgetRepo;
-use crate::features::widget::types::Widget;
+use crate::features::widget::types::{Widget, WidgetSortField};
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
+use crate::infra::sort::SortOrder;
 
 /// 内存内部行:比 `Widget` 多 `deleted_at`(DTO 不暴露,但软删除要它)。
 #[derive(Clone)]
@@ -72,7 +73,13 @@ impl Default for InMemoryWidgetRepo {
 
 #[async_trait]
 impl WidgetRepo for InMemoryWidgetRepo {
-    async fn list(&self, page: &PageParams, owner: Option<&str>) -> Result<Page<Widget>, AppError> {
+    async fn list(
+        &self,
+        page: &PageParams,
+        owner: Option<&str>,
+        sort_by: WidgetSortField,
+        order: SortOrder,
+    ) -> Result<Page<Widget>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
         let mut alive: Vec<Row> = store
             .widgets
@@ -82,8 +89,6 @@ impl WidgetRepo for InMemoryWidgetRepo {
             .filter(|r| owner.is_none_or(|o| r.created_by.as_deref() == Some(o)))
             .cloned()
             .collect();
-        // ORDER BY id DESC(v7 id 即创建序倒序,最新在前)
-        alive.sort_by(|a, b| b.id.cmp(&a.id));
 
         match page {
             PageParams::Offset {
@@ -91,6 +96,18 @@ impl WidgetRepo for InMemoryWidgetRepo {
                 size,
                 with_total,
             } => {
+                // parity 于 PG offset:ORDER BY <sort_by> <order>, id <order>(id tiebreaker,方向随主键)。
+                alive.sort_by(|a, b| {
+                    let primary = match sort_by {
+                        WidgetSortField::CreatedAt => a.created_at.cmp(&b.created_at),
+                        WidgetSortField::Name => a.name.cmp(&b.name),
+                    };
+                    let asc = primary.then_with(|| a.id.cmp(&b.id));
+                    match order {
+                        SortOrder::Asc => asc,
+                        SortOrder::Desc => asc.reverse(),
+                    }
+                });
                 let total = if *with_total {
                     Some(alive.len() as u64)
                 } else {
@@ -106,6 +123,8 @@ impl WidgetRepo for InMemoryWidgetRepo {
                 Ok(Page::offset(items, *page, *size, total))
             }
             PageParams::Cursor { after, limit } => {
+                // cursor keyset 恒按 id DESC(v7 id 即创建序倒序);sort_by 不参与(parity 于 PG)。
+                alive.sort_by(|a, b| b.id.cmp(&a.id));
                 let mut items: Vec<Widget> = alive
                     .iter()
                     .filter(|r| match after {

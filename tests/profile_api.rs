@@ -73,6 +73,13 @@ fn test_app() -> (
         .signer(signer.clone())
         .verifier(verifier.clone())
         .build(),
+        user_admin: baserust::features::users::UserAdminService::new(
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+        ),
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(Policy::from_roles([

@@ -4,6 +4,8 @@
 
 mod content_avatar_probe;
 mod idm_user_directory;
+mod in_process_profile_directory;
 
 pub use content_avatar_probe::ContentAvatarProbe;
 pub use idm_user_directory::InProcessUserDirectory;
+pub use in_process_profile_directory::InProcessProfileDirectory;

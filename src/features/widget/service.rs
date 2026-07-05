@@ -7,11 +7,12 @@ use uuid::Uuid;
 use super::events::{EventBus, WidgetEvent};
 use super::port::UserDirectory;
 use super::repo::WidgetRepo;
-use super::types::{CreateWidget, UpdateWidget, Widget};
+use super::types::{CreateWidget, UpdateWidget, Widget, WidgetSortField};
 use super::view::WidgetView;
 use crate::infra::audit::AuditContext;
 use crate::infra::error::AppError;
-use crate::infra::pagination::{Page, PageInfo, PageQuery};
+use crate::infra::pagination::{Page, PageInfo, PageParams, PageQuery};
+use crate::infra::sort::SortOrder;
 
 /// 业务逻辑层。范式:
 /// - 持 `Arc<dyn WidgetRepo>` 端口,不关心底层是内存还是 Postgres。
@@ -48,19 +49,34 @@ impl WidgetService {
     ) -> Result<Page<Widget>, AppError> {
         let params = query.resolve()?;
         let owner = owner.map(|id| id.to_string());
-        self.repo.list(&params, owner.as_deref()).await
+        // 无排序诉求的内部路径(count/测试)→ 默认序(created_at desc)。
+        self.repo
+            .list(
+                &params,
+                owner.as_deref(),
+                WidgetSortField::default(),
+                SortOrder::default(),
+            )
+            .await
     }
 
     /// 富化列表:list 后收集 distinct created_by → **一次** batch → 内存拼成 `WidgetView`。
     /// 防 N+1 的纪律在此:一次 `batch_by_ids`、不是每行一次;脏值('system'/NULL/非 UUID)与
     /// 已删用户优雅降级成 `created_by_user: null`,绝不报错、绝不跨 schema join。
     /// `owner` 同 [`Self::list`]:行级所有权过滤(在查询层,分页正确)。
+    /// `params` 由 handler `resolve()`(cursor+非默认 sort 的 422 校验在 handler);`sort_by`/`order` 下传 repo。
     pub async fn list_enriched(
         &self,
-        query: PageQuery,
+        params: PageParams,
         owner: Option<Uuid>,
+        sort_by: WidgetSortField,
+        order: SortOrder,
     ) -> Result<Page<WidgetView>, AppError> {
-        let page = self.list(query, owner).await?;
+        let owner = owner.map(|id| id.to_string());
+        let page = self
+            .repo
+            .list(&params, owner.as_deref(), sort_by, order)
+            .await?;
         // 收集 distinct + parse 过滤:'system'/NULL/历史脏值 parse 失败的不当 user 查。
         let ids: Vec<Uuid> = page
             .items
@@ -232,7 +248,15 @@ mod tests {
             },
         )])));
         let svc = WidgetService::new(repo, dir, Arc::new(MemoryEventBus::new()));
-        let page = svc.list_enriched(first_page(), None).await.unwrap();
+        let page = svc
+            .list_enriched(
+                first_page().resolve().unwrap(),
+                None,
+                WidgetSortField::default(),
+                SortOrder::default(),
+            )
+            .await
+            .unwrap();
         let by = |n: &str| page.items.iter().find(|v| v.name == n).unwrap();
         assert_eq!(
             by("known").created_by_user.as_ref().unwrap().username,

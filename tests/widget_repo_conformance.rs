@@ -42,6 +42,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: true,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -61,6 +63,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: false,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -77,6 +81,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 limit: 2,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -102,6 +108,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 limit: 2,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -126,6 +134,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: true,
             },
             Some("tester"), // a 的 created_by;b/c 是 None
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -166,6 +176,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: true,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -238,6 +250,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: true,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -254,6 +268,8 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
                 with_total: true,
             },
             None,
+            Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();

@@ -170,6 +170,35 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "widget_overview",
         perm: PermReq::Any(&[Perm::WidgetRead, Perm::UsersAdmin]),
     },
+    // ── users(后台用户管理):全 superadmin 专属(users:admin);admin:login 由 admin 组注入 ──
+    OpAuthz {
+        operation_id: "list_users",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "create_user",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "get_user",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "update_user",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "delete_user",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "set_user_roles",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "reset_user_password",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
 ];
 
 /// 按 operationId 查授权目录。不在表 = public。

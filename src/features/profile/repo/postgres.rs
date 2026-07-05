@@ -22,6 +22,10 @@ const GET_SQL: &str = "select user_id, display_name, phone, \
      avatar_content_id, created_by, created_at, updated_by, updated_at \
      from profiles where user_id = $1";
 
+const FIND_BY_IDS_SQL: &str = "select user_id, display_name, phone, \
+     avatar_content_id, created_by, created_at, updated_by, updated_at \
+     from profiles where user_id = any($1)";
+
 /// 全量替换 upsert:conflict 分支**不碰 created_by/created_at**(替换保留),updated_at 归触发器。
 /// `(xmax = 0)` ⇔ 本行由这条语句 INSERT(未走 UPDATE 分支)—— PG 惯用的"建 or 替"单语句判别,
 /// 免二次查询/竞态。
@@ -50,6 +54,17 @@ impl ProfileRepo for PgProfileRepo {
         sqlx::query_as::<_, Profile>(GET_SQL)
             .bind(user_id)
             .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn find_by_ids(&self, user_ids: &[Uuid]) -> Result<Vec<Profile>, AppError> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new()); // 空集省一次查询,也避开空 ANY
+        }
+        sqlx::query_as::<_, Profile>(FIND_BY_IDS_SQL)
+            .bind(user_ids)
+            .fetch_all(&self.pool)
             .await
             .map_err(|e| AppError::Internal(e.into()))
     }

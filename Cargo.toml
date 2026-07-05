@@ -9,7 +9,7 @@ default-run = "baserust"
 [dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
-idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.2.0" }
+idm = { path = "../rust-idm" }
 
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`

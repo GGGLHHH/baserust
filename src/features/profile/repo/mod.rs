@@ -27,6 +27,9 @@ pub struct ProfileFields {
 pub trait ProfileRepo: Send + Sync {
     /// 未建 → `None`(路由译 404)。
     async fn get(&self, user_id: Uuid) -> Result<Option<Profile>, AppError>;
+    /// 按 user_id **批量**取(跨模块富化的根原语:users 列表补 display_name/avatar)。
+    /// 一条 SQL(`WHERE user_id = ANY(...)`)解 N+1;查不到的 id 不在结果里(交调用方降级)。
+    async fn find_by_ids(&self, user_ids: &[Uuid]) -> Result<Vec<Profile>, AppError>;
     /// **全量替换 upsert**;bool = 新建(路由据此 201/200)。
     /// 替换只盖业务字段 + updated_by(updated_at PG 归触发器 / memory 手动),**created_by/created_at 保留**。
     async fn upsert(

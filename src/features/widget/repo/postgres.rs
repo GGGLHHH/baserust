@@ -8,9 +8,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{WidgetRepo, WidgetTags, Widgets, COLS};
-use crate::features::widget::types::Widget;
+use crate::features::widget::types::{Widget, WidgetSortField};
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
+use crate::infra::sort::SortOrder;
 
 pub struct PgWidgetRepo {
     pool: PgPool,
@@ -33,7 +34,13 @@ impl PgWidgetRepo {
 
 #[async_trait]
 impl WidgetRepo for PgWidgetRepo {
-    async fn list(&self, page: &PageParams, owner: Option<&str>) -> Result<Page<Widget>, AppError> {
+    async fn list(
+        &self,
+        page: &PageParams,
+        owner: Option<&str>,
+        sort_by: WidgetSortField,
+        order: SortOrder,
+    ) -> Result<Page<Widget>, AppError> {
         match page {
             PageParams::Offset {
                 page,
@@ -41,13 +48,15 @@ impl WidgetRepo for PgWidgetRepo {
                 with_total,
             } => {
                 // SELECT cols FROM widgets WHERE deleted_at IS NULL [AND created_by = owner]
-                //   ORDER BY id DESC LIMIT size OFFSET (page-1)*size
+                //   ORDER BY <sort_by> <order>, id <order> LIMIT size OFFSET (page-1)*size
+                // id 作 tiebreaker(同 name/created_at 值时定序);方向随主键一致。
                 let mut q = Self::base_select();
                 q.columns(COLS);
                 if let Some(o) = owner {
                     q.and_where(Expr::col(Widgets::CreatedBy).eq(o)); // ownership 过滤
                 }
-                q.order_by(Widgets::Id, Order::Desc)
+                q.order_by(sort_by.column(), order.into())
+                    .order_by(Widgets::Id, order.into())
                     .limit(*size)
                     .offset((page.saturating_sub(1)) * size);
                 let (sql, values) = q.build_sqlx(PostgresQueryBuilder);

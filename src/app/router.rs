@@ -27,7 +27,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{auth, content, profile, widget};
+use crate::features::{auth, content, profile, users, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -75,7 +75,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     if needs_idm {
         public = public.merge(auth::public_router());
         frontend = frontend.merge(auth::me_router());
-        admin = admin.merge(auth::admin_router());
+        admin = admin
+            .merge(auth::admin_router())
+            .merge(users::admin_router());
         admin_open = admin_open.merge(auth::admin_login_router());
     }
     // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
@@ -181,6 +183,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                     OpenApiRouter::new()
                         .merge(widget::admin_router())
                         .merge(auth::admin_router())
+                        .merge(users::admin_router())
                         .merge(auth::admin_login_router()),
                 ),
         )
