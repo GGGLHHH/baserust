@@ -149,6 +149,7 @@ impl AppState {
                     &config.s3_bucket,
                     &config.s3_access_key,
                     &config.s3_secret_key,
+                    config.s3_presign_relative,
                 )
                 .await;
                 (Arc::new(store), "minio".to_owned())

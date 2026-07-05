@@ -30,21 +30,26 @@ const PRESIGN_TTL: Duration = Duration::from_secs(300);
 const PRESIGN_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 
 /// minio/S3 后端。`Client` 内部是 Arc(廉价 Clone),`bucket` 是落字节的桶名。
+/// `presign_relative`:presign 出的 URL 是否剥 host 成相对(见 [`Self::finalize`])。
 pub struct S3ObjectStore {
     client: Client,
     bucket: String,
+    presign_relative: bool,
 }
 
 impl S3ObjectStore {
     /// 建 minio/S3 客户端:显式 endpoint + region + **静态凭据** + `force_path_style(true)`
     /// (minio 必须走 path-style,否则 SDK 默认 vhost-style 解析不到桶)。
     /// 凭据从 config 显式给(不走 SDK 的环境/profile 默认链)——脚手架要可控、可零环境变量复现。
+    /// `presign_relative`:true → presign URL 剥 host 成相对(prod 边缘 TLS 拓扑,浏览器经 nginx→minio,
+    /// 零域名配置);false → 绝对 URL(dev/直连 minio,host 来自 endpoint)。
     pub async fn new(
         endpoint: &str,
         region: &str,
         bucket: &str,
         access_key: &str,
         secret_key: &str,
+        presign_relative: bool,
     ) -> Self {
         let creds = Credentials::new(access_key, secret_key, None, None, "static");
         let shared = aws_config::defaults(BehaviorVersion::latest())
@@ -60,6 +65,24 @@ impl S3ObjectStore {
         Self {
             client: Client::from_conf(conf),
             bucket: bucket.to_owned(),
+            presign_relative,
+        }
+    }
+
+    /// presign URL 定形。relative 模式剥 `scheme://host`,只留 `/<bucket>/<key>?X-Amz-...`——
+    /// 签名只覆盖 host 值本身(不覆盖"URL 里写没写 host"),故剥 host 不破签名;反代把 Host 固定回
+    /// 签名 host(= `S3_ENDPOINT`)即验签通过。浏览器按 origin 解析相对路径,容器全程不知域名。
+    fn finalize(&self, url: String) -> String {
+        if !self.presign_relative {
+            return url;
+        }
+        // scheme://host[:port]/path?query → /path?query(找 "://" 后第一个 '/')。
+        match url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.find('/').map(|i| rest[i..].to_owned()))
+        {
+            Some(rel) => rel,
+            None => url, // 无预期形状:原样(presigned 总是 scheme://host/bucket/key,不该走到)
         }
     }
 
@@ -83,7 +106,7 @@ impl S3ObjectStore {
             .presigned(cfg)
             .await
             .map_err(store_err)?;
-        Ok(Some(req.uri().to_string()))
+        Ok(Some(self.finalize(req.uri().to_string())))
     }
 }
 
@@ -152,7 +175,7 @@ impl ObjectStore for S3ObjectStore {
             req = req.content_type(mime);
         }
         let signed = req.presigned(cfg).await.map_err(store_err)?;
-        Ok(Some(signed.uri().to_string()))
+        Ok(Some(self.finalize(signed.uri().to_string())))
     }
 
     /// 预签名下载 URL(attachment;filename 由 service 层按"metadata 优先"决议好传入)。
@@ -218,6 +241,7 @@ mod tests {
             "content",
             "minio",
             "minio12345",
+            false, // 绝对 URL 模式(host 来自 endpoint)
         )
         .await;
         let dl = store
@@ -259,5 +283,48 @@ mod tests {
         );
         // 无 mime:凭证照签,只是不钉 content-type。
         assert!(store.upload_url("k1/k2", None).await.unwrap().is_some());
+    }
+
+    /// relative 模式:presign URL 剥 host,只留 `/<bucket>/<key>?...`——浏览器经反代→minio,零域名。
+    /// 签名/disposition/TTL 仍在(剥 host 不破签名:反代把 Host 固定回签名 host 即验签通过)。
+    #[tokio::test]
+    async fn relative_presign_strips_host_keeps_signature() {
+        let store = S3ObjectStore::new(
+            "http://minio:9000", // 内网 host:签名用它,反代把 Host 固定回它
+            "us-east-1",
+            "content",
+            "minio",
+            "minio12345",
+            true, // relative 模式
+        )
+        .await;
+        let dl = store
+            .download_url("k1/k2", Some("f.pdf"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            dl.starts_with("/content/k1/k2?"),
+            "应是相对路径,无 scheme/host: {dl}"
+        );
+        assert!(!dl.contains("minio:9000"), "不该含内网 host: {dl}");
+        assert!(!dl.contains("://"), "不该含 scheme: {dl}");
+        assert!(dl.contains("X-Amz-Signature="), "签名仍在: {dl}");
+        assert!(
+            dl.contains("response-content-disposition=attachment"),
+            "{dl}"
+        );
+
+        let up = store
+            .upload_url("k1/k2", Some("image/png"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(up.starts_with("/content/k1/k2?"), "直传凭证也相对: {up}");
+        assert!(up.contains("X-Amz-SignedHeaders="), "{up}");
+
+        let pv = store.preview_url("k1/k2").await.unwrap().unwrap();
+        assert!(pv.starts_with("/content/k1/k2?"), "{pv}");
+        assert!(pv.contains("response-content-disposition=inline"), "{pv}");
     }
 }

@@ -178,6 +178,12 @@ pub struct Config {
     /// 区域,`S3_REGION`,默认 `us-east-1`(minio 不校验,但 SDK 需一个值)。
     #[serde(default = "default_s3_region")]
     pub s3_region: String,
+    /// presign URL 形态,`S3_PRESIGN_RELATIVE`,默认 false。
+    /// false = 绝对 URL(host 来自 `S3_ENDPOINT`,浏览器直连 minio;dev/单域名)。
+    /// true = 相对 URL(仅 path+query,浏览器经反代 nginx→minio;prod 边缘 TLS 拓扑,只开 80、零域名配置)。
+    /// true 时 `S3_ENDPOINT` 应指内网(如 `http://minio:9000`),nginx 把 `/<bucket>/` 的 Host 固定回它。
+    #[serde(default)]
+    pub s3_presign_relative: bool,
 }
 
 fn default_bind_addr() -> SocketAddr {
@@ -284,6 +290,7 @@ impl Default for Config {
             s3_access_key: default_s3_access_key(),
             s3_secret_key: default_s3_secret_key(),
             s3_region: default_s3_region(),
+            s3_presign_relative: false,
         }
     }
 }
