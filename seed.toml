@@ -55,7 +55,9 @@ description = "修改任何人的资料(而非仅自己)"
 # 最经典的三轴数据矩阵:
 #  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin
 #  admin      —— 读写删 + 看所有人的(read:all),但无 users:admin
-#  user       —— 只读,且**只看自己创建的**(无 read:all → ownership 落到 Own;无 write → RBAC 拒写)
+#  user       —— widget 只读且**只看自己创建的**(无 read:all → ownership 落到 Own;无 write → RBAC 拒写);
+#               content 可读写**自己的**(contents:write 是头像两步上传的前提——profiles:write 没有它,
+#               avatar 流第一步 prepare 就 403,资料可写头像不可传是配漏),无 delete。
 [[roles]]
 name = "superadmin"
 display_name = "超级管理员"
@@ -71,7 +73,7 @@ permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:del
 [[roles]]
 name = "user"
 display_name = "普通用户"
-permissions = ["widgets:read", "contents:read", "profiles:read", "profiles:write"]
+permissions = ["widgets:read", "contents:read", "contents:write", "profiles:read", "profiles:write"]
 
 [[accounts]]
 username = "superadmin"
