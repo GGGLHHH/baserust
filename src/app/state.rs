@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use super::adapters::{ContentAvatarProbe, InProcessUserDirectory};
 use super::router::Mount;
-use crate::features::auth::AppTokens;
+use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgProfileRepo, ProfileRepo, ProfileService,
 };
@@ -61,8 +61,10 @@ pub struct AppState {
     /// **授权策略(归 app)**:role→权限,从 `seed.toml` 派生的内存只读 `Policy`。handler 经
     /// `state.policy.require(_scoped)` gate 端点。**不查 idm 库**(roles 在 token 里)。
     pub policy: Arc<Policy>,
-    /// app 自有的 JWT 签验(claim 形状 + scope)。中间件用它读 `scope` claim;也可 `mint_scoped` 降权令牌。
-    pub tokens: Arc<AppTokens>,
+    /// JWT 验证半边(公钥)。所有进程持有 —— authenticate 中间件验签/取 scope。
+    pub token_verifier: Arc<AppTokenVerifier>,
+    /// JWT 签发半边(私钥)。**仅 needs_idm 进程 Some**;`Mount::App` = None(app 被攻破铸不出 token)。
+    pub token_signer: Option<Arc<AppTokenSigner>>,
 }
 
 impl AppState {
@@ -72,6 +74,21 @@ impl AppState {
     pub async fn new(config: &Config, mount: Mount) -> anyhow::Result<Self> {
         let needs_app = matches!(mount, Mount::App | Mount::Both);
         let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
+
+        // prod fail-fast(**先于连库**:钥错比 DB 错更该早报,也守"安全不变量最前"):内嵌 dev 密钥
+        // 只准开发用 —— 公钥全进程校验,私钥只在真持有它的进程(needs_idm)校验。
+        if config.app_env.is_prod() {
+            anyhow::ensure!(
+                config.jwt_public_key_pem != crate::infra::config::DEV_JWT_PUBLIC_KEY_PEM,
+                "prod 禁用内嵌 dev JWT 公钥:设 JWT_PUBLIC_KEY_FILE"
+            );
+            if needs_idm {
+                anyhow::ensure!(
+                    config.jwt_private_key_pem != crate::infra::config::DEV_JWT_PRIVATE_KEY_PEM,
+                    "prod 禁用内嵌 dev JWT 私钥:设 JWT_PRIVATE_KEY_FILE"
+                );
+            }
+        }
 
         // widget(app schema):仅 app/both 进程需要。设了 APP_DB_HOST → PG,否则内存(脚手架默认)。
         let app_pool = if needs_app {
@@ -225,13 +242,27 @@ impl AppState {
         let user_directory: Arc<dyn UserDirectory> =
             Arc::new(InProcessUserDirectory::new(idm_users.clone()));
 
-        // app **显式拥有 JWT claim 形状**:注入自己的 AppTokens(实现 idm 的 TokenSigner/TokenVerifier),
-        // 经 builder 替代 AuthService::new 的默认 claim。改 claim 在 features/auth 的 AppClaims。
-        let tokens = Arc::new(AppTokens::new(&config.idm_jwt_secret));
+        // 非对称 JWT:验证半边人人有,签发半边只进 idm 进程(分进程最小权限)。dev/prod 钥校验见函数首。
+        let token_verifier = Arc::new(
+            AppTokenVerifier::from_pem(&config.jwt_public_key_pem).context("JWT 公钥装配失败")?,
+        );
+        let token_signer = if needs_idm {
+            Some(Arc::new(
+                AppTokenSigner::from_pem(&config.jwt_private_key_pem)
+                    .context("JWT 私钥装配失败")?,
+            ))
+        } else {
+            None
+        };
+        // app 进程注入 NoopSigner:签发路径本不可达(auth 路由不挂),真被调到就炸(wiring bug)。
+        let signer_port: Arc<dyn idm::TokenSigner> = match &token_signer {
+            Some(s) => s.clone(),
+            None => Arc::new(NoopSigner),
+        };
         let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
             .hasher(Arc::new(Argon2Hasher))
-            .signer(tokens.clone())
-            .verifier(tokens.clone())
+            .signer(signer_port)
+            .verifier(token_verifier.clone())
             .access_ttl_secs(config.idm_access_ttl_secs)
             .refresh_ttl_secs(config.idm_refresh_ttl_secs)
             .build();
@@ -246,7 +277,8 @@ impl AppState {
             db_pool: app_pool.or(idm_pool),
             cookie_secure: config.app_env.is_prod(),
             policy,
-            tokens,
+            token_verifier,
+            token_signer,
         })
     }
 }
@@ -276,4 +308,25 @@ async fn connect_pool(url: &str) -> anyhow::Result<PgPool> {
         .connect(url)
         .await
         .context("连接 Postgres 失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::config::Profile;
+
+    /// prod + 内嵌 dev 密钥 → 启动拒(公钥全进程;私钥仅 needs_idm)。
+    #[tokio::test]
+    async fn prod_rejects_embedded_dev_jwt_keys() {
+        let cfg = Config {
+            app_env: Profile::Prod,
+            ..Config::default()
+        };
+        // AppState 无 Debug(含 trait object 字段),手动 match 而非 expect_err/unwrap_err。
+        let err = match AppState::new(&cfg, Mount::Both).await {
+            Ok(_) => panic!("prod+dev 钥应拒启动"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("JWT"), "{err}");
+    }
 }

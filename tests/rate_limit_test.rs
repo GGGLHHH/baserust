@@ -10,7 +10,7 @@ use tower::ServiceExt; // oneshot
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::AppTokens;
+use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use xchangeai::infra::authz::Policy;
 use xchangeai::infra::config::Config;
@@ -36,6 +36,9 @@ fn rate_limited_app() -> Router {
             Arc::new(content::InMemoryObjectStore::new()),
             "memory",
         ),
+        // 仅供 /health 用:此 fixture 的 AuthService 走 idm 默认 HS256 便捷构造,与 state 的
+        // EdDSA token_verifier 算法不同 —— **不可扩展到登录/鉴权类断言**(HS256 签的 token 会被
+        // EdDSA-only verifier 静默判空 scope 而非报错,假绿)。要打认证端点见 auth_api 的 fixture。
         auth: AuthService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
@@ -48,7 +51,8 @@ fn rate_limited_app() -> Router {
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(Policy::default()),
-        tokens: Arc::new(AppTokens::new("test-secret")),
+        token_signer: Some(Arc::new(AppTokenSigner::dev())),
+        token_verifier: Arc::new(AppTokenVerifier::dev()),
     };
     let config = Config {
         rate_limit_enabled: true,
@@ -116,6 +120,9 @@ async fn rate_limit_off_by_default_lets_all_through() {
             Arc::new(content::InMemoryObjectStore::new()),
             "memory",
         ),
+        // 仅供 /health 用:此 fixture 的 AuthService 走 idm 默认 HS256 便捷构造,与 state 的
+        // EdDSA token_verifier 算法不同 —— **不可扩展到登录/鉴权类断言**(HS256 签的 token 会被
+        // EdDSA-only verifier 静默判空 scope 而非报错,假绿)。要打认证端点见 auth_api 的 fixture。
         auth: AuthService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
@@ -128,7 +135,8 @@ async fn rate_limit_off_by_default_lets_all_through() {
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(Policy::default()),
-        tokens: Arc::new(AppTokens::new("test-secret")),
+        token_signer: Some(Arc::new(AppTokenSigner::dev())),
+        token_verifier: Arc::new(AppTokenVerifier::dev()),
     };
     let app = build_router(state, &Config::default(), Mount::Both);
     for _ in 0..10 {

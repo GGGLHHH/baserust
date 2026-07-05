@@ -14,12 +14,13 @@ use tower::ServiceExt; // oneshot
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::AppTokens;
+use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
 fn test_app() -> Router {
-    let tokens = Arc::new(AppTokens::new("test-secret"));
+    let signer = Arc::new(AppTokenSigner::dev());
+    let verifier = Arc::new(AppTokenVerifier::dev());
     let bus: Arc<dyn xchangeai::features::widget::EventBus> =
         Arc::new(xchangeai::features::widget::MemoryEventBus::new());
     let state = AppState {
@@ -39,11 +40,12 @@ fn test_app() -> Router {
             Arc::new(content::InMemoryObjectStore::new()),
             "memory",
         ),
-        auth: test_auth(tokens.clone()),
+        auth: test_auth(signer.clone(), verifier.clone()),
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(xchangeai::infra::authz::Policy::default()), // 这套契约不测授权
-        tokens,
+        token_signer: Some(signer.clone()),
+        token_verifier: verifier,
     };
     build_router(
         state,
@@ -52,16 +54,16 @@ fn test_app() -> Router {
     )
 }
 
-/// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + **生产同款 AppTokens**(app 显式 claim)。
-fn test_auth(tokens: Arc<AppTokens>) -> AuthService {
+/// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + **生产同款非对称签验**(app 显式 claim)。
+fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> AuthService {
     AuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
-    .signer(tokens.clone())
-    .verifier(tokens)
+    .signer(signer)
+    .verifier(verifier)
     .access_ttl_secs(900)
     .refresh_ttl_secs(604_800)
     .build()

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::adapters::ContentAvatarProbe;
 use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::AppTokens;
+use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
 use xchangeai::features::profile::{InMemoryProfileRepo, ProfileService};
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use xchangeai::infra::authz::{Perm, Policy};
@@ -32,9 +32,10 @@ fn test_app() -> (
     String,
     String,
 ) {
-    let tokens = Arc::new(AppTokens::new("test-secret"));
+    let signer = Arc::new(AppTokenSigner::dev());
+    let verifier = Arc::new(AppTokenVerifier::dev());
     let mint = |id: Uuid, name: &str, role: &str| {
-        tokens
+        signer
             .mint_scoped(id, name, vec![role.to_owned()], vec![], 900)
             .unwrap()
     };
@@ -69,8 +70,8 @@ fn test_app() -> (
             Arc::new(InMemoryRoleRepo::new()),
         )
         .hasher(Arc::new(FakeHasher))
-        .signer(tokens.clone())
-        .verifier(tokens.clone())
+        .signer(signer.clone())
+        .verifier(verifier.clone())
         .build(),
         db_pool: None,
         cookie_secure: false,
@@ -96,7 +97,8 @@ fn test_app() -> (
                 ],
             ),
         ])),
-        tokens,
+        token_signer: Some(signer.clone()),
+        token_verifier: verifier,
     };
     let app = build_router(
         state,

@@ -98,6 +98,13 @@ migrate-add schema name:
 seed:
     IDM_DB_HOST="{{pg_host}}" IDM_DB_PORT="{{pg_port}}" IDM_DB_DATABASE="{{pg_db}}" APP_DB_HOST="{{pg_host}}" APP_DB_PORT="{{pg_port}}" APP_DB_DATABASE="{{pg_db}}" cargo run --bin seed
 
+# 生成生产 JWT 密钥对(Ed25519)。dev 对已入库(keys/),这个目标给 prod 造新对。
+gen-keys out="./keys/prod-ed25519":
+    openssl genpkey -algorithm ed25519 -out {{out}}.pem
+    openssl pkey -in {{out}}.pem -pubout -out {{out}}.pub.pem
+    @echo "idm 进程: JWT_PRIVATE_KEY_FILE={{out}}.pem + JWT_PUBLIC_KEY_FILE={{out}}.pub.pem"
+    @echo "app 进程: 只设 JWT_PUBLIC_KEY_FILE={{out}}.pub.pem"
+
 # lint:格式检查 + clippy(警告即失败)
 lint:
     cargo fmt --all -- --check

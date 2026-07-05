@@ -4,6 +4,10 @@ use anyhow::Context;
 use figment::{providers::Env, Figment};
 use serde::Deserialize;
 
+/// 内嵌开发密钥对(keys/,**明文入库是刻意的**:零配置启动铁律)。prod 启动校验拒用(见 AppState::new)。
+pub const DEV_JWT_PRIVATE_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pem");
+pub const DEV_JWT_PUBLIC_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pub.pem");
+
 /// 运行环境。影响:日志格式(prod 走 JSON / 非 prod 走彩色)、是否暴露 /docs、CORS 策略。
 /// 环境变量 `APP_ENV`(dev/staging/prod),缺省 dev。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -96,15 +100,24 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub app_db_sslmode: String,
 
-    /// idm JWT 签名密钥(HS256),`IDM_JWT_SECRET`。脚手架给 dev 默认(静默启动),**生产必须覆盖**。
-    #[serde(default = "default_jwt_secret")]
-    pub idm_jwt_secret: String,
     /// access token 有效秒数,`IDM_ACCESS_TTL_SECS`,默认 900(15min)。
     #[serde(default = "default_access_ttl_secs")]
     pub idm_access_ttl_secs: i64,
     /// refresh token 有效秒数,`IDM_REFRESH_TTL_SECS`,默认 604800(7天)。
     #[serde(default = "default_refresh_ttl_secs")]
     pub idm_refresh_ttl_secs: i64,
+
+    /// JWT 签发私钥 PEM(Ed25519)。默认内嵌 dev 私钥;生产 idm 进程经 JWT_PRIVATE_KEY_FILE 覆盖。
+    #[serde(default = "default_jwt_private_key_pem")]
+    pub jwt_private_key_pem: String,
+    /// JWT 验签公钥 PEM。默认内嵌 dev 公钥;生产两进程都经 JWT_PUBLIC_KEY_FILE 覆盖。
+    #[serde(default = "default_jwt_public_key_pem")]
+    pub jwt_public_key_pem: String,
+    /// 设了则读该文件覆盖 jwt_private_key_pem(镜像 SEED_FILE 范式;env 里放路径不放多行 PEM)。
+    #[serde(default)]
+    pub jwt_private_key_file: Option<String>,
+    #[serde(default)]
+    pub jwt_public_key_file: Option<String>,
 
     /// 进程内 seed:idm-mounting 进程启动时**幂等**写默认 role/账号(memory 与 PG 都适用)。
     /// `IDM_SEED_ON_START`(true/false)。**未设时默认 = 非 prod 才 seed**(dev 便利;prod 不自动建
@@ -194,15 +207,17 @@ fn default_idm_embedded() -> bool {
 fn default_rate_limit_burst() -> u32 {
     20
 }
-fn default_jwt_secret() -> String {
-    // dev 默认:零环境变量也能静默启动;生产**务必**用 IDM_JWT_SECRET 覆盖。
-    "dev-insecure-secret-change-me-in-prod".into()
-}
 fn default_access_ttl_secs() -> i64 {
     900
 }
 fn default_refresh_ttl_secs() -> i64 {
     604_800
+}
+fn default_jwt_private_key_pem() -> String {
+    DEV_JWT_PRIVATE_KEY_PEM.into()
+}
+fn default_jwt_public_key_pem() -> String {
+    DEV_JWT_PUBLIC_KEY_PEM.into()
 }
 fn default_idm_db_user() -> String {
     "idm".into()
@@ -244,9 +259,12 @@ impl Default for Config {
             app_db_user: default_app_db_user(),
             app_db_password: default_db_password(),
             app_db_sslmode: default_db_sslmode(),
-            idm_jwt_secret: default_jwt_secret(),
             idm_access_ttl_secs: default_access_ttl_secs(),
             idm_refresh_ttl_secs: default_refresh_ttl_secs(),
+            jwt_private_key_pem: default_jwt_private_key_pem(),
+            jwt_public_key_pem: default_jwt_public_key_pem(),
+            jwt_private_key_file: None,
+            jwt_public_key_file: None,
             idm_seed_on_start: None,
             idm_db_host: None,
             idm_db_port: default_db_port(),
@@ -274,10 +292,12 @@ impl Config {
     /// 从环境变量加载(调用方先 load 过 .env)。**全部环境变量的读取/默认值收口在本文件**:
     /// 加变量 = 加字段(figment 变量名转小写匹配),别在别处 `std::env::var`。
     pub fn load() -> anyhow::Result<Self> {
-        Figment::new()
+        let mut cfg: Config = Figment::new()
             .merge(Env::raw())
             .extract()
-            .context("解析环境变量配置失败")
+            .context("解析环境变量配置失败")?;
+        apply_jwt_key_file_overrides(&mut cfg)?;
+        Ok(cfg)
     }
 
     /// app schema 的连接串(role=app)。`None` = 没设 `APP_DB_HOST` → widget 走内存。
@@ -353,6 +373,20 @@ impl Config {
     }
 }
 
+/// `JWT_*_KEY_FILE` 覆盖:设了则读文件内容覆盖对应 PEM 字段(镜像 SEED_FILE 范式)。抽成独立函数以便单测,
+/// 不依赖 figment/环境变量。
+fn apply_jwt_key_file_overrides(cfg: &mut Config) -> anyhow::Result<()> {
+    if let Some(p) = &cfg.jwt_private_key_file {
+        cfg.jwt_private_key_pem = std::fs::read_to_string(p)
+            .with_context(|| format!("读 JWT_PRIVATE_KEY_FILE {p} 失败"))?;
+    }
+    if let Some(p) = &cfg.jwt_public_key_file {
+        cfg.jwt_public_key_pem = std::fs::read_to_string(p)
+            .with_context(|| format!("读 JWT_PUBLIC_KEY_FILE {p} 失败"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +431,29 @@ mod tests {
         assert!(Profile::Dev.expose_docs());
         assert!(Profile::Staging.expose_docs());
         assert!(!Profile::Prod.expose_docs());
+    }
+
+    /// JWT_*_KEY_FILE 覆盖:设了文件则读内容覆盖 PEM 字段;未设保持内嵌默认。
+    #[test]
+    fn jwt_key_file_overrides_pem_fields() {
+        let dir = std::env::temp_dir().join("jwt-key-override-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("k.pub.pem");
+        std::fs::write(
+            &p,
+            "-----BEGIN PUBLIC KEY-----\nfake\n-----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.jwt_public_key_pem, DEV_JWT_PUBLIC_KEY_PEM,
+            "默认应是内嵌 dev"
+        );
+        cfg.jwt_public_key_file = Some(p.to_string_lossy().into_owned());
+        apply_jwt_key_file_overrides(&mut cfg).unwrap();
+        assert!(cfg.jwt_public_key_pem.contains("fake"), "应被文件内容覆盖");
+        // 指向不存在的文件 → 报错带路径
+        cfg.jwt_private_key_file = Some("/no/such/key.pem".to_owned());
+        assert!(apply_jwt_key_file_overrides(&mut cfg).is_err());
     }
 }

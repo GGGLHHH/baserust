@@ -31,7 +31,7 @@ pub async fn authenticate(
             req.extensions_mut().insert(user);
             // 身份验过后,把 app 自有的 scope claim 读进 extensions(idm 的 VerifiedToken 不带 scope)。
             req.extensions_mut()
-                .insert(TokenScope(state.tokens.scope_of(&token)));
+                .insert(TokenScope(state.token_verifier.scope_of(&token)));
         }
     }
     next.run(req).await

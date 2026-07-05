@@ -14,16 +14,17 @@ use uuid::Uuid;
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState};
-use xchangeai::features::auth::AppTokens;
+use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
 use xchangeai::features::widget::{InMemoryWidgetRepo, WidgetService};
 use xchangeai::infra::authz::{Perm, Policy};
 
 /// 内存仓储的测试 app(无 DB)+ **admin 令牌**(widget 端点现需登录 + RBAC + ownership)。
 /// admin 有 read:all → 看全部,故沿用原有"建后即见"断言;struct 直建不跑 mock seed,repo 空、不受干扰。
 fn test_app() -> (Router, String) {
-    let tokens = Arc::new(AppTokens::new("test-secret"));
+    let signer = Arc::new(AppTokenSigner::dev());
+    let verifier = Arc::new(AppTokenVerifier::dev());
     // admin 满权令牌(roles=[admin],scope 空):mint 即可,不必走真实登录。
-    let admin = tokens
+    let admin = signer
         .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
         .unwrap();
     let bus: Arc<dyn xchangeai::features::widget::EventBus> =
@@ -40,11 +41,12 @@ fn test_app() -> (Router, String) {
             std::sync::Arc::new(xchangeai::features::profile::StaticAvatarProbe::empty()),
         ),
         contents: test_contents(),
-        auth: test_auth(tokens.clone()),
+        auth: test_auth(signer.clone(), verifier.clone()),
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,
         policy: Arc::new(test_policy()),
-        tokens,
+        token_signer: Some(signer.clone()),
+        token_verifier: verifier,
     };
     let app = build_router(
         state,
@@ -77,16 +79,16 @@ fn test_policy() -> Policy {
     )])
 }
 
-/// 测试用 AuthService:FakeHasher + 内存 repo + **生产同款 AppTokens**(claim 带 roles,中间件才认)。
-fn test_auth(tokens: Arc<AppTokens>) -> AuthService {
+/// 测试用 AuthService:FakeHasher + 内存 repo + **生产同款非对称签验**(claim 带 roles,中间件才认)。
+fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> AuthService {
     AuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
-    .signer(tokens.clone())
-    .verifier(tokens)
+    .signer(signer)
+    .verifier(verifier)
     .access_ttl_secs(900)
     .refresh_ttl_secs(604_800)
     .build()
@@ -403,8 +405,8 @@ async fn sse_requires_auth() {
 #[tokio::test]
 async fn sse_requires_read_scope() {
     let (app, _admin) = test_app();
-    let tokens = AppTokens::new("test-secret"); // 与 test_app 同 secret,验签才过
-    let scoped = tokens
+    let signer = AppTokenSigner::dev(); // 与 test_app 同 dev 密钥,验签才过
+    let scoped = signer
         .mint_scoped(
             Uuid::nil(),
             "admin",
@@ -430,9 +432,9 @@ async fn sse_requires_read_scope() {
 #[tokio::test]
 async fn multi_perm_and_or_endpoints() {
     let (app, admin) = test_app();
-    let tokens = AppTokens::new("test-secret"); // 与 fixture 同 secret,可自铸降权令牌
+    let signer = AppTokenSigner::dev(); // 与 fixture 同 dev 密钥,可自铸降权令牌
     let narrowed = |scope: Vec<Perm>| {
-        tokens
+        signer
             .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], scope, 900)
             .unwrap()
     };

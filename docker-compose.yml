@@ -81,8 +81,9 @@ services:
       # nginx 按 /api/v1/{public,frontend,admin}/auth 分流。
       # 经 Config 解析,只认小写 true/false。
       IDM_EMBEDDED: "false"
-      # app 的鉴权中间件要 decode JWT,密钥须与 idm 一致。
-      IDM_JWT_SECRET: ${IDM_JWT_SECRET:-dev-insecure-secret-change-me-in-prod}
+      # app 的鉴权中间件只 decode JWT:非对称 Ed25519,只需公钥。默认用内嵌 dev 公钥;
+      # 生产挂 JWT_PUBLIC_KEY_FILE 指向卷内公钥(app 进程不持私钥,被攻破也铸不出 token)。
+      # JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
       # 跨模块读 idm 的预留凭据(依赖方向 app 业务→idm 认证):富化接口时 connect_for_schema(Idm) 用,
       # 拿到连接后走 idm 模块的 repo 读、绝不跨 schema join。当前主连接按 mount(needs_idm=false)不连,纯预留。
       IDM_DB_HOST: pg
@@ -127,8 +128,10 @@ services:
       IDM_DB_DATABASE: ${POSTGRES_DB:-xchangeai}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
-      # JWT 密钥须与 app 一致(app 也 decode token)。
-      IDM_JWT_SECRET: ${IDM_JWT_SECRET:-dev-insecure-secret-change-me-in-prod}
+      # idm 签发 JWT:非对称 Ed25519,持私钥签发 + 公钥(与 app 同一把)。默认内嵌 dev 对;
+      # 生产挂 JWT_PRIVATE_KEY_FILE(签发)+ JWT_PUBLIC_KEY_FILE(自验),app 只挂公钥。
+      # JWT_PRIVATE_KEY_FILE: /keys/prod-ed25519.pem
+      # JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
       interval: 10s

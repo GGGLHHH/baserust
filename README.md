@@ -97,6 +97,7 @@ src/
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
 - **基础实体**:审计字段(created_by/at · updated_by/at)+ 软删除(`deleted_at`,`base_select` 收口);`updated_at` 由 DB 触发器维护
 - **审计上下文**:`AuditContext`(未认证 → Anonymous → created_by NULL;已认证 → 取鉴权中间件 `auth::authenticate` 塞的 `idm::AuthUser` 作 created_by)
+- **认证**:httponly cookie + Bearer 兜底;JWT 用 Ed25519 非对称:idm 私钥签发、app 公钥验签(`keys/` dev 对仅开发,prod `just gen-keys`)
 - **分页**:offset(跳页+total)/ cursor(keyset on uuid v7)双模式
 
 ## 测试

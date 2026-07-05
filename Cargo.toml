@@ -81,8 +81,9 @@ aws-sdk-s3 = "1"
 # std feature 拉入 rand + getrandom,SaltString::generate(OsRng) 才可用。
 argon2 = { version = "0.5", features = ["std"] }
 
-# JWT access token(HS256):app 自己的 claim 形状 + 签验(features/auth/token.rs 的 AppTokens,
-# 实现 idm 的 TokenSigner/TokenVerifier 端口)。claim 由 app 显式拥有,要换 RS256/KMS 改 AppTokens。
+# JWT access token(Ed25519 非对称):app 自己的 claim 形状 + 签验(features/auth/token.rs 的
+# AppTokenSigner 私钥签发 / AppTokenVerifier 公钥验签,实现 idm 的 TokenSigner/TokenVerifier 端口)。
+# 签发只在 idm 进程,app 只持公钥。claim 由 app 显式拥有,要换 KMS/轮换 kid 改这两个类型。
 jsonwebtoken = "9"
 # refresh token:sha2 算 SHA-256 hash 落库,rand 出 32B CSPRNG 明文。
 sha2 = "0.10"

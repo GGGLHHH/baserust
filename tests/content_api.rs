@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::AppTokens;
+use xchangeai::features::auth::{AppTokenSigner, AppTokenVerifier};
 use xchangeai::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use xchangeai::infra::authz::{Perm, Policy};
 
@@ -23,8 +23,9 @@ use xchangeai::infra::authz::{Perm, Policy};
 /// (presign 用例喂覆写 URL 方法的假 store)。admin/viewer 各有独立 owner uuid(content list 按
 /// owner 过滤,故 admin 上传 admin 才看得到)。
 fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String, String) {
-    let tokens = Arc::new(AppTokens::new("test-secret"));
-    let admin = tokens
+    let signer = Arc::new(AppTokenSigner::dev());
+    let verifier = Arc::new(AppTokenVerifier::dev());
+    let admin = signer
         .mint_scoped(
             Uuid::from_u128(1),
             "admin",
@@ -33,7 +34,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             900,
         )
         .unwrap();
-    let viewer = tokens
+    let viewer = signer
         .mint_scoped(
             Uuid::from_u128(2),
             "viewer",
@@ -61,11 +62,12 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             store,
             "memory",
         ),
-        auth: test_auth(tokens.clone()),
+        auth: test_auth(signer.clone(), verifier.clone()),
         db_pool: None,
         cookie_secure: false,
         policy: Arc::new(test_policy()),
-        tokens,
+        token_signer: Some(signer.clone()),
+        token_verifier: verifier,
     };
     let app = build_router(
         state,
@@ -90,15 +92,15 @@ fn test_policy() -> Policy {
     ])
 }
 
-fn test_auth(tokens: Arc<AppTokens>) -> AuthService {
+fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> AuthService {
     AuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
-    .signer(tokens.clone())
-    .verifier(tokens)
+    .signer(signer)
+    .verifier(verifier)
     .access_ttl_secs(900)
     .refresh_ttl_secs(604_800)
     .build()

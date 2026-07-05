@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use idm::{AuthOutcome, LoginInput};
 use xchangeai::app::{build_router, AppState, Mount};
-use xchangeai::features::auth::authenticate;
+use xchangeai::features::auth::{authenticate, AppTokenSigner};
 use xchangeai::infra::audit::CurrentUser;
 use xchangeai::infra::authz::{Perm, TokenScope};
 use xchangeai::infra::config::Config;
@@ -160,8 +160,9 @@ async fn scope_downscopes_below_role_grant() {
     let admin = login(&state, "admin").await;
 
     // 给 admin 签一个**只含 widgets:read** 的降权令牌(模拟 PAT / 第三方授权)
-    let scoped = state
-        .tokens
+    // state 的 verifier 用内嵌默认 dev 公钥,故本地 dev 私钥签的令牌它也认。
+    let signer = AppTokenSigner::dev();
+    let scoped = signer
         .mint_scoped(
             admin.user.id,
             &admin.user.username,
@@ -385,8 +386,7 @@ async fn scope_without_read_all_narrows_admin_to_own() {
     assert!(full.contains("user-w1"), "满权应见全部: {full}");
 
     // admin 降权令牌:scope=[widgets:read],**不含 read:all** → 跌回 Own → 只见自己的
-    let scoped = state
-        .tokens
+    let scoped = AppTokenSigner::dev()
         .mint_scoped(
             admin.user.id,
             &admin.user.username,
@@ -418,9 +418,9 @@ async fn my_permissions_reflect_role_and_scope() {
         })
         .await
         .unwrap();
+    let signer = AppTokenSigner::dev();
     let mint = |roles: Vec<String>, scope: Vec<Perm>| {
-        state
-            .tokens
+        signer
             .mint_scoped(admin.user.id, "probe", roles, scope, 900)
             .unwrap()
     };

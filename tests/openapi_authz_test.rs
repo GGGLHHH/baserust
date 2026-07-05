@@ -22,6 +22,7 @@ use uuid::Uuid;
 use idm::LoginInput;
 use xchangeai::app::router::api_spec;
 use xchangeai::app::{build_router, AppState, Mount};
+use xchangeai::features::auth::AppTokenSigner;
 use xchangeai::infra::authz::Perm;
 use xchangeai::infra::config::Config;
 
@@ -74,9 +75,10 @@ async fn spec_security_matches_real_enforcement() {
         })
         .await
         .unwrap();
+    // state 的 verifier 用内嵌默认 dev 公钥,故本地 dev 私钥签的令牌它也认。
+    let signer = AppTokenSigner::dev();
     let mint = |scope: Vec<Perm>| {
-        state
-            .tokens
+        signer
             .mint_scoped(
                 su.user.id,
                 &su.user.username,
@@ -117,8 +119,7 @@ async fn spec_security_matches_real_enforcement() {
             let union: Vec<Perm> = branches.iter().flatten().copied().collect();
             if union.is_empty() {
                 // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
-                let zero = state
-                    .tokens
+                let zero = signer
                     .mint_scoped(su.user.id, "probe", vec![], vec![], 900)
                     .unwrap();
                 let s = hit(&app, method, &uri, op_id, &zero).await;
