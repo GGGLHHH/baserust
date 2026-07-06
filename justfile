@@ -35,20 +35,30 @@ test:
 #   CREATEDB —— #[sqlx::test] 建临时库;CREATE ON DATABASE —— 在 base 库建 _sqlx_test 元数据 schema。
 # 没装本机 psql 可改:docker compose exec -T pg psql -U <super> -d <db> -c "<同样的 SQL>"
 pg-test-grant:
-    psql "postgres://{{env_var_or_default('POSTGRES_USER','baserust')}}:{{env_var_or_default('POSTGRES_PASSWORD','baserust')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}};"
+    psql "postgres://{{env_var_or_default('POSTGRES_USER','baserust')}}:{{env_var_or_default('POSTGRES_PASSWORD','baserust')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}}; alter role {{env_var_or_default('SEARCH_DB_USER','search')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('SEARCH_DB_USER','search')}};"
 
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance -- --nocapture
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance -- --nocapture
 
-# NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)
+# NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)+ JetStream 发布端冒烟
 test-nats:
-    NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features nats-conformance --test event_bus_conformance -- --nocapture
+    NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features nats-conformance --test event_bus_conformance --test jetstream_smoke -- --nocapture
 
 # 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance + NATS 契约
 # (idm 仓储 conformance 随 idm 抽成独立 rust-idm crate 后已迁出本仓)
 test-all: test test-pg test-nats
+
+# P1 durable-events 端到端(真用户写 → 真事件落 JetStream 流)。需**全栈**:先 `just up` 起 pg + nats,
+# `.env` 配好 pg + NATS_URL(测试自读 .env)。双 feature 门,单线程串跑。**刻意不进 test-all**:
+# 重 e2e、要整套依赖,留作独立 opt-in gate。
+test-durable:
+    cargo test --features pg-conformance,nats-conformance --test durable_events_p1 -- --nocapture --test-threads=1
+
+# search 投影 e2e(pg+nats;先 just up + just migrate-search)
+test-search: pg-test-grant
+    NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features pg-conformance,nats-conformance --test search_projection_p3 -- --nocapture --test-threads=1
 
 # ───── 数据库迁移(sqlx-cli,类似 goose;显式执行,不在 app 启动时跑)─────
 # 每个 schema 用同名 role 连接(role 的 search_path = 同名 schema),各自独立 _sqlx_migrations,
@@ -60,9 +70,10 @@ pg_db := env_var_or_default("POSTGRES_DB", "baserust")
 app_db_url := env_var_or_default("APP_DATABASE_URL", "postgres://" + env_var_or_default("APP_DB_USER", "app") + ":" + env_var_or_default("APP_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 idm_db_url := env_var_or_default("IDM_DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 content_db_url := env_var_or_default("CONTENT_DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+search_db_url := env_var_or_default("SEARCH_DATABASE_URL", "postgres://" + env_var_or_default("SEARCH_DB_USER", "search") + ":" + env_var_or_default("SEARCH_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 
 # 所有 schema 迁移(聚合,像 Go Makefile 的 migrate 总目标)
-migrate: migrate-app migrate-idm migrate-content
+migrate: migrate-app migrate-idm migrate-content migrate-search
 
 # ── app schema(role app)──
 migrate-app:
@@ -87,6 +98,14 @@ migrate-content-revert:
     sqlx migrate revert --source migrations/content --database-url "{{content_db_url}}"
 migrate-content-info:
     sqlx migrate info --source migrations/content --database-url "{{content_db_url}}"
+
+# ── search schema(role search)── CQRS 读模型:admin_user_index(projector 写,P4 list 读)
+migrate-search:
+    sqlx migrate run --source migrations/search --database-url "{{search_db_url}}"
+migrate-search-revert:
+    sqlx migrate revert --source migrations/search --database-url "{{search_db_url}}"
+migrate-search-info:
+    sqlx migrate info --source migrations/search --database-url "{{search_db_url}}"
 
 # 新建某 schema 的可回滚迁移(内部参数化,创建用):just migrate-add app create_widgets
 migrate-add schema name:

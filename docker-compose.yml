@@ -2,7 +2,7 @@
 #
 # 环境变量(都有默认值、可在同目录 .env 覆盖):
 #   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 baserust)
-#   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
+#   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD · SEARCH_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
 #   MINIO_USER / MINIO_PASSWORD · S3_BUCKET           minio 凭据(默认 minio/minio12345)与桶名(默认 content)
 #   NGINX_PORT(80) · APP_PORT(6453) · IDM_PORT(6454) · DBHUB_PORT(3777) · PG_PORT(5821)   主机端口
 #   MINIO_PORT(9862, S3 API) · MINIO_CONSOLE_PORT(9863, 控制台)         minio 主机端口
@@ -128,6 +128,15 @@ services:
       IDM_DB_DATABASE: ${POSTGRES_DB:-baserust}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
+      # 连 search schema(role=search):projector 落 admin_user_index 投影(消费 idm/profile 的 outbox 事件)。
+      SEARCH_DB_HOST: pg
+      SEARCH_DB_PORT: "5432"
+      SEARCH_DB_DATABASE: ${POSTGRES_DB:-baserust}
+      SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
+      SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
+      # idm 进程连 NATS:①outbox relay 把 idm.outbox 事件发到 JetStream ②projector 消费 stream 落投影。
+      # 缺它 → idm 事件不外发 + projector 不起(投影只靠 rebuild bin 填)。
+      NATS_URL: nats://nats:4222
       # idm 签发 JWT:非对称 Ed25519,持私钥签发 + 公钥(与 app 同一把)。默认内嵌 dev 对;
       # 生产挂 JWT_PRIVATE_KEY_FILE(签发)+ JWT_PUBLIC_KEY_FILE(自验),app 只挂公钥。
       # JWT_PRIVATE_KEY_FILE: /keys/prod-ed25519.pem
@@ -158,9 +167,11 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
-      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content 三 schema 各用同名 role 跑)。
+      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content/search 四 schema 各用同名 role 跑)。
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
+      SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
+      SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
     restart: "no"
 
   pg:
@@ -176,11 +187,13 @@ services:
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
+      SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
+      SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
     ports:
       - "${PG_PORT:-5821}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # 首次初始化时建 app/idm/content 的 role + schema(role 的 search_path 指向自己 schema)。
+      # 首次初始化时建 app/idm/content/search 的 role + schema(role 的 search_path 指向自己 schema)。
       # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建(或手建 role)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -206,12 +219,14 @@ services:
     ports:
       - "${DBHUB_PORT:-3777}:8080"
 
-  # NATS:widget 事件总线的多实例扇出后端(EventBus 选择链最高优先,app 设 NATS_URL 即用)。
+  # NATS:widget 事件总线的多实例扇出后端(EventBus 选择链最高优先,app 设 NATS_URL 即用),
+  # 也是 JetStreamPublisher(durable events P1)的投递目标。
   # core NATS 纯内存转发、无持久化(契约就是 best-effort);脚手架无鉴权裸跑,跨信任域配 token/TLS。
+  # -js 开 JetStream(durable stream + 去重,供 JetStreamPublisher 用;不影响 core NATS 语义)。
   # -m 8222 开监控端口,healthz 供 healthcheck(app fail-fast 连接,依赖它先 healthy)。
   nats:
     image: nats:alpine
-    command: ["-m", "8222"]
+    command: ["-js", "-m", "8222"]
     ports:
       - "${NATS_PORT:-2224}:4222"
     healthcheck:
