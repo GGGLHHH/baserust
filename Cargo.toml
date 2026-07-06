@@ -9,7 +9,7 @@ default-run = "baserust"
 [dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
-idm = { path = "../rust-idm" }
+idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.4.0" }
 
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`
@@ -55,8 +55,8 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres",
 
 # SQL builder(为必然到来的动态查询铺路:可选 filter / 分页 / 多变 JOIN)。
 # 注意 crate 名是 sea-query-sqlx —— 旧名 sea-query-binder 停在 sqlx 0.8;1.0 线才接 sqlx 0.9。
-sea-query = "1.0"
-sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time"] }
+sea-query = { version = "1.0", features = ["postgres-array"] }
+sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time", "postgres-array"] }
 
 # trait 对象 + async fn:dyn 安全需要 async-trait 宏(原生 async-in-trait 不 object-safe)
 async-trait = "0.1"

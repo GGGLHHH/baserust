@@ -2044,7 +2044,8 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.3.0"
+version = "0.4.0"
+source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.4.0#c1f8e9a49d646db715cd227828bc6b52110061a6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2055,6 +2056,7 @@ dependencies = [
  "sea-query",
  "sea-query-sqlx",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.18",
