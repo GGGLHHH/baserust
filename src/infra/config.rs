@@ -399,12 +399,14 @@ impl Config {
 
     /// 日志过滤指令:`RUST_LOG` 优先;未设按环境缺省(prod=info、非 prod=debug)。
     pub fn log_filter(&self) -> &str {
+        // sqlx::query=warn:压掉 sqlx 每条 SQL 的 info/debug 刷屏,只留慢查询 WARN + 错误。
+        // 要看 SQL 调试:显式设 RUST_LOG(如 `RUST_LOG=debug,sqlx::query=debug`)覆盖本默认。
         self.rust_log
             .as_deref()
             .unwrap_or(if self.app_env.is_prod() {
-                "info"
+                "info,sqlx::query=warn"
             } else {
-                "debug"
+                "debug,sqlx::query=warn"
             })
     }
 

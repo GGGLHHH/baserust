@@ -48,7 +48,7 @@ services:
         condition: service_healthy
     environment:
       BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-info,baserust=info}
+      RUST_LOG: ${RUST_LOG:-info,baserust=info,sqlx::query=warn}
       # 运行环境:dev(默认)→彩色日志+挂/docs+CORS宽松;prod→JSON日志+不挂/docs+CORS白名单
       APP_ENV: ${APP_ENV:-dev}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
@@ -119,7 +119,7 @@ services:
         condition: service_completed_successfully
     environment:
       BIND_ADDR: 0.0.0.0:8080
-      RUST_LOG: ${RUST_LOG:-info,baserust=info}
+      RUST_LOG: ${RUST_LOG:-info,baserust=info,sqlx::query=warn}
       APP_ENV: ${APP_ENV:-dev}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       # 连 idm schema(role=idm):me 查 user / roles、会话 revoke 等。
