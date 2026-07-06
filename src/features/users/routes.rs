@@ -21,6 +21,8 @@ use crate::infra::sort::SortOrder;
 
 /// 分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。
 /// cursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。
+/// `q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;
+/// 未接后端时二者 → 422(回退路只能 idm 直查,不具备搜索能力)。
 #[utoipa::path(
     get,
     path = "/users",
@@ -30,7 +32,7 @@ use crate::infra::sort::SortOrder;
         (status = 200, description = "用户分页列表(display_name/avatar 富化,缺则 null)", body = Page<AdminUserView>),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 users:admin 权限(仅 superadmin)", body = ErrorBody),
-        (status = 422, description = "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)", body = ErrorBody)
+        (status = 422, description = "cursor 分页 + 非默认 sort_by;或 q/sort_by=display_name 但无 search 投影后端", body = ErrorBody)
     )
 )]
 pub async fn list_users(

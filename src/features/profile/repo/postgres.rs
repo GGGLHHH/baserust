@@ -1,9 +1,11 @@
 //! Postgres 实现。固定语句 const SQL(sqlx 对 `&'static str` 天然 SqlSafe,无需 AssertSqlSafe)。
 
 use async_trait::async_trait;
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::outbox::emit_outbox;
 use super::{ProfileFields, ProfileRepo};
 use crate::features::profile::types::Profile;
 use crate::infra::error::AppError;
@@ -75,13 +77,42 @@ impl ProfileRepo for PgProfileRepo {
         f: ProfileFields,
         by: Option<String>,
     ) -> Result<(Profile, bool), AppError> {
+        // 事务:upsert + emit outbox 同提交(镜像 widget create_with_tags / idm 写方法的父子写范式)。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+
+        let avatar_content_id = f.avatar_content_id;
         let row = sqlx::query_as::<_, UpsertRow>(UPSERT_SQL)
             .bind(user_id)
             .bind(f.display_name)
             .bind(f.phone)
-            .bind(f.avatar_content_id)
+            .bind(avatar_content_id)
             .bind(by)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+
+        // avatar_url:同 service::enrich 的相对 preview 口径,但**不探测就绪性**——那是读侧关注
+        // (探测要 import content 模块,repo 层不做);这里只记录写入意图,悬空/未就绪由后续
+        // relay/读侧消费者各自决定语义。
+        let avatar_url =
+            avatar_content_id.map(|cid| format!("/api/v1/frontend/contents/{cid}/preview"));
+        emit_outbox(
+            &mut tx,
+            "profile.updated",
+            user_id,
+            json!({
+                "user_id": user_id,
+                "display_name": row.profile.display_name.clone(),
+                "avatar_url": avatar_url,
+            }),
+        )
+        .await?;
+
+        tx.commit()
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok((row.profile, row.inserted))

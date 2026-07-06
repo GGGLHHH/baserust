@@ -13,7 +13,10 @@ use utoipa_axum::routes;
 use crate::app::state::AppState;
 
 pub use port::{AvatarInfo, AvatarProbe, StaticAvatarProbe};
-pub use repo::{InMemoryProfileRepo, PgProfileRepo, ProfileFields, ProfileRepo};
+pub use repo::{
+    AppOutboxRecord, InMemoryAppOutbox, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo,
+    ProfileFields, ProfileRepo,
+};
 pub use service::ProfileService;
 pub use types::{Profile, ProfileResponse, PutProfileRequest};
 

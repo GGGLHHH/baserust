@@ -58,7 +58,7 @@ async fn demo_admin(
 
 /// 真实 AppState(内存,进程内 seed 出 admin/user/superadmin)+ mock 端点 + 真实鉴权中间件。
 async fn setup() -> (AppState, Router) {
-    let state = AppState::new(&Config::default(), Mount::Both)
+    let (state, _bg) = AppState::new(&Config::default(), Mount::Both)
         .await
         .expect("内存模式 AppState 应可建(含进程内 seed)");
     let app = Router::new()
@@ -408,7 +408,7 @@ async fn scope_without_read_all_narrows_admin_to_own() {
 #[tokio::test]
 async fn my_permissions_reflect_role_and_scope() {
     let config = Config::default();
-    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
     let app = build_router(state.clone(), &config, Mount::Both);
     let admin = state
         .auth

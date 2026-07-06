@@ -3,6 +3,7 @@
 //! 不引 sea-query/Iden/COLS——那套是给动态查询(可选 filter/分页)的,这里没有。
 
 mod memory;
+mod outbox;
 mod postgres;
 
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use super::types::Profile;
 use crate::infra::error::AppError;
 
 pub use memory::InMemoryProfileRepo;
+pub use outbox::{AppOutboxRecord, InMemoryAppOutbox, PgAppOutbox};
 pub use postgres::PgProfileRepo;
 
 /// 写入的业务字段(全量替换单元)。审计 `by` 单独传:实现体在"建"时落 created_*、"替"时**保留**。

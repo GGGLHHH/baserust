@@ -155,6 +155,21 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub content_db_sslmode: String,
 
+    /// search schema 的数据库连接,按 role 分字段(role=search,镜像 content_db_*)。
+    /// `SEARCH_DB_HOST` 的存在 = 启用投影读模型(projector 写 + P4 list 读);不设 → 无投影(P4 list 回退)。
+    #[serde(default)]
+    pub search_db_host: Option<String>,
+    #[serde(default = "default_db_port")]
+    pub search_db_port: u16,
+    #[serde(default = "default_db_database")]
+    pub search_db_database: String,
+    #[serde(default = "default_search_db_user")]
+    pub search_db_user: String,
+    #[serde(default = "default_db_password")]
+    pub search_db_password: String,
+    #[serde(default = "default_db_sslmode")]
+    pub search_db_sslmode: String,
+
     /// NATS 地址,`NATS_URL`(如 `nats://localhost:2224`,本地 compose 主机端口)—— widget 事件总线选择链的**最高优先**:
     /// 设了 → NatsEventBus(多实例默认);没设但有 app pool → PgEventBus(LISTEN/NOTIFY 退路);
     /// 都没有 → 内存(单实例,最终 fallback)。装配在组合根 `AppState::new`。
@@ -231,6 +246,9 @@ fn default_idm_db_user() -> String {
 fn default_content_db_user() -> String {
     "content".into()
 }
+fn default_search_db_user() -> String {
+    "search".into()
+}
 fn default_s3_bucket() -> String {
     "content".into()
 }
@@ -284,6 +302,12 @@ impl Default for Config {
             content_db_user: default_content_db_user(),
             content_db_password: default_db_password(),
             content_db_sslmode: default_db_sslmode(),
+            search_db_host: None,
+            search_db_port: default_db_port(),
+            search_db_database: default_db_database(),
+            search_db_user: default_search_db_user(),
+            search_db_password: default_db_password(),
+            search_db_sslmode: default_db_sslmode(),
             nats_url: None,
             s3_endpoint: None,
             s3_bucket: default_s3_bucket(),
@@ -348,6 +372,21 @@ impl Config {
                 self.content_db_port,
                 self.content_db_database,
                 self.content_db_sslmode,
+            )
+        })
+    }
+
+    /// search schema 的连接串(role=search)。`None` = 没设 `SEARCH_DB_HOST` → 无投影 backend。
+    pub fn search_database_url(&self) -> Option<String> {
+        self.search_db_host.as_ref().map(|host| {
+            format!(
+                "postgres://{}:{}@{}:{}/{}?sslmode={}",
+                self.search_db_user,
+                self.search_db_password,
+                host,
+                self.search_db_port,
+                self.search_db_database,
+                self.search_db_sslmode,
             )
         })
     }

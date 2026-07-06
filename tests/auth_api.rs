@@ -47,6 +47,7 @@ fn test_app() -> Router {
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            None,
         ),
         db_pool: None,
         cookie_secure: false,
@@ -521,7 +522,7 @@ async fn change_password_old_fails_new_works() {
 #[tokio::test]
 async fn in_process_seed_lets_superadmin_log_in() {
     let config = baserust::infra::config::Config::default(); // dev → seed_on_start = true
-    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
     let app = build_router(state, &config, Mount::Both);
 
     let resp = app

@@ -79,6 +79,7 @@ fn test_app() -> (
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            None,
         ),
         db_pool: None,
         cookie_secure: false,

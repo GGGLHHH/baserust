@@ -48,6 +48,7 @@ fn test_app() -> (Router, String) {
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            None,
         ),
         db_pool: None, // 内存模式:readyz 恒就绪
         cookie_secure: false,

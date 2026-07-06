@@ -7,10 +7,10 @@ use std::sync::Arc;
 use garde::Validate;
 use uuid::Uuid;
 
-use super::port::ProfileDirectory;
+use super::port::{ProfileDirectory, UserSearchFilter, UserSearchIndex};
 use super::types::{
     AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, SetRolesRequest,
-    UpdateUserRequest,
+    UpdateUserRequest, UserSortField,
 };
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
@@ -34,6 +34,8 @@ pub struct UserAdminService {
     sessions: Arc<dyn SessionRepo>,
     hasher: Arc<dyn PwHasher>,
     profiles: Arc<dyn ProfileDirectory>,
+    /// 只读检索投影(search 模块);None = 未接 search 后端 → list() 回退 idm 直查(q/DisplayName 排序 422)。
+    search: Option<Arc<dyn UserSearchIndex>>,
 }
 
 impl UserAdminService {
@@ -43,6 +45,7 @@ impl UserAdminService {
         sessions: Arc<dyn SessionRepo>,
         hasher: Arc<dyn PwHasher>,
         profiles: Arc<dyn ProfileDirectory>,
+        search: Option<Arc<dyn UserSearchIndex>>,
     ) -> Self {
         Self {
             users,
@@ -50,12 +53,81 @@ impl UserAdminService {
             sessions,
             hasher,
             profiles,
+            search,
         }
     }
 
-    /// 列表:idm 单 schema 主查询(过滤 + 排序 + 分页)→ 批量富化 profile → `Page<AdminUserView>`。
+    /// 列表:有 search 投影后端 → 走投影(支持 `q`/`display_name` 排序);无 → 回退 idm 直查
+    /// (此时 `q`/`sort_by=display_name` → 422,因为回退路无法提供搜索能力)。
     /// `page` 的 cursor + 非默认 sort 的 422 校验在 handler(此处只翻译参数)。
     pub async fn list(
+        &self,
+        filter: &ListUsersFilter,
+        page: PageParams,
+    ) -> Result<Page<AdminUserView>, AppError> {
+        match &self.search {
+            Some(search) => self.list_via_projection(search.clone(), filter, page).await,
+            None => {
+                let wants_search = filter.q.as_deref().is_some_and(|s| !s.trim().is_empty())
+                    || matches!(filter.sort_by, UserSortField::DisplayName);
+                if wants_search {
+                    return Err(AppError::Validation(
+                        "search requires projection backend".into(),
+                    ));
+                }
+                self.list_via_idm(filter, page).await
+            }
+        }
+    }
+
+    /// 投影路:走 search 索引(`q`/角色/时间过滤 + 4 键排序)→ 批量富化 avatar(投影不存 avatar)。
+    async fn list_via_projection(
+        &self,
+        search: Arc<dyn UserSearchIndex>,
+        filter: &ListUsersFilter,
+        page: PageParams,
+    ) -> Result<Page<AdminUserView>, AppError> {
+        let sf = UserSearchFilter {
+            username: filter.username.clone(),
+            q: filter.q.clone(),
+            roles_any: filter.roles_any(),
+            roles_none: filter.roles_none(),
+            created_from: filter.created_from,
+            created_to: filter.created_to,
+        };
+        let result = search
+            .query(&sf, filter.sort_by.to_search(), filter.order, &page)
+            .await?;
+
+        // avatar 富化(投影不存 avatar;display_name 取自投影):批量防 N+1,缺 → null。
+        let ids: Vec<Uuid> = result.rows.iter().map(|r| r.id).collect();
+        let briefs = self.profiles.batch(&ids).await?;
+        let items: Vec<AdminUserView> = result
+            .rows
+            .into_iter()
+            .map(|r| AdminUserView {
+                id: r.id,
+                username: r.username,
+                email: r.email,
+                email_verified: r.email_verified,
+                created_at: r.created_at,
+                roles: r.roles,
+                display_name: r.display_name, // 投影(可搜键)
+                avatar_url: briefs.get(&r.id).and_then(|b| b.avatar_url.clone()), // 富化(display-only)
+            })
+            .collect();
+
+        Ok(match page {
+            PageParams::Offset { page, size, .. } => Page::offset(items, page, size, result.total),
+            PageParams::Cursor { limit, .. } => {
+                Page::cursor(items, limit, result.next_after.map(encode_cursor))
+            }
+        })
+    }
+
+    /// 回退路:idm 单 schema 主查询(过滤 + 排序 + 分页)→ 批量富化 profile → `Page<AdminUserView>`。
+    /// 现有(pre-search)逻辑原样保留,不支持 `q`/`display_name` 排序(由 `list()` 提前 422)。
+    async fn list_via_idm(
         &self,
         filter: &ListUsersFilter,
         page: PageParams,
@@ -254,6 +326,7 @@ mod tests {
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
             Arc::new(StaticProfileDirectory::empty()),
+            None,
         )
     }
 
@@ -343,5 +416,239 @@ mod tests {
             svc.get(Uuid::now_v7()).await,
             Err(AppError::NotFound)
         ));
+    }
+
+    fn offset_page() -> PageParams {
+        PageParams::Offset {
+            page: 1,
+            size: 20,
+            with_total: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_without_search_backend_rejects_q_and_display_name_sort() {
+        let svc = test_service().await;
+
+        let e = svc
+            .list(
+                &ListUsersFilter {
+                    q: Some("x".into()),
+                    ..Default::default()
+                },
+                offset_page(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)));
+
+        let e = svc
+            .list(
+                &ListUsersFilter {
+                    sort_by: UserSortField::DisplayName,
+                    ..Default::default()
+                },
+                offset_page(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn list_without_search_backend_and_plain_filter_falls_back_to_idm() {
+        let svc = test_service().await;
+        svc.create(
+            CreateUserRequest {
+                username: "bob".into(),
+                email: None,
+                password: "password123".into(),
+                roles: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page = svc
+            .list(&ListUsersFilter::default(), offset_page())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].username, "bob");
+    }
+
+    /// 钉死 `list()` 的 422 门是 `.trim().is_empty()` 而非 `.is_empty()`——纯空白 `q` 不该被当成
+    /// "要搜索" 拦下,应落回 idm 直查路(无 search 后端也能正常翻页)。
+    #[tokio::test]
+    async fn list_without_search_backend_whitespace_q_falls_back_to_idm_not_422() {
+        let svc = test_service().await;
+        svc.create(
+            CreateUserRequest {
+                username: "dora".into(),
+                email: None,
+                password: "password123".into(),
+                roles: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page = svc
+            .list(
+                &ListUsersFilter {
+                    q: Some("   ".into()),
+                    ..Default::default()
+                },
+                offset_page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].username, "dora");
+    }
+
+    /// 假 search 后端:忽略入参,原样回放预置行(测投影分支的映射/富化,不测查询语义)。
+    struct FakeSearchIndex {
+        rows: Vec<super::super::port::UserSearchRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl UserSearchIndex for FakeSearchIndex {
+        async fn query(
+            &self,
+            _filter: &UserSearchFilter,
+            _sort: super::super::port::UserSearchSort,
+            _order: SortOrder,
+            _page: &PageParams,
+        ) -> Result<super::super::port::UserSearchPage, AppError> {
+            Ok(super::super::port::UserSearchPage {
+                rows: self.rows.clone(),
+                total: Some(self.rows.len() as u64),
+                next_after: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_with_search_backend_uses_projection_and_enriches_avatar() {
+        use super::super::port::{ProfileBrief, UserSearchRow};
+
+        let id = Uuid::now_v7();
+        let mut avatar_seed = HashMap::new();
+        avatar_seed.insert(
+            id,
+            ProfileBrief {
+                // 富化目录也带 display_name,但投影路必须优先用投影自带的值,不应被覆盖。
+                display_name: Some("should-not-be-used".into()),
+                avatar_url: Some("avatar.png".into()),
+            },
+        );
+
+        let mem_users = InMemoryUserRepo::new();
+        let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
+        let svc = UserAdminService::new(
+            Arc::new(mem_users),
+            Arc::new(mem_roles),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(StaticProfileDirectory(avatar_seed)),
+            Some(Arc::new(FakeSearchIndex {
+                rows: vec![UserSearchRow {
+                    id,
+                    username: "carol".into(),
+                    email: Some("c@x.io".into()),
+                    email_verified: true,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    roles: vec!["user".into()],
+                    display_name: Some("Carol Projection".into()),
+                }],
+            })),
+        );
+
+        let page = svc
+            .list(
+                &ListUsersFilter {
+                    q: Some("carol".into()),
+                    ..Default::default()
+                },
+                offset_page(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].username, "carol");
+        assert_eq!(
+            page.items[0].display_name.as_deref(),
+            Some("Carol Projection")
+        );
+        assert_eq!(page.items[0].avatar_url.as_deref(), Some("avatar.png"));
+    }
+
+    /// 假 search 后端:记录收到的 `UserSearchFilter`(测 `list_via_projection` 组 filter 时是否把
+    /// `username` 也透传给底层——回归点:曾经只传 `q`,`username` 被静默丢弃)。
+    struct RecordingSearchIndex {
+        received: std::sync::Mutex<Option<UserSearchFilter>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UserSearchIndex for RecordingSearchIndex {
+        async fn query(
+            &self,
+            filter: &UserSearchFilter,
+            _sort: super::super::port::UserSearchSort,
+            _order: SortOrder,
+            _page: &PageParams,
+        ) -> Result<super::super::port::UserSearchPage, AppError> {
+            *self.received.lock().expect("锁未中毒") = Some(filter.clone());
+            Ok(super::super::port::UserSearchPage {
+                rows: vec![],
+                total: Some(0),
+                next_after: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_via_projection_passes_username_filter_through() {
+        let mem_users = InMemoryUserRepo::new();
+        let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
+        let recorder = Arc::new(RecordingSearchIndex {
+            received: std::sync::Mutex::new(None),
+        });
+        let svc = UserAdminService::new(
+            Arc::new(mem_users),
+            Arc::new(mem_roles),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(StaticProfileDirectory::empty()),
+            Some(recorder.clone()),
+        );
+
+        svc.list(
+            &ListUsersFilter {
+                username: Some("alice".into()),
+                q: Some("wonder".into()),
+                ..Default::default()
+            },
+            offset_page(),
+        )
+        .await
+        .unwrap();
+
+        let got = recorder
+            .received
+            .lock()
+            .expect("锁未中毒")
+            .clone()
+            .expect("query 应被调用一次");
+        assert_eq!(
+            got.username.as_deref(),
+            Some("alice"),
+            "username 过滤应透传给投影后端,不该被静默丢弃"
+        );
+        assert_eq!(got.q.as_deref(), Some("wonder"));
     }
 }

@@ -18,7 +18,7 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
     init_tracing(&config);
 
     let mount = select_mount(&config);
-    let state = AppState::new(&config, mount).await?;
+    let (state, bg) = AppState::new(&config, mount).await?;
     let app = build_router(state, &config, mount);
     // metrics(opt-in,METRICS_ENABLED):Prometheus 请求计数/延迟直方图 + /metrics 端点。
     // 放这(不进 build_router):prometheus 全局 recorder 只能 install 一次,oneshot 测试多次
@@ -51,13 +51,26 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
     tracing::info!("API 文档 (Scalar)  http://{host}:{port}/docs");
     tracing::info!("OpenAPI JSON      http://{host}:{port}/api-docs/openapi.json");
 
+    // 后台任务:outbox relay(各 schema 轮询发 JetStream)+ search projector(消费投影读模型);
+    // 都随服务优雅退出而停。
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    for relay in bg.relays {
+        tokio::spawn(relay.run(shutdown_rx.clone()));
+    }
+    if let Some(projector) = bg.projector {
+        tokio::spawn(projector.run(shutdown_rx.clone()));
+    }
+
     // into_make_service_with_connect_info:给 SmartIpKeyExtractor 的 peer-IP fallback 提供 ConnectInfo
     // (生产 nginx 设 X-Forwarded-For 时走 header;直连/无代理时回落到对端 IP)。
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    })
     .await
     .context("服务器异常退出")?;
     Ok(())

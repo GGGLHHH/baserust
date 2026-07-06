@@ -72,6 +72,8 @@ pub enum UserSortField {
     CreatedAt,
     Username,
     Email,
+    /// 仅投影路(search 索引)支持;回退路(无 search 后端)在 `list()` 以 422 拦截。
+    DisplayName,
 }
 
 impl UserSortField {
@@ -80,6 +82,20 @@ impl UserSortField {
             UserSortField::CreatedAt => idm::UserSortBy::CreatedAt,
             UserSortField::Username => idm::UserSortBy::Username,
             UserSortField::Email => idm::UserSortBy::Email,
+            UserSortField::DisplayName => {
+                unreachable!("display_name 排序仅投影路;回退路已在 list() 以 422 拦截")
+            }
+        }
+    }
+
+    /// 一一映射到投影侧排序键(投影路专用)。
+    pub fn to_search(self) -> crate::features::users::port::UserSearchSort {
+        use crate::features::users::port::UserSearchSort;
+        match self {
+            UserSortField::CreatedAt => UserSearchSort::CreatedAt,
+            UserSortField::Username => UserSearchSort::Username,
+            UserSortField::Email => UserSearchSort::Email,
+            UserSortField::DisplayName => UserSearchSort::DisplayName,
         }
     }
 }
@@ -92,6 +108,8 @@ impl UserSortField {
 pub struct ListUsersFilter {
     /// 用户名模糊(ILIKE 子串)。
     pub username: Option<String>,
+    /// 用户名 + 显示名模糊搜索(仅投影/search 后端支持;无后端 → 422)。
+    pub q: Option<String>,
     /// 正选:含任一角色(逗号分隔,如 `?role=admin,editor`)。
     pub role: Option<String>,
     /// 反选:不含任一角色(逗号分隔)。

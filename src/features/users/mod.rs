@@ -6,8 +6,15 @@ mod routes;
 mod service;
 mod types;
 
-pub use port::{ProfileBrief, ProfileDirectory, StaticProfileDirectory};
+pub use port::{
+    ProfileBrief, ProfileDirectory, StaticProfileDirectory, UserSearchFilter, UserSearchIndex,
+    UserSearchPage, UserSearchRow, UserSearchSort,
+};
 pub use service::UserAdminService;
+pub use types::{
+    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, SetRolesRequest,
+    UpdateUserRequest, UserSortField,
+};
 
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;

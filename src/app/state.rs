@@ -4,27 +4,33 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-use super::adapters::{ContentAvatarProbe, InProcessProfileDirectory, InProcessUserDirectory};
+use super::adapters::{
+    ContentAvatarProbe, IdmOutboxSource, InProcessProfileDirectory, InProcessUserDirectory,
+    SearchIndexAdapter,
+};
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::profile::{
-    AvatarProbe, InMemoryProfileRepo, PgProfileRepo, ProfileRepo, ProfileService,
+    AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
 };
-use crate::features::users::{self, UserAdminService};
+use crate::features::search::{projector::Projector, PgSearchIndexRepo, SearchIndexRepo};
+use crate::features::users::{self, UserAdminService, UserSearchIndex};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
     UserDirectory, WidgetRepo, WidgetService,
 };
 use crate::infra::authz::Policy;
 use crate::infra::config::Config;
+use crate::infra::jetstream::JetStreamPublisher;
 use crate::infra::objectstore::S3ObjectStore;
+use crate::infra::outbox::{EventPublisher, OutboxRelay, OutboxSource};
 use content::{
     ContentRepo, ContentService, InMemoryContentRepo, InMemoryObjectRepo, InMemoryObjectStore,
     ObjectRepo, ObjectStore, PgContentRepo, PgObjectRepo,
 };
 use idm::{
-    Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, PgRoleRepo,
-    PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
+    Argon2Hasher, AuthService, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, OutboxRepo,
+    PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
 };
 
 /// 数据库 schema(= role = 连接归属)。每个 schema 用自己的 role 连接。
@@ -38,6 +44,7 @@ pub enum Schema {
     App,
     Idm,
     Content,
+    Search,
 }
 
 /// 应用级依赖容器。范式(替代 DI 框架):
@@ -70,11 +77,18 @@ pub struct AppState {
     pub token_signer: Option<Arc<AppTokenSigner>>,
 }
 
+/// 组合根装的后台任务(随 `run` 的优雅退出而停)。P1 outbox relay + P3 search projector,
+/// 都是"装了就 spawn、没装就跳过"的可选后台循环 —— 打包一份返回,省得 `new` 签名越加越长。
+pub struct BackgroundTasks {
+    pub relays: Vec<OutboxRelay>,
+    pub projector: Option<Projector>,
+}
+
 impl AppState {
     /// 按 `mount` 只装配本进程真正用到的库:app 进程连 app DB(widget)、idm 进程连 idm DB(auth/me),
     /// 各自不连对方的库 —— 省掉闲置连接,也让 readyz 探针 ping 的是本进程主库。
     /// app 进程的鉴权中间件只 decode JWT(roles 在 claim 里),不查 idm 库,故 idm 用内存占位即可。
-    pub async fn new(config: &Config, mount: Mount) -> anyhow::Result<Self> {
+    pub async fn new(config: &Config, mount: Mount) -> anyhow::Result<(Self, BackgroundTasks)> {
         let needs_app = matches!(mount, Mount::App | Mount::Both);
         let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
 
@@ -181,6 +195,12 @@ impl AppState {
         } else {
             None
         };
+        // search(search schema,读模型归 idm 侧):仅 needs_idm 进程需要,只喂 projector(不进 AppState 字段)。
+        let search_pool = if needs_idm {
+            connect_for_schema(config, Schema::Search).await?
+        } else {
+            None
+        };
         let (idm_users, idm_sessions, idm_roles): (
             Arc<dyn UserRepo>,
             Arc<dyn SessionRepo>,
@@ -279,12 +299,20 @@ impl AppState {
         // idm repos 被 AuthService::builder move 走 —— user_admin 先 clone(Arc,廉价)。
         let profile_directory: Arc<dyn users::ProfileDirectory> =
             Arc::new(InProcessProfileDirectory::new(profile_repo.clone()));
+        // 配了 search pool(SEARCH_DB_HOST + needs_idm)→ list 读投影(q/display_name 搜/排);
+        // 否则 None → list 回退 idm 直查 + q/display_name-sort 422。读侧独立建 PgSearchIndexRepo(与
+        // build_projector 的写侧各持 pool.clone(),廉价 Arc,读写解耦、不共享实例)。
+        let user_search: Option<Arc<dyn UserSearchIndex>> = search_pool.as_ref().map(|pool| {
+            let repo: Arc<dyn SearchIndexRepo> = Arc::new(PgSearchIndexRepo::new(pool.clone()));
+            Arc::new(SearchIndexAdapter::new(repo)) as Arc<dyn UserSearchIndex>
+        });
         let user_admin = UserAdminService::new(
             idm_users.clone(),
             idm_roles.clone(),
             idm_sessions.clone(),
             Arc::new(Argon2Hasher),
             profile_directory,
+            user_search,
         );
 
         let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
@@ -295,21 +323,104 @@ impl AppState {
             .refresh_ttl_secs(config.idm_refresh_ttl_secs)
             .build();
 
-        Ok(Self {
-            widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
-            profiles,
-            widget_events,
-            contents,
-            auth,
-            user_admin,
-            // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
-            db_pool: app_pool.or(idm_pool),
-            cookie_secure: config.app_env.is_prod(),
-            policy,
-            token_verifier,
-            token_signer,
-        })
+        let outbox_relays = build_outbox_relays(
+            config,
+            needs_idm,
+            needs_app,
+            idm_pool.as_ref(),
+            app_pool.as_ref(),
+        )
+        .await?;
+        let projector = build_projector(config, needs_idm, search_pool.as_ref()).await?;
+
+        Ok((
+            Self {
+                widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
+                profiles,
+                widget_events,
+                contents,
+                auth,
+                user_admin,
+                // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
+                db_pool: app_pool.or(idm_pool),
+                cookie_secure: config.app_env.is_prod(),
+                policy,
+                token_verifier,
+                token_signer,
+            },
+            BackgroundTasks {
+                relays: outbox_relays,
+                projector,
+            },
+        ))
     }
+}
+
+/// 装配 outbox relay(JetStream 交付腿)。规则:设了 `NATS_URL` 且本进程持有对应 schema 的 pg pool
+/// 才起该 schema 的 relay —— idm relay 归 needs_idm 进程、app relay 归 needs_app 进程(单体 Both 两个都起)。
+/// 无 nats(脚手架默认)→ 空 Vec,不外发事件(P4 的 list 走回退)。nats 设了但连不上 → fail-fast(同 NatsEventBus)。
+async fn build_outbox_relays(
+    config: &Config,
+    needs_idm: bool,
+    needs_app: bool,
+    idm_pool: Option<&PgPool>,
+    app_pool: Option<&PgPool>,
+) -> anyhow::Result<Vec<OutboxRelay>> {
+    use std::time::Duration;
+    let Some(nats_url) = config.nats_url.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let idm_src = if needs_idm { idm_pool } else { None };
+    let app_src = if needs_app { app_pool } else { None };
+    if idm_src.is_none() && app_src.is_none() {
+        return Ok(Vec::new()); // nats 设了但本进程无相关 schema pool → 无可 relay
+    }
+    // 与 NatsEventBus::connect 同哲学:nats 挂着起不来。
+    let publisher: Arc<dyn EventPublisher> = Arc::new(JetStreamPublisher::connect(nats_url).await?);
+    // poll_interval/batch:P1 纯轮询的合理默认;P2 叠 NOTIFY 降延迟。
+    let poll_interval = Duration::from_secs(1);
+    let batch = 128;
+    let mut relays = Vec::new();
+    if let Some(pool) = idm_src {
+        let repo: Arc<dyn OutboxRepo> = Arc::new(PgOutboxRepo::new(pool.clone()));
+        let source: Arc<dyn OutboxSource> = Arc::new(IdmOutboxSource::new(repo));
+        relays.push(OutboxRelay::new(
+            source,
+            publisher.clone(),
+            poll_interval,
+            batch,
+        ));
+    }
+    if let Some(pool) = app_src {
+        let source: Arc<dyn OutboxSource> = Arc::new(PgAppOutbox::new(pool.clone()));
+        relays.push(OutboxRelay::new(
+            source,
+            publisher.clone(),
+            poll_interval,
+            batch,
+        ));
+    }
+    tracing::info!("装配 {} 个 outbox relay(JetStream 交付)", relays.len());
+    Ok(relays)
+}
+
+/// 装配 projector:needs_idm 进程 + NATS_URL + search pool 三者齐才起(它连 nats consume + 写 search)。
+/// 否则 None(无投影;P4 list 回退)。durable name 固定 "admin_user_projector"。
+async fn build_projector(
+    config: &Config,
+    needs_idm: bool,
+    search_pool: Option<&PgPool>,
+) -> anyhow::Result<Option<Projector>> {
+    let (Some(nats_url), Some(pool)) = (
+        config.nats_url.as_deref().filter(|_| needs_idm),
+        search_pool,
+    ) else {
+        return Ok(None);
+    };
+    let repo: Arc<dyn SearchIndexRepo> = Arc::new(PgSearchIndexRepo::new(pool.clone()));
+    Ok(Some(
+        Projector::connect(nats_url, repo, "admin_user_projector").await?,
+    ))
 }
 
 /// 按 `schema` 起连接池(复用该 schema 自己的 role)。未配置对应 `*_DB_HOST` → `None`(走内存)。
@@ -321,6 +432,7 @@ pub async fn connect_for_schema(config: &Config, schema: Schema) -> anyhow::Resu
         Schema::App => config.app_database_url(),
         Schema::Idm => config.idm_database_url(),
         Schema::Content => config.content_database_url(),
+        Schema::Search => config.search_database_url(),
     };
     match url {
         Some(url) => Ok(Some(connect_pool(&url).await?)),
@@ -353,7 +465,7 @@ mod tests {
         };
         // AppState 无 Debug(含 trait object 字段),手动 match 而非 expect_err/unwrap_err。
         let err = match AppState::new(&cfg, Mount::Both).await {
-            Ok(_) => panic!("prod+dev 钥应拒启动"),
+            Ok((_, _)) => panic!("prod+dev 钥应拒启动"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("JWT"), "{err}");

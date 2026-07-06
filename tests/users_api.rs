@@ -56,6 +56,7 @@ async fn test_app() -> (Router, String, String) {
         sessions_repo,
         Arc::new(FakeHasher),
         Arc::new(InProcessProfileDirectory::new(profile_repo.clone())),
+        None,
     );
 
     // policy(归 app):superadmin 满权(含 users:admin + profiles:write:all);admin 仅后台准入。
@@ -408,6 +409,60 @@ async fn list_filter_sort_page() {
         resp.status(),
         StatusCode::UNPROCESSABLE_ENTITY,
         "cursor + 非默认 sort_by 应 422"
+    );
+}
+
+// ── 3b. 内存回退(无 search 后端):q / sort_by=display_name → 422;plain/空白 q → 200 ──
+
+/// 本套 harness(`test_app`)装的 `UserAdminService::search = None`(无 search 投影后端)→
+/// `list()` 走 idm 直查回退路,`q`/`sort_by=display_name` 因回退路不具备搜索能力而 422
+/// (纯空白 q trim 后视为"未搜索",仍走回退且 200)。
+#[tokio::test]
+async fn list_memory_fallback_rejects_q_and_display_name_sort() {
+    let (app, sa, _admin) = test_app().await;
+
+    // q=alice → 422(无 search 后端无法提供跨字段搜索)
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/admin/users?q=alice", &sa))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "无 search 后端时 q 应 422"
+    );
+
+    // sort_by=display_name → 422(回退路无法排 display_name)
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/admin/users?sort_by=display_name", &sa))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "无 search 后端时 sort_by=display_name 应 422"
+    );
+
+    // q=（纯空白,url-encoded）→ 200(trim 后为空,不算"要搜索",落回 idm 直查)
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/admin/users?q=%20%20", &sa))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "纯空白 q 应落回 idm 直查,200"
+    );
+
+    // plain(无 q、默认 sort)→ 200,回退 idm 直查照常
+    let resp = app.oneshot(get("/api/v1/admin/users", &sa)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "plain 请求应 200(回退 idm 直查照常)"
     );
 }
 

@@ -72,7 +72,7 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
 #[tokio::test]
 async fn spec_security_matches_real_enforcement() {
     let config = Config::default();
-    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
     let app = build_router(state.clone(), &config, Mount::Both);
     let su = state
         .auth

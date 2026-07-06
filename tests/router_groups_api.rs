@@ -11,7 +11,7 @@ use baserust::infra::config::Config;
 
 async fn setup() -> (Router, AppState) {
     let config = Config::default();
-    let state = AppState::new(&config, Mount::Both).await.unwrap();
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
     let app = build_router(state.clone(), &config, Mount::Both);
     (app, state)
 }
