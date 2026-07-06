@@ -17,6 +17,7 @@ pub use events::{
 pub use port::{StaticUserDirectory, UserBrief, UserDirectory};
 pub use repo::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo};
 pub use service::WidgetService;
+pub use types::WidgetSortField;
 pub use view::WidgetView;
 
 use utoipa_axum::router::OpenApiRouter;

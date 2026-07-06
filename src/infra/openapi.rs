@@ -19,6 +19,13 @@ use crate::infra::op_perms::{op_authz, PermReq};
 #[derive(OpenApi)]
 #[openapi(
     info(title = "baserust API", version = "0.1.0", description = "Rust 脚手架"),
+    // query 参数枚举:utoipa 只自动收集 responses/request_body 可达的 schema,
+    // IntoParams 字段用的 ToSchema 枚举不会被收集 —— 必须在此显式声明,否则 spec 出悬空 $ref。
+    components(schemas(
+        crate::infra::sort::SortOrder,
+        crate::features::widget::WidgetSortField,
+        crate::features::users::UserSortField,
+    )),
     modifiers(&SecurityAddon),
     tags(
         (name = "health", description = "健康检查"),
