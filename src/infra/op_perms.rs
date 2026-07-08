@@ -224,6 +224,14 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "list_auth_events",
         perm: PermReq::All(&[Perm::UsersAdmin]),
     },
+    OpAuthz {
+        operation_id: "stats_auth_events",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "stream_auth_events",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
 ];
 
 /// 按 operationId 查授权目录。不在表 = public。

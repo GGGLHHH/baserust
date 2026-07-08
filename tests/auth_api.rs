@@ -56,6 +56,7 @@ fn test_app() -> Router {
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: None,
+        auth_events_bus: None,
     };
     build_router(
         state,

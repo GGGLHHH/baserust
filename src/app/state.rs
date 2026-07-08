@@ -11,7 +11,7 @@ use super::adapters::{
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::auth_audit::{
-    projector::AuthEventProjector, AuthEventRepo, AuthRetentionJob, PgAuthEventRepo,
+    projector::AuthEventProjector, AuthEventBus, AuthEventRepo, AuthRetentionJob, PgAuthEventRepo,
 };
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
@@ -82,6 +82,10 @@ pub struct AppState {
     pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
     /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
     pub auth_events: Option<Arc<dyn AuthEventRepo>>,
+    /// auth_event 实时推送总线(`/admin/auth/auth-events/stream` SSE 用;projector 持同一实例发布)。
+    /// 仅当 `auth_projector` 真装起来(needs_idm && NATS_URL && search pool)时 Some ——
+    /// 唯一发布者没装,总线就不该对外暴露(否则 SSE 200 挂着永不推送,见 `AuthEventBus` 头注)。
+    pub auth_events_bus: Option<AuthEventBus>,
 }
 
 /// 组合根装的后台任务(随 `run` 的优雅退出而停)。P1 outbox relay + P3 search projector,
@@ -351,8 +355,14 @@ impl AppState {
         let auth_events: Option<Arc<dyn AuthEventRepo>> = search_pool
             .as_ref()
             .map(|p| Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>);
+        // SSE 总线:唯一发布者是下面的 auth_projector,只有它真装起来了总线才该对外暴露 ——
+        // 否则 needs_idm 但 nats/search 未配时,`/stream` 会 200 挂着却永不推送(sibling 端点已 404)。
+        // 装配顺序在 `db_pool` 移动 idm_pool 之前 —— 之后还要 `.clone()` 一份塞进 projector。
+        let bus = needs_idm.then(AuthEventBus::new);
         let auth_projector =
-            build_auth_event_projector(config, needs_idm, search_pool.as_ref()).await?;
+            build_auth_event_projector(config, needs_idm, search_pool.as_ref(), bus.clone())
+                .await?;
+        let auth_events_bus = if auth_projector.is_some() { bus } else { None };
         let auth_retention = search_pool.as_ref().map(|p| {
             AuthRetentionJob::new(
                 Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>
@@ -375,6 +385,7 @@ impl AppState {
                 token_signer,
                 idm_outbox,
                 auth_events,
+                auth_events_bus,
             },
             BackgroundTasks {
                 relays: outbox_relays,
@@ -455,10 +466,12 @@ async fn build_projector(
 
 /// 装配 auth_event 投影器:needs_idm + NATS_URL + search pool 三者齐才起。镜像 `build_projector`;
 /// 独立 durable name "auth_event_projector",消费 `events.idm.auth.>`(见 `AuthEventProjector::connect`)。
+/// `bus`:落库成功后发布给 SSE 订阅者,转发给 `AuthEventProjector::connect`。
 async fn build_auth_event_projector(
     config: &Config,
     needs_idm: bool,
     search_pool: Option<&PgPool>,
+    bus: Option<AuthEventBus>,
 ) -> anyhow::Result<Option<AuthEventProjector>> {
     let (Some(nats_url), Some(pool)) = (
         config.nats_url.as_deref().filter(|_| needs_idm),
@@ -468,7 +481,7 @@ async fn build_auth_event_projector(
     };
     let repo: Arc<dyn AuthEventRepo> = Arc::new(PgAuthEventRepo::new(pool.clone()));
     Ok(Some(
-        AuthEventProjector::connect(nats_url, repo, "auth_event_projector").await?,
+        AuthEventProjector::connect(nats_url, repo, "auth_event_projector", bus).await?,
     ))
 }
 

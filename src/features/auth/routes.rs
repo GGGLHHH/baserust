@@ -17,6 +17,7 @@ use super::types::{
     UserResponse,
 };
 use crate::app::state::AppState;
+use crate::features::auth_audit::AuthEventType;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::Perm;
 use crate::infra::client_context::ClientContext;
@@ -93,9 +94,15 @@ pub async fn register(
     let outcome = state.auth.register(req.into(), audit.audit_id()).await?;
     emit_auth_event(
         &state.idm_outbox,
-        "auth.registered",
+        AuthEventType::Registered,
         outcome.user.id,
-        success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+        success_data(
+            &ctx,
+            "public",
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
     )
     .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
@@ -122,9 +129,15 @@ pub async fn login(
         Ok(outcome) => {
             emit_auth_event(
                 &state.idm_outbox,
-                "auth.login_succeeded",
+                AuthEventType::LoginSucceeded,
                 outcome.user.id,
-                success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+                success_data(
+                    &ctx,
+                    "public",
+                    outcome.user.id,
+                    Some(outcome.session_id),
+                    Some(&outcome.user.username),
+                ),
             )
             .await;
             let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
@@ -144,7 +157,7 @@ pub async fn login(
             };
             emit_auth_event(
                 &state.idm_outbox,
-                "auth.login_failed",
+                AuthEventType::LoginFailed,
                 Uuid::nil(),
                 failure_data(&ctx, "public", None, Some(&identifier), reason),
             )
@@ -173,9 +186,15 @@ pub async fn refresh(
     let outcome = state.auth.refresh(&refresh).await?;
     emit_auth_event(
         &state.idm_outbox,
-        "auth.refreshed",
+        AuthEventType::Refreshed,
         outcome.user.id,
-        success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+        success_data(
+            &ctx,
+            "public",
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
     )
     .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
@@ -196,9 +215,9 @@ pub async fn logout(
         if let Some(session) = state.auth.logout(c.value()).await? {
             emit_auth_event(
                 &state.idm_outbox,
-                "auth.logged_out",
+                AuthEventType::LoggedOut,
                 session.user_id,
-                session_event_data(&ctx, "public", session.user_id, session.id),
+                session_event_data(&ctx, "public", session.user_id, session.id, None),
             )
             .await;
         }
@@ -218,9 +237,9 @@ pub async fn logout_all(
     state.auth.logout_all(user.0.id).await?;
     emit_auth_event(
         &state.idm_outbox,
-        "auth.logout_all",
+        AuthEventType::LogoutAll,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None),
+        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -281,9 +300,9 @@ pub async fn delete_me(
         .await?;
     emit_auth_event(
         &state.idm_outbox,
-        "auth.account_deleted",
+        AuthEventType::AccountDeleted,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None),
+        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -307,9 +326,9 @@ pub async fn change_password(
     state.auth.change_password(user.0.id, req.into()).await?;
     emit_auth_event(
         &state.idm_outbox,
-        "auth.password_changed",
+        AuthEventType::PasswordChanged,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None),
+        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -349,7 +368,7 @@ pub async fn admin_login(
             };
             emit_auth_event(
                 &state.idm_outbox,
-                "auth.login_failed",
+                AuthEventType::LoginFailed,
                 Uuid::nil(),
                 failure_data(&ctx, "admin", None, Some(&identifier), reason),
             )
@@ -367,7 +386,7 @@ pub async fn admin_login(
         state.auth.logout(&outcome.refresh_token).await?;
         emit_auth_event(
             &state.idm_outbox,
-            "auth.admin_access_denied",
+            AuthEventType::AdminAccessDenied,
             outcome.user.id,
             failure_data(
                 &ctx,
@@ -382,9 +401,15 @@ pub async fn admin_login(
     }
     emit_auth_event(
         &state.idm_outbox,
-        "auth.login_succeeded",
+        AuthEventType::LoginSucceeded,
         outcome.user.id,
-        success_data(&ctx, "admin", outcome.user.id, Some(outcome.session_id)),
+        success_data(
+            &ctx,
+            "admin",
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
     )
     .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);

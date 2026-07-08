@@ -1,7 +1,174 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+/// 认证审计事件类型闭集。存储值不变(仍是 `emit` 写的 `"auth.xxx"` 字符串,免数据迁移),
+/// 这里只是给它上一层强类型:emit 侧编译期防手滑字面量,读侧 utoipa 生成前端可辨识联合类型。
+/// 故意不设 `#[serde(other)]` 兜底 —— 该列只由本仓 `auth::emit` 写入(闭集只增不改),
+/// 出现未知值本身就是数据异常,该让它在解码处炸出来而不是悄悄吞掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum AuthEventType {
+    #[serde(rename = "auth.login_succeeded")]
+    #[sqlx(rename = "auth.login_succeeded")]
+    LoginSucceeded,
+    #[serde(rename = "auth.login_failed")]
+    #[sqlx(rename = "auth.login_failed")]
+    LoginFailed,
+    #[serde(rename = "auth.admin_access_denied")]
+    #[sqlx(rename = "auth.admin_access_denied")]
+    AdminAccessDenied,
+    #[serde(rename = "auth.refreshed")]
+    #[sqlx(rename = "auth.refreshed")]
+    Refreshed,
+    #[serde(rename = "auth.logged_out")]
+    #[sqlx(rename = "auth.logged_out")]
+    LoggedOut,
+    #[serde(rename = "auth.logout_all")]
+    #[sqlx(rename = "auth.logout_all")]
+    LogoutAll,
+    #[serde(rename = "auth.password_changed")]
+    #[sqlx(rename = "auth.password_changed")]
+    PasswordChanged,
+    #[serde(rename = "auth.registered")]
+    #[sqlx(rename = "auth.registered")]
+    Registered,
+    #[serde(rename = "auth.account_deleted")]
+    #[sqlx(rename = "auth.account_deleted")]
+    AccountDeleted,
+}
+
+impl AuthEventType {
+    /// 发射到 outbox 的线上串(`idm::OutboxRepo::emit` 只吃 `&str`)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthEventType::LoginSucceeded => "auth.login_succeeded",
+            AuthEventType::LoginFailed => "auth.login_failed",
+            AuthEventType::AdminAccessDenied => "auth.admin_access_denied",
+            AuthEventType::Refreshed => "auth.refreshed",
+            AuthEventType::LoggedOut => "auth.logged_out",
+            AuthEventType::LogoutAll => "auth.logout_all",
+            AuthEventType::PasswordChanged => "auth.password_changed",
+            AuthEventType::Registered => "auth.registered",
+            AuthEventType::AccountDeleted => "auth.account_deleted",
+        }
+    }
+}
+
+/// `NewAuthEvent.event_type`(写模型,恒为本仓 emit 产出的合法串)→ 枚举,给内存 repo 的
+/// 读侧映射用(pg 侧走 `sqlx::Type` 的 Decode,走不到这里)。见 `sqlx(rename)` 的反向表。
+impl std::str::FromStr for AuthEventType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "auth.login_succeeded" => Self::LoginSucceeded,
+            "auth.login_failed" => Self::LoginFailed,
+            "auth.admin_access_denied" => Self::AdminAccessDenied,
+            "auth.refreshed" => Self::Refreshed,
+            "auth.logged_out" => Self::LoggedOut,
+            "auth.logout_all" => Self::LogoutAll,
+            "auth.password_changed" => Self::PasswordChanged,
+            "auth.registered" => Self::Registered,
+            "auth.account_deleted" => Self::AccountDeleted,
+            other => return Err(format!("未知 auth event_type: {other}")),
+        })
+    }
+}
+
+/// 认证渠道闭集(`public` 前台 / `admin` 后台)。同 `AuthEventType` 头注:存储值不变,只加读侧
+/// 强类型;无 `#[serde(other)]` 兜底,原因同上(唯一写者是本仓 emit)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum AuthChannel {
+    #[serde(rename = "public")]
+    #[sqlx(rename = "public")]
+    Public,
+    #[serde(rename = "admin")]
+    #[sqlx(rename = "admin")]
+    Admin,
+}
+
+/// 见 `AuthEventType` 上同名 impl 的注释:内存 repo 读侧映射用,pg 侧走 `sqlx::Type` 走不到这里。
+impl std::str::FromStr for AuthChannel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "public" => Self::Public,
+            "admin" => Self::Admin,
+            other => return Err(format!("未知 channel: {other}")),
+        })
+    }
+}
+
+/// 认证结果闭集(`success` / `failure`)。同上头注。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum AuthOutcome {
+    #[serde(rename = "success")]
+    #[sqlx(rename = "success")]
+    Success,
+    #[serde(rename = "failure")]
+    #[sqlx(rename = "failure")]
+    Failure,
+}
+
+impl AuthOutcome {
+    /// filter 下推(`apply_filters`)/内存 repo 过滤要跟 `NewAuthEvent.outcome`(仍是 `String`)比较。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthOutcome::Success => "success",
+            AuthOutcome::Failure => "failure",
+        }
+    }
+}
+
+impl std::str::FromStr for AuthOutcome {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            other => return Err(format!("未知 outcome: {other}")),
+        })
+    }
+}
+
+/// 失败原因闭集。同上头注;`account_locked`/`rate_limited` 目前 emit 侧未产出(预留取值,
+/// 闭集只增不改 —— 出现才炸,不提前拒绝合法但暂未使用的取值)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum FailureReason {
+    #[serde(rename = "unknown_user")]
+    #[sqlx(rename = "unknown_user")]
+    UnknownUser,
+    #[serde(rename = "bad_password")]
+    #[sqlx(rename = "bad_password")]
+    BadPassword,
+    #[serde(rename = "no_admin_perm")]
+    #[sqlx(rename = "no_admin_perm")]
+    NoAdminPerm,
+    #[serde(rename = "account_locked")]
+    #[sqlx(rename = "account_locked")]
+    AccountLocked,
+    #[serde(rename = "rate_limited")]
+    #[sqlx(rename = "rate_limited")]
+    RateLimited,
+}
+
+impl std::str::FromStr for FailureReason {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "unknown_user" => Self::UnknownUser,
+            "bad_password" => Self::BadPassword,
+            "no_admin_perm" => Self::NoAdminPerm,
+            "account_locked" => Self::AccountLocked,
+            "rate_limited" => Self::RateLimited,
+            other => return Err(format!("未知 failure_reason: {other}")),
+        })
+    }
+}
 
 /// 写模型:projector 从 envelope 组装后交 repo 落库(Phase 1 富化列不在此,DB 默认 null)。
 #[derive(Debug, Clone)]
@@ -28,15 +195,16 @@ pub struct NewAuthEvent {
 #[derive(Debug, Clone, Serialize, ToSchema, sqlx::FromRow)]
 pub struct AuthEventRow {
     pub id: Uuid,
-    pub event_type: String,
+    pub event_type: AuthEventType,
     #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
-    pub channel: String,
+    pub channel: AuthChannel,
     pub user_id: Option<Uuid>,
     pub identifier_attempted: Option<String>,
     pub session_id: Option<Uuid>,
-    pub outcome: String,
-    pub failure_reason: Option<String>,
+    pub actor: Option<String>,
+    pub outcome: AuthOutcome,
+    pub failure_reason: Option<FailureReason>,
     pub ip: Option<String>, // inet → 文本回传
     pub user_agent: Option<String>,
     pub country: Option<String>,
@@ -50,8 +218,59 @@ pub struct AuthEventRow {
 pub struct AuthEventQuery {
     pub user_id: Option<Uuid>,
     pub event_type: Option<String>,
-    pub outcome: Option<String>,
+    pub outcome: Option<AuthOutcome>,
     pub ip: Option<String>,
     pub from: Option<OffsetDateTime>,
     pub to: Option<OffsetDateTime>,
+}
+
+/// 仪表盘统计(admin `/auth-events/stats`)。时间序列 + 各维度 group-by 计数。
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StatBucket {
+    #[serde(with = "time::serde::rfc3339")]
+    pub t: OffsetDateTime,
+    pub success: i64,
+    pub failure: i64,
+}
+
+/// `types` group-by 计数的强类型版本。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TypeCount {
+    pub key: AuthEventType,
+    pub count: i64,
+}
+
+/// `reasons` group-by 计数的强类型版本(镜像 `TypeCount`)。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReasonCount {
+    pub key: FailureReason,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IpStat {
+    pub ip: String,
+    pub failures: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthKpi {
+    pub total_events: i64,
+    pub failed_count: i64,
+    pub unique_ips: i64,
+    pub success_rate: f64,
+    /// (当前 - 上个等长窗口) / 上个等长窗口;上个窗口为 0 时记 0.0(无基数,不作 +∞/NaN)。
+    pub total_delta: f64,
+    pub failed_delta: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthStats {
+    pub activity: Vec<StatBucket>,
+    pub reasons: Vec<ReasonCount>,
+    pub types: Vec<TypeCount>,
+    pub top_ips: Vec<IpStat>,
+    pub kpi: AuthKpi,
 }

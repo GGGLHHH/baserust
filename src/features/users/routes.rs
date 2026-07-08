@@ -1,7 +1,7 @@
 //! 后台用户管理端点(admin 组,归 idm 进程)。每 handler 首行 `require_scoped(UsersAdmin)`
 //! (组闸 admin:login 之上再 gate superadmin 专属的 users:admin)。写操作 `by = ctx.audit_id()`。
 //! `#[utoipa::path]` **不手写 security** —— op_perms 经 `inject_operation_security` 注入。
-//! path 相对 admin 组(nest 加 `/api/v1/admin`)→ 实际 `/api/v1/admin/users*`。
+//! path 相对 admin 组(nest 加 `/api/v1/admin/auth`)→ 实际 `/api/v1/admin/auth/users*`。
 
 use std::collections::HashMap;
 

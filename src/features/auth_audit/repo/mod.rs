@@ -2,12 +2,14 @@ mod memory;
 mod postgres;
 
 pub use memory::InMemoryAuthEventRepo;
+// to_row:projector 发布 SSE 行时复用同一份 NewAuthEvent→AuthEventRow 映射(见 memory.rs)。
+pub(crate) use memory::to_row;
 pub use postgres::PgAuthEventRepo;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use super::types::{AuthEventQuery, AuthEventRow, NewAuthEvent};
+use super::types::{AuthEventQuery, AuthEventRow, AuthStats, NewAuthEvent};
 use crate::infra::error::AppError;
 use crate::infra::pagination::{Page, PageParams};
 
@@ -23,4 +25,6 @@ pub trait AuthEventRepo: Send + Sync {
     ) -> Result<Page<AuthEventRow>, AppError>;
     /// 保留:删 occurred_at < cutoff 的行,返回删除数。
     async fn delete_older_than(&self, cutoff: OffsetDateTime) -> Result<u64, AppError>;
+    /// 仪表盘聚合:`[from, to)` 区间的时间序列 + group-by 计数(admin `/auth-events/stats` 用)。
+    async fn stats(&self, from: OffsetDateTime, to: OffsetDateTime) -> Result<AuthStats, AppError>;
 }

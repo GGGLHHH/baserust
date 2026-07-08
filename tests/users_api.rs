@@ -84,6 +84,7 @@ async fn test_app() -> (Router, String, String) {
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: None,
+        auth_events_bus: None,
     };
     let app = build_router(
         state,
@@ -185,7 +186,7 @@ fn delete_req(uri: &str, token: &str) -> Request<Body> {
 async fn role_ids_json(app: &Router, token: &str, names: &[&str]) -> String {
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/roles", token))
+        .oneshot(get("/api/v1/admin/auth/roles", token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "取角色目录应 200");
@@ -213,7 +214,7 @@ async fn create_user(app: &Router, token: &str, username: &str, roles: &[&str]) 
     );
     let resp = app
         .clone()
-        .oneshot(post_json("/api/v1/admin/users", &body, token))
+        .oneshot(post_json("/api/v1/admin/auth/users", &body, token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED, "建 {username} 应 201");
@@ -244,7 +245,7 @@ async fn authz_matrix() {
     let resp = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/admin/users")
+            Request::get("/api/v1/admin/auth/users")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -255,7 +256,7 @@ async fn authz_matrix() {
     // admin 过组闸(有 admin:login)但 handler require_scoped(users:admin) → 403
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users", &admin))
+        .oneshot(get("/api/v1/admin/auth/users", &admin))
         .await
         .unwrap();
     assert_eq!(
@@ -266,7 +267,7 @@ async fn authz_matrix() {
 
     // superadmin → 200
     let resp = app
-        .oneshot(get("/api/v1/admin/users", &superadmin))
+        .oneshot(get("/api/v1/admin/auth/users", &superadmin))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "superadmin 应 200");
@@ -283,7 +284,7 @@ async fn create_user_cases() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/admin/users",
+            "/api/v1/admin/auth/users",
             &format!(
                 r#"{{"username":"neo","email":"neo@example.com","password":"password123","roles":{user_ids}}}"#
             ),
@@ -311,7 +312,7 @@ async fn create_user_cases() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/admin/users",
+            "/api/v1/admin/auth/users",
             &format!(
                 r#"{{"username":"neo","email":null,"password":"password123","roles":{user_ids}}}"#
             ),
@@ -325,7 +326,7 @@ async fn create_user_cases() {
     let resp = app
         .clone()
         .oneshot(post_json(
-            "/api/v1/admin/users",
+            "/api/v1/admin/auth/users",
             r#"{"username":"ghosty","email":null,"password":"password123","roles":["00000000-0000-0000-0000-000000000000"]}"#,
             &sa,
         ))
@@ -340,7 +341,7 @@ async fn create_user_cases() {
     // 空 username → 422(garde length(min=1))
     let resp = app
         .oneshot(post_json(
-            "/api/v1/admin/users",
+            "/api/v1/admin/auth/users",
             r#"{"username":"","email":null,"password":"password123","roles":[]}"#,
             &sa,
         ))
@@ -367,7 +368,7 @@ async fn list_filter_sort_page() {
     let resp = app
         .clone()
         .oneshot(get(
-            "/api/v1/admin/users?username=a&sort_by=username&order=asc&page=1&with_total=true",
+            "/api/v1/admin/auth/users?username=a&sort_by=username&order=asc&page=1&with_total=true",
             &sa,
         ))
         .await
@@ -390,7 +391,7 @@ async fn list_filter_sort_page() {
     // 正选 role=user → alice、bob 命中,carol(admin)不在。
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users?role=user", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?role=user", &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -413,7 +414,7 @@ async fn list_filter_sort_page() {
     // 反选 role_not=user → 排除 alice/bob,仅 carol。
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users?role_not=user", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?role_not=user", &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -435,7 +436,7 @@ async fn list_filter_sort_page() {
 
     // cursor 模式(空 cursor = 首页)+ 非默认 sort_by → 422(keyset 恒按 id,排序仅 offset)。
     let resp = app
-        .oneshot(get("/api/v1/admin/users?cursor=&sort_by=username", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?cursor=&sort_by=username", &sa))
         .await
         .unwrap();
     assert_eq!(
@@ -457,7 +458,7 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
     // q=alice → 422(无 search 后端无法提供跨字段搜索)
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users?q=alice", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?q=alice", &sa))
         .await
         .unwrap();
     assert_eq!(
@@ -469,7 +470,7 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
     // sort_by=display_name → 422(回退路无法排 display_name)
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users?sort_by=display_name", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?sort_by=display_name", &sa))
         .await
         .unwrap();
     assert_eq!(
@@ -481,7 +482,7 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
     // q=（纯空白,url-encoded）→ 200(trim 后为空,不算"要搜索",落回 idm 直查)
     let resp = app
         .clone()
-        .oneshot(get("/api/v1/admin/users?q=%20%20", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?q=%20%20", &sa))
         .await
         .unwrap();
     assert_eq!(
@@ -491,7 +492,7 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
     );
 
     // plain(无 q、默认 sort)→ 200,回退 idm 直查照常
-    let resp = app.oneshot(get("/api/v1/admin/users", &sa)).await.unwrap();
+    let resp = app.oneshot(get("/api/v1/admin/auth/users", &sa)).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -524,7 +525,7 @@ async fn list_enriches_display_name_from_profile() {
 
     // list erin → display_name 富化命中(内存模式,富化端口读同一 profile repo)
     let resp = app
-        .oneshot(get("/api/v1/admin/users?username=erin", &sa))
+        .oneshot(get("/api/v1/admin/auth/users?username=erin", &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -547,7 +548,7 @@ async fn get_update_delete() {
     // GET 存在 → 200,created_at 可解析
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/admin/users/{id}"), &sa))
+        .oneshot(get(&format!("/api/v1/admin/auth/users/{id}"), &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -564,7 +565,7 @@ async fn get_update_delete() {
     // GET 随机 uuid → 404
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/admin/users/{}", Uuid::now_v7()), &sa))
+        .oneshot(get(&format!("/api/v1/admin/auth/users/{}", Uuid::now_v7()), &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "不存在应 404");
@@ -573,7 +574,7 @@ async fn get_update_delete() {
     let resp = app
         .clone()
         .oneshot(put_json(
-            &format!("/api/v1/admin/users/{id}"),
+            &format!("/api/v1/admin/auth/users/{id}"),
             r#"{"username":"gina2","email":null}"#,
             &sa,
         ))
@@ -586,7 +587,7 @@ async fn get_update_delete() {
     let resp = app
         .clone()
         .oneshot(put_json(
-            &format!("/api/v1/admin/users/{id}"),
+            &format!("/api/v1/admin/auth/users/{id}"),
             r#"{"username":"taken","email":null}"#,
             &sa,
         ))
@@ -597,12 +598,12 @@ async fn get_update_delete() {
     // DELETE → 204,再 DELETE → 404
     let resp = app
         .clone()
-        .oneshot(delete_req(&format!("/api/v1/admin/users/{id}"), &sa))
+        .oneshot(delete_req(&format!("/api/v1/admin/auth/users/{id}"), &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "软删应 204");
     let resp = app
-        .oneshot(delete_req(&format!("/api/v1/admin/users/{id}"), &sa))
+        .oneshot(delete_req(&format!("/api/v1/admin/auth/users/{id}"), &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "再删应 404");
@@ -620,7 +621,7 @@ async fn set_roles_full_replace() {
     let resp = app
         .clone()
         .oneshot(put_json(
-            &format!("/api/v1/admin/users/{id}/roles"),
+            &format!("/api/v1/admin/auth/users/{id}/roles"),
             &format!(r#"{{"roles":{admin_user}}}"#),
             &sa,
         ))
@@ -635,7 +636,7 @@ async fn set_roles_full_replace() {
     // 含未知角色 id → 422(全量原子,不留半态)
     let resp = app
         .oneshot(put_json(
-            &format!("/api/v1/admin/users/{id}/roles"),
+            &format!("/api/v1/admin/auth/users/{id}/roles"),
             r#"{"roles":["00000000-0000-0000-0000-000000000000"]}"#,
             &sa,
         ))
@@ -657,7 +658,7 @@ async fn reset_password_204() {
 
     let resp = app
         .oneshot(post_json(
-            &format!("/api/v1/admin/users/{id}/password"),
+            &format!("/api/v1/admin/auth/users/{id}/password"),
             r#"{"new_password":"newpass123"}"#,
             &sa,
         ))
@@ -680,7 +681,7 @@ async fn admin_profile_get_put_under_users_admin() {
     let resp = app
         .clone()
         .oneshot(put_json(
-            &format!("/api/v1/admin/users/{id}/profile"),
+            &format!("/api/v1/admin/auth/users/{id}/profile"),
             r#"{"display_name":"Ada Admin","phone":"123","avatar_content_id":null}"#,
             &sa,
         ))
@@ -692,7 +693,7 @@ async fn admin_profile_get_put_under_users_admin() {
     // superadmin GET 资料 → 200 命中
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/admin/users/{id}/profile"), &sa))
+        .oneshot(get(&format!("/api/v1/admin/auth/users/{id}/profile"), &sa))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -700,7 +701,7 @@ async fn admin_profile_get_put_under_users_admin() {
 
     // admin(只有 admin:login,无 users:admin)→ 403
     let resp = app
-        .oneshot(get(&format!("/api/v1/admin/users/{id}/profile"), &admin))
+        .oneshot(get(&format!("/api/v1/admin/auth/users/{id}/profile"), &admin))
         .await
         .unwrap();
     assert_eq!(

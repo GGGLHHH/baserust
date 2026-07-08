@@ -90,6 +90,7 @@ async fn test_app_with_config(
         token_verifier: verifier,
         idm_outbox: Some(outbox.clone() as Arc<dyn OutboxRepo>),
         auth_events: None,
+        auth_events_bus: None,
     };
     let app = build_router(state, &config, Mount::Both);
     (app, outbox, roles_repo)
@@ -320,7 +321,11 @@ async fn logout_emits_logged_out_only_when_session_found() {
         .await
         .expect("有会话登出应发事件");
     assert_eq!(ev.payload["user_id"], user_id, "logged_out 应带 user_id");
-    assert_eq!(ev.aggregate_id.to_string(), user_id, "aggregate_id 应是 user_id 而非 session_id");
+    assert_eq!(
+        ev.aggregate_id.to_string(),
+        user_id,
+        "aggregate_id 应是 user_id 而非 session_id"
+    );
 }
 
 #[tokio::test]
@@ -476,7 +481,10 @@ async fn login_headers_resolve_through_wired_trusted_hops() {
     let ev = find_event(&outbox, "auth.login_succeeded")
         .await
         .expect("应发 auth.login_succeeded");
-    assert_eq!(ev.payload["ip"], "203.0.113.9", "1 跳可信 → XFF 唯一条即真实 IP");
+    assert_eq!(
+        ev.payload["ip"], "203.0.113.9",
+        "1 跳可信 → XFF 唯一条即真实 IP"
+    );
     assert_eq!(ev.payload["user_agent"], "SmokeTest/1.0");
     assert_eq!(ev.payload["request_id"], "req-abc");
     assert_eq!(ev.payload["forwarded_chain"], "203.0.113.9");

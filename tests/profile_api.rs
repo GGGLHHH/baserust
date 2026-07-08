@@ -109,6 +109,7 @@ fn test_app() -> (
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: None,
+        auth_events_bus: None,
     };
     let app = build_router(
         state,

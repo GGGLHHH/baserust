@@ -13,8 +13,9 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::repo::AuthEventRepo;
-use super::types::NewAuthEvent;
+use super::events::AuthEventBus;
+use super::repo::{to_row, AuthEventRepo};
+use super::types::{AuthEventRow, NewAuthEvent};
 use crate::infra::jetstream::STREAM_NAME;
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +68,8 @@ pub enum ApplyError {
 pub struct AuthEventProjector {
     consumer: jetstream::consumer::Consumer<pull::Config>,
     repo: Arc<dyn AuthEventRepo>,
+    /// 落库成功后发布给 SSE 订阅者(`/admin/auth/auth-events/stream`)。`None` = 非 needs_idm 进程。
+    bus: Option<AuthEventBus>,
 }
 
 impl AuthEventProjector {
@@ -76,6 +79,7 @@ impl AuthEventProjector {
         nats_url: &str,
         repo: Arc<dyn AuthEventRepo>,
         durable_name: &str,
+        bus: Option<AuthEventBus>,
     ) -> anyhow::Result<Self> {
         let client = async_nats::connect(nats_url)
             .await
@@ -97,7 +101,11 @@ impl AuthEventProjector {
             )
             .await
             .with_context(|| format!("创建/绑定 durable consumer {durable_name} 失败"))?;
-        Ok(Self { consumer, repo })
+        Ok(Self {
+            consumer,
+            repo,
+            bus,
+        })
     }
 
     /// 后台循环:拉消息 → `apply_message` → 成功 ack,失败留待重投;`shutdown` 置位即退出。
@@ -128,7 +136,13 @@ impl AuthEventProjector {
                     };
                     // 成功 / 毒消息 → ack(毒消息永不可投,重投无意义、只会死循环);暂时故障 → 不 ack、等重投。
                     let should_ack = match Self::apply_message(&*self.repo, &msg.payload).await {
-                        Ok(()) => true,
+                        Ok(row) => {
+                            // SSE 推送:发布失败(无订阅者)不影响落库结果,fire-and-forget。
+                            if let (Some(bus), Some(row)) = (&self.bus, row) {
+                                bus.publish(row);
+                            }
+                            true
+                        }
                         Err(ApplyError::Poison(why)) => {
                             tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
                             true
@@ -154,12 +168,18 @@ impl AuthEventProjector {
     }
 
     /// 纯路由逻辑(单测入口,不碰 NATS):解 envelope → 非 `auth.*` 忽略(前向兼容)→
-    /// 解 `data` → 组装 `NewAuthEvent` → `repo.insert`。
-    async fn apply_message(repo: &dyn AuthEventRepo, payload: &[u8]) -> Result<(), ApplyError> {
+    /// 解 `data` → 组装 `NewAuthEvent` → `repo.insert`。成功落库 → `Some(row)`(供 `run()` 发布 SSE);
+    /// 非 auth.* 忽略 → `None`。
+    /// ponytail:`insert` 幂等(ON CONFLICT DO NOTHING),重投的旧消息也会返回 `Some` —— 即偶发
+    /// SSE 重复推送同一行,不影响正确性(SSE 只是提示流,列表/统计端点才是真相来源)。
+    async fn apply_message(
+        repo: &dyn AuthEventRepo,
+        payload: &[u8],
+    ) -> Result<Option<AuthEventRow>, ApplyError> {
         let env: Envelope = serde_json::from_slice(payload)
             .map_err(|e| ApplyError::Poison(format!("envelope 反序列化: {e}")))?;
         if !env.r#type.starts_with("auth.") {
-            return Ok(()); // 非 auth 事件,忽略(前向兼容)
+            return Ok(None); // 非 auth 事件,忽略(前向兼容)
         }
         let d: AuthEventData = serde_json::from_value(env.data)
             .map_err(|e| ApplyError::Poison(format!("{} data: {e}", env.r#type)))?;
@@ -181,7 +201,9 @@ impl AuthEventProjector {
             request_id: d.request_id,
             event_seq: env.seq,
         };
-        repo.insert(&new).await.map_err(ApplyError::Transient)
+        let row = to_row(&new);
+        repo.insert(&new).await.map_err(ApplyError::Transient)?;
+        Ok(Some(row))
     }
 }
 
@@ -236,5 +258,30 @@ mod tests {
             Err(ApplyError::Poison(_))
         ));
         assert_eq!(repo.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe {
+    use super::*;
+    use crate::features::auth_audit::InMemoryAuthEventRepo;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn bad_channel_value_currently_panics_instead_of_poison() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        let payload = serde_json::to_vec(&json!({
+            "event_id": "idm-99", "schema": "idm", "type": "auth.login_succeeded",
+            "aggregate_id": "00000000-0000-0000-0000-000000000000", "seq": 99,
+            "data": {
+                "occurred_at": "2026-07-08T10:00:00Z", "channel": "totally-bogus", "outcome": "success",
+                "user_id": null, "session_id": null, "identifier_attempted": null,
+                "failure_reason": null, "ip": null, "forwarded_chain": null, "user_agent": null, "request_id": null,
+            },
+        })).unwrap();
+        let r = AuthEventProjector::apply_message(repo.as_ref(), &payload).await;
+        // 期望:语义非法的 enum 字符串也该走 Poison,不该 panic。
+        assert!(matches!(r, Err(ApplyError::Poison(_))));
     }
 }

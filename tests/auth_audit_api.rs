@@ -99,6 +99,7 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: Some(auth_events.clone() as Arc<dyn AuthEventRepo>),
+        auth_events_bus: None,
     };
     let app = build_router(
         state,
@@ -178,7 +179,7 @@ async fn auth_events_authz_matrix() {
     let r = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/admin/auth-events")
+            Request::get("/api/v1/admin/auth/auth-events")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -189,7 +190,7 @@ async fn auth_events_authz_matrix() {
     // admin(admin:login,无 users:admin)→ 403
     let r = app
         .clone()
-        .oneshot(get("/api/v1/admin/auth-events", &admin))
+        .oneshot(get("/api/v1/admin/auth/auth-events", &admin))
         .await
         .unwrap();
     assert_eq!(
@@ -200,7 +201,7 @@ async fn auth_events_authz_matrix() {
 
     // superadmin → 200 + 命中手插行
     let r = app
-        .oneshot(get("/api/v1/admin/auth-events", &superadmin))
+        .oneshot(get("/api/v1/admin/auth/auth-events", &superadmin))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "superadmin 应 200");
@@ -208,12 +209,66 @@ async fn auth_events_authz_matrix() {
     assert_eq!(v["items"].as_array().unwrap().len(), 1, "应命中手插的 1 行");
 }
 
+// ── 授权矩阵 + 响应体形状:GET /admin/auth-events/stats ──
+
+#[tokio::test]
+async fn stats_endpoint_returns_shape_and_gates() {
+    let (app, _events, superadmin, admin) = test_app().await;
+
+    // 无 token → 401
+    let r = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/admin/auth/auth-events/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "无 token 应 401");
+
+    // admin(admin:login,无 users:admin)→ 403
+    let r = app
+        .clone()
+        .oneshot(get("/api/v1/admin/auth/auth-events/stats", &admin))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "admin 无 users:admin 应 403"
+    );
+
+    // superadmin → 200 + 响应形状(手插的 1 行落在默认 24h 窗口内)
+    let r = app
+        .oneshot(get("/api/v1/admin/auth/auth-events/stats", &superadmin))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "superadmin 应 200");
+    let v = json_body(r).await;
+    assert!(
+        !v["activity"].as_array().unwrap().is_empty(),
+        "默认 24h 窗口应零填充出小时桶,即便手插行都不在内"
+    );
+    assert!(v["reasons"].is_array(), "应有 reasons 字段");
+    assert!(v["types"].is_array(), "应有 types 字段");
+    assert!(v["top_ips"].is_array(), "应有 top_ips 字段");
+    assert!(
+        v["kpi"]["total_events"].is_number(),
+        "kpi.total_events 应是数字"
+    );
+    assert!(
+        v["kpi"]["success_rate"].is_number(),
+        "kpi.success_rate 应是数字"
+    );
+}
+
 // ── 授权矩阵:GET /admin/users/{id}/auth-events ──
 
 #[tokio::test]
 async fn user_auth_events_authz_matrix() {
     let (app, _events, superadmin, admin) = test_app().await;
-    let uri = format!("/api/v1/admin/users/{}/auth-events", Uuid::now_v7());
+    let uri = format!("/api/v1/admin/auth/users/{}/auth-events", Uuid::now_v7());
 
     let r = app
         .clone()
@@ -272,6 +327,7 @@ async fn no_auth_events_backend_is_404_not_panic() {
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: None,
+        auth_events_bus: None,
     };
     let app = build_router(
         state,
@@ -289,7 +345,7 @@ async fn no_auth_events_backend_is_404_not_panic() {
         .unwrap();
 
     let r = app
-        .oneshot(get("/api/v1/admin/auth-events", &superadmin))
+        .oneshot(get("/api/v1/admin/auth/auth-events", &superadmin))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);

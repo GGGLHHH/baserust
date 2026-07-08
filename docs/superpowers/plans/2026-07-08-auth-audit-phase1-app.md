@@ -1228,13 +1228,13 @@ git commit -m "feat(audit): wire auth_event projector + 90d retention job"
 async fn auth_events_authz_matrix() {
     let (app, superadmin, admin) = test_app().await; // 同 users_api::test_app,AppState.auth_events = Some(in-mem)
     // 无 token → 组闸 401
-    let r = app.clone().oneshot(Request::get("/api/v1/admin/auth-events").body(Body::empty()).unwrap()).await.unwrap();
+    let r = app.clone().oneshot(Request::get("/api/v1/admin/auth/auth-events").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     // admin 有 admin:login 无 users:admin → 403
-    let r = app.clone().oneshot(get("/api/v1/admin/auth-events", &admin)).await.unwrap();
+    let r = app.clone().oneshot(get("/api/v1/admin/auth/auth-events", &admin)).await.unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     // superadmin → 200
-    let r = app.oneshot(get("/api/v1/admin/auth-events", &superadmin)).await.unwrap();
+    let r = app.oneshot(get("/api/v1/admin/auth/auth-events", &superadmin)).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
 ```

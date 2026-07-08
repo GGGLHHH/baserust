@@ -78,6 +78,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
         token_verifier: verifier,
         idm_outbox: None,
         auth_events: None,
+        auth_events_bus: None,
     };
     let app = build_router(
         state,
