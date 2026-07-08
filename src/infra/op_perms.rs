@@ -199,6 +199,22 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "reset_user_password",
         perm: PermReq::All(&[Perm::UsersAdmin]),
     },
+    OpAuthz {
+        operation_id: "list_roles",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "get_user_profile",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "set_user_profile",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "set_user_avatar",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
 ];
 
 /// 按 operationId 查授权目录。不在表 = public。

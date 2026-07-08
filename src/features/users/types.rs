@@ -27,6 +27,25 @@ pub struct AdminUserView {
     pub avatar_url: Option<String>,
 }
 
+/// 角色目录项(admin 分配角色的候选集;`GET /roles` 返回)。
+/// `name`=机器码(唯一稳定,JWT/权限引用),`display_name`=展示名(UI,可改)。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RoleView {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
+}
+
+impl From<idm::Role> for RoleView {
+    fn from(r: idm::Role) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            display_name: r.display_name,
+        }
+    }
+}
+
 /// 建号(原子含角色)。`password` 复用 `RegisterRequest` 的长度口径(auth/types.rs `length(min=3)`)。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct CreateUserRequest {
@@ -36,9 +55,9 @@ pub struct CreateUserRequest {
     pub email: Option<String>,
     #[garde(length(min = 3))]
     pub password: String,
-    /// 角色名(空 = 不授角色);未知名 → 422。
+    /// 角色 id(空 = 不授角色);未知 id → 422。
     #[garde(skip)]
-    pub roles: Vec<String>,
+    pub roles: Vec<Uuid>,
 }
 
 /// 改身份(PUT 全量)。`email=None` 即清空(替换 email 会重置 email_verified,idm 语义)。
@@ -50,11 +69,11 @@ pub struct UpdateUserRequest {
     pub email: Option<String>,
 }
 
-/// 全量设角色(原子替换)。
+/// 全量设角色(原子替换)。传角色 id;未知 id → 422。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct SetRolesRequest {
     #[garde(skip)]
-    pub roles: Vec<String>,
+    pub roles: Vec<Uuid>,
 }
 
 /// 管理员重置密码(无需旧密码)。

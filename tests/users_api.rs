@@ -178,10 +178,36 @@ fn delete_req(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// 建号(superadmin),断言 201,返回新 id。`roles` 是 JSON 数组串,如 `["user"]`。
-async fn create_user(app: &Router, token: &str, username: &str, roles: &str) -> String {
+/// 取角色目录(GET /admin/roles),把角色名映射成其 id,返回可嵌进 body 的 JSON 数组串
+/// 如 `["<uuid>"]`(角色现按 id 传;存活名唯一,映射无歧义)。
+async fn role_ids_json(app: &Router, token: &str, names: &[&str]) -> String {
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/admin/roles", token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "取角色目录应 200");
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    let ids: Vec<&str> = names
+        .iter()
+        .map(|n| {
+            items
+                .iter()
+                .find(|r| r["name"].as_str() == Some(n))
+                .unwrap_or_else(|| panic!("角色目录缺 {n}"))["id"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    serde_json::to_string(&ids).unwrap()
+}
+
+/// 建号(superadmin),断言 201,返回新 id。`roles` 是角色**名**,内部解析成 id 提交。
+async fn create_user(app: &Router, token: &str, username: &str, roles: &[&str]) -> String {
+    let ids = role_ids_json(app, token, roles).await;
     let body = format!(
-        r#"{{"username":"{username}","email":null,"password":"password123","roles":{roles}}}"#
+        r#"{{"username":"{username}","email":null,"password":"password123","roles":{ids}}}"#
     );
     let resp = app
         .clone()
@@ -249,13 +275,16 @@ async fn authz_matrix() {
 #[tokio::test]
 async fn create_user_cases() {
     let (app, sa, _admin) = test_app().await;
+    let user_ids = role_ids_json(&app, &sa, &["user"]).await;
 
-    // 合法建号 → 201 + roles 命中
+    // 合法建号 → 201 + roles 命中(响应 roles 仍是名字)
     let resp = app
         .clone()
         .oneshot(post_json(
             "/api/v1/admin/users",
-            r#"{"username":"neo","email":"neo@example.com","password":"password123","roles":["user"]}"#,
+            &format!(
+                r#"{{"username":"neo","email":"neo@example.com","password":"password123","roles":{user_ids}}}"#
+            ),
             &sa,
         ))
         .await
@@ -281,19 +310,21 @@ async fn create_user_cases() {
         .clone()
         .oneshot(post_json(
             "/api/v1/admin/users",
-            r#"{"username":"neo","email":null,"password":"password123","roles":["user"]}"#,
+            &format!(
+                r#"{{"username":"neo","email":null,"password":"password123","roles":{user_ids}}}"#
+            ),
             &sa,
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT, "重名应 409");
 
-    // 未知角色名 → 422
+    // 未知角色 id → 422(合法 uuid 但不在目录)
     let resp = app
         .clone()
         .oneshot(post_json(
             "/api/v1/admin/users",
-            r#"{"username":"ghosty","email":null,"password":"password123","roles":["ghost"]}"#,
+            r#"{"username":"ghosty","email":null,"password":"password123","roles":["00000000-0000-0000-0000-000000000000"]}"#,
             &sa,
         ))
         .await
@@ -308,7 +339,7 @@ async fn create_user_cases() {
     let resp = app
         .oneshot(post_json(
             "/api/v1/admin/users",
-            r#"{"username":"","email":null,"password":"password123","roles":["user"]}"#,
+            r#"{"username":"","email":null,"password":"password123","roles":[]}"#,
             &sa,
         ))
         .await
@@ -326,9 +357,9 @@ async fn create_user_cases() {
 async fn list_filter_sort_page() {
     let (app, sa, _admin) = test_app().await;
     // alice/bob 带 user 角色,carol 带 admin 角色(令正反选有区分度)。
-    create_user(&app, &sa, "alice", r#"["user"]"#).await;
-    create_user(&app, &sa, "bob", r#"["user"]"#).await;
-    create_user(&app, &sa, "carol", r#"["admin"]"#).await;
+    create_user(&app, &sa, "alice", &["user"]).await;
+    create_user(&app, &sa, "bob", &["user"]).await;
+    create_user(&app, &sa, "carol", &["admin"]).await;
 
     // username=a(子串)+ 按 username 升序 + offset 首页 + total:命中 alice、carol(bob 无 'a')。
     let resp = app
@@ -471,7 +502,7 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
 #[tokio::test]
 async fn list_enriches_display_name_from_profile() {
     let (app, sa, _admin) = test_app().await;
-    let id = create_user(&app, &sa, "erin", r#"["user"]"#).await;
+    let id = create_user(&app, &sa, "erin", &["user"]).await;
 
     // superadmin(有 profiles:write:all)替 erin 建资料
     let resp = app
@@ -508,8 +539,8 @@ async fn list_enriches_display_name_from_profile() {
 #[tokio::test]
 async fn get_update_delete() {
     let (app, sa, _admin) = test_app().await;
-    let id = create_user(&app, &sa, "gina", r#"["user"]"#).await;
-    create_user(&app, &sa, "taken", r#"["user"]"#).await;
+    let id = create_user(&app, &sa, "gina", &["user"]).await;
+    create_user(&app, &sa, "taken", &["user"]).await;
 
     // GET 存在 → 200,created_at 可解析
     let resp = app
@@ -580,14 +611,15 @@ async fn get_update_delete() {
 #[tokio::test]
 async fn set_roles_full_replace() {
     let (app, sa, _admin) = test_app().await;
-    let id = create_user(&app, &sa, "roleuser", r#"["user"]"#).await;
+    let id = create_user(&app, &sa, "roleuser", &["user"]).await;
+    let admin_user = role_ids_json(&app, &sa, &["admin", "user"]).await;
 
-    // 全量设 [admin, user] → 200 + roles 集 == {admin, user}(order-insensitive)
+    // 全量设 [admin, user] → 200 + roles 集 == {admin, user}(响应仍是名字,order-insensitive)
     let resp = app
         .clone()
         .oneshot(put_json(
             &format!("/api/v1/admin/users/{id}/roles"),
-            r#"{"roles":["admin","user"]}"#,
+            &format!(r#"{{"roles":{admin_user}}}"#),
             &sa,
         ))
         .await
@@ -598,11 +630,11 @@ async fn set_roles_full_replace() {
         vec!["admin".to_owned(), "user".to_owned()]
     );
 
-    // 含未知角色 → 422(全量原子,不留半态)
+    // 含未知角色 id → 422(全量原子,不留半态)
     let resp = app
         .oneshot(put_json(
             &format!("/api/v1/admin/users/{id}/roles"),
-            r#"{"roles":["admin","ghost"]}"#,
+            r#"{"roles":["00000000-0000-0000-0000-000000000000"]}"#,
             &sa,
         ))
         .await
@@ -619,7 +651,7 @@ async fn set_roles_full_replace() {
 #[tokio::test]
 async fn reset_password_204() {
     let (app, sa, _admin) = test_app().await;
-    let id = create_user(&app, &sa, "pwuser", r#"["user"]"#).await;
+    let id = create_user(&app, &sa, "pwuser", &["user"]).await;
 
     let resp = app
         .oneshot(post_json(
@@ -631,4 +663,47 @@ async fn reset_password_204() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "重置密码应 204");
     // 撤会话是 best-effort 且本套 auth 用独立 repo,不测 refresh 撤销(harness 不共享登录态)。
+}
+
+// ── 8. 用户资料(纳入 users:admin) ──
+
+/// 后台改/读用户资料走 users:admin(不再需要 profiles:write:all)。avatar 上传路径由
+/// openapi_authz 契约钉 gate;此处验 GET/PUT display_name/phone 的往返 + admin(无 users:admin)403。
+#[tokio::test]
+async fn admin_profile_get_put_under_users_admin() {
+    let (app, sa, admin) = test_app().await;
+    let id = create_user(&app, &sa, "profiled", &["user"]).await;
+
+    // superadmin PUT 资料 → 200
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/admin/users/{id}/profile"),
+            r#"{"display_name":"Ada Admin","phone":"123","avatar_content_id":null}"#,
+            &sa,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改资料应 200");
+    assert_eq!(json_body(resp).await["display_name"], "Ada Admin");
+
+    // superadmin GET 资料 → 200 命中
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/admin/users/{id}/profile"), &sa))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["display_name"], "Ada Admin");
+
+    // admin(只有 admin:login,无 users:admin)→ 403
+    let resp = app
+        .oneshot(get(&format!("/api/v1/admin/users/{id}/profile"), &admin))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "无 users:admin 应 403"
+    );
 }

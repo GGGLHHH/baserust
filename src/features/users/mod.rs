@@ -12,8 +12,8 @@ pub use port::{
 };
 pub use service::UserAdminService;
 pub use types::{
-    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, SetRolesRequest,
-    UpdateUserRequest, UserSortField,
+    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, RoleView,
+    SetRolesRequest, UpdateUserRequest, UserSortField,
 };
 
 use utoipa_axum::router::OpenApiRouter;
@@ -32,4 +32,7 @@ pub fn admin_router() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(routes::set_user_roles))
         .routes(routes!(routes::reset_user_password))
+        .routes(routes!(routes::list_roles))
+        .routes(routes!(routes::get_user_profile, routes::set_user_profile))
+        .routes(routes!(routes::set_user_avatar))
 }

@@ -1,7 +1,7 @@
 //! `UserAdminService`:后台用户 CRUD 编排。壳套 idm 原语(身份权威在 idm),读侧富化 app.profiles。
 //! 原子写靠 idm 侧本地事务(`create_with_roles`/`set_roles`);跨 repo(软删 + 撤会话)不组一个 tx。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use garde::Validate;
@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use super::port::{ProfileDirectory, UserSearchFilter, UserSearchIndex};
 use super::types::{
-    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, SetRolesRequest,
-    UpdateUserRequest, UserSortField,
+    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, RoleView,
+    SetRolesRequest, UpdateUserRequest, UserSortField,
 };
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
@@ -200,14 +200,24 @@ impl UserAdminService {
         by: Option<String>,
     ) -> Result<AdminUserView, AppError> {
         req.validate()?;
-        let role_ids = self.resolve_role_ids(&req.roles).await?;
+        // 去重角色 id(保序):create_with_roles 靠 ON CONFLICT 去重,响应须与落库一致
+        // (否则传 [admin, admin] 会让 201 回显两个 admin)。
+        let mut seen = HashSet::new();
+        let role_ids: Vec<Uuid> = req
+            .roles
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect();
+        // 传入的是角色 id:校验都存在(未知 → 422),并取其名字组装视图。
+        let role_names = self.resolve_role_names(&role_ids).await?;
         let hash = self.hasher.hash(&req.password)?;
         let user = self
             .users
             .create_with_roles(&req.username, req.email.as_deref(), &hash, &role_ids, by)
             .await?;
-        // roles = 调用方传入的名(已校验都存在);新号 display_name 通常 null。
-        self.enrich_view(user, req.roles).await
+        // 新号 display_name 通常 null。
+        self.enrich_view(user, role_names).await
     }
 
     /// 详情。不存在/软删 → 404。
@@ -242,16 +252,33 @@ impl UserAdminService {
         Ok(())
     }
 
-    /// 全量设角色(原子替换)。名→id 解析(未知 → 422)。
+    /// 全量设角色(原子替换)。传角色 id;未知 id → 422。
     pub async fn set_roles(
         &self,
         id: Uuid,
         req: SetRolesRequest,
         by: Option<String>,
     ) -> Result<AdminUserView, AppError> {
-        let role_ids = self.resolve_role_ids(&req.roles).await?;
-        self.roles.set_roles(id, &role_ids, by).await?;
+        // 先确认用户存在(不存在/软删 → 404):否则空 roles 会对幽灵/软删用户做空替换 +
+        // 发 outbox 事件,却仍在末尾 get() 才报 404(幽灵事件 + 清掉软删用户的角色行)。
+        self.users.find_by_id(id).await?;
+        // 校验 id 都存在(未知 → 422),再原子替换。get() 会重取名字组装视图。
+        self.resolve_role_names(&req.roles).await?;
+        self.roles.set_roles(id, &req.roles, by).await?;
         self.get(id).await
+    }
+
+    /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
+    pub async fn list_roles(&self) -> Result<Page<RoleView>, AppError> {
+        let items: Vec<RoleView> = self
+            .roles
+            .list()
+            .await?
+            .into_iter()
+            .map(RoleView::from)
+            .collect();
+        let limit = items.len().max(1) as u64;
+        Ok(Page::cursor(items, limit, None))
     }
 
     /// 管理员重置密码 + best-effort 撤会话(强制重新登录;撤失败仅 warn)。
@@ -269,18 +296,17 @@ impl UserAdminService {
         Ok(())
     }
 
-    /// 角色名 → id 解析。未知名 → `Validation`(422)。
-    async fn resolve_role_ids(&self, names: &[String]) -> Result<Vec<Uuid>, AppError> {
+    /// 角色 id → name 解析。校验每个 id 都在存活目录里,未知 id → `Validation`(422)。
+    /// 返回名字集(顺序同入参),供 `AdminUserView.roles`(名字)组装 / 单纯校验。
+    async fn resolve_role_names(&self, ids: &[Uuid]) -> Result<Vec<String>, AppError> {
         let catalog = self.roles.list().await?;
-        let by_name: HashMap<&str, Uuid> =
-            catalog.iter().map(|r| (r.name.as_str(), r.id)).collect();
-        names
-            .iter()
-            .map(|n| {
-                by_name
-                    .get(n.as_str())
-                    .copied()
-                    .ok_or_else(|| AppError::Validation(format!("unknown role: {n}")))
+        let by_id: HashMap<Uuid, &str> = catalog.iter().map(|r| (r.id, r.name.as_str())).collect();
+        ids.iter()
+            .map(|id| {
+                by_id
+                    .get(id)
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))
             })
             .collect()
     }
@@ -333,13 +359,16 @@ mod tests {
     #[tokio::test]
     async fn create_then_list_and_set_roles() {
         let svc = test_service().await;
+        // 角色现按 id 传;从目录按名取 id(存活名唯一)。
+        let catalog = svc.list_roles().await.unwrap();
+        let rid = |name: &str| catalog.items.iter().find(|r| r.name == name).unwrap().id;
         let created = svc
             .create(
                 CreateUserRequest {
                     username: "alice".into(),
                     email: Some("a@x.io".into()),
                     password: "password123".into(),
-                    roles: vec!["admin".into()],
+                    roles: vec![rid("admin")],
                 },
                 Some("root".into()),
             )
@@ -354,7 +383,7 @@ mod tests {
                     username: "z".into(),
                     email: None,
                     password: "password123".into(),
-                    roles: vec!["ghost".into()],
+                    roles: vec![Uuid::now_v7()],
                 },
                 None,
             )
@@ -367,7 +396,7 @@ mod tests {
             .set_roles(
                 created.id,
                 SetRolesRequest {
-                    roles: vec!["editor".into(), "user".into()],
+                    roles: vec![rid("editor"), rid("user")],
                 },
                 None,
             )
@@ -382,7 +411,7 @@ mod tests {
             .set_roles(
                 created.id,
                 SetRolesRequest {
-                    roles: vec!["editor".into(), "ghost".into()],
+                    roles: vec![rid("editor"), Uuid::now_v7()],
                 },
                 None,
             )
@@ -416,6 +445,38 @@ mod tests {
             svc.get(Uuid::now_v7()).await,
             Err(AppError::NotFound)
         ));
+    }
+
+    /// set_roles 对不存在用户先报 404,不做写(空 roles 也不许漏过去空替换 + 发事件)。
+    #[tokio::test]
+    async fn set_roles_on_missing_user_is_404_before_mutating() {
+        let svc = test_service().await;
+        let err = svc
+            .set_roles(Uuid::now_v7(), SetRolesRequest { roles: vec![] }, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound));
+    }
+
+    /// create 传重复角色 id:响应 roles 去重(与 idm ON CONFLICT 落库一致,不回显两遍)。
+    #[tokio::test]
+    async fn create_dedups_duplicate_role_ids_in_response() {
+        let svc = test_service().await;
+        let catalog = svc.list_roles().await.unwrap();
+        let admin = catalog.items.iter().find(|r| r.name == "admin").unwrap().id;
+        let created = svc
+            .create(
+                CreateUserRequest {
+                    username: "dup".into(),
+                    email: None,
+                    password: "password123".into(),
+                    roles: vec![admin, admin],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.roles, vec!["admin".to_string()]);
     }
 
     fn offset_page() -> PageParams {

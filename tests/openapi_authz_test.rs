@@ -40,7 +40,7 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
     // 写端点 gate 在 body 提取**之后**跑 → 反向用例须发可提取的 body,否则提取器的 400/422 遮 403(假绿)。
     let body = match op_id {
         "create_widget" | "update_widget" | "create_content" | "update_content"
-        | "prepare_upload" | "put_profile" => {
+        | "prepare_upload" | "put_profile" | "set_user_profile" => {
             b = b.header("content-type", "application/json");
             Body::from(r#"{"name":"probe"}"#)
         }
@@ -56,7 +56,7 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
             )
         }
         // multipart 端点:require_scoped 在 Multipart 提取后、读字段前跑 → 只需 content-type 合法即可触达 gate。
-        "upload_content" => {
+        "upload_content" | "set_user_avatar" => {
             b = b.header("content-type", "multipart/form-data; boundary=X");
             Body::from("--X--\r\n")
         }
