@@ -54,6 +54,8 @@ fn test_app() -> Router {
         policy: Arc::new(baserust::infra::authz::Policy::default()), // 这套契约不测授权
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        idm_outbox: None,
+        auth_events: None,
     };
     build_router(
         state,

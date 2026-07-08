@@ -63,6 +63,11 @@ pub struct Config {
     #[serde(default)]
     pub metrics_enabled: bool,
 
+    /// 信任的反向代理层数(nginx 等),`TRUSTED_PROXY_HOPS`,默认 1。
+    /// `ClientContext` 解析真实客户端 IP 时,按此值从 X-Forwarded-For 右数第 (N+1) 跳取值(防伪造最左)。
+    #[serde(default = "default_trusted_proxy_hops")]
+    pub trusted_proxy_hops: usize,
+
     /// app 进程是否内嵌 idm,`IDM_EMBEDDED`,默认 true(开发单体 `Both`)。
     /// 生产设 `IDM_EMBEDDED=false` → 只挂 app,idm 走独立 `idm` bin(nginx 按前缀分流)。
     #[serde(default = "default_idm_embedded")]
@@ -225,6 +230,9 @@ fn default_rate_limit_per_sec() -> u32 {
 fn default_idm_embedded() -> bool {
     true
 }
+fn default_trusted_proxy_hops() -> usize {
+    1
+}
 fn default_rate_limit_burst() -> u32 {
     20
 }
@@ -272,6 +280,7 @@ impl Default for Config {
             rate_limit_per_sec: default_rate_limit_per_sec(),
             rate_limit_burst: default_rate_limit_burst(),
             metrics_enabled: false,
+            trusted_proxy_hops: default_trusted_proxy_hops(),
             idm_embedded: default_idm_embedded(),
             rust_log: None,
             log_file: None,

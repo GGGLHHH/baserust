@@ -61,6 +61,8 @@ fn rate_limited_app() -> Router {
         policy: Arc::new(Policy::default()),
         token_signer: Some(Arc::new(AppTokenSigner::dev())),
         token_verifier: Arc::new(AppTokenVerifier::dev()),
+        idm_outbox: None,
+        auth_events: None,
     };
     let config = Config {
         rate_limit_enabled: true,
@@ -153,6 +155,8 @@ async fn rate_limit_off_by_default_lets_all_through() {
         policy: Arc::new(Policy::default()),
         token_signer: Some(Arc::new(AppTokenSigner::dev())),
         token_verifier: Arc::new(AppTokenVerifier::dev()),
+        idm_outbox: None,
+        auth_events: None,
     };
     let app = build_router(state, &Config::default(), Mount::Both);
     for _ in 0..10 {

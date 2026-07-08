@@ -71,6 +71,16 @@ mod tests {
                 .extend_from_slice(ids);
             Ok(())
         }
+
+        // ponytail: 本文件只测 poll_unpublished/mark_published 的适配转译,emit 无调用方,给空实现即可。
+        async fn emit(
+            &self,
+            _event_type: &str,
+            _aggregate_id: Uuid,
+            _payload: serde_json::Value,
+        ) -> Result<(), IdmError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

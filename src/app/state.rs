@@ -10,6 +10,9 @@ use super::adapters::{
 };
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
+use crate::features::auth_audit::{
+    projector::AuthEventProjector, AuthEventRepo, AuthRetentionJob, PgAuthEventRepo,
+};
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
 };
@@ -75,6 +78,10 @@ pub struct AppState {
     pub token_verifier: Arc<AppTokenVerifier>,
     /// JWT 签发半边(私钥)。**仅 needs_idm 进程 Some**;`Mount::App` = None(app 被攻破铸不出 token)。
     pub token_signer: Option<Arc<AppTokenSigner>>,
+    /// idm.outbox 写句柄(仅 needs_idm 进程 Some):auth handler 发审计事件用(fire-and-forget)。
+    pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
+    /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
+    pub auth_events: Option<Arc<dyn AuthEventRepo>>,
 }
 
 /// 组合根装的后台任务(随 `run` 的优雅退出而停)。P1 outbox relay + P3 search projector,
@@ -82,6 +89,8 @@ pub struct AppState {
 pub struct BackgroundTasks {
     pub relays: Vec<OutboxRelay>,
     pub projector: Option<Projector>,
+    pub auth_projector: Option<AuthEventProjector>,
+    pub auth_retention: Option<AuthRetentionJob>,
 }
 
 impl AppState {
@@ -333,6 +342,23 @@ impl AppState {
         .await?;
         let projector = build_projector(config, needs_idm, search_pool.as_ref()).await?;
 
+        // auth 审计:写句柄(idm.outbox,handler 发事件用)+ 读句柄(auth_event,admin 查询用)+
+        // projector(消费投影)+ 保留 job,都在 `db_pool: app_pool.or(idm_pool)` **移动 idm_pool 之前**
+        // 用 `.as_ref()` 建好(镜像上面 search_pool/user_search 的写法)。
+        let idm_outbox: Option<Arc<dyn idm::OutboxRepo>> = idm_pool
+            .as_ref()
+            .map(|p| Arc::new(PgOutboxRepo::new(p.clone())) as Arc<dyn idm::OutboxRepo>);
+        let auth_events: Option<Arc<dyn AuthEventRepo>> = search_pool
+            .as_ref()
+            .map(|p| Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>);
+        let auth_projector =
+            build_auth_event_projector(config, needs_idm, search_pool.as_ref()).await?;
+        let auth_retention = search_pool.as_ref().map(|p| {
+            AuthRetentionJob::new(
+                Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>
+            )
+        });
+
         Ok((
             Self {
                 widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
@@ -347,10 +373,14 @@ impl AppState {
                 policy,
                 token_verifier,
                 token_signer,
+                idm_outbox,
+                auth_events,
             },
             BackgroundTasks {
                 relays: outbox_relays,
                 projector,
+                auth_projector,
+                auth_retention,
             },
         ))
     }
@@ -420,6 +450,25 @@ async fn build_projector(
     let repo: Arc<dyn SearchIndexRepo> = Arc::new(PgSearchIndexRepo::new(pool.clone()));
     Ok(Some(
         Projector::connect(nats_url, repo, "admin_user_projector").await?,
+    ))
+}
+
+/// 装配 auth_event 投影器:needs_idm + NATS_URL + search pool 三者齐才起。镜像 `build_projector`;
+/// 独立 durable name "auth_event_projector",消费 `events.idm.auth.>`(见 `AuthEventProjector::connect`)。
+async fn build_auth_event_projector(
+    config: &Config,
+    needs_idm: bool,
+    search_pool: Option<&PgPool>,
+) -> anyhow::Result<Option<AuthEventProjector>> {
+    let (Some(nats_url), Some(pool)) = (
+        config.nats_url.as_deref().filter(|_| needs_idm),
+        search_pool,
+    ) else {
+        return Ok(None);
+    };
+    let repo: Arc<dyn AuthEventRepo> = Arc::new(PgAuthEventRepo::new(pool.clone()));
+    Ok(Some(
+        AuthEventProjector::connect(nats_url, repo, "auth_event_projector").await?,
     ))
 }
 

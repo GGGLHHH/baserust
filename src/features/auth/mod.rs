@@ -4,6 +4,7 @@
 //! 这是 idm 从"自带 HTTP 的框架"改回"纯领域库"后,app 侧的 HTTP 壳 —— 结构同 widget:
 //! `routes`(handler,薄)→ idm `AuthService`(service)→ idm `repo`。DTO 与校验在 `types`。
 
+mod emit;
 mod middleware;
 mod routes;
 mod token;

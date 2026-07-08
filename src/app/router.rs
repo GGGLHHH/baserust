@@ -27,7 +27,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{auth, content, profile, users, widget};
+use crate::features::{auth, auth_audit, content, profile, users, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::ErrorBody;
@@ -77,7 +77,8 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         frontend = frontend.merge(auth::me_router());
         admin = admin
             .merge(auth::admin_router())
-            .merge(users::admin_router());
+            .merge(users::admin_router())
+            .merge(auth_audit::admin_router());
         admin_open = admin_open.merge(auth::admin_login_router());
     }
     // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
@@ -123,6 +124,10 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         ))
         // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
         .layer(cors_layer(config))
+        // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
+        .layer(axum::Extension(crate::infra::client_context::TrustedHops(
+            config.trusted_proxy_hops,
+        )))
         // 鉴权:best-effort 解析 token(cookie 优先/Bearer 兜底),验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -184,6 +189,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                         .merge(widget::admin_router())
                         .merge(auth::admin_router())
                         .merge(users::admin_router())
+                        .merge(auth_audit::admin_router())
                         .merge(auth::admin_login_router()),
                 ),
         )

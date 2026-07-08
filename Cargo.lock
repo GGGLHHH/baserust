@@ -2044,8 +2044,8 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.4.0"
-source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.4.0#c1f8e9a49d646db715cd227828bc6b52110061a6"
+version = "0.5.0"
+source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.5.0#2f3854fb73bed5031cc9f81df9c9d110a9f5e307"
 dependencies = [
  "anyhow",
  "argon2",

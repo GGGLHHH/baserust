@@ -55,6 +55,8 @@ fn test_app() -> (Router, String) {
         policy: Arc::new(test_policy()),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        idm_outbox: None,
+        auth_events: None,
     };
     let app = build_router(
         state,

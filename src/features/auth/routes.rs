@@ -9,7 +9,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use garde::Validate;
+use uuid::Uuid;
 
+use super::emit::{emit_auth_event, failure_data, session_event_data, success_data};
 use super::types::{
     ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
     UserResponse,
@@ -17,6 +19,7 @@ use super::types::{
 use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::Perm;
+use crate::infra::client_context::ClientContext;
 use crate::infra::error::{AppError, ErrorBody};
 use crate::infra::extract::Json;
 
@@ -82,11 +85,19 @@ fn expired_cookie(name: &'static str) -> Cookie<'static> {
 pub async fn register(
     State(state): State<AppState>,
     jar: CookieJar,
-    ctx: AuditContext,
+    ctx: ClientContext,
+    audit: AuditContext,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, CookieJar, Json<UserResponse>), AppError> {
     req.validate()?;
-    let outcome = state.auth.register(req.into(), ctx.audit_id()).await?;
+    let outcome = state.auth.register(req.into(), audit.audit_id()).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.registered",
+        outcome.user.id,
+        success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+    )
+    .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
     Ok((StatusCode::CREATED, jar, Json(outcome.user.into())))
 }
@@ -101,13 +112,46 @@ pub async fn register(
 )]
 pub async fn login(
     State(state): State<AppState>,
+    ctx: ClientContext,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
     req.validate()?;
-    let outcome = state.auth.login(req.into()).await?;
-    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
-    Ok((jar, Json(outcome.user.into())))
+    let identifier = req.identifier.clone();
+    match state.auth.login(req.into()).await {
+        Ok(outcome) => {
+            emit_auth_event(
+                &state.idm_outbox,
+                "auth.login_succeeded",
+                outcome.user.id,
+                success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+            )
+            .await;
+            let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+            Ok((jar, Json(outcome.user.into())))
+        }
+        // 失败原因(仅供审计)必须在 `idm::IdmError` → `AppError` 的 `From` 转换**之前**读出
+        // (转换后统一收口 401,原因丢失);HTTP 仍统一 401,防枚举不变。
+        Err(idm_err) => {
+            let reason = match &idm_err {
+                idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
+                    "unknown_user"
+                }
+                idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
+                    "bad_password"
+                }
+                _ => return Err(idm_err.into()),
+            };
+            emit_auth_event(
+                &state.idm_outbox,
+                "auth.login_failed",
+                Uuid::nil(),
+                failure_data(&ctx, "public", None, Some(&identifier), reason),
+            )
+            .await;
+            Err(idm_err.into())
+        }
+    }
 }
 
 #[utoipa::path(
@@ -119,6 +163,7 @@ pub async fn login(
 )]
 pub async fn refresh(
     State(state): State<AppState>,
+    ctx: ClientContext,
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
     let refresh = jar
@@ -126,6 +171,13 @@ pub async fn refresh(
         .map(|c| c.value().to_owned())
         .ok_or(AppError::Unauthorized)?;
     let outcome = state.auth.refresh(&refresh).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.refreshed",
+        outcome.user.id,
+        success_data(&ctx, "public", outcome.user.id, Some(outcome.session_id)),
+    )
+    .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
     Ok((jar, Json(outcome.user.into())))
 }
@@ -136,11 +188,20 @@ pub async fn refresh(
 )]
 pub async fn logout(
     State(state): State<AppState>,
+    ctx: ClientContext,
     jar: CookieJar,
 ) -> Result<(StatusCode, CookieJar), AppError> {
-    // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等。
+    // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等 —— 没找到活跃会话不发事件。
     if let Some(c) = jar.get(REFRESH_COOKIE) {
-        state.auth.logout(c.value()).await?;
+        if let Some(session) = state.auth.logout(c.value()).await? {
+            emit_auth_event(
+                &state.idm_outbox,
+                "auth.logged_out",
+                session.user_id,
+                session_event_data(&ctx, "public", session.user_id, session.id),
+            )
+            .await;
+        }
     }
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
@@ -150,10 +211,18 @@ pub async fn logout(
 )]
 pub async fn logout_all(
     State(state): State<AppState>,
+    ctx: ClientContext,
     jar: CookieJar,
     user: CurrentUser,
 ) -> Result<(StatusCode, CookieJar), AppError> {
     state.auth.logout_all(user.0.id).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.logout_all",
+        user.0.id,
+        success_data(&ctx, "public", user.0.id, None),
+    )
+    .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
@@ -199,7 +268,8 @@ pub async fn update_me(
 )]
 pub async fn delete_me(
     State(state): State<AppState>,
-    ctx: AuditContext,
+    ctx: ClientContext,
+    audit: AuditContext,
     user: CurrentUser,
     jar: CookieJar,
     Json(req): Json<DeleteMeRequest>,
@@ -207,8 +277,15 @@ pub async fn delete_me(
     req.validate()?;
     state
         .auth
-        .delete_me(user.0.id, req.password, ctx.audit_id())
+        .delete_me(user.0.id, req.password, audit.audit_id())
         .await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.account_deleted",
+        user.0.id,
+        success_data(&ctx, "public", user.0.id, None),
+    )
+    .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
@@ -221,12 +298,20 @@ pub async fn delete_me(
 )]
 pub async fn change_password(
     State(state): State<AppState>,
+    ctx: ClientContext,
     user: CurrentUser,
     jar: CookieJar,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<(StatusCode, CookieJar), AppError> {
     req.validate()?;
     state.auth.change_password(user.0.id, req.into()).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.password_changed",
+        user.0.id,
+        success_data(&ctx, "public", user.0.id, None),
+    )
+    .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
 }
 
@@ -243,11 +328,35 @@ pub async fn change_password(
 )]
 pub async fn admin_login(
     State(state): State<AppState>,
+    ctx: ClientContext,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
     req.validate()?;
-    let outcome = state.auth.login(req.into()).await?;
+    let identifier = req.identifier.clone();
+    let outcome = match state.auth.login(req.into()).await {
+        Ok(outcome) => outcome,
+        // 凭据本身错(同 public login 的原因匹配);HTTP 仍统一 401,防枚举不变。
+        Err(idm_err) => {
+            let reason = match &idm_err {
+                idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
+                    "unknown_user"
+                }
+                idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
+                    "bad_password"
+                }
+                _ => return Err(idm_err.into()),
+            };
+            emit_auth_event(
+                &state.idm_outbox,
+                "auth.login_failed",
+                Uuid::nil(),
+                failure_data(&ctx, "admin", None, Some(&identifier), reason),
+            )
+            .await;
+            return Err(idm_err.into());
+        }
+    };
     // 验密后闸:无 admin:login(后台准入)→ 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
     // login 已铸的 refresh 会话立即撤销,不留"验过密但没资格"的孤儿会话。
     if !state
@@ -256,8 +365,28 @@ pub async fn admin_login(
         .contains(&Perm::AdminLogin)
     {
         state.auth.logout(&outcome.refresh_token).await?;
+        emit_auth_event(
+            &state.idm_outbox,
+            "auth.admin_access_denied",
+            outcome.user.id,
+            failure_data(
+                &ctx,
+                "admin",
+                Some(outcome.user.id),
+                Some(&identifier),
+                "no_admin_perm",
+            ),
+        )
+        .await;
         return Err(AppError::Forbidden);
     }
+    emit_auth_event(
+        &state.idm_outbox,
+        "auth.login_succeeded",
+        outcome.user.id,
+        success_data(&ctx, "admin", outcome.user.id, Some(outcome.session_id)),
+    )
+    .await;
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
     Ok((jar, Json(outcome.user.into())))
 }

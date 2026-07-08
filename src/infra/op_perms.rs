@@ -215,6 +215,15 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "set_user_avatar",
         perm: PermReq::All(&[Perm::UsersAdmin]),
     },
+    // ── auth_audit(认证审计查询):同 users,superadmin 专属(users:admin)。 ──
+    OpAuthz {
+        operation_id: "list_user_auth_events",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "list_auth_events",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
 ];
 
 /// 按 operationId 查授权目录。不在表 = public。

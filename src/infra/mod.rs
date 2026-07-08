@@ -3,6 +3,7 @@
 
 pub mod audit;
 pub mod authz;
+pub mod client_context;
 pub mod config;
 pub mod error;
 pub mod extract;

@@ -146,6 +146,8 @@ impl From<idm::IdmError> for AppError {
         match e {
             idm::IdmError::NotFound => AppError::NotFound,
             idm::IdmError::Unauthorized => AppError::Unauthorized,
+            // 失败原因只供审计(handler 发事件时读),HTTP 仍统一 401,防枚举不变。
+            idm::IdmError::InvalidCredentials(_) => AppError::Unauthorized,
             idm::IdmError::Conflict(m) => AppError::Conflict(m),
             idm::IdmError::Internal(e) => AppError::Internal(e),
         }
@@ -215,5 +217,14 @@ mod tests {
         assert_eq!(c.status_code(), StatusCode::CONFLICT);
         assert_eq!(c.code(), "conflict");
         assert_eq!(c.client_message(), "This email is already registered");
+    }
+
+    #[test]
+    fn invalid_credentials_maps_to_401() {
+        let e = AppError::from(idm::IdmError::InvalidCredentials(
+            idm::CredentialFailure::BadPassword,
+        ));
+        assert!(matches!(e, AppError::Unauthorized));
+        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -60,6 +60,12 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
     if let Some(projector) = bg.projector {
         tokio::spawn(projector.run(shutdown_rx.clone()));
     }
+    if let Some(auth_projector) = bg.auth_projector {
+        tokio::spawn(auth_projector.run(shutdown_rx.clone()));
+    }
+    if let Some(auth_retention) = bg.auth_retention {
+        tokio::spawn(auth_retention.run(shutdown_rx.clone()));
+    }
 
     // into_make_service_with_connect_info:给 SmartIpKeyExtractor 的 peer-IP fallback 提供 ConnectInfo
     // (生产 nginx 设 X-Forwarded-For 时走 header;直连/无代理时回落到对端 IP)。

@@ -2,6 +2,7 @@
 //! 加业务:在此 `pub mod xxx;`,照抄 widget/ 的结构。
 
 pub mod auth;
+pub mod auth_audit;
 pub mod content;
 pub mod profile;
 pub mod search;
