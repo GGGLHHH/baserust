@@ -467,9 +467,9 @@ mod tests {
     #[test]
     fn log_filter_prefers_rust_log_then_env_default() {
         let mut c = Config::default();
-        assert_eq!(c.log_filter(), "debug");
+        assert_eq!(c.log_filter(), "debug,sqlx::query=warn");
         c.app_env = Profile::Prod;
-        assert_eq!(c.log_filter(), "info");
+        assert_eq!(c.log_filter(), "info,sqlx::query=warn");
         c.rust_log = Some("warn".into());
         assert_eq!(c.log_filter(), "warn");
     }

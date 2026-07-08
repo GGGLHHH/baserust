@@ -263,9 +263,9 @@ impl UserAdminService {
         req.validate()?;
         let hash = self.hasher.hash(&req.new_password)?;
         self.users.update_password(id, &hash).await?;
-        if let Err(e) = self.sessions.revoke_all(id, None).await {
-            tracing::warn!(error = %e, user_id = %id, "改密后撤销会话失败(best-effort,不阻断)");
-        }
+        // 撤会话 fail-closed(区别于 delete 的 best-effort):refresh 路径不验密码,撤失败=旧 refresh
+        // 会话仍可续签 → 改密到 refresh TTL 才真生效。对齐 idm 自助 change_password(那边也 `?`)。
+        self.sessions.revoke_all(id, None).await?;
         Ok(())
     }
 
