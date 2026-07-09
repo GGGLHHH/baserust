@@ -49,7 +49,7 @@ pub async fn seed_authz(pool: &PgPool, seed: &SeedData) -> anyhow::Result<()> {
                  ON CONFLICT (role_name, permission) DO NOTHING",
             )
             .bind(role_name)
-            .bind(perm_wire(*perm))
+            .bind(perm_wire(perm))
             .execute(pool)
             .await
             .context("upsert role_permissions 失败")?;

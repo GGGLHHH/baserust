@@ -134,10 +134,94 @@ impl Perm {
             _ => &[],
         }
     }
+
+    /// 人读说明(落 `permissions` 表 / 权限清单)。曾在 `seed.toml` `[[permissions]]`,
+    /// 现收进代码 —— **enum 是唯一真相**,词表不再另存镜像。
+    pub fn description(&self) -> &'static str {
+        match self {
+            Perm::WidgetRead => "查看自己创建的 widget",
+            Perm::WidgetReadAll => "查看所有人的 widget(而非仅自己)",
+            Perm::WidgetWrite => "创建 / 修改 widget",
+            Perm::WidgetDelete => "删除 widget",
+            Perm::ContentRead => "查看内容 / 下载 / 列对象与元数据",
+            Perm::ContentWrite => "创建 / 上传 / 修改内容与元数据",
+            Perm::ContentDelete => "删除内容",
+            Perm::UsersAdmin => "用户管理(superadmin 专属)",
+            Perm::AdminLogin => "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)",
+            Perm::ProfileRead => "查看任意用户资料",
+            Perm::ProfileWrite => "修改自己的资料",
+            Perm::ProfileWriteAll => "修改任何人的资料(而非仅自己)",
+        }
+    }
 }
 
-/// role → 权限集。从 `seed.toml` 的 `[[roles]].permissions` 派生(见 `app::seed::SeedData::policy`),
-/// 装进 `AppState`(`Arc`,廉价 Clone)。**不可变**:载入一次,运行期只读。
+/// 角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,
+/// 见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT
+/// claim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub enum RoleName {
+    #[serde(rename = "superadmin")]
+    Superadmin,
+    #[serde(rename = "admin")]
+    Admin,
+    #[serde(rename = "user")]
+    User,
+}
+
+impl RoleName {
+    /// 全部变体(seed / 目录 / round-trip 测试用)。加变体必补这里。
+    pub const ALL: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
+
+    /// wire 串(== serde `rename`;单一来源,`role_name_wire_matches` 测试钉死不漂移)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RoleName::Superadmin => "superadmin",
+            RoleName::Admin => "admin",
+            RoleName::User => "user",
+        }
+    }
+
+    /// 人读显示名(seed idm.roles.display_name)。
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            RoleName::Superadmin => "超级管理员",
+            RoleName::Admin => "管理员",
+            RoleName::User => "普通用户",
+        }
+    }
+
+    /// **bootstrap 默认**权限(seed 写进 `role_permissions`,`ON CONFLICT DO NOTHING` 不覆盖运行期改动)。
+    /// superadmin = `Perm::ALL`(随闭集自动增长,消除"加权限忘补超管"漂移)。运行期真值以库为准。
+    pub fn default_permissions(&self) -> Vec<Perm> {
+        match self {
+            RoleName::Superadmin => Perm::ALL.to_vec(),
+            RoleName::Admin => vec![
+                Perm::WidgetRead,
+                Perm::WidgetReadAll,
+                Perm::WidgetWrite,
+                Perm::WidgetDelete,
+                Perm::ContentRead,
+                Perm::ContentWrite,
+                Perm::ContentDelete,
+                Perm::ProfileRead,
+                Perm::ProfileWrite,
+                Perm::ProfileWriteAll,
+                Perm::AdminLogin,
+            ],
+            RoleName::User => vec![
+                Perm::WidgetRead,
+                Perm::ContentRead,
+                Perm::ContentWrite,
+                Perm::ProfileRead,
+                Perm::ProfileWrite,
+            ],
+        }
+    }
+}
+
+/// role → 权限集。默认从 `RoleName::default_permissions()` 派生(见 `app::seed::SeedData::policy`);
+/// 设 `APP_DB_HOST` 时改从 `role_permissions` 表载(运行期可改)。装进 `AppState`
+/// (`Arc`,廉价 Clone)。**不可变**:载入一次,运行期只读。
 #[derive(Default, Debug)]
 pub struct Policy {
     by_role: HashMap<String, HashSet<Perm>>,
@@ -417,6 +501,20 @@ mod tests {
             assert_eq!(seg.next(), p.qualifier(), "{wire}: qualifier");
             assert_eq!(seg.next(), None, "{wire}: 多余段");
         }
+    }
+
+    /// RoleName: `as_str()` == serde rename(不漂移);superadmin 默认持全权闭集。
+    #[test]
+    fn role_name_wire_matches() {
+        for r in RoleName::ALL {
+            let wire = serde_json::to_value(r).unwrap();
+            assert_eq!(wire.as_str(), Some(r.as_str()), "{r:?}: as_str ↔ serde rename");
+        }
+        assert_eq!(
+            RoleName::Superadmin.default_permissions().len(),
+            Perm::ALL.len(),
+            "superadmin 默认应持全权闭集"
+        );
     }
 
     /// implies:角色只配 `read:all`(漏 `read`)→ 载入期自动补 `read`,顶层 read 闸不再 403。

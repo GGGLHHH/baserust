@@ -239,9 +239,8 @@ impl AppState {
                 )
             }
         };
-        // seed.toml 是 idm 默认数据 + **app 授权策略**两份真相的载体,**load 一次**:
+        // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
-        seed.assert_permission_catalog()?; // 启动期不变量:seed 权限词表 == 代码 Perm 闭集(多/漏即拒启动)
 
         // 授权策略(归 app),**可拔插**(同 widget):设了 APP_DB_HOST → 读 app schema 的 role_permissions 表
         // (role→权限可运行时改);否则从 seed.toml 派生内存 Policy。dev(seed_on_start)先幂等灌表。

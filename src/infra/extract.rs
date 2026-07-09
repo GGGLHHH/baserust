@@ -3,7 +3,10 @@
 //!
 //! 加新提取需求时照此包一层:调 axum 原提取器,失败分支映射进 AppError。
 
-use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Query as AxumQuery, Request};
+use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Request};
+// serde_html_form 基座:支持重复 key 解进 Vec(如 `?role=a&role=b`),serde_urlencoded 不能。
+// 标量解析与 serde_urlencoded 等价,现有 13 处 Query<...> 调用点无感。
+use axum_extra::extract::Query as AxumQuery;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::Json as AxumJson;

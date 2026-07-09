@@ -25,6 +25,8 @@ use crate::infra::op_perms::{op_authz, PermReq};
         crate::infra::sort::SortOrder,
         crate::features::widget::WidgetSortField,
         crate::features::users::UserSortField,
+        // 仅出现在 list_users 的 role/role_not query 数组里($ref),无响应体承载它 → 显式登记,否则 ref 悬空。
+        crate::infra::authz::RoleName,
     )),
     modifiers(&SecurityAddon),
     tags(

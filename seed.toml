@@ -1,83 +1,9 @@
-# idm 默认数据 seed + **app 授权策略(role→permissions)唯一真相**。
-# `just seed` / 进程内 seed 读 name/display_name/accounts 写进 idm(幂等);
-# app 组合根另读 `permissions` 建内存 Policy(见 src/infra/authz.rs)——permissions **永不写进 idm 库**。
-# 改这里增删默认角色/账号/权限,不动代码。账号引用的 role 必须在 [[roles]] 里先声明。
-# permissions 取值是 src/infra/authz.rs 的 Perm 闭集;拼错的串启动即解析失败(fail-fast)。
-
-# ── 权限词表(catalog)──
-# **enum 是 enforcement 唯一真相**(src/infra/authz.rs 的 `Perm`);这里是它的**可读镜像 + 人读名**。
-# 启动期校验:声明 **== Perm 闭集**(多/漏/重复即 fail-fast),杜绝"声明了无变体兜底的死权限"或漏声明。
-# 加权限:先在 `Perm` 加变体,再来这里声明一条,`[[roles]].permissions` 才能引用。
-[[permissions]]
-key = "widgets:read"
-description = "查看自己创建的 widget"
-
-[[permissions]]
-key = "widgets:read:all"
-description = "查看所有人的 widget(而非仅自己)"
-
-[[permissions]]
-key = "widgets:write"
-description = "创建 / 修改 widget"
-
-[[permissions]]
-key = "widgets:delete"
-description = "删除 widget"
-
-[[permissions]]
-key = "contents:read"
-description = "查看内容 / 下载 / 列对象与元数据"
-
-[[permissions]]
-key = "contents:write"
-description = "创建 / 上传 / 修改内容与元数据"
-
-[[permissions]]
-key = "contents:delete"
-description = "删除内容"
-
-[[permissions]]
-key = "users:admin"
-description = "用户管理(superadmin 专属)"
-
-[[permissions]]
-key = "admin:login"
-description = "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)"
-
-[[permissions]]
-key = "profiles:read"
-description = "查看任意用户资料"
-
-[[permissions]]
-key = "profiles:write"
-description = "修改自己的资料"
-
-[[permissions]]
-key = "profiles:write:all"
-description = "修改任何人的资料(而非仅自己)"
-
-# 最经典的三轴数据矩阵:
-#  superadmin —— 全权 + 看所有人的 widget(read:all)+ users:admin(用户管理)+ admin:login(后台准入)
-#  admin      —— 读写删 + 看所有人的(read:all)+ admin:login(能登后台);**无 users:admin**(够不到 superadmin 专属端点,如跨用户列全 widget)
-#  user       —— widget 只读且**只看自己创建的**(无 read:all → ownership 落到 Own;无 write → RBAC 拒写);
-#               content 可读写**自己的**(contents:write 是头像两步上传的前提——profiles:write 没有它,
-#               avatar 流第一步 prepare 就 403,资料可写头像不可传是配漏),无 delete。
-[[roles]]
-name = "superadmin"
-display_name = "超级管理员"
-# "*" = 全权(载入期展开成 Perm 闭集,加新权限自动跟上——不用每次记得来补这行)。
-# 只许单独出现,与显式权限混用拒启动。其他角色仍显式列(最小授权要看得见)。
-permissions = ["*"]
-
-[[roles]]
-name = "admin"
-display_name = "管理员"
-permissions = ["widgets:read", "widgets:read:all", "widgets:write", "widgets:delete", "contents:read", "contents:write", "contents:delete", "profiles:read", "profiles:write", "profiles:write:all", "admin:login"]
-
-[[roles]]
-name = "user"
-display_name = "普通用户"
-permissions = ["widgets:read", "contents:read", "contents:write", "profiles:read", "profiles:write"]
+# idm 默认**账号**(实例数据 + 密码)。`just seed` / 进程内 seed 读它幂等写进 idm。
+# `SEED_FILE` 可指外部文件覆盖(prod 换真账号/密码)。
+#
+# 角色集 / 权限集 / role→权限默认 **不在这里** —— 它们是代码闭集(src/infra/authz.rs 的
+# `RoleName` / `Perm`,不做动态 CRUD)。role→权限的运行期改动落 app schema 的 `role_permissions` 表。
+# 账号引用的 role 必须是 `RoleName` 的已知变体(superadmin/admin/user),拼错启动/测试即挂。
 
 [[accounts]]
 username = "superadmin"

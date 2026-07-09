@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::infra::authz::RoleName;
 use crate::infra::sort::SortOrder;
 
 /// 后台用户视图:身份(idm.users)+ 角色(idm)+ 富化的资料(app.profiles;缺/分进程降级 → null)。
@@ -120,7 +121,9 @@ impl UserSortField {
 }
 
 /// 列表过滤 query(扁平)。`#[serde(default)]`:缺字段回落默认,不 400。
-/// 类目过滤范式:正选 `role`(数组)+ 反选 `role_not`(数组),逗号分隔 wire。
+/// 类目过滤范式:正选 `role`(数组)+ 反选 `role_not`(数组)。角色是代码闭集 [`RoleName`],
+/// OpenAPI 数组按 `style=form, explode=true` 走**重复 key**(`?role=admin&role=user`);
+/// 靠 `axum_extra::extract::Query`(serde_html_form)把重复 key 解进 `Vec`。
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[serde(default)]
 #[into_params(parameter_in = Query)]
@@ -129,10 +132,12 @@ pub struct ListUsersFilter {
     pub username: Option<String>,
     /// 用户名 + 显示名模糊搜索(仅投影/search 后端支持;无后端 → 422)。
     pub q: Option<String>,
-    /// 正选:含任一角色(逗号分隔,如 `?role=admin,editor`)。
-    pub role: Option<String>,
-    /// 反选:不含任一角色(逗号分隔)。
-    pub role_not: Option<String>,
+    /// 正选:含任一角色(重复 key,如 `?role=admin&role=user`)。
+    #[param(style = Form, explode)]
+    pub role: Vec<RoleName>,
+    /// 反选:不含任一角色。
+    #[param(style = Form, explode)]
+    pub role_not: Vec<RoleName>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub created_from: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -142,26 +147,15 @@ pub struct ListUsersFilter {
 }
 
 impl ListUsersFilter {
-    /// 正选角色名。逗号切分、trim、去空。
+    /// 正选角色名(wire 串)。喂给按角色**名**过滤的 idm / 投影(role name 是稳定机器键)。
     pub fn roles_any(&self) -> Vec<String> {
-        split_roles(self.role.as_deref())
+        self.role.iter().map(|r| r.as_str().to_owned()).collect()
     }
 
-    /// 反选角色名。逗号切分、trim、去空。
+    /// 反选角色名(wire 串)。
     pub fn roles_none(&self) -> Vec<String> {
-        split_roles(self.role_not.as_deref())
+        self.role_not.iter().map(|r| r.as_str().to_owned()).collect()
     }
-}
-
-fn split_roles(s: Option<&str>) -> Vec<String> {
-    s.map(|s| {
-        s.split(',')
-            .map(str::trim)
-            .filter(|x| !x.is_empty())
-            .map(String::from)
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -169,26 +163,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn comma_split_roles() {
+    fn role_filter_maps_enum_to_names() {
         let f = ListUsersFilter {
-            role: Some("admin, editor".into()),
-            role_not: Some("banned".into()),
+            role: vec![RoleName::Admin, RoleName::User],
+            role_not: vec![RoleName::Superadmin],
             ..Default::default()
         };
-        assert_eq!(
-            f.roles_any(),
-            vec!["admin".to_string(), "editor".to_string()]
-        );
-        assert_eq!(f.roles_none(), vec!["banned".to_string()]);
+        assert_eq!(f.roles_any(), vec!["admin".to_string(), "user".to_string()]);
+        assert_eq!(f.roles_none(), vec!["superadmin".to_string()]);
         assert!(ListUsersFilter::default().roles_any().is_empty());
-        // 空段被丢弃(尾逗号 / 连续逗号不产生空角色名)
-        let g = ListUsersFilter {
-            role: Some("admin,, ,editor,".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            g.roles_any(),
-            vec!["admin".to_string(), "editor".to_string()]
-        );
     }
 }
