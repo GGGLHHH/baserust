@@ -262,8 +262,10 @@ impl AppState {
         });
         policy.assert_roles_covered(seed.granted_roles())?; // 启动期不变量:账号引用的 role 都得有策略条目
 
-        // 进程内 seed:idm-mounting 进程 + 开启时(默认非 prod),幂等写默认 role/账号(复用 &seed)。
-        // memory 与 PG 都生效 —— dev 内存模式也能有 superadmin/admin/user 登录。prod 默认不跑,走显式 `seed` bin。
+        // 进程内 seed:idm-mounting 进程 + 开启时,幂等写默认 role/账号(复用 &seed)。
+        // memory 与 PG 都生效 —— dev 内存模式也有 superadmin/admin/user 登录。
+        // 门控见 `Config::seed_on_start`:非 prod 默认开(嵌入弱默认账号);prod 仅当挂了 `SEED_FILE`
+        // (真密码)才开 —— 容器无 `just`/`cargo`,靠此在启动幂等建号,不再依赖外部 seed bin。
         if needs_idm && config.seed_on_start() {
             super::seed::apply(
                 idm_users.as_ref(),

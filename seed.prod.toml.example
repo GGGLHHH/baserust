@@ -1,14 +1,20 @@
 # 生产 seed 账号模板 —— **复制成 `seed.prod.toml`(已被 .gitignore 挡,绝不入库),填真密码**。
 #
-#   cp seed.prod.toml.example seed.prod.toml
-#   # 编辑 seed.prod.toml,把每个 password 换成强密码
-#   SEED_FILE=seed.prod.toml just seed-prod          # 或直接 SEED_FILE=... cargo run --bin seed
+# 【容器 / prod 主路径】把本文件(填好真密码后)作为 secret 挂进容器,进程启动时自动幂等建号:
+#   - 挂载:k8s secret / docker secret / volume → 容器内某路径,如 /run/secrets/seed.prod.toml
+#   - 设 env:SEED_FILE=/run/secrets/seed.prod.toml
+#   - idm 进程启动即 seed(seed_on_start:prod 检测到 SEED_FILE 才开;无则不建号,防弱默认)
+#   容器镜像无 just/cargo —— 不依赖任何外部命令,建号发生在二进制启动时。
+#
+# 【本地 / 一次性】prod-like 手动 seed:
+#   cp seed.prod.toml.example seed.prod.toml && vi seed.prod.toml   # 填强密码
+#   SEED_FILE=seed.prod.toml just seed-prod
 #
 # 只放**账号**(实例数据 + 密码)。角色集 / 权限集是代码闭集(src/infra/authz.rs 的
 # RoleName / Perm),不在此;role→权限默认由启动时 seed_authz 幂等灌 app 表(prod+dev 都跑)。
 # 账号引用的 role 必须是 RoleName 已知变体(superadmin/admin/user),拼错启动即挂。
 #
-# 密码存库经 Argon2 哈希;此文件的明文只用于首次 seed。prod 首建后可删本地明文文件。
+# 密码存库经 Argon2 哈希;幂等 —— 账号已存在则跳过,重启不冲掉运维轮换过的密码。
 
 [[accounts]]
 username = "superadmin"

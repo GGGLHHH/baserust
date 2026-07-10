@@ -402,10 +402,17 @@ impl Config {
         })
     }
 
-    /// 是否在进程内 seed idm 默认数据。未显式设 `IDM_SEED_ON_START` → **非 prod 才 seed**
-    /// (dev/staging 便利;prod 不自动建 superadmin/pwd,避免启动期意外写库)。
+    /// 是否在进程内 seed idm 默认账号(+ demo 数据)。未显式设 `IDM_SEED_ON_START` 时:
+    /// - **非 prod** → true(dev/staging 用嵌入的默认账号便利);
+    /// - **prod** → 仅当提供了 `SEED_FILE`(= 运维显式给了真账号/密码文件)才 true。
+    ///
+    /// 容器/prod 无 `just`/`cargo`,只有二进制 —— seed 必须在启动时跑;prod 挂 `SEED_FILE`
+    /// (真密码,非仓库里的 `pwd` 弱默认)即在 idm 进程启动幂等建号。没给 SEED_FILE → 不 seed,
+    /// 绝不用嵌入默认在 prod 建 superadmin/pwd(这才是原「避免启动期意外写库」真正针对的)。
+    /// 幂等:账号已存在则跳过(`seed::apply`),重启不冲掉运维轮换过的密码。
     pub fn seed_on_start(&self) -> bool {
-        self.idm_seed_on_start.unwrap_or(!self.app_env.is_prod())
+        self.idm_seed_on_start
+            .unwrap_or(!self.app_env.is_prod() || self.seed_file.is_some())
     }
 
     /// 日志过滤指令:`RUST_LOG` 优先;未设按环境缺省(prod=info、非 prod=debug)。
@@ -514,5 +521,27 @@ mod tests {
         // 指向不存在的文件 → 报错带路径
         cfg.jwt_private_key_file = Some("/no/such/key.pem".to_owned());
         assert!(apply_jwt_key_file_overrides(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn seed_on_start_prod_needs_seed_file() {
+        let seeds = |env: Profile, seed_file: Option<&str>, explicit: Option<bool>| {
+            Config {
+                app_env: env,
+                seed_file: seed_file.map(Into::into),
+                idm_seed_on_start: explicit,
+                ..Config::default()
+            }
+            .seed_on_start()
+        };
+        // 非 prod:恒开(嵌入默认账号便利)。
+        assert!(seeds(Profile::Dev, None, None));
+        // prod 无 SEED_FILE:关(绝不用嵌入的 pwd 弱默认建超管)。
+        assert!(!seeds(Profile::Prod, None, None));
+        // prod + SEED_FILE(运维给了真账号/密码):开(启动幂等建号,容器无外部命令)。
+        assert!(seeds(Profile::Prod, Some("seed.prod.toml"), None));
+        // 显式 IDM_SEED_ON_START 永远优先(prod 无 SEED_FILE 也能强开,反之强关)。
+        assert!(seeds(Profile::Prod, None, Some(true)));
+        assert!(!seeds(Profile::Prod, Some("seed.prod.toml"), Some(false)));
     }
 }
