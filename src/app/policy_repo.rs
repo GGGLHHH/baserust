@@ -60,9 +60,8 @@ pub async fn seed_authz(pool: &PgPool, seed: &SeedData) -> anyhow::Result<()> {
 }
 
 /// 从 `role_permissions` 表读出 role→权限,建内存 `Policy`(`implies` 由 `from_roles` 展开,同内存路径)。
-/// 闭集外权限串 **warn + 跳过**而非启动失败:迁移(0005 起)成了本表第二写者,存在
-/// "新迁移行 + 旧二进制"的版本偏斜窗口 —— 跳过 = 少授不误授(fail-closed),
-/// 且例行回滚二进制不再被一行未知权限卡成停机。(seed.toml 路径仍是反序列化 fail-fast。)
+/// 闭集外权限串 **fail-fast**:唯一写者是 `seed_authz`(源 = `Perm::ALL` 代码闭集),表里出现
+/// 非闭集串 = 配置漂移(手工改库 / 库领先于二进制),启动期大声炸出来而非静默少授。
 pub async fn load_policy(pool: &PgPool) -> anyhow::Result<Policy> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT role_name, permission FROM role_permissions")
@@ -71,13 +70,10 @@ pub async fn load_policy(pool: &PgPool) -> anyhow::Result<Policy> {
             .context("读 role_permissions 失败")?;
     let mut by_role: HashMap<String, Vec<Perm>> = HashMap::new();
     for (role, perm) in rows {
-        match perm_from_wire(&perm) {
-            Ok(p) => by_role.entry(role).or_default().push(p),
-            Err(e) => {
-                tracing::warn!(role = %role, permission = %perm, error = %e,
-                    "role_permissions 含闭集外权限串,跳过不授(版本偏斜?新迁移行 + 旧二进制)");
-            }
-        }
+        by_role
+            .entry(role)
+            .or_default()
+            .push(perm_from_wire(&perm)?);
     }
     Ok(Policy::from_roles(by_role))
 }
