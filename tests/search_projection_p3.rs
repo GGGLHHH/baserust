@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use baserust::app::adapters::ProfileDisplayNames;
 use baserust::app::state::{connect_for_schema, Schema};
 use baserust::app::{AppState, Mount};
 use baserust::features::profile::{PgProfileRepo, PutProfileRequest};
@@ -246,7 +247,7 @@ async fn user_write_converges_into_projection_row() -> anyhow::Result<()> {
         .await?;
     rebuild(
         &PgUserRepo::new(idm_pool.clone()),
-        &PgProfileRepo::new(app_pool.clone()),
+        &ProfileDisplayNames::new(Arc::new(PgProfileRepo::new(app_pool.clone()))),
         &*index_repo,
         p_idm,
         p_app,

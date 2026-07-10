@@ -213,7 +213,47 @@ pub struct AuthEventRow {
     pub browser: Option<String>,
 }
 
-/// 列表过滤(admin)。空 = 不限。
+/// 列表过滤 query DTO(admin 端点入参;`into_query` 组装成域内 `AuthEventQuery`)。空 = 不限。
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[serde(default)]
+#[into_params(parameter_in = Query)]
+pub struct AuthEventFilter {
+    /// 事件类型(闭集;未知值 → 422 而非静默空结果)。
+    pub event_type: Option<AuthEventType>,
+    pub outcome: Option<AuthOutcome>,
+    pub ip: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub from: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub to: Option<OffsetDateTime>,
+}
+
+impl AuthEventFilter {
+    /// 组装域内查询(`user_id` 由端点决定:单用户历史传 `Some`,全局流传 `None`)。
+    pub fn into_query(self, user_id: Option<Uuid>) -> AuthEventQuery {
+        AuthEventQuery {
+            user_id,
+            event_type: self.event_type,
+            outcome: self.outcome,
+            ip: self.ip,
+            from: self.from,
+            to: self.to,
+        }
+    }
+}
+
+/// 统计区间 query DTO。空 = 默认最近 24h(缺省/clamp 在 service)。
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[serde(default)]
+#[into_params(parameter_in = Query)]
+pub struct StatsQuery {
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub from: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub to: Option<OffsetDateTime>,
+}
+
+/// 列表过滤(域内)。空 = 不限。
 #[derive(Debug, Default)]
 pub struct AuthEventQuery {
     pub user_id: Option<Uuid>,

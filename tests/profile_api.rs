@@ -108,7 +108,7 @@ fn test_app() -> (
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
         idm_outbox: None,
-        auth_events: None,
+        auth_audit: None,
         auth_events_bus: None,
     };
     let app = build_router(

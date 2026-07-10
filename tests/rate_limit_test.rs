@@ -62,7 +62,7 @@ fn rate_limited_app() -> Router {
         token_signer: Some(Arc::new(AppTokenSigner::dev())),
         token_verifier: Arc::new(AppTokenVerifier::dev()),
         idm_outbox: None,
-        auth_events: None,
+        auth_audit: None,
         auth_events_bus: None,
     };
     let config = Config {
@@ -157,7 +157,7 @@ async fn rate_limit_off_by_default_lets_all_through() {
         token_signer: Some(Arc::new(AppTokenSigner::dev())),
         token_verifier: Arc::new(AppTokenVerifier::dev()),
         idm_outbox: None,
-        auth_events: None,
+        auth_audit: None,
         auth_events_bus: None,
     };
     let app = build_router(state, &Config::default(), Mount::Both);

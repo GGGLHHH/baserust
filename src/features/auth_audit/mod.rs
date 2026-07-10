@@ -3,14 +3,16 @@ pub mod projector;
 pub mod repo;
 pub mod retention;
 pub mod routes;
+mod service;
 pub mod types;
 
 pub use events::AuthEventBus;
 pub use repo::{AuthEventRepo, InMemoryAuthEventRepo, PgAuthEventRepo};
 pub use retention::AuthRetentionJob;
+pub use service::AuthAuditService;
 pub use types::{
-    AuthChannel, AuthEventQuery, AuthEventRow, AuthEventType, AuthOutcome, AuthStats,
-    FailureReason, NewAuthEvent,
+    AuthChannel, AuthEventFilter, AuthEventQuery, AuthEventRow, AuthEventType, AuthOutcome,
+    AuthStats, FailureReason, NewAuthEvent, StatsQuery,
 };
 
 use utoipa_axum::router::OpenApiRouter;

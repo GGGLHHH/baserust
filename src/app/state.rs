@@ -11,7 +11,8 @@ use super::adapters::{
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::auth_audit::{
-    projector::AuthEventProjector, AuthEventBus, AuthEventRepo, AuthRetentionJob, PgAuthEventRepo,
+    projector::AuthEventProjector, AuthAuditService, AuthEventBus, AuthEventRepo, AuthRetentionJob,
+    PgAuthEventRepo,
 };
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
@@ -81,7 +82,7 @@ pub struct AppState {
     /// idm.outbox 写句柄(仅 needs_idm 进程 Some):auth handler 发审计事件用(fire-and-forget)。
     pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
     /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
-    pub auth_events: Option<Arc<dyn AuthEventRepo>>,
+    pub auth_audit: Option<AuthAuditService>,
     /// auth_event 实时推送总线(`/admin/auth/auth-events/stream` SSE 用;projector 持同一实例发布)。
     /// 仅当 `auth_projector` 真装起来(needs_idm && NATS_URL && search pool)时 Some ——
     /// 唯一发布者没装,总线就不该对外暴露(否则 SSE 200 挂着永不推送,见 `AuthEventBus` 头注)。
@@ -351,9 +352,11 @@ impl AppState {
         let idm_outbox: Option<Arc<dyn idm::OutboxRepo>> = idm_pool
             .as_ref()
             .map(|p| Arc::new(PgOutboxRepo::new(p.clone())) as Arc<dyn idm::OutboxRepo>);
-        let auth_events: Option<Arc<dyn AuthEventRepo>> = search_pool
-            .as_ref()
-            .map(|p| Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>);
+        let auth_audit = search_pool.as_ref().map(|p| {
+            AuthAuditService::new(
+                Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>
+            )
+        });
         // SSE 总线:唯一发布者是下面的 auth_projector,只有它真装起来了总线才该对外暴露 ——
         // 否则 needs_idm 但 nats/search 未配时,`/stream` 会 200 挂着却永不推送(sibling 端点已 404)。
         // 装配顺序在 `db_pool` 移动 idm_pool 之前 —— 之后还要 `.clone()` 一份塞进 projector。
@@ -383,7 +386,7 @@ impl AppState {
                 token_verifier,
                 token_signer,
                 idm_outbox,
-                auth_events,
+                auth_audit,
                 auth_events_bus,
             },
             BackgroundTasks {

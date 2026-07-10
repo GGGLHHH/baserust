@@ -15,7 +15,9 @@ use uuid::Uuid;
 use baserust::app::adapters::InProcessProfileDirectory;
 use baserust::app::{build_router, AppState};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
-use baserust::features::auth_audit::{AuthEventRepo, InMemoryAuthEventRepo, NewAuthEvent};
+use baserust::features::auth_audit::{
+    AuthAuditService, AuthEventRepo, InMemoryAuthEventRepo, NewAuthEvent,
+};
 use baserust::features::profile::{
     InMemoryProfileRepo, ProfileRepo, ProfileService, StaticAvatarProbe,
 };
@@ -98,7 +100,9 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
         idm_outbox: None,
-        auth_events: Some(auth_events.clone() as Arc<dyn AuthEventRepo>),
+        auth_audit: Some(AuthAuditService::new(
+            auth_events.clone() as Arc<dyn AuthEventRepo>
+        )),
         auth_events_bus: None,
     };
     let app = build_router(
@@ -326,7 +330,7 @@ async fn no_auth_events_backend_is_404_not_panic() {
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
         idm_outbox: None,
-        auth_events: None,
+        auth_audit: None,
         auth_events_bus: None,
     };
     let app = build_router(

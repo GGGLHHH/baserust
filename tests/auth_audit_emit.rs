@@ -89,7 +89,7 @@ async fn test_app_with_config(
         token_signer: Some(signer),
         token_verifier: verifier,
         idm_outbox: Some(outbox.clone() as Arc<dyn OutboxRepo>),
-        auth_events: None,
+        auth_audit: None,
         auth_events_bus: None,
     };
     let app = build_router(state, &config, Mount::Both);

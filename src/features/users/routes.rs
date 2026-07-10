@@ -5,9 +5,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Multipart, State};
+use axum::extract::State;
 use axum::http::StatusCode;
-use content::UploadContentInput;
 use idm::AuthUser;
 use uuid::Uuid;
 
@@ -16,7 +15,6 @@ use super::types::{
     SetRolesRequest, UpdateUserRequest, UserSortField,
 };
 use crate::app::state::AppState;
-use crate::features::profile::{AvatarForm, ProfileResponse, PutProfileRequest};
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, Policy, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
@@ -300,153 +298,6 @@ pub async fn list_roles(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     Ok(Json(state.user_admin.list_roles().await?))
-}
-
-// ── 用户资料(纳入 users:admin:后台管理员管别人的头像/display_name/phone 不再需要
-//    profiles:write:all + contents:write,整条收进 users:admin 授权面)──
-
-/// 后台读某用户资料(display_name/phone/avatar)。归 `users:admin`。资料未建 → 404。
-#[utoipa::path(
-    get,
-    path = "/users/{id}/profile",
-    tag = "users",
-    params(("id" = Uuid, Path, description = "user id")),
-    responses(
-        (status = 200, description = "用户资料", body = ProfileResponse),
-        (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
-        (status = 404, description = "资料未建", body = ErrorBody)
-    )
-)]
-pub async fn get_user_profile(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    scope: TokenScope,
-    Path(id): Path<Uuid>,
-) -> Result<Json<ProfileResponse>, AppError> {
-    state
-        .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    Ok(Json(state.profiles.get(id).await?))
-}
-
-/// 后台改某用户资料(PUT 全量:display_name/phone/avatar_content_id)。归 `users:admin`。
-#[utoipa::path(
-    put,
-    path = "/users/{id}/profile",
-    tag = "users",
-    params(("id" = Uuid, Path, description = "user id")),
-    request_body = PutProfileRequest,
-    responses(
-        (status = 200, description = "已更新", body = ProfileResponse),
-        (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
-        (status = 422, description = "校验失败 / 头像非法", body = ErrorBody)
-    )
-)]
-pub async fn set_user_profile(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    scope: TokenScope,
-    ctx: AuditContext,
-    Path(id): Path<Uuid>,
-    Json(input): Json<PutProfileRequest>,
-) -> Result<Json<ProfileResponse>, AppError> {
-    state
-        .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    let (_created, resp) = state.profiles.put(id, input, &ctx).await?;
-    Ok(Json(resp))
-}
-
-/// 后台传某用户头像(multipart 表单,`file` 部分为图片)。上传即绑定(auto-bind):
-/// content owner = 目标用户,保留现有 display_name/phone,返回更新后的资料。归 `users:admin`。
-#[utoipa::path(
-    post,
-    path = "/users/{id}/avatar",
-    tag = "users",
-    params(("id" = Uuid, Path, description = "user id")),
-    request_body(content = inline(AvatarForm), content_type = "multipart/form-data"),
-    responses(
-        (status = 200, description = "头像已更新并绑定", body = ProfileResponse),
-        (status = 400, description = "multipart 解析失败", body = ErrorBody),
-        (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
-        (status = 422, description = "缺 file 部分 / 非 image", body = ErrorBody)
-    )
-)]
-pub async fn set_user_avatar(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    scope: TokenScope,
-    ctx: AuditContext,
-    Path(id): Path<Uuid>,
-    mut multipart: Multipart,
-) -> Result<Json<ProfileResponse>, AppError> {
-    state
-        .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-
-    let mut data = None;
-    let mut file_name = None;
-    let mut mime_type = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?
-    {
-        if field.name() == Some("file") {
-            file_name = field.file_name().map(str::to_owned);
-            mime_type = field.content_type().map(str::to_owned);
-            data = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::BadRequest(e.to_string()))?,
-            );
-        } else {
-            let _ = field.bytes().await;
-        }
-    }
-    let data = data.ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
-
-    // content 归目标用户(是他的头像);单租户 tenant=nil。
-    let input = UploadContentInput {
-        tenant_id: Uuid::nil(),
-        owner_id: id,
-        owner_type: None,
-        name: None,
-        description: None,
-        document_type: None,
-        object_key: None,
-        file_name,
-        mime_type,
-        tags: Vec::new(),
-        custom_metadata: None,
-        data,
-    };
-    let outcome = state.contents.upload_content(input, ctx.audit_id()).await?;
-    let content_id = outcome.content.id;
-
-    // auto-bind:保留现有 display_name/phone(无资料行 → None),换上新头像。
-    let (display_name, phone) = match state.profiles.get(id).await {
-        Ok(p) => (p.display_name, p.phone),
-        Err(AppError::NotFound) => (None, None),
-        Err(e) => return Err(e),
-    };
-    let (_created, resp) = state
-        .profiles
-        .put(
-            id,
-            PutProfileRequest {
-                avatar_content_id: Some(content_id),
-                display_name,
-                phone,
-            },
-            &ctx,
-        )
-        .await?;
-    Ok(Json(resp))
 }
 
 /// 管理员重置密码(无需旧密码)+ best-effort 撤会话(强制重新登录)。

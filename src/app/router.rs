@@ -79,6 +79,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
             "/auth",
             OpenApiRouter::new()
                 .merge(users::admin_router())
+                .merge(profile::admin_router())
                 .merge(auth_audit::admin_router()),
         );
         admin_open = admin_open.merge(auth::admin_login_router());
@@ -194,6 +195,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                             "/auth",
                             OpenApiRouter::new()
                                 .merge(users::admin_router())
+                                .merge(profile::admin_router())
                                 .merge(auth_audit::admin_router()),
                         )
                         .merge(auth::admin_login_router()),

@@ -7,6 +7,6 @@ pub mod rebuild;
 pub mod repo;
 pub mod types;
 
-pub use rebuild::rebuild;
+pub use rebuild::{rebuild, DisplayNameSource};
 pub use repo::{InMemorySearchIndexRepo, PgSearchIndexRepo, SearchIndexRepo};
 pub use types::{AdminUserIndexRow, IndexQuery, IndexQueryResult, IndexSort};

@@ -7,12 +7,23 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use idm::{ListPage, SortDir, UserListFilter, UserRepo, UserSortBy};
 use uuid::Uuid;
 
 use super::{AdminUserIndexRow, SearchIndexRepo};
-use crate::features::profile::ProfileRepo;
 use crate::infra::error::AppError;
+
+/// rebuild 的窄端口(端口归消费方,见 cross-module-enrichment skill):只要
+/// "user_id → display_name" 批量映射,不吃 profile 模块的整个仓储 trait。
+/// 适配在组合根(`app::adapters::ProfileDisplayNames`)。
+#[async_trait]
+pub trait DisplayNameSource: Send + Sync {
+    async fn display_names_by_ids(
+        &self,
+        user_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<String>>, AppError>;
+}
 
 /// 每页拉取的用户数——大页降低往返次数,循环到不满页即结束。
 const PAGE_LIMIT: u64 = 500;
@@ -25,7 +36,7 @@ const PAGE_LIMIT: u64 = 500;
 /// 返回写入的行数。
 pub async fn rebuild(
     users: &dyn UserRepo,
-    profiles: &dyn ProfileRepo,
+    profiles: &dyn DisplayNameSource,
     index: &dyn SearchIndexRepo,
     p_idm: i64,
     p_app: i64,
@@ -50,14 +61,9 @@ pub async fn rebuild(
             break;
         }
 
-        // 批量取 profile(一条 SQL 解 N+1),按 user_id 建 display_name 映射;缺失 id → None。
+        // 批量取 display_name(端口内一条 SQL 解 N+1);缺失 id → None。
         let ids: Vec<Uuid> = page.rows.iter().map(|row| row.id).collect();
-        let display_names: HashMap<Uuid, Option<String>> = profiles
-            .find_by_ids(&ids)
-            .await?
-            .into_iter()
-            .map(|p| (p.user_id, p.display_name))
-            .collect();
+        let display_names = profiles.display_names_by_ids(&ids).await?;
 
         for row in page.rows {
             let display_name = display_names.get(&row.id).cloned().flatten();
@@ -90,14 +96,16 @@ pub async fn rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::profile::{InMemoryProfileRepo, ProfileFields};
+    use crate::app::adapters::ProfileDisplayNames;
+    use crate::features::profile::{InMemoryProfileRepo, ProfileFields, ProfileRepo};
     use crate::features::search::InMemorySearchIndexRepo;
     use idm::InMemoryUserRepo;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn backfills_all_alive_users_with_profile_enrichment_and_watermarks() {
         let users = InMemoryUserRepo::new();
-        let profiles = InMemoryProfileRepo::new();
+        let profiles = Arc::new(InMemoryProfileRepo::new());
         let index = InMemorySearchIndexRepo::new();
 
         // 两个存活用户;u1 建了 profile(display_name),u2 没有 → 应回填为 None。
@@ -121,7 +129,15 @@ mod tests {
             .await
             .unwrap();
 
-        let written = rebuild(&users, &profiles, &index, 100, 200).await.unwrap();
+        let written = rebuild(
+            &users,
+            &ProfileDisplayNames::new(profiles),
+            &index,
+            100,
+            200,
+        )
+        .await
+        .unwrap();
         assert_eq!(written, 2);
 
         let row1 = index.get(u1.id).await.unwrap().expect("u1 应已回填");
@@ -142,10 +158,12 @@ mod tests {
     #[tokio::test]
     async fn no_alive_users_backfills_zero() {
         let users = InMemoryUserRepo::new();
-        let profiles = InMemoryProfileRepo::new();
+        let profiles = Arc::new(InMemoryProfileRepo::new());
         let index = InMemorySearchIndexRepo::new();
 
-        let written = rebuild(&users, &profiles, &index, 1, 1).await.unwrap();
+        let written = rebuild(&users, &ProfileDisplayNames::new(profiles), &index, 1, 1)
+            .await
+            .unwrap();
         assert_eq!(written, 0);
     }
 }

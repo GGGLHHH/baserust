@@ -6,6 +6,7 @@
 //! **前提是配好**——idm/app/search 的 `*_DB_HOST` 都须设(rebuild 天然需要三个真实源),缺一即报错退出。
 
 use anyhow::Context;
+use baserust::app::adapters::ProfileDisplayNames;
 use baserust::app::state::{connect_for_schema, Schema};
 use baserust::features::profile::PgProfileRepo;
 use baserust::features::search::{rebuild, PgSearchIndexRepo};
@@ -42,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         .context("读 app outbox 水位失败")?;
 
     let users = PgUserRepo::new(idm_pool);
-    let profiles = PgProfileRepo::new(app_pool);
+    let profiles = ProfileDisplayNames::new(std::sync::Arc::new(PgProfileRepo::new(app_pool)));
     let index = PgSearchIndexRepo::new(search_pool);
 
     let count = rebuild(&users, &profiles, &index, p_idm, p_app).await?;
