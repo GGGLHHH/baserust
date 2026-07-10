@@ -21,12 +21,20 @@ const MAX_SIZE: u64 = 100;
 pub struct PageQuery {
     /// 提供 ⇒ offset 模式(可跳页),1-based。
     pub page: Option<u64>,
-    /// 提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。
+    /// 提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。
+    /// serde_html_form 基座(见 infra/extract.rs)会把空值 Option 解成 None,丢掉
+    /// "cursor 模式首页"的表达 —— 自定义 deserializer 保住 `Some("")`。
+    #[serde(default, deserialize_with = "de_keep_empty")]
     pub cursor: Option<String>,
     /// 每页条数,两模式共用;越界自动 clamp 到 [1,100]。
     pub size: Option<u64>,
     /// 仅 offset 有意义:是否计算 total(默认 true)。
     pub with_total: Option<bool>,
+}
+
+/// 键存在即 `Some`(含空值),键缺席走 `#[serde(default)]` → `None`。
+fn de_keep_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    serde::Deserialize::deserialize(d).map(Some)
 }
 
 /// 域内分页参数(service/repo `match`)。由 `PageQuery::resolve()` 产出。
