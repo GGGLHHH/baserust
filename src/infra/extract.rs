@@ -87,6 +87,44 @@ where
     }
 }
 
+/// multipart 里第一个 `file` 部分(文件名 / MIME / 字节)。
+pub struct FilePart {
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub data: bytes::Bytes,
+}
+
+/// 读出 multipart 中名为 `file` 的部分,排空其余部分(推进流)。
+/// 无 `file` 部分 → `Ok(None)`(调用方按自己的语义回 422);读取失败 → 400。
+/// 单文件表单(如头像上传)直接用;多字段表单(如 contents/upload)仍手写循环。
+pub async fn file_part(
+    multipart: &mut axum::extract::Multipart,
+) -> Result<Option<FilePart>, AppError> {
+    let mut out = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?
+    {
+        if field.name() == Some("file") && out.is_none() {
+            let file_name = field.file_name().map(str::to_owned);
+            let mime_type = field.content_type().map(str::to_owned);
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            out = Some(FilePart {
+                file_name,
+                mime_type,
+                data,
+            });
+        } else {
+            let _ = field.bytes().await; // 未知/重复部分:读掉推进流
+        }
+    }
+    Ok(out)
+}
+
 /// 同名 `Json` 既是提取器(上面 FromRequest),也是响应体:委托 axum::Json 序列化。
 /// 这样 handler 的参数和返回值都能统一用 `crate::infra::extract::Json`。
 impl<T: Serialize> IntoResponse for Json<T> {

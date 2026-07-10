@@ -181,13 +181,17 @@ impl AuthEventProjector {
         if !env.r#type.starts_with("auth.") {
             return Ok(None); // 非 auth 事件,忽略(前向兼容)
         }
+        // 未知 auth.* 子类型 ≠ 毒消息:多半是滚动升级窗口里新版本 emitter 发的合法新事件,
+        // 与"非 auth.* 忽略"同属前向兼容 —— warn + 跳过(该类型的投影缺口随 projector 升级补齐),
+        // 不标 Poison(那是 payload 损坏专用)。
+        if env.r#type.parse::<AuthEventType>().is_err() {
+            tracing::warn!(event_type = %env.r#type, "未知 auth.* 事件类型,前向兼容跳过(projector 落后于 emitter?)");
+            return Ok(None);
+        }
         let d: AuthEventData = serde_json::from_value(env.data)
             .map_err(|e| ApplyError::Poison(format!("{} data: {e}", env.r#type)))?;
         // 闭集校验在信任边界:wire 来的串必须落在枚举内,否则 Poison —— 不能等到
         // to_row 的 expect 炸 panic(那些 expect 只为"本仓 emit 写入"的不变量背书)。
-        env.r#type
-            .parse::<AuthEventType>()
-            .map_err(ApplyError::Poison)?;
         d.channel
             .parse::<AuthChannel>()
             .map_err(ApplyError::Poison)?;

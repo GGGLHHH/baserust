@@ -57,8 +57,9 @@ impl PageQuery {
     pub fn resolve(self) -> Result<PageParams, AppError> {
         let size = self.size.unwrap_or(DEFAULT_SIZE).clamp(1, MAX_SIZE);
         match (self.page, self.cursor) {
-            // page + 非空 cursor 互斥(语义冲突)
-            (Some(_), Some(c)) if !c.is_empty() => Err(AppError::Validation(
+            // page + cursor(含空值)互斥:空 cursor= 已是"cursor 模式首页"的表达,
+            // 再带 page 就是语义冲突 —— 静默吞掉任何一个都会让分页 UI 无声卡死。
+            (Some(_), Some(_)) => Err(AppError::Validation(
                 "page and cursor are mutually exclusive".into(),
             )),
             // 有 cursor 参数即 cursor 模式:空字符串 = 首页(after=None),非空 = 解码锚点。
@@ -71,10 +72,10 @@ impl PageQuery {
                 },
                 limit: size,
             }),
-            // 无 cursor → offset(可跳页),默认第 1 页。上限夹住:下游 (page-1)*size 的
-            // u64 乘法不被 query 参数打溢出(size ≤ MAX_SIZE,故 page ≤ MAX/MAX_SIZE 恒安全)。
+            // 无 cursor → offset(可跳页),默认第 1 页。上限夹到 i64::MAX/MAX_SIZE:
+            // (page-1)*size 既不打爆 u64 乘法,也不超 PG bigint 的 OFFSET 取值域。
             (page, None) => Ok(PageParams::Offset {
-                page: page.unwrap_or(1).clamp(1, u64::MAX / MAX_SIZE),
+                page: page.unwrap_or(1).clamp(1, i64::MAX as u64 / MAX_SIZE),
                 size,
                 with_total: self.with_total.unwrap_or(true),
             }),
@@ -186,6 +187,25 @@ mod tests {
             with_total: None,
         };
         assert!(matches!(q.resolve(), Err(AppError::Validation(_))));
+        // 空 cursor= 也互斥:不能静默吞 page 进 cursor 首页。
+        let q = PageQuery {
+            page: Some(2),
+            cursor: Some(String::new()),
+            size: None,
+            with_total: None,
+        };
+        assert!(matches!(q.resolve(), Err(AppError::Validation(_))));
+        // 单独的空 cursor= = keyset 首页。
+        let q = PageQuery {
+            page: None,
+            cursor: Some(String::new()),
+            size: None,
+            with_total: None,
+        };
+        assert!(matches!(
+            q.resolve(),
+            Ok(PageParams::Cursor { after: None, .. })
+        ));
     }
 
     #[test]

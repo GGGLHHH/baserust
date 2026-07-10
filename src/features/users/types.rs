@@ -38,16 +38,16 @@ pub struct RoleView {
     pub display_name: String,
 }
 
-impl From<idm::Role> for RoleView {
-    fn from(r: idm::Role) -> Self {
-        Self {
+impl TryFrom<idm::Role> for RoleView {
+    /// Err = 不在闭集的原始角色名(调用方决定跳过/告警,不 panic)。
+    type Error = String;
+    fn try_from(r: idm::Role) -> Result<Self, String> {
+        let name = r.name.parse().map_err(|_| r.name)?;
+        Ok(Self {
             id: r.id,
-            name: r
-                .name
-                .parse()
-                .expect("role name 恒为 RoleName 已知取值(仅由 seed 写入)"),
+            name,
             display_name: r.display_name,
-        }
+        })
     }
 }
 

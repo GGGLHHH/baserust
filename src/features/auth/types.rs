@@ -111,14 +111,7 @@ impl From<idm::UserView> for UserResponse {
             username: u.username,
             email: u.email,
             email_verified: u.email_verified,
-            roles: u
-                .roles
-                .into_iter()
-                .map(|r| {
-                    r.parse()
-                        .expect("角色名恒为 RoleName 已知取值(仅由 seed 写入)")
-                })
-                .collect(),
+            roles: RoleName::parse_lossy(u.roles),
         }
     }
 }

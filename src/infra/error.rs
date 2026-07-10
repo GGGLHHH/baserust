@@ -119,6 +119,19 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// 全部变体(wire round-trip 测试用)。加变体必补这里(忘了 → 测试挂),镜像 `Perm::ALL`。
+    pub const ALL: [ErrorCode; 9] = [
+        ErrorCode::NotFound,
+        ErrorCode::Validation,
+        ErrorCode::BadRequest,
+        ErrorCode::Unauthorized,
+        ErrorCode::Conflict,
+        ErrorCode::Forbidden,
+        ErrorCode::Internal,
+        ErrorCode::Timeout,
+        ErrorCode::RateLimited,
+    ];
+
     /// 日志字段用的 wire 串(== serde rename;`error_code_wire_matches` 测试钉死不漂移)。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -263,17 +276,7 @@ mod tests {
 
     #[test]
     fn error_code_wire_matches() {
-        for c in [
-            ErrorCode::NotFound,
-            ErrorCode::Validation,
-            ErrorCode::BadRequest,
-            ErrorCode::Unauthorized,
-            ErrorCode::Conflict,
-            ErrorCode::Forbidden,
-            ErrorCode::Internal,
-            ErrorCode::Timeout,
-            ErrorCode::RateLimited,
-        ] {
+        for c in ErrorCode::ALL {
             let wire = serde_json::to_value(c).unwrap();
             assert_eq!(
                 wire.as_str(),

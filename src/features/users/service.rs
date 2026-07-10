@@ -18,17 +18,6 @@ use crate::infra::pagination::{encode_cursor, Page, PageParams};
 use crate::infra::sort::SortOrder;
 use idm::{PwHasher, RoleRepo, SessionRepo, UserRepo};
 
-/// idm/投影侧的角色名串 → 闭集(唯一写者是 seed;未知值 = 数据异常,炸出来,见 closed-enums skill)。
-fn parse_role_names(roles: Vec<String>) -> Vec<RoleName> {
-    roles
-        .into_iter()
-        .map(|r| {
-            r.parse()
-                .expect("角色名恒为 RoleName 已知取值(仅由 seed 写入)")
-        })
-        .collect()
-}
-
 /// `SortOrder`(app 共享)→ idm 侧排序方向。SortOrder 是本 crate 类型,orphan 规则允许。
 impl From<SortOrder> for idm::SortDir {
     fn from(o: SortOrder) -> Self {
@@ -123,7 +112,7 @@ impl UserAdminService {
                 email: r.email,
                 email_verified: r.email_verified,
                 created_at: r.created_at,
-                roles: parse_role_names(r.roles),
+                roles: RoleName::parse_lossy(r.roles),
                 display_name: r.display_name, // 投影(可搜键)
                 avatar_url: briefs.get(&r.id).and_then(|b| b.avatar_url.clone()), // 富化(display-only)
             })
@@ -190,7 +179,7 @@ impl UserAdminService {
                     email: r.email,
                     email_verified: r.email_verified,
                     created_at: r.created_at,
-                    roles: parse_role_names(r.roles),
+                    roles: RoleName::parse_lossy(r.roles),
                     display_name: brief.and_then(|b| b.display_name.clone()),
                     avatar_url: brief.and_then(|b| b.avatar_url.clone()),
                 }
@@ -282,12 +271,19 @@ impl UserAdminService {
 
     /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
     pub async fn list_roles(&self) -> Result<Page<RoleView>, AppError> {
+        // 不在闭集的角色行(存量脏数据)跳出目录 + warn,不打挂端点。
         let items: Vec<RoleView> = self
             .roles
             .list()
             .await?
             .into_iter()
-            .map(RoleView::from)
+            .filter_map(|r| match RoleView::try_from(r) {
+                Ok(v) => Some(v),
+                Err(name) => {
+                    tracing::warn!(role = %name, "角色名不在 RoleName 闭集内,目录跳过");
+                    None
+                }
+            })
             .collect();
         let limit = items.len().max(1) as u64;
         Ok(Page::cursor(items, limit, None))
@@ -337,7 +333,7 @@ impl UserAdminService {
             email: user.email,
             email_verified: user.email_verified,
             created_at: user.created_at,
-            roles: parse_role_names(roles),
+            roles: RoleName::parse_lossy(roles),
             display_name: brief.and_then(|b| b.display_name.clone()),
             avatar_url: brief.and_then(|b| b.avatar_url.clone()),
         })

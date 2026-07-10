@@ -239,6 +239,24 @@ impl RoleName {
     }
 }
 
+impl RoleName {
+    /// wire 串集合 → 闭集,**lossy**:不在闭集的(存量部署遗留 / 手工 INSERT 的旧角色名)
+    /// 跳过 + warn,绝不 panic —— 一行脏数据不该打挂整个读路径(login/me/用户列表/权限清单)。
+    /// closed-enums skill 的「数据异常就炸」只背书单写者不变量;角色行存在版本偏斜面(旧 seed、运维手改)。
+    pub fn parse_lossy<I: IntoIterator<Item = String>>(roles: I) -> Vec<RoleName> {
+        roles
+            .into_iter()
+            .filter_map(|r| match r.parse() {
+                Ok(role) => Some(role),
+                Err(_) => {
+                    tracing::warn!(role = %r, "角色名不在 RoleName 闭集内,读模型跳过(存量脏数据?)");
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
 /// wire 串(JWT claim / idm.roles.name)→ 枚举,给读模型强类型化用(镜像 `AuthEventType::FromStr`)。
 impl std::str::FromStr for RoleName {
     type Err = String;
@@ -497,15 +515,7 @@ pub async fn get_my_permissions(
         .filter(|&p| state.policy.require_scoped(&user.0, &scope.0, p).is_ok())
         .collect();
     permissions.sort_by_key(|p| p.wire()); // 仍按 wire 串序,JSON 输出不变
-    let roles = user
-        .0
-        .roles
-        .iter()
-        .map(|r| {
-            r.parse()
-                .expect("claim 角色恒为 RoleName 已知取值(仅由 idm 按闭集签发)")
-        })
-        .collect();
+    let roles = RoleName::parse_lossy(user.0.roles.clone());
     crate::infra::extract::Json(MyPermissionsResponse { roles, permissions })
 }
 
@@ -542,6 +552,16 @@ mod tests {
     }
 
     /// RoleName: `as_str()` == serde rename(不漂移);superadmin 默认持全权闭集。
+    #[test]
+    fn parse_lossy_skips_unknown_roles_without_panic() {
+        // 存量脏角色名(旧 seed / 手工 INSERT)只跳过,绝不打挂读路径。
+        let roles = vec!["admin".to_owned(), "editor".to_owned(), "user".to_owned()];
+        assert_eq!(
+            RoleName::parse_lossy(roles),
+            vec![RoleName::Admin, RoleName::User]
+        );
+    }
+
     #[test]
     fn role_name_wire_matches() {
         for r in RoleName::ALL {

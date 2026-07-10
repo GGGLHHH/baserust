@@ -156,6 +156,16 @@ pub enum FailureReason {
     RateLimited,
 }
 
+/// idm 凭据失败原因 → 审计闭集(login/admin_login 两处发事件共用,消除逐字复制的 match)。
+impl From<&idm::CredentialFailure> for FailureReason {
+    fn from(f: &idm::CredentialFailure) -> Self {
+        match f {
+            idm::CredentialFailure::UnknownUser => Self::UnknownUser,
+            idm::CredentialFailure::BadPassword => Self::BadPassword,
+        }
+    }
+}
+
 impl std::str::FromStr for FailureReason {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {

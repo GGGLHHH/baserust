@@ -32,6 +32,8 @@ use garde::Validate;
 /// 行级 ownership(镜像 widget 的 get 范式):owner 本人或持越权 perm(`contents:read:all` /
 /// `contents:write:all`,经 `data_access` 判 mode)→ 放行并返回该行;否则 **404**。
 /// 读写同码 404:本模块读侧 owner-scoped(list 只回自己的),存在性敏感,403 会泄露"这 id 存在"。
+/// ponytail: 每个单条端点多一次 PK 查询(下游 ContentService 方法内部会再 get 同一行);
+/// content 库零 authz 是刻意分层,守卫只能落 app。真在意时把 Access 下推进库的 service 方法签名。
 async fn fetch_content_owned(
     state: &AppState,
     user: &idm::AuthUser,
@@ -370,7 +372,7 @@ pub async fn download_content(
         (status = 200, description = "inline 字节(代理回退,Content-Type 取自元数据)", content_type = "application/octet-stream"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
-        (status = 404, description = "不存在 / 无可预览对象", body = ErrorBody),
+        (status = 404, description = "不存在 / 非 owner 且非 image/*(头像跨用户展示例外;不区分,防泄露存在)", body = ErrorBody),
         (status = 409, description = "内容未就绪", body = ErrorBody)
     )
 )]
@@ -383,8 +385,26 @@ pub async fn preview_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    // 刻意**不做** ownership:preview 是头像等跨用户展示的稳定 URL(profile 富化指到这);
-    // 敏感内容不该走 preview 语义。收紧时按 read:all 放行、owner 之外 404。
+    // ownership 折中:preview 与 download 指向同一原始对象字节,全开会让 404 守卫被
+    // 兄弟端点整体绕过(任意文档可越权拉取)。头像跨用户展示又必须保留 —— 故:
+    // owner / read:all → 任意类型可预览;其他人只放行 image/*(头像场景),其余 404。
+    let c = state.contents.get_content(id).await?;
+    let owned = state
+        .policy
+        .data_access(&user.0, &scope.0, Perm::ContentReadAll)
+        .allows(c.owner_id);
+    if !owned {
+        let is_image = state
+            .contents
+            .get_content_metadata(id)
+            .await
+            .ok()
+            .and_then(|m| m.mime_type)
+            .is_some_and(|m| m.starts_with("image/"));
+        if !is_image {
+            return Err(AppError::NotFound); // 同 get/download:不泄露存在
+        }
+    }
     if let Some(url) = state.contents.preview_url(id).await? {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
         let mut resp = Redirect::temporary(&url).into_response();

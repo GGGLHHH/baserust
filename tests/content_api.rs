@@ -619,6 +619,37 @@ async fn cross_user_content_is_404_unless_all_mode() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri} 非本人应 404");
     }
 
+    // preview 折中:非 owner 的非图片 → 404(否则 download 的 404 守卫被兄弟端点绕过)
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &viewer,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "非 owner 预览非图片应 404"
+    );
+    // 非 owner 的 image/* 保持可预览(头像跨用户展示场景)
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "a.png", "image/png", b"\x89PNG"))
+        .await
+        .unwrap();
+    let img_id = uploaded_content_id(resp).await;
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{img_id}/preview"),
+            &viewer,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "非 owner 预览图片应放行");
+
     // auditor(read:all + write:all)跨用户读 → 200,删 → 204
     let signer = AppTokenSigner::dev();
     let auditor = signer

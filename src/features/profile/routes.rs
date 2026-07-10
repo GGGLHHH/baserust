@@ -191,28 +191,9 @@ pub async fn set_user_avatar(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
 
-    let mut data = None;
-    let mut file_name = None;
-    let mut mime_type = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?
-    {
-        if field.name() == Some("file") {
-            file_name = field.file_name().map(str::to_owned);
-            mime_type = field.content_type().map(str::to_owned);
-            data = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::BadRequest(e.to_string()))?,
-            );
-        } else {
-            let _ = field.bytes().await;
-        }
-    }
-    let data = data.ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
+    let file = crate::infra::extract::file_part(&mut multipart)
+        .await?
+        .ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
 
     // content 归目标用户(是他的头像);单租户 tenant=nil。
     let input = UploadContentInput {
@@ -223,11 +204,11 @@ pub async fn set_user_avatar(
         description: None,
         document_type: None,
         object_key: None,
-        file_name,
-        mime_type,
+        file_name: file.file_name,
+        mime_type: file.mime_type,
         tags: Vec::new(),
         custom_metadata: None,
-        data,
+        data: file.data,
     };
     let outcome = state.contents.upload_content(input, ctx.audit_id()).await?;
     let content_id = outcome.content.id;

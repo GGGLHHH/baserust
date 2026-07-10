@@ -157,18 +157,12 @@ impl AppTokenVerifier {
 
 impl TokenVerifier for AppTokenVerifier {
     fn verify(&self, token: &str) -> Result<VerifiedToken, IdmError> {
-        let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
-        let claims = jsonwebtoken::decode::<AppClaims>(token, &self.decoding, &validation)
-            .map(|d| d.claims)
-            .map_err(|_| IdmError::Unauthorized)?;
-        let user_id = claims
-            .sub
-            .parse::<Uuid>()
-            .map_err(|_| IdmError::Unauthorized)?;
+        // 复用 verify_with_scope 的单次 decode,丢弃 scope(镜像 scope_of 的委托姿势)。
+        let (user, _scope) = self.verify_with_scope(token)?;
         Ok(VerifiedToken {
-            user_id,
-            username: claims.username,
-            roles: claims.roles,
+            user_id: user.id,
+            username: user.username,
+            roles: user.roles,
         })
     }
 }

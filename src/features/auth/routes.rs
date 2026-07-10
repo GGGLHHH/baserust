@@ -148,12 +148,7 @@ pub async fn login(
         // (转换后统一收口 401,原因丢失);HTTP 仍统一 401,防枚举不变。
         Err(idm_err) => {
             let reason = match &idm_err {
-                idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
-                    FailureReason::UnknownUser
-                }
-                idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
-                    FailureReason::BadPassword
-                }
+                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
                 _ => return Err(idm_err.into()),
             };
             emit_auth_event(
@@ -381,12 +376,7 @@ pub async fn admin_login(
         // 凭据本身错(同 public login 的原因匹配);HTTP 仍统一 401,防枚举不变。
         Err(idm_err) => {
             let reason = match &idm_err {
-                idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
-                    FailureReason::UnknownUser
-                }
-                idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
-                    FailureReason::BadPassword
-                }
+                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
                 _ => return Err(idm_err.into()),
             };
             emit_auth_event(

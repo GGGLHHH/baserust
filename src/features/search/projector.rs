@@ -145,6 +145,11 @@ impl Projector {
                     // 暂时故障 → **原地重试、不前进**(保序):若跳过本条继续消费,同用户更大 seq
                     // 先落库推高水位后,ack_wait 重投的本条会被 `idm_seq <` 守卫丢弃,
                     // 其独有字段变更(如 email)静默永久丢失。
+                    // 重试有上限:Transient 涵盖 repo 的一切错误,含永久性 DB 错(迁移漂移、
+                    // 非法字节),无限重试会让单条坏消息冻结全 stream。指数退避 1s→512s
+                    // (共 ~17min,盖住常规 DB 抖动/故障切换),仍失败按毒消息跳过 + error 级告警
+                    // (数据可经 bin/rebuild_search 回填)。
+                    let mut attempt = 0u32;
                     let should_ack = loop {
                         match Self::apply_message(&*self.repo, &msg.payload).await {
                             Ok(()) => break true,
@@ -152,10 +157,16 @@ impl Projector {
                                 tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
                                 break true;
                             }
+                            Err(ApplyError::Transient(err)) if attempt >= 10 => {
+                                tracing::error!(error = %err, attempt, "projector 重试超限,按毒消息跳过(投影缺口需 rebuild_search 回填)");
+                                break true;
+                            }
                             Err(ApplyError::Transient(err)) => {
-                                tracing::warn!(error = %err, "projector apply 暂时失败,1s 后原地重试(保序)");
+                                let backoff = std::time::Duration::from_secs(1 << attempt.min(9));
+                                attempt += 1;
+                                tracing::warn!(error = %err, attempt, ?backoff, "projector apply 暂时失败,退避后原地重试(保序)");
                                 tokio::select! {
-                                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                    _ = tokio::time::sleep(backoff) => {}
                                     changed = shutdown.changed() => {
                                         if changed.is_err() || *shutdown.borrow() {
                                             break false; // 关停:不 ack,留待重投
