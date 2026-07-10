@@ -27,7 +27,7 @@ use baserust::infra::authz::{Perm, Policy};
 use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, RoleRepo};
 
 /// 内存 app + 两个令牌:`superadmin`(有 users:admin,满权)与 `admin`(只有 admin:login)。
-/// idm user/role repo 共享并预置角色(superadmin/admin/user/editor);profile repo 三方共享 →
+/// idm user/role repo 共享并预置角色(superadmin/admin/user,即 RoleName 闭集);profile repo 三方共享 →
 /// 富化可端到端断言。auth 服务用独立占位 repo(本套不测真实登录)。
 async fn test_app() -> (Router, String, String) {
     let signer = Arc::new(AppTokenSigner::dev());
@@ -40,7 +40,6 @@ async fn test_app() -> (Router, String, String) {
         ("superadmin", "Super"),
         ("admin", "Admin"),
         ("user", "User"),
-        ("editor", "Editor"),
     ] {
         mem_roles.upsert(name, display, None).await.unwrap();
     }

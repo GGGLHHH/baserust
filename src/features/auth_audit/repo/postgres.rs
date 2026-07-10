@@ -35,8 +35,8 @@ fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
     if let Some(u) = f.user_id {
         q.and_where(Expr::col(AuthEvent::UserId).eq(u));
     }
-    if let Some(t) = &f.event_type {
-        q.and_where(Expr::col(AuthEvent::EventType).eq(t.clone()));
+    if let Some(t) = f.event_type {
+        q.and_where(Expr::col(AuthEvent::EventType).eq(t.as_str()));
     }
     if let Some(o) = &f.outcome {
         q.and_where(Expr::col(AuthEvent::Outcome).eq(o.as_str()));

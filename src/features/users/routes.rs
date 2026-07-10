@@ -75,7 +75,11 @@ async fn role_names_of(state: &AppState, role_ids: &[Uuid]) -> Result<Vec<String
         return Ok(Vec::new());
     }
     let catalog = state.user_admin.list_roles().await?;
-    let by_id: HashMap<Uuid, String> = catalog.items.into_iter().map(|r| (r.id, r.name)).collect();
+    let by_id: HashMap<Uuid, String> = catalog
+        .items
+        .into_iter()
+        .map(|r| (r.id, r.name.as_str().to_owned()))
+        .collect();
     Ok(role_ids
         .iter()
         .filter_map(|id| by_id.get(id).cloned())

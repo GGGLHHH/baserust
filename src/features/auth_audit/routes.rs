@@ -13,7 +13,9 @@ use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use crate::app::state::AppState;
-use crate::features::auth_audit::{AuthEventQuery, AuthEventRow, AuthOutcome, AuthStats};
+use crate::features::auth_audit::{
+    AuthEventQuery, AuthEventRow, AuthEventType, AuthOutcome, AuthStats,
+};
 use crate::infra::audit::CurrentUser;
 use crate::infra::authz::{Perm, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
@@ -25,7 +27,8 @@ use crate::infra::pagination::{Page, PageQuery};
 #[serde(default)]
 #[into_params(parameter_in = Query)]
 pub struct AuthEventFilter {
-    pub event_type: Option<String>,
+    /// 事件类型(闭集;未知值 → 422 而非静默空结果)。
+    pub event_type: Option<AuthEventType>,
     pub outcome: Option<AuthOutcome>,
     pub ip: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]

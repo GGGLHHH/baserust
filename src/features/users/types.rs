@@ -20,8 +20,8 @@ pub struct AdminUserView {
     pub email_verified: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
-    /// idm 角色名(全量)。
-    pub roles: Vec<String>,
+    /// idm 角色名(全量;闭集,生成前端 union)。
+    pub roles: Vec<RoleName>,
     /// 富化:app.profiles 的显示名(悬空/分进程 → null)。
     pub display_name: Option<String>,
     /// 富化:相对 preview 路径(悬空/分进程 → null)。
@@ -33,7 +33,8 @@ pub struct AdminUserView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RoleView {
     pub id: Uuid,
-    pub name: String,
+    /// 机器码(闭集,生成前端 union)。
+    pub name: RoleName,
     pub display_name: String,
 }
 
@@ -41,7 +42,10 @@ impl From<idm::Role> for RoleView {
     fn from(r: idm::Role) -> Self {
         Self {
             id: r.id,
-            name: r.name,
+            name: r
+                .name
+                .parse()
+                .expect("role name 恒为 RoleName 已知取值(仅由 seed 写入)"),
             display_name: r.display_name,
         }
     }

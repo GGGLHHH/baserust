@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::infra::authz::RoleName;
+
 /// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct RegisterRequest {
@@ -59,7 +61,8 @@ pub struct UserResponse {
     pub username: String,
     pub email: Option<String>,
     pub email_verified: bool,
-    pub roles: Vec<String>,
+    /// 角色名(闭集,生成前端 union)。
+    pub roles: Vec<RoleName>,
 }
 
 // ── 边界转换:app DTO ↔ idm 领域类型 ──
@@ -108,7 +111,14 @@ impl From<idm::UserView> for UserResponse {
             username: u.username,
             email: u.email,
             email_verified: u.email_verified,
-            roles: u.roles,
+            roles: u
+                .roles
+                .into_iter()
+                .map(|r| {
+                    r.parse()
+                        .expect("角色名恒为 RoleName 已知取值(仅由 seed 写入)")
+                })
+                .collect(),
         }
     }
 }

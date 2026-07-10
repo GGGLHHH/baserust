@@ -92,7 +92,7 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
         let mut items: Vec<&NewAuthEvent> = rows
             .iter()
             .filter(|r| f.user_id.is_none_or(|u| r.user_id == Some(u)))
-            .filter(|r| f.event_type.as_ref().is_none_or(|t| &r.event_type == t))
+            .filter(|r| f.event_type.is_none_or(|t| r.event_type == t.as_str()))
             .filter(|r| f.outcome.is_none_or(|o| r.outcome == o.as_str()))
             .collect();
         items.sort_by(|a, b| b.id.cmp(&a.id)); // id v7 DESC

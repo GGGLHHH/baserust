@@ -30,7 +30,7 @@ use crate::app::AppState;
 use crate::features::{auth, auth_audit, content, profile, users, widget};
 use crate::health;
 use crate::infra::config::Config;
-use crate::infra::error::ErrorBody;
+use crate::infra::error::{ErrorBody, ErrorCode};
 use crate::infra::openapi;
 
 /// 请求处理超时上限,超过返回 408 + 统一错误契约。
@@ -237,7 +237,11 @@ async fn timeout_or_408(
         Ok(resp) => resp,
         Err(_) => {
             tracing::warn!(timeout_secs = dur.as_secs(), "request timed out");
-            error_response(StatusCode::REQUEST_TIMEOUT, "timeout", "Request timed out")
+            error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                ErrorCode::Timeout,
+                "Request timed out",
+            )
         }
     }
 }
@@ -252,13 +256,13 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     tracing::error!(detail, "request panicked, fell back to 500");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "internal",
+        ErrorCode::Internal,
         "Internal server error",
     )
 }
 
 /// 构造与 `AppError` 同形的 `{code,error}` 响应,供 panic/timeout 这类绕过 AppError 的路径复用。
-fn error_response(status: StatusCode, code: &'static str, msg: &str) -> Response {
+fn error_response(status: StatusCode, code: ErrorCode, msg: &str) -> Response {
     let body = ErrorBody {
         code,
         error: msg.to_owned(),
@@ -272,7 +276,7 @@ fn rate_limit_response(err: GovernorError) -> Response {
         GovernorError::TooManyRequests { headers, .. } => {
             let mut resp = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
+                ErrorCode::RateLimited,
                 "Too many requests, please try again later",
             );
             if let Some(h) = headers {
@@ -282,11 +286,11 @@ fn rate_limit_response(err: GovernorError) -> Response {
         }
         GovernorError::UnableToExtractKey => error_response(
             StatusCode::BAD_REQUEST,
-            "bad_request",
+            ErrorCode::BadRequest,
             "Could not identify request source",
         ),
         GovernorError::Other { code, headers, .. } => {
-            let mut resp = error_response(code, "internal", "Rate limit error");
+            let mut resp = error_response(code, ErrorCode::Internal, "Rate limit error");
             if let Some(h) = headers {
                 resp.headers_mut().extend(h);
             }

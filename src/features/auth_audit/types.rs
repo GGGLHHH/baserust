@@ -217,7 +217,7 @@ pub struct AuthEventRow {
 #[derive(Debug, Default)]
 pub struct AuthEventQuery {
     pub user_id: Option<Uuid>,
-    pub event_type: Option<String>,
+    pub event_type: Option<AuthEventType>,
     pub outcome: Option<AuthOutcome>,
     pub ip: Option<String>,
     pub from: Option<OffsetDateTime>,

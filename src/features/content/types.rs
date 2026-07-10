@@ -1,5 +1,5 @@
 //! content 模块的 HTTP DTO —— **app 拥有的对外形状**(投影自 content 库的领域类型)。
-//! 出参 DTO:`Serialize` + `ToSchema`,`status` 投影成字符串(库里是 typed 枚举);
+//! 出参 DTO:`Serialize` + `ToSchema`,`status` 投影成闭集视图枚举(镜像库里的 typed 枚举);
 //! 入参 DTO:`Deserialize` + garde `Validate`,handler 校验后 `.into_input()` 成库的领域 input。
 //!
 //! owner/tenant 约定见 routes.rs:owner_id = 认证主体的 UUID(不入参);tenant_id 单租户脚手架默认 nil。
@@ -11,11 +11,64 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use content::{
-    Content, ContentMetadata, Object, PrepareUploadInput, SetContentMetadataInput,
-    UpdateContentInput, UploadOutcome,
+    Content, ContentMetadata, ContentStatus, Object, ObjectStatus, PrepareUploadInput,
+    SetContentMetadataInput, UpdateContentInput, UploadOutcome,
 };
 
-/// 内容主体的对外响应(投影 `content::Content`;`status` 投影成字符串)。
+/// 内容生命周期状态闭集(镜像 `content::ContentStatus` 的 wire 串;库零 HTTP 不 derive
+/// ToSchema,视图枚举归消费方 —— 见 closed-enums skill)。`From` 穷尽匹配:库加变体这里编译错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentStatusView {
+    Created,
+    Uploading,
+    Uploaded,
+    Processing,
+    Processed,
+    Failed,
+    Archived,
+}
+
+impl From<ContentStatus> for ContentStatusView {
+    fn from(s: ContentStatus) -> Self {
+        match s {
+            ContentStatus::Created => Self::Created,
+            ContentStatus::Uploading => Self::Uploading,
+            ContentStatus::Uploaded => Self::Uploaded,
+            ContentStatus::Processing => Self::Processing,
+            ContentStatus::Processed => Self::Processed,
+            ContentStatus::Failed => Self::Failed,
+            ContentStatus::Archived => Self::Archived,
+        }
+    }
+}
+
+/// 对象状态闭集(镜像 `content::ObjectStatus`;无 `Archived`,归档是内容级语义)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ObjectStatusView {
+    Created,
+    Uploading,
+    Uploaded,
+    Processing,
+    Processed,
+    Failed,
+}
+
+impl From<ObjectStatus> for ObjectStatusView {
+    fn from(s: ObjectStatus) -> Self {
+        match s {
+            ObjectStatus::Created => Self::Created,
+            ObjectStatus::Uploading => Self::Uploading,
+            ObjectStatus::Uploaded => Self::Uploaded,
+            ObjectStatus::Processing => Self::Processing,
+            ObjectStatus::Processed => Self::Processed,
+            ObjectStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+/// 内容主体的对外响应(投影 `content::Content`;`status` 投影成闭集视图)。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ContentResponse {
     pub id: Uuid,
@@ -25,8 +78,8 @@ pub struct ContentResponse {
     pub name: Option<String>,
     pub description: Option<String>,
     pub document_type: Option<String>,
-    /// 生命周期状态(created/uploading/uploaded/processing/processed/failed/archived)。
-    pub status: String,
+    /// 生命周期状态(闭集,生成前端 union)。
+    pub status: ContentStatusView,
     pub derivation_type: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -44,7 +97,7 @@ impl From<Content> for ContentResponse {
             name: c.name,
             description: c.description,
             document_type: c.document_type,
-            status: c.status.as_str().to_owned(),
+            status: c.status.into(),
             derivation_type: c.derivation_type,
             created_at: c.created_at,
             updated_at: c.updated_at,
@@ -63,7 +116,8 @@ pub struct ObjectResponse {
     pub file_name: Option<String>,
     pub version: i32,
     pub object_type: Option<String>,
-    pub status: String,
+    /// 对象状态(闭集,生成前端 union)。
+    pub status: ObjectStatusView,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -81,7 +135,7 @@ impl From<Object> for ObjectResponse {
             file_name: o.file_name,
             version: o.version,
             object_type: o.object_type,
-            status: o.status.as_str().to_owned(),
+            status: o.status.into(),
             created_at: o.created_at,
             updated_at: o.updated_at,
         }

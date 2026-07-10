@@ -59,15 +59,15 @@ impl AppError {
     }
 
     /// 机器可读错误类别 —— 前端按它分支,而非脆弱地解析人读消息。
-    fn code(&self) -> &'static str {
+    fn code(&self) -> ErrorCode {
         match self {
-            AppError::NotFound => "not_found",
-            AppError::Validation(_) => "validation",
-            AppError::BadRequest(_) => "bad_request",
-            AppError::Unauthorized => "unauthorized",
-            AppError::Conflict(_) => "conflict",
-            AppError::Forbidden => "forbidden",
-            AppError::Internal(_) => "internal",
+            AppError::NotFound => ErrorCode::NotFound,
+            AppError::Validation(_) => ErrorCode::Validation,
+            AppError::BadRequest(_) => ErrorCode::BadRequest,
+            AppError::Unauthorized => ErrorCode::Unauthorized,
+            AppError::Conflict(_) => ErrorCode::Conflict,
+            AppError::Forbidden => ErrorCode::Forbidden,
+            AppError::Internal(_) => ErrorCode::Internal,
         }
     }
 
@@ -101,12 +101,45 @@ impl AppError {
     }
 }
 
+/// 错误机器码闭集(前端按它分支;闭集生成前端 union,见 closed-enums skill)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    NotFound,
+    Validation,
+    BadRequest,
+    Unauthorized,
+    Conflict,
+    Forbidden,
+    Internal,
+    /// 仅 router 全局超时兜底路径产出(绕过 AppError)。
+    Timeout,
+    /// 仅 router 限流层产出(绕过 AppError)。
+    RateLimited,
+}
+
+impl ErrorCode {
+    /// 日志字段用的 wire 串(== serde rename;`error_code_wire_matches` 测试钉死不漂移)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::NotFound => "not_found",
+            ErrorCode::Validation => "validation",
+            ErrorCode::BadRequest => "bad_request",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::Conflict => "conflict",
+            ErrorCode::Forbidden => "forbidden",
+            ErrorCode::Internal => "internal",
+            ErrorCode::Timeout => "timeout",
+            ErrorCode::RateLimited => "rate_limited",
+        }
+    }
+}
+
 /// 统一错误响应体。pub + ToSchema:让这个契约出现在 OpenAPI,前端 codegen 能看到错误形状。
 #[derive(Serialize, ToSchema)]
 pub struct ErrorBody {
-    /// 机器可读错误类别(not_found / validation / bad_request / unauthorized / conflict / internal)
-    #[schema(value_type = String)]
-    pub code: &'static str,
+    /// 机器可读错误类别(闭集)
+    pub code: ErrorCode,
     /// 给人看的安全消息 —— 不含 SQL/解析器/路径等任何内部原始措辞
     pub error: String,
 }
@@ -118,9 +151,9 @@ impl IntoResponse for AppError {
         // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
         if let Some(detail) = self.log_detail() {
             if status.is_server_error() {
-                tracing::error!(code = self.code(), detail, "request failed");
+                tracing::error!(code = self.code().as_str(), detail, "request failed");
             } else {
-                tracing::warn!(code = self.code(), detail, "request rejected");
+                tracing::warn!(code = self.code().as_str(), detail, "request rejected");
             }
         }
         let body = ErrorBody {
@@ -188,7 +221,7 @@ mod tests {
         assert_eq!(e.client_message(), "Internal server error");
         assert!(!e.client_message().contains("widgets"));
         assert!(e.log_detail().unwrap().contains("widgets"));
-        assert_eq!(e.code(), "internal");
+        assert_eq!(e.code().as_str(), "internal");
     }
 
     #[test]
@@ -200,7 +233,7 @@ mod tests {
         let v = AppError::Validation("name: length is lower than 1".to_owned());
         assert!(v.client_message().contains("name"));
         assert!(v.log_detail().is_none());
-        assert_eq!(v.code(), "validation");
+        assert_eq!(v.code().as_str(), "validation");
     }
 
     #[test]
@@ -208,14 +241,14 @@ mod tests {
         // 401 文案必须通用:不暴露"是用户不存在还是密码错" —— 防账号枚举
         let e = AppError::Unauthorized;
         assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(e.code(), "unauthorized");
+        assert_eq!(e.code().as_str(), "unauthorized");
         assert_eq!(e.client_message(), "Authentication failed");
         assert!(e.log_detail().is_none());
 
         // Conflict:409,消息写给用户、可回传
         let c = AppError::Conflict("This email is already registered".to_owned());
         assert_eq!(c.status_code(), StatusCode::CONFLICT);
-        assert_eq!(c.code(), "conflict");
+        assert_eq!(c.code().as_str(), "conflict");
         assert_eq!(c.client_message(), "This email is already registered");
     }
 
@@ -226,5 +259,27 @@ mod tests {
         ));
         assert!(matches!(e, AppError::Unauthorized));
         assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn error_code_wire_matches() {
+        for c in [
+            ErrorCode::NotFound,
+            ErrorCode::Validation,
+            ErrorCode::BadRequest,
+            ErrorCode::Unauthorized,
+            ErrorCode::Conflict,
+            ErrorCode::Forbidden,
+            ErrorCode::Internal,
+            ErrorCode::Timeout,
+            ErrorCode::RateLimited,
+        ] {
+            let wire = serde_json::to_value(c).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(c.as_str()),
+                "{c:?}: as_str ↔ serde rename"
+            );
+        }
     }
 }

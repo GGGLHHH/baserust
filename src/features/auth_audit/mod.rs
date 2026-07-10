@@ -9,7 +9,8 @@ pub use events::AuthEventBus;
 pub use repo::{AuthEventRepo, InMemoryAuthEventRepo, PgAuthEventRepo};
 pub use retention::AuthRetentionJob;
 pub use types::{
-    AuthEventQuery, AuthEventRow, AuthEventType, AuthOutcome, AuthStats, NewAuthEvent,
+    AuthChannel, AuthEventQuery, AuthEventRow, AuthEventType, AuthOutcome, AuthStats,
+    FailureReason, NewAuthEvent,
 };
 
 use utoipa_axum::router::OpenApiRouter;

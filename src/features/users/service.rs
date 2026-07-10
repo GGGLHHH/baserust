@@ -12,10 +12,22 @@ use super::types::{
     AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, RoleView,
     SetRolesRequest, UpdateUserRequest, UserSortField,
 };
+use crate::infra::authz::RoleName;
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
 use crate::infra::sort::SortOrder;
 use idm::{PwHasher, RoleRepo, SessionRepo, UserRepo};
+
+/// idm/投影侧的角色名串 → 闭集(唯一写者是 seed;未知值 = 数据异常,炸出来,见 closed-enums skill)。
+fn parse_role_names(roles: Vec<String>) -> Vec<RoleName> {
+    roles
+        .into_iter()
+        .map(|r| {
+            r.parse()
+                .expect("角色名恒为 RoleName 已知取值(仅由 seed 写入)")
+        })
+        .collect()
+}
 
 /// `SortOrder`(app 共享)→ idm 侧排序方向。SortOrder 是本 crate 类型,orphan 规则允许。
 impl From<SortOrder> for idm::SortDir {
@@ -111,7 +123,7 @@ impl UserAdminService {
                 email: r.email,
                 email_verified: r.email_verified,
                 created_at: r.created_at,
-                roles: r.roles,
+                roles: parse_role_names(r.roles),
                 display_name: r.display_name, // 投影(可搜键)
                 avatar_url: briefs.get(&r.id).and_then(|b| b.avatar_url.clone()), // 富化(display-only)
             })
@@ -178,7 +190,7 @@ impl UserAdminService {
                     email: r.email,
                     email_verified: r.email_verified,
                     created_at: r.created_at,
-                    roles: r.roles,
+                    roles: parse_role_names(r.roles),
                     display_name: brief.and_then(|b| b.display_name.clone()),
                     avatar_url: brief.and_then(|b| b.avatar_url.clone()),
                 }
@@ -325,7 +337,7 @@ impl UserAdminService {
             email: user.email,
             email_verified: user.email_verified,
             created_at: user.created_at,
-            roles,
+            roles: parse_role_names(roles),
             display_name: brief.and_then(|b| b.display_name.clone()),
             avatar_url: brief.and_then(|b| b.avatar_url.clone()),
         })
@@ -339,11 +351,15 @@ mod tests {
     use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
     /// 内存装配:user/role repo **共享** RoleStore(否则新号角色对 list/roles_for_user 不可见);
-    /// seed 角色 admin/editor/user;FakeHasher + 空富化目录。
+    /// seed 角色 superadmin/admin/user(闭集);FakeHasher + 空富化目录。
     async fn test_service() -> UserAdminService {
         let mem_users = InMemoryUserRepo::new();
         let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
-        for (n, d) in [("admin", "Admin"), ("editor", "Editor"), ("user", "User")] {
+        for (n, d) in [
+            ("superadmin", "Superadmin"),
+            ("admin", "Admin"),
+            ("user", "User"),
+        ] {
             mem_roles.upsert(n, d, None).await.unwrap();
         }
         UserAdminService::new(
@@ -361,7 +377,14 @@ mod tests {
         let svc = test_service().await;
         // 角色现按 id 传;从目录按名取 id(存活名唯一)。
         let catalog = svc.list_roles().await.unwrap();
-        let rid = |name: &str| catalog.items.iter().find(|r| r.name == name).unwrap().id;
+        let rid = |name: &str| {
+            catalog
+                .items
+                .iter()
+                .find(|r| r.name.as_str() == name)
+                .unwrap()
+                .id
+        };
         let created = svc
             .create(
                 CreateUserRequest {
@@ -374,7 +397,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created.roles, vec!["admin".to_string()]);
+        assert_eq!(created.roles, vec![RoleName::Admin]);
 
         // 未知角色 → Validation(422)
         let e = svc
@@ -396,22 +419,22 @@ mod tests {
             .set_roles(
                 created.id,
                 SetRolesRequest {
-                    roles: vec![rid("editor"), rid("user")],
+                    roles: vec![rid("superadmin"), rid("user")],
                 },
                 None,
             )
             .await
             .unwrap();
         let mut r = after.roles.clone();
-        r.sort();
-        assert_eq!(r, vec!["editor".to_string(), "user".to_string()]);
+        r.sort_by_key(|x| x.as_str());
+        assert_eq!(r, vec![RoleName::Superadmin, RoleName::User]);
 
         // 含未知角色的 set_roles → Validation(全量原子,不留半态)
         let e = svc
             .set_roles(
                 created.id,
                 SetRolesRequest {
-                    roles: vec![rid("editor"), Uuid::now_v7()],
+                    roles: vec![rid("superadmin"), Uuid::now_v7()],
                 },
                 None,
             )
@@ -463,7 +486,12 @@ mod tests {
     async fn create_dedups_duplicate_role_ids_in_response() {
         let svc = test_service().await;
         let catalog = svc.list_roles().await.unwrap();
-        let admin = catalog.items.iter().find(|r| r.name == "admin").unwrap().id;
+        let admin = catalog
+            .items
+            .iter()
+            .find(|r| r.name == RoleName::Admin)
+            .unwrap()
+            .id;
         let created = svc
             .create(
                 CreateUserRequest {
@@ -476,7 +504,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(created.roles, vec!["admin".to_string()]);
+        assert_eq!(created.roles, vec![RoleName::Admin]);
     }
 
     fn offset_page() -> PageParams {

@@ -17,7 +17,7 @@ use super::types::{
     UserResponse,
 };
 use crate::app::state::AppState;
-use crate::features::auth_audit::AuthEventType;
+use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::Perm;
 use crate::infra::client_context::ClientContext;
@@ -98,7 +98,7 @@ pub async fn register(
         outcome.user.id,
         success_data(
             &ctx,
-            "public",
+            AuthChannel::Public,
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),
@@ -134,7 +134,7 @@ pub async fn login(
                 outcome.user.id,
                 success_data(
                     &ctx,
-                    "public",
+                    AuthChannel::Public,
                     outcome.user.id,
                     Some(outcome.session_id),
                     Some(&outcome.user.username),
@@ -149,10 +149,10 @@ pub async fn login(
         Err(idm_err) => {
             let reason = match &idm_err {
                 idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
-                    "unknown_user"
+                    FailureReason::UnknownUser
                 }
                 idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
-                    "bad_password"
+                    FailureReason::BadPassword
                 }
                 _ => return Err(idm_err.into()),
             };
@@ -160,7 +160,7 @@ pub async fn login(
                 &state.idm_outbox,
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
-                failure_data(&ctx, "public", None, Some(&identifier), reason),
+                failure_data(&ctx, AuthChannel::Public, None, Some(&identifier), reason),
             )
             .await;
             Err(idm_err.into())
@@ -191,7 +191,7 @@ pub async fn refresh(
         outcome.user.id,
         success_data(
             &ctx,
-            "public",
+            AuthChannel::Public,
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),
@@ -218,7 +218,7 @@ pub async fn logout(
                 &state.idm_outbox,
                 AuthEventType::LoggedOut,
                 session.user_id,
-                session_event_data(&ctx, "public", session.user_id, session.id, None),
+                session_event_data(&ctx, AuthChannel::Public, session.user_id, session.id, None),
             )
             .await;
         }
@@ -240,7 +240,13 @@ pub async fn logout_all(
         &state.idm_outbox,
         AuthEventType::LogoutAll,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -305,7 +311,13 @@ pub async fn delete_me(
         &state.idm_outbox,
         AuthEventType::AccountDeleted,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -332,7 +344,13 @@ pub async fn change_password(
         &state.idm_outbox,
         AuthEventType::PasswordChanged,
         user.0.id,
-        success_data(&ctx, "public", user.0.id, None, Some(&user.0.username)),
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
@@ -364,10 +382,10 @@ pub async fn admin_login(
         Err(idm_err) => {
             let reason = match &idm_err {
                 idm::IdmError::InvalidCredentials(idm::CredentialFailure::UnknownUser) => {
-                    "unknown_user"
+                    FailureReason::UnknownUser
                 }
                 idm::IdmError::InvalidCredentials(idm::CredentialFailure::BadPassword) => {
-                    "bad_password"
+                    FailureReason::BadPassword
                 }
                 _ => return Err(idm_err.into()),
             };
@@ -375,7 +393,7 @@ pub async fn admin_login(
                 &state.idm_outbox,
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
-                failure_data(&ctx, "admin", None, Some(&identifier), reason),
+                failure_data(&ctx, AuthChannel::Admin, None, Some(&identifier), reason),
             )
             .await;
             return Err(idm_err.into());
@@ -395,10 +413,10 @@ pub async fn admin_login(
             outcome.user.id,
             failure_data(
                 &ctx,
-                "admin",
+                AuthChannel::Admin,
                 Some(outcome.user.id),
                 Some(&identifier),
-                "no_admin_perm",
+                FailureReason::NoAdminPerm,
             ),
         )
         .await;
@@ -410,7 +428,7 @@ pub async fn admin_login(
         outcome.user.id,
         success_data(
             &ctx,
-            "admin",
+            AuthChannel::Admin,
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),

@@ -13,7 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::features::auth_audit::AuthEventType;
+use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
 use crate::infra::client_context::ClientContext;
 
 /// 把事件写进 idm.outbox。`outbox` 为 `None`(非 needs_idm 进程 / 测试未装)时静默跳过。
@@ -41,7 +41,7 @@ fn now_rfc3339() -> String {
 /// (读模型 `AuthEventRow.actor`),未知时传 `None`(前端回退展示 `user_id`)。
 pub fn success_data(
     ctx: &ClientContext,
-    channel: &str,
+    channel: AuthChannel,
     user_id: Uuid,
     session_id: Option<Uuid>,
     actor: Option<&str>,
@@ -64,7 +64,7 @@ pub fn success_data(
 /// `success_data` 分开一个更窄的变体,但 `user_id`/`session_id` 都带,支持按用户查审计历史。
 pub fn session_event_data(
     ctx: &ClientContext,
-    channel: &str,
+    channel: AuthChannel,
     user_id: Uuid,
     session_id: Uuid,
     actor: Option<&str>,
@@ -88,10 +88,10 @@ pub fn session_event_data(
 /// `identifier`(提交的用户名/邮箱原文,失败场景没有更可信的展示名)。
 pub fn failure_data(
     ctx: &ClientContext,
-    channel: &str,
+    channel: AuthChannel,
     user_id: Option<Uuid>,
     identifier: Option<&str>,
-    reason: &str,
+    reason: FailureReason,
 ) -> Value {
     json!({
         "occurred_at": now_rfc3339(),

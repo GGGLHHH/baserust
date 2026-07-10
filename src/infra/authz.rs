@@ -24,7 +24,7 @@ use idm::AuthUser;
 /// 权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。
 /// wire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。
 /// 加权限 = 加一个变体 + `rename`,别处不动。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Perm {
     #[serde(rename = "widgets:read")]
     WidgetRead,
@@ -218,6 +218,19 @@ impl RoleName {
                 Perm::ProfileWrite,
             ],
         }
+    }
+}
+
+/// wire 串(JWT claim / idm.roles.name)→ 枚举,给读模型强类型化用(镜像 `AuthEventType::FromStr`)。
+impl std::str::FromStr for RoleName {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "superadmin" => Self::Superadmin,
+            "admin" => Self::Admin,
+            "user" => Self::User,
+            other => return Err(format!("未知角色名: {other}")),
+        })
     }
 }
 
@@ -436,10 +449,10 @@ pub async fn require_admin_login(
 /// role 展开(含 implies)∩ scope 收窄,wire 串排序输出。
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MyPermissionsResponse {
-    /// token claim 里的角色名。
-    pub roles: Vec<String>,
-    /// 有效权限 wire 串(排序)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。
-    pub permissions: Vec<String>,
+    /// token claim 里的角色名(闭集,生成前端 union)。
+    pub roles: Vec<RoleName>,
+    /// 有效权限(闭集,wire 串序输出)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。
+    pub permissions: Vec<Perm>,
 }
 
 /// 当前令牌能干什么(仅登录零 perm —— 自我操作范式;问"能干什么"本身不需要先有权限)。
@@ -459,18 +472,23 @@ pub async fn get_my_permissions(
     user: crate::infra::audit::CurrentUser,
     scope: TokenScope,
 ) -> crate::infra::extract::Json<MyPermissionsResponse> {
-    let mut permissions: Vec<String> = state
+    let mut permissions: Vec<Perm> = state
         .policy
         .perms_for(&user.0.roles)
         .into_iter()
         .filter(|&p| state.policy.require_scoped(&user.0, &scope.0, p).is_ok())
-        .map(|p| p.wire())
         .collect();
-    permissions.sort();
-    crate::infra::extract::Json(MyPermissionsResponse {
-        roles: user.0.roles.clone(),
-        permissions,
-    })
+    permissions.sort_by_key(|p| p.wire()); // 仍按 wire 串序,JSON 输出不变
+    let roles = user
+        .0
+        .roles
+        .iter()
+        .map(|r| {
+            r.parse()
+                .expect("claim 角色恒为 RoleName 已知取值(仅由 idm 按闭集签发)")
+        })
+        .collect();
+    crate::infra::extract::Json(MyPermissionsResponse { roles, permissions })
 }
 
 /// 本端点的 router,composition root 挂 frontend 组(app 进程,policy 权威侧)。
