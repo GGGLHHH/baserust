@@ -3,8 +3,6 @@
 //! `#[utoipa::path]` **不手写 security** —— op_perms 经 `inject_operation_security` 注入。
 //! path 相对 admin 组(nest 加 `/api/v1/admin/auth`)→ 实际 `/api/v1/admin/auth/users*`。
 
-use std::collections::HashMap;
-
 use axum::extract::State;
 use axum::http::StatusCode;
 use idm::AuthUser;
@@ -66,22 +64,11 @@ fn assert_self_keeps_admin(
     Ok(())
 }
 
-/// 把角色 id 解析成名字(经 list_roles 目录)。未知 id 跳过(交 service 走 422)。
-/// 提权/自锁判定要角色名(→ 经 policy 展成权限);故先解析。
+/// 把角色 id 解析成**原始**名字(未过滤;未知 id 跳过,交 service 走 422)。
+/// 提权/自锁判定要角色名(→ 经 policy 展成权限);必须与 service 落库校验用同一份未过滤目录,
+/// 否则闭集外存量角色会从守卫视野消失、却照样落库 —— 提权闸被绕过。
 async fn role_names_of(state: &AppState, role_ids: &[Uuid]) -> Result<Vec<String>, AppError> {
-    if role_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let catalog = state.user_admin.list_roles().await?;
-    let by_id: HashMap<Uuid, String> = catalog
-        .items
-        .into_iter()
-        .map(|r| (r.id, r.name.as_str().to_owned()))
-        .collect();
-    Ok(role_ids
-        .iter()
-        .filter_map(|id| by_id.get(id).cloned())
-        .collect())
+    state.user_admin.role_names_by_ids(role_ids).await
 }
 
 /// 分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。

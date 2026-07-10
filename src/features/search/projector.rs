@@ -108,6 +108,9 @@ impl Projector {
                 pull::Config {
                     durable_name: Some(durable_name.to_owned()),
                     ack_policy: AckPolicy::Explicit,
+                    // 必须盖过 run() 退避梯子的单次最长 sleep(512s):默认 30s 会让服务端
+                    // 在原地重试期间判超时重投,副本绕过"保序"且末尾 ack 消不掉它们。
+                    ack_wait: std::time::Duration::from_secs(600),
                     ..Default::default()
                 },
             )
@@ -165,6 +168,10 @@ impl Projector {
                                 let backoff = std::time::Duration::from_secs(1 << attempt.min(9));
                                 attempt += 1;
                                 tracing::warn!(error = %err, attempt, ?backoff, "projector apply 暂时失败,退避后原地重试(保序)");
+                                // 续期 ack_wait(WIP):告诉服务端"还在处理",跨多轮退避不被重投。
+                                if let Err(e) = msg.ack_with(jetstream::AckKind::Progress).await {
+                                    tracing::warn!(error = %e, "ack Progress 续期失败(重投风险,幂等守卫兜底)");
+                                }
                                 tokio::select! {
                                     _ = tokio::time::sleep(backoff) => {}
                                     changed = shutdown.changed() => {

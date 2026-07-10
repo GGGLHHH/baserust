@@ -65,6 +65,8 @@ pub struct Config {
 
     /// 信任的反向代理层数(nginx 等),`TRUSTED_PROXY_HOPS`,默认 1。
     /// `ClientContext` 解析真实客户端 IP 时,按此值从 X-Forwarded-For 右数第 (N+1) 跳取值(防伪造最左)。
+    /// **直连暴露(前面没有反代)必须设 0**:否则客户端自造的单条 XFF 恰是"右数第 1 跳"而被当可信
+    /// —— 审计 IP 与限流键(TrustedIpKeyExtractor)都会吃到伪造值。
     #[serde(default = "default_trusted_proxy_hops")]
     pub trusted_proxy_hops: usize,
 

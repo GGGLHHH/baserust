@@ -36,40 +36,28 @@ pub(crate) fn floor_hour(t: OffsetDateTime) -> OffsetDateTime {
     t.replace_time(Time::from_hms(t.hour(), 0, 0).expect("hour 0-23 恒合法"))
 }
 
-pub(crate) fn to_row(e: &NewAuthEvent) -> AuthEventRow {
-    AuthEventRow {
+/// `NewAuthEvent`(写模型,String)→ 读模型强类型行。**唯一的闭集解析权威**:
+/// projector 在信任边界用它(Err → Poison);内存 repo 读侧 expect(单写者不变量,
+/// 数据异常就炸,见 types.rs 头注;pg 侧走 sqlx::Type 的 Decode 走不到这里)。
+pub(crate) fn to_row(e: &NewAuthEvent) -> Result<AuthEventRow, String> {
+    Ok(AuthEventRow {
         id: e.id,
-        // event_type 只由本仓 auth::emit 写入,恒是 AuthEventType 的合法串(pg 侧走 sqlx::Type
-        // 的 Decode 走不到这里;这里 parse 失败 = 数据异常,炸出来而非静默吞掉,见 types.rs 头注)。
-        event_type: e
-            .event_type
-            .parse()
-            .expect("event_type 恒为 AuthEventType 已知取值(仅由本仓 emit 写入)"),
+        event_type: e.event_type.parse()?,
         occurred_at: e.occurred_at,
-        // channel/outcome/failure_reason:同 event_type,恒为本仓 emit 产出的合法串,见 types.rs 头注。
-        channel: e
-            .channel
-            .parse()
-            .expect("channel 恒为 AuthChannel 已知取值(仅由本仓 emit 写入)"),
+        channel: e.channel.parse()?,
         user_id: e.user_id,
         identifier_attempted: e.identifier_attempted.clone(),
         session_id: e.session_id,
         actor: e.actor.clone(),
-        outcome: e
-            .outcome
-            .parse()
-            .expect("outcome 恒为 AuthOutcome 已知取值(仅由本仓 emit 写入)"),
-        failure_reason: e.failure_reason.as_deref().map(|r| {
-            r.parse()
-                .expect("failure_reason 恒为 FailureReason 已知取值(仅由本仓 emit 写入)")
-        }),
+        outcome: e.outcome.parse()?,
+        failure_reason: e.failure_reason.as_deref().map(str::parse).transpose()?,
         ip: e.ip.map(|i| i.to_string()),
         user_agent: e.user_agent.clone(),
         country: None,
         city: None,
         os: None,
         browser: None,
-    }
+    })
 }
 
 #[async_trait]
@@ -96,7 +84,10 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
             .filter(|r| f.outcome.is_none_or(|o| r.outcome == o.as_str()))
             .collect();
         items.sort_by(|a, b| b.id.cmp(&a.id)); // id v7 DESC
-        let out: Vec<AuthEventRow> = items.iter().map(|e| to_row(e)).collect();
+        let out: Vec<AuthEventRow> = items
+            .iter()
+            .map(|e| to_row(e).expect("闭集串恒合法(仅由本仓 emit/投影校验后写入)"))
+            .collect();
         match page {
             PageParams::Offset {
                 page,

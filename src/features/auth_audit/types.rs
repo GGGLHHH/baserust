@@ -228,7 +228,7 @@ pub struct AuthEventRow {
 #[serde(default)]
 #[into_params(parameter_in = Query)]
 pub struct AuthEventFilter {
-    /// 事件类型(闭集;未知值 → 422 而非静默空结果)。
+    /// 事件类型(闭集;未知值在 Query 提取器被拒 → 400 bad_request,而非静默空结果)。
     pub event_type: Option<AuthEventType>,
     pub outcome: Option<AuthOutcome>,
     pub ip: Option<String>,

@@ -68,13 +68,21 @@ impl ProfileService {
         Ok((created, self.enrich(p).await))
     }
 
-    /// 富化 avatar_url:就绪 → 相对 preview 路径;悬空/未就绪 → null;
+    /// 富化 avatar_url:就绪**且 image/\***→ 相对 preview 路径;悬空/未就绪/已非图片 → null;
     /// **探测故障也 → null + warn**(读路径不因旁路故障炸——与写前校验的 500 刻意相反)。
+    /// mime 口径与 content preview 的非 owner 守卫一致:owner 事后把 mime 改掉,别人本就取不到
+    /// 该 URL(404)—— 广播一个取不到的地址比广播 null 更糟(全站头像对他人静默破图)。
     async fn enrich(&self, p: Profile) -> ProfileResponse {
         let avatar_url = match p.avatar_content_id {
             None => None,
             Some(cid) => match self.avatars.probe(cid).await {
-                Ok(Some(info)) if info.ready => {
+                Ok(Some(info))
+                    if info.ready
+                        && info
+                            .mime_type
+                            .as_deref()
+                            .is_some_and(|m| m.starts_with("image/")) =>
+                {
                     Some(format!("/api/v1/frontend/contents/{cid}/preview"))
                 }
                 Ok(_) => None,

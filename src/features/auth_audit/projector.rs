@@ -15,9 +15,7 @@ use uuid::Uuid;
 
 use super::events::AuthEventBus;
 use super::repo::{to_row, AuthEventRepo};
-use super::types::{
-    AuthChannel, AuthEventRow, AuthEventType, AuthOutcome, FailureReason, NewAuthEvent,
-};
+use super::types::{AuthEventRow, AuthEventType, NewAuthEvent};
 use crate::infra::jetstream::STREAM_NAME;
 
 #[derive(Debug, Deserialize)]
@@ -190,17 +188,6 @@ impl AuthEventProjector {
         }
         let d: AuthEventData = serde_json::from_value(env.data)
             .map_err(|e| ApplyError::Poison(format!("{} data: {e}", env.r#type)))?;
-        // 闭集校验在信任边界:wire 来的串必须落在枚举内,否则 Poison —— 不能等到
-        // to_row 的 expect 炸 panic(那些 expect 只为"本仓 emit 写入"的不变量背书)。
-        d.channel
-            .parse::<AuthChannel>()
-            .map_err(ApplyError::Poison)?;
-        d.outcome
-            .parse::<AuthOutcome>()
-            .map_err(ApplyError::Poison)?;
-        if let Some(r) = &d.failure_reason {
-            r.parse::<FailureReason>().map_err(ApplyError::Poison)?;
-        }
         let new = NewAuthEvent {
             id: Uuid::now_v7(),
             event_type: env.r#type,
@@ -219,7 +206,9 @@ impl AuthEventProjector {
             request_id: d.request_id,
             event_seq: env.seq,
         };
-        let row = to_row(&new);
+        // 闭集校验在信任边界:to_row 是唯一解析权威,wire 串不在枚举内 → Poison
+        // (语义非法的 payload 不落库、不 panic)。
+        let row = to_row(&new).map_err(ApplyError::Poison)?;
         let inserted = repo.insert(&new).await.map_err(ApplyError::Transient)?;
         // 重投被幂等吞掉 → 不再 SSE 发布(row.id 是本次新造的,库里根本不存在)。
         Ok(inserted.then_some(row))

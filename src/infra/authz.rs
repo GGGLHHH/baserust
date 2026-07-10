@@ -244,12 +244,19 @@ impl RoleName {
     /// 跳过 + warn,绝不 panic —— 一行脏数据不该打挂整个读路径(login/me/用户列表/权限清单)。
     /// closed-enums skill 的「数据异常就炸」只背书单写者不变量;角色行存在版本偏斜面(旧 seed、运维手改)。
     pub fn parse_lossy<I: IntoIterator<Item = String>>(roles: I) -> Vec<RoleName> {
+        // warn 每进程每名一次:该函数在热读路径(list 每行 / me 每请求),一条存量脏角色
+        // 会持续刷屏 —— 去重后仍保留首个信号供排障。
+        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
         roles
             .into_iter()
             .filter_map(|r| match r.parse() {
                 Ok(role) => Some(role),
                 Err(_) => {
-                    tracing::warn!(role = %r, "角色名不在 RoleName 闭集内,读模型跳过(存量脏数据?)");
+                    let warned = WARNED.get_or_init(Default::default);
+                    if warned.lock().unwrap().insert(r.clone()) {
+                        tracing::warn!(role = %r, "角色名不在 RoleName 闭集内,读模型跳过(存量脏数据?)");
+                    }
                     None
                 }
             })
@@ -261,12 +268,11 @@ impl RoleName {
 impl std::str::FromStr for RoleName {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "superadmin" => Self::Superadmin,
-            "admin" => Self::Admin,
-            "user" => Self::User,
-            other => return Err(format!("未知角色名: {other}")),
-        })
+        // 经 ALL × as_str 查表:不再手写第三份 wire 映射(serde rename / as_str 之外),加变体零改动。
+        RoleName::ALL
+            .into_iter()
+            .find(|r| r.as_str() == s)
+            .ok_or_else(|| format!("未知角色名: {s}"))
     }
 }
 

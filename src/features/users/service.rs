@@ -264,7 +264,22 @@ impl UserAdminService {
         // 发 outbox 事件,却仍在末尾 get() 才报 404(幽灵事件 + 清掉软删用户的角色行)。
         self.users.find_by_id(id).await?;
         // 校验 id 都存在(未知 → 422),再原子替换。get() 会重取名字组装视图。
-        self.resolve_role_names(&req.roles).await?;
+        let new_names = self.resolve_role_names(&req.roles).await?;
+        // 读改写防丢:闭集外存量角色在读模型/目录里都不可见(parse_lossy 跳过),按所见全量
+        // 替换会把它静默剥除且无从补选 —— fail-closed 409,提示先清数据(或显式带上该角色 id)。
+        let stripped: Vec<String> = self
+            .roles
+            .roles_for_user(id)
+            .await?
+            .into_iter()
+            .filter(|n| n.parse::<RoleName>().is_err() && !new_names.contains(n))
+            .collect();
+        if !stripped.is_empty() {
+            return Err(AppError::Conflict(format!(
+                "user holds roles outside the closed set: {} — resolve the data anomaly (or include them explicitly) before replacing roles",
+                stripped.join(", ")
+            )));
+        }
         self.roles.set_roles(id, &req.roles, by).await?;
         self.get(id).await
     }
@@ -302,6 +317,23 @@ impl UserAdminService {
         // 会话仍可续签 → 改密到 refresh TTL 才真生效。对齐 idm 自助 change_password(那边也 `?`)。
         self.sessions.revoke_all(id, None).await?;
         Ok(())
+    }
+
+    /// 角色 id → **原始**角色名(未过滤,未知 id 跳过;落库校验由 `resolve_role_names` 的 422 兜)。
+    /// 提权/自锁守卫用:守卫必须看见全部角色名(含闭集外存量角色)—— 若经闭集过滤的目录解析,
+    /// 脏角色会从守卫视野里消失,而 set_roles 仍按未过滤目录放行落库 → 提权闸被绕过。
+    pub async fn role_names_by_ids(&self, ids: &[Uuid]) -> Result<Vec<String>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let by_id: HashMap<Uuid, String> = self
+            .roles
+            .list()
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r.name))
+            .collect();
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     /// 角色 id → name 解析。校验每个 id 都在存活目录里,未知 id → `Validation`(422)。
@@ -735,5 +767,64 @@ mod tests {
             "username 过滤应透传给投影后端,不该被静默丢弃"
         );
         assert_eq!(got.q.as_deref(), Some("wonder"));
+    }
+
+    /// 读改写防丢 + 守卫可见性:闭集外存量角色(读模型/目录均不可见)——
+    /// 全量替换若会静默剥除它 → 409;显式带上该 id → 放行;守卫解析(role_names_by_ids)能看见原始名。
+    #[tokio::test]
+    async fn set_roles_fails_closed_on_legacy_role_strip() {
+        let mem_users = InMemoryUserRepo::new();
+        let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
+        let mut ids = std::collections::HashMap::new();
+        for (n, d) in [("admin", "Admin"), ("user", "User"), ("editor", "Editor")] {
+            ids.insert(n, mem_roles.upsert(n, d, None).await.unwrap());
+        }
+        let svc = UserAdminService::new(
+            Arc::new(mem_users),
+            Arc::new(mem_roles),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(FakeHasher),
+            Arc::new(StaticProfileDirectory::empty()),
+            None,
+        );
+        // 守卫解析走未过滤目录:editor 原始名可见(闭集过滤的目录会让提权闸失明)
+        let names = svc.role_names_by_ids(&[ids["editor"]]).await.unwrap();
+        assert_eq!(names, vec!["editor".to_string()]);
+
+        // 建号直接带存量角色(模拟旧部署遗留分配行)
+        let u = svc
+            .create(
+                CreateUserRequest {
+                    username: "legacy".into(),
+                    email: None,
+                    password: "password123".into(),
+                    roles: vec![ids["editor"], ids["user"]],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        // 不带 editor 的全量替换 → 409(防按"所见"读改写静默剥除)
+        let e = svc
+            .set_roles(
+                u.id,
+                SetRolesRequest {
+                    roles: vec![ids["admin"]],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, AppError::Conflict(_)), "应 409,得 {e:?}");
+        // 显式带上 editor → 放行
+        svc.set_roles(
+            u.id,
+            SetRolesRequest {
+                roles: vec![ids["admin"], ids["editor"]],
+            },
+            None,
+        )
+        .await
+        .unwrap();
     }
 }

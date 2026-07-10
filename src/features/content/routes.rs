@@ -41,16 +41,28 @@ async fn fetch_content_owned(
     all_perm: Perm,
     id: Uuid,
 ) -> Result<content::Content, AppError> {
-    let c = state.contents.get_content(id).await?;
-    if state
-        .policy
-        .data_access(user, scope, all_perm)
-        .allows(c.owner_id)
-    {
+    let (c, owned) = fetch_content_with_access(state, user, scope, all_perm, id).await?;
+    if owned {
         Ok(c)
     } else {
         Err(AppError::NotFound)
     }
+}
+
+/// 同上,但把 ownership 判定交还调用方(preview 需要"非 owner 但 image 放行"的折中)。
+async fn fetch_content_with_access(
+    state: &AppState,
+    user: &idm::AuthUser,
+    scope: &[Perm],
+    all_perm: Perm,
+    id: Uuid,
+) -> Result<(content::Content, bool), AppError> {
+    let c = state.contents.get_content(id).await?;
+    let owned = state
+        .policy
+        .data_access(user, scope, all_perm)
+        .allows(c.owner_id);
+    Ok((c, owned))
 }
 
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。
@@ -191,6 +203,8 @@ pub async fn upload_content(
 
 /// 列当前用户的内容(单租户:tenant=nil)。需 `contents:read`。
 /// 所有权固有:service 按 (owner_id, tenant_id) 列,只回自己创建的。
+/// ponytail: `contents:read:all` 在此**不生效**(content 库 list 签名强制 owner,无"列全部"入口);
+/// 单条端点已按 mode 放行。要让越权读贯通列表,需 content 库 list 的 owner 参数改 Option。
 #[utoipa::path(
     get,
     path = "/contents",
@@ -250,7 +264,7 @@ pub async fn get_content(
         (status = 200, description = "已更新", body = ContentResponse),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:write 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]
@@ -284,7 +298,7 @@ pub async fn update_content(
         (status = 204, description = "已软删除"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:delete 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody)
+        (status = 404, description = "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)", body = ErrorBody)
     )
 )]
 pub async fn delete_content(
@@ -314,7 +328,7 @@ pub async fn delete_content(
         (status = 200, description = "字节流(Content-Type/Disposition 取自元数据)", content_type = "application/octet-stream"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
-        (status = 404, description = "不存在 / 无可下载对象", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人且无 contents:read:all / 无可下载对象(不区分,防泄露存在)", body = ErrorBody),
         (status = 409, description = "内容未就绪(状态不允许下载)", body = ErrorBody)
     )
 )]
@@ -388,19 +402,17 @@ pub async fn preview_content(
     // ownership 折中:preview 与 download 指向同一原始对象字节,全开会让 404 守卫被
     // 兄弟端点整体绕过(任意文档可越权拉取)。头像跨用户展示又必须保留 —— 故:
     // owner / read:all → 任意类型可预览;其他人只放行 image/*(头像场景),其余 404。
-    let c = state.contents.get_content(id).await?;
-    let owned = state
-        .policy
-        .data_access(&user.0, &scope.0, Perm::ContentReadAll)
-        .allows(c.owner_id);
+    // owner 事后改/清 metadata.mime → 对他人即刻收回可见性(profile 富化同口径,见 enrich)。
+    let (_c, owned) =
+        fetch_content_with_access(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
     if !owned {
-        let is_image = state
-            .contents
-            .get_content_metadata(id)
-            .await
-            .ok()
-            .and_then(|m| m.mime_type)
-            .is_some_and(|m| m.starts_with("image/"));
+        // 只把 NotFound 折叠成"非图片";瞬时故障(池耗尽/切换)必须 5xx 上抛,
+        // 折成 404 会让前端把头像当"不存在"缓存、运维丢告警。
+        let is_image = match state.contents.get_content_metadata(id).await {
+            Ok(m) => m.mime_type.is_some_and(|m| m.starts_with("image/")),
+            Err(content::ContentError::NotFound) => false,
+            Err(e) => return Err(e.into()),
+        };
         if !is_image {
             return Err(AppError::NotFound); // 同 get/download:不泄露存在
         }
@@ -473,7 +485,7 @@ pub async fn list_content_objects(
         (status = 200, description = "内容元数据", body = ContentMetadataResponse),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
-        (status = 404, description = "无元数据", body = ErrorBody)
+        (status = 404, description = "不存在 / 非本人且无 contents:read:all / 无元数据(不区分,防泄露存在)", body = ErrorBody)
     )
 )]
 pub async fn get_content_metadata(
@@ -500,7 +512,7 @@ pub async fn get_content_metadata(
         (status = 204, description = "已设置"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:write 权限", body = ErrorBody),
-        (status = 404, description = "内容不存在", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]
@@ -581,7 +593,7 @@ pub async fn prepare_upload(
         (status = 200, description = "已销账(uploaded)", body = ContentResponse),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:write 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)", body = ErrorBody),
         (status = 409, description = "字节未落桶(先传再销账)", body = ErrorBody)
     )
 )]
