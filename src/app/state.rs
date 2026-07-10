@@ -244,11 +244,16 @@ impl AppState {
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
 
         // 授权策略(归 app),**可拔插**(同 widget):设了 APP_DB_HOST → 读 app schema 的 role_permissions 表
-        // (role→权限可运行时改);否则从 seed.toml 派生内存 Policy。dev(seed_on_start)先幂等灌表。
+        // (role→权限可运行时改);否则从 seed.toml 派生内存 Policy。
         // 注:prod 分进程 Idm 时 needs_app=false、app_pool=None → 走内存(idm 进程只 gate /me,够用)。
+        //
+        // **词表幂等同步不门控 seed_on_start**:prod+dev 只要连了 app 库就在启动跑 seed_authz。
+        // 它把 `Perm` 代码闭集投影进 permissions/role_permissions,ON CONFLICT 只增补、不覆盖
+        // 运行期改动(admin 后台编辑安全)、无密钥非敏感 —— 加权限变体重启即自动进表,无需迁移/手工 seed。
+        // 与账号+密码 seed(下方 seed_on_start 门控,prod 不自动建超管)刻意解耦:那个才是"避免启动期意外写库"的对象。
         let policy = Arc::new(match &app_pool {
             Some(pool) => {
-                if needs_app && config.seed_on_start() {
+                if needs_app {
                     super::policy_repo::seed_authz(pool, &seed).await?;
                 }
                 super::policy_repo::load_policy(pool).await?
