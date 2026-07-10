@@ -436,7 +436,10 @@ async fn list_filter_sort_page() {
 
     // cursor 模式(空 cursor = 首页)+ 非默认 sort_by → 422(keyset 恒按 id,排序仅 offset)。
     let resp = app
-        .oneshot(get("/api/v1/admin/auth/users?cursor=&sort_by=username", &sa))
+        .oneshot(get(
+            "/api/v1/admin/auth/users?cursor=&sort_by=username",
+            &sa,
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -492,7 +495,10 @@ async fn list_memory_fallback_rejects_q_and_display_name_sort() {
     );
 
     // plain(无 q、默认 sort)→ 200,回退 idm 直查照常
-    let resp = app.oneshot(get("/api/v1/admin/auth/users", &sa)).await.unwrap();
+    let resp = app
+        .oneshot(get("/api/v1/admin/auth/users", &sa))
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -565,7 +571,10 @@ async fn get_update_delete() {
     // GET 随机 uuid → 404
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/admin/auth/users/{}", Uuid::now_v7()), &sa))
+        .oneshot(get(
+            &format!("/api/v1/admin/auth/users/{}", Uuid::now_v7()),
+            &sa,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "不存在应 404");
@@ -701,7 +710,10 @@ async fn admin_profile_get_put_under_users_admin() {
 
     // admin(只有 admin:login,无 users:admin)→ 403
     let resp = app
-        .oneshot(get(&format!("/api/v1/admin/auth/users/{id}/profile"), &admin))
+        .oneshot(get(
+            &format!("/api/v1/admin/auth/users/{id}/profile"),
+            &admin,
+        ))
         .await
         .unwrap();
     assert_eq!(

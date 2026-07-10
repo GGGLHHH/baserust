@@ -147,7 +147,9 @@ impl Perm {
             Perm::ContentWrite => "创建 / 上传 / 修改内容与元数据",
             Perm::ContentDelete => "删除内容",
             Perm::UsersAdmin => "用户管理(superadmin 专属)",
-            Perm::AdminLogin => "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)",
+            Perm::AdminLogin => {
+                "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)"
+            }
             Perm::ProfileRead => "查看任意用户资料",
             Perm::ProfileWrite => "修改自己的资料",
             Perm::ProfileWriteAll => "修改任何人的资料(而非仅自己)",
@@ -508,7 +510,11 @@ mod tests {
     fn role_name_wire_matches() {
         for r in RoleName::ALL {
             let wire = serde_json::to_value(r).unwrap();
-            assert_eq!(wire.as_str(), Some(r.as_str()), "{r:?}: as_str ↔ serde rename");
+            assert_eq!(
+                wire.as_str(),
+                Some(r.as_str()),
+                "{r:?}: as_str ↔ serde rename"
+            );
         }
         assert_eq!(
             RoleName::Superadmin.default_permissions().len(),

@@ -31,7 +31,11 @@ pub fn resolve_client_ip(
         return peer;
     }
     if let Some(xff) = xff {
-        let hops: Vec<&str> = xff.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let hops: Vec<&str> = xff
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         if let Some(ip) = hops
             .len()
             .checked_sub(trusted_hops)
@@ -96,24 +100,36 @@ mod tests {
     #[test]
     fn single_nginx_takes_the_appended_client_entry() {
         // nginx `$proxy_add_x_forwarded_for` 单条 = 客户端真实 IP;信 1 层 → 取它。
-        assert_eq!(resolve_client_ip(Some("203.0.113.9"), None, None, 1), Some(ip("203.0.113.9")));
+        assert_eq!(
+            resolve_client_ip(Some("203.0.113.9"), None, None, 1),
+            Some(ip("203.0.113.9"))
+        );
     }
 
     #[test]
     fn two_hops_ignore_client_forged_leftmost() {
         // 客户端伪造 1.2.3.4;CDN 追加真实客户端 203.0.113.9;nginx 追加 CDN 10.0.0.1。信 2 层 → XFF[len-2]。
         let xff = "1.2.3.4, 203.0.113.9, 10.0.0.1";
-        assert_eq!(resolve_client_ip(Some(xff), None, None, 2), Some(ip("203.0.113.9")));
+        assert_eq!(
+            resolve_client_ip(Some(xff), None, None, 2),
+            Some(ip("203.0.113.9"))
+        );
     }
 
     #[test]
     fn falls_back_to_real_ip_then_peer_never_forged() {
-        assert_eq!(resolve_client_ip(None, Some("198.51.100.7"), None, 1), Some(ip("198.51.100.7")));
+        assert_eq!(
+            resolve_client_ip(None, Some("198.51.100.7"), None, 1),
+            Some(ip("198.51.100.7"))
+        );
         let peer = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
         assert_eq!(resolve_client_ip(None, None, Some(peer), 1), Some(peer));
         assert_eq!(resolve_client_ip(None, None, None, 1), None);
         // trusted_hops=0 → 只信 peer,忽略客户端自送 XFF。
-        assert_eq!(resolve_client_ip(Some("9.9.9.9"), None, Some(peer), 0), Some(peer));
+        assert_eq!(
+            resolve_client_ip(Some("9.9.9.9"), None, Some(peer), 0),
+            Some(peer)
+        );
         // XFF 短于可信层数 → 不退回伪造的最左值,落回退(此处无 real/peer → None)。
         assert_eq!(resolve_client_ip(Some("1.2.3.4"), None, None, 2), None);
     }
@@ -128,6 +144,9 @@ mod tests {
         );
         // 无 real_ip 时继续退到 peer。
         let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
-        assert_eq!(resolve_client_ip(Some("1.2.3.4"), None, Some(peer), 2), Some(peer));
+        assert_eq!(
+            resolve_client_ip(Some("1.2.3.4"), None, Some(peer), 2),
+            Some(peer)
+        );
     }
 }

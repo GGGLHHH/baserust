@@ -154,7 +154,10 @@ impl ListUsersFilter {
 
     /// 反选角色名(wire 串)。
     pub fn roles_none(&self) -> Vec<String> {
-        self.role_not.iter().map(|r| r.as_str().to_owned()).collect()
+        self.role_not
+            .iter()
+            .map(|r| r.as_str().to_owned())
+            .collect()
     }
 }
 
