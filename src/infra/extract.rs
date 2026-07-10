@@ -69,6 +69,24 @@ where
     }
 }
 
+/// multipart 表单提取器。边界/Content-Type 拒绝(如 InvalidBoundary)→ `AppError::BadRequest`
+/// (400 + 统一 JSON),不再漏 axum 的纯文本响应。字段级读取错误仍由 handler 逐字段处理。
+pub struct Multipart(pub axum::extract::Multipart);
+
+impl<S> FromRequest<S> for Multipart
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Multipart::from_request(req, state).await {
+            Ok(mp) => Ok(Self(mp)),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+        }
+    }
+}
+
 /// 同名 `Json` 既是提取器(上面 FromRequest),也是响应体:委托 axum::Json 序列化。
 /// 这样 handler 的参数和返回值都能统一用 `crate::infra::extract::Json`。
 impl<T: Serialize> IntoResponse for Json<T> {

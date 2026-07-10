@@ -3,7 +3,7 @@
 //! 越权失败给 **403 而非 404** —— profile 本就任意可读,存在性不敏感,藏 404 无意义
 //! (对比 widget GET 的 404:那里 ownership 是可见性,这里只是写权)。
 
-use axum::extract::{Multipart, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
-use crate::infra::extract::{Json, Path};
+use crate::infra::extract::{Json, Multipart, Path};
 
 /// 读任意用户的资料(需 `profiles:read`;所有登录角色都有)。
 /// 注意:响应含 phone 等 PII,"任意登录可读"是脚手架的刻意选择——收紧时给 GET 加 ownership 或拆敏感字段视图。
@@ -185,7 +185,7 @@ pub async fn set_user_avatar(
     scope: TokenScope,
     ctx: AuditContext,
     Path(id): Path<Uuid>,
-    mut multipart: Multipart,
+    Multipart(mut multipart): Multipart,
 ) -> Result<Json<ProfileResponse>, AppError> {
     state
         .policy

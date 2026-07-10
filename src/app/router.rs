@@ -15,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::SmartIpKeyExtractor;
+use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::{GovernorError, GovernorLayer};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
@@ -141,11 +141,15 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
 
     // 限流(opt-in,RATE_LIMIT_ENABLED):按 IP 令牌桶,超限 429 + 统一 ErrorBody。
     // 加在最外(请求最先过),IP 滥用在鉴权/业务前就挡;429 经 error_handler 出错误契约。
+    // 键提取复用 resolve_client_ip 的"信 N 层反代"语义 —— SmartIpKeyExtractor 信 XFF 最左
+    // (客户端可伪造,每请求换一个假 IP 即绕过限流),不可用。
     let router = if config.rate_limit_enabled {
         let gov = GovernorConfigBuilder::default()
             .per_second(config.rate_limit_per_sec as u64)
             .burst_size(config.rate_limit_burst)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(TrustedIpKeyExtractor {
+                trusted_hops: config.trusted_proxy_hops,
+            })
             .finish()
             .expect("限流配置应合法");
         router.layer(GovernorLayer::new(gov).error_handler(rate_limit_response))
@@ -270,6 +274,29 @@ fn error_response(status: StatusCode, code: ErrorCode, msg: &str) -> Response {
         error: msg.to_owned(),
     };
     (status, Json(body)).into_response()
+}
+
+/// 限流键 = 可信客户端 IP(与审计同源:`resolve_client_ip` 按"信任 N 层反代"取
+/// `XFF[len-N]`,拒最左伪造值;缺头回退 X-Real-IP → socket peer)。取不到键 → 400。
+#[derive(Clone)]
+struct TrustedIpKeyExtractor {
+    trusted_hops: usize,
+}
+
+impl KeyExtractor for TrustedIpKeyExtractor {
+    type Key = std::net::IpAddr;
+
+    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
+        let headers = req.headers();
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        let real_ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+        let peer = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        crate::infra::client_context::resolve_client_ip(xff, real_ip, peer, self.trusted_hops)
+            .ok_or(GovernorError::UnableToExtractKey)
+    }
 }
 
 /// 限流超限 → 统一 `ErrorBody`,透传 governor 的 retry-after 等 header(错误契约也覆盖限流)。

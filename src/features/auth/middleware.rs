@@ -4,7 +4,7 @@
 //! - `CurrentUser` 提取器(受保护端点)读不到 → 401;
 //! - `AuditContext` 读不到 → 降级 `Anonymous`(created_by 写 NULL)。
 //!
-//! token 校验是这里**唯一**的真相源(`AuthService::authenticate_token`),提取器只读 extension。
+//! token 校验是这里**唯一**的真相源(`AppTokenVerifier::verify_with_scope`),提取器只读 extension。
 //! 具体 over `AppState`(直接持 `AuthService`)—— 不再需要 idm 旧版的 `HasAuth` 泛型机关。
 
 use axum::extract::{Request, State};
@@ -27,11 +27,10 @@ pub async fn authenticate(
         .map(|c| c.value().to_owned())
         .or_else(|| bearer_token(&req).map(str::to_owned));
     if let Some(token) = token {
-        if let Ok(user) = state.auth.authenticate_token(&token) {
+        // 单次验签同时出身份 + scope(热路径;语义 == idm::authenticate_token + scope_of)。
+        if let Ok((user, scope)) = state.token_verifier.verify_with_scope(&token) {
             req.extensions_mut().insert(user);
-            // 身份验过后,把 app 自有的 scope claim 读进 extensions(idm 的 VerifiedToken 不带 scope)。
-            req.extensions_mut()
-                .insert(TokenScope(state.token_verifier.scope_of(&token)));
+            req.extensions_mut().insert(TokenScope(scope));
         }
     }
     next.run(req).await

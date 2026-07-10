@@ -126,12 +126,32 @@ impl AppTokenVerifier {
         Self::from_pem(crate::infra::config::DEV_JWT_PUBLIC_KEY_PEM).expect("内嵌 dev 公钥必然合法")
     }
 
-    /// 读出令牌 scope claim(鉴权中间件用)。**验签**通过才信;失败 → 空(身份闸随后 401)。
+    /// 读出令牌 scope claim(测试/工具用)。**验签**通过才信;失败 → 空(身份闸随后 401)。
     pub fn scope_of(&self, token: &str) -> Vec<Perm> {
-        let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
-        jsonwebtoken::decode::<AppClaims>(token, &self.decoding, &validation)
-            .map(|d| d.claims.scope)
+        self.verify_with_scope(token)
+            .map(|(_, scope)| scope)
             .unwrap_or_default()
+    }
+
+    /// **单次 decode** 同时产出身份与 scope —— 鉴权中间件热路径专用,
+    /// 避免 authenticate_token + scope_of 各做一次完整 Ed25519 验签。
+    pub fn verify_with_scope(&self, token: &str) -> Result<(idm::AuthUser, Vec<Perm>), IdmError> {
+        let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        let claims = jsonwebtoken::decode::<AppClaims>(token, &self.decoding, &validation)
+            .map(|d| d.claims)
+            .map_err(|_| IdmError::Unauthorized)?;
+        let user_id = claims
+            .sub
+            .parse::<Uuid>()
+            .map_err(|_| IdmError::Unauthorized)?;
+        Ok((
+            idm::AuthUser {
+                id: user_id,
+                username: claims.username,
+                roles: claims.roles,
+            },
+            claims.scope,
+        ))
     }
 }
 

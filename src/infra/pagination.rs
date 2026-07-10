@@ -71,9 +71,10 @@ impl PageQuery {
                 },
                 limit: size,
             }),
-            // 无 cursor → offset(可跳页),默认第 1 页
+            // 无 cursor → offset(可跳页),默认第 1 页。上限夹住:下游 (page-1)*size 的
+            // u64 乘法不被 query 参数打溢出(size ≤ MAX_SIZE,故 page ≤ MAX/MAX_SIZE 恒安全)。
             (page, None) => Ok(PageParams::Offset {
-                page: page.unwrap_or(1).max(1),
+                page: page.unwrap_or(1).clamp(1, u64::MAX / MAX_SIZE),
                 size,
                 with_total: self.with_total.unwrap_or(true),
             }),

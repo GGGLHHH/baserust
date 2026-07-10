@@ -118,7 +118,7 @@ impl ObjectStore for S3ObjectStore {
             .put_object()
             .bucket(&self.bucket)
             .key(&params.object_key)
-            .body(ByteStream::from(data.to_vec()));
+            .body(ByteStream::from(data)); // Bytes 已 owned,直接喂,免整块复制
         if let Some(ct) = &params.mime_type {
             req = req.content_type(ct);
         }

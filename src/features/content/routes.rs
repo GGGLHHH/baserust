@@ -9,7 +9,7 @@
 //! ponytail: 单租户先用 nil 兜底;真要多租户时把 tenant 从 token/claim 取,别现在加抽象。
 
 use axum::body::Body;
-use axum::extract::{Multipart, State};
+use axum::extract::State;
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -25,7 +25,7 @@ use crate::app::state::AppState;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
-use crate::infra::extract::{Json, Path};
+use crate::infra::extract::{Json, Multipart, Path};
 use content::{CreateContentInput, UploadContentInput};
 use garde::Validate;
 
@@ -89,7 +89,7 @@ pub async fn upload_content(
     user: CurrentUser,
     scope: TokenScope,
     ctx: AuditContext,
-    mut multipart: Multipart,
+    Multipart(mut multipart): Multipart,
 ) -> Result<(StatusCode, Json<UploadResponse>), AppError> {
     state
         .policy
