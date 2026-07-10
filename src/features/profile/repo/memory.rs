@@ -86,9 +86,9 @@ impl ProfileRepo for InMemoryProfileRepo {
                 (v.insert(p).clone(), true)
             }
         };
-        drop(store); // 锁内已完成写;emit 不需持锁(与 PG 侧"同锁/同事务落地"的等价语义已满足)
-
-        // 写成功后(本方法无失败路径,恒执行)同锁单元内 push 到共享 outbox store。
+        // emit 必须留在 store 锁内:先放锁会让并发 upsert 的 profile 写序与 outbox 事件序
+        // 倒挂(旧快照拿到更大 seq),投影按 seq 水位会用旧值覆盖新值。锁序恒 store→outbox,
+        // InMemoryAppOutbox 只拿自己的锁,无死锁。(镜像 PG 侧"同事务落地"的语义)
         // avatar_url:同 service::enrich 的相对 preview 口径,但**不探测就绪性**——那是读侧关注,
         // 这里只记录写入意图(悬空/未就绪由后续 relay/读侧消费者各自决定语义)。
         let avatar_url = profile

@@ -16,7 +16,8 @@ use crate::infra::pagination::{Page, PageParams};
 #[async_trait]
 pub trait AuthEventRepo: Send + Sync {
     /// 幂等落库:同 event_seq 重投不重复(ON CONFLICT DO NOTHING)。
-    async fn insert(&self, ev: &NewAuthEvent) -> Result<(), AppError>;
+    /// 返回是否**真插入**(false = 重投被幂等吞掉)—— projector 据此决定要不要 SSE 发布。
+    async fn insert(&self, ev: &NewAuthEvent) -> Result<bool, AppError>;
     /// keyset(id v7)+ 过滤列表。
     async fn list(
         &self,

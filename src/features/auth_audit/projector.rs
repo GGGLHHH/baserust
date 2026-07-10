@@ -172,8 +172,6 @@ impl AuthEventProjector {
     /// 纯路由逻辑(单测入口,不碰 NATS):解 envelope → 非 `auth.*` 忽略(前向兼容)→
     /// 解 `data` → 组装 `NewAuthEvent` → `repo.insert`。成功落库 → `Some(row)`(供 `run()` 发布 SSE);
     /// 非 auth.* 忽略 → `None`。
-    /// ponytail:`insert` 幂等(ON CONFLICT DO NOTHING),重投的旧消息也会返回 `Some` —— 即偶发
-    /// SSE 重复推送同一行,不影响正确性(SSE 只是提示流,列表/统计端点才是真相来源)。
     async fn apply_message(
         repo: &dyn AuthEventRepo,
         payload: &[u8],
@@ -218,8 +216,9 @@ impl AuthEventProjector {
             event_seq: env.seq,
         };
         let row = to_row(&new);
-        repo.insert(&new).await.map_err(ApplyError::Transient)?;
-        Ok(Some(row))
+        let inserted = repo.insert(&new).await.map_err(ApplyError::Transient)?;
+        // 重投被幂等吞掉 → 不再 SSE 发布(row.id 是本次新造的,库里根本不存在)。
+        Ok(inserted.then_some(row))
     }
 }
 

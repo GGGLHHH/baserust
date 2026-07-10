@@ -54,7 +54,7 @@ fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
 
 #[async_trait]
 impl AuthEventRepo for PgAuthEventRepo {
-    async fn insert(&self, ev: &NewAuthEvent) -> Result<(), AppError> {
+    async fn insert(&self, ev: &NewAuthEvent) -> Result<bool, AppError> {
         // 显式列 INSERT + ON CONFLICT (event_seq) DO NOTHING(幂等)。富化列不写 → DB 默认 null。
         // ip 用 ::inet cast(sea-query 无 inet 类型,用文本 cast 交给 sqlx bind)。
         let sql = r#"insert into auth_event
@@ -62,7 +62,7 @@ impl AuthEventRepo for PgAuthEventRepo {
              session_id, actor, outcome, failure_reason, ip, forwarded_chain, user_agent, request_id, event_seq)
             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::inet,$13,$14,$15,$16)
             on conflict (event_seq) do nothing"#;
-        sqlx::query(sql)
+        let res = sqlx::query(sql)
             .bind(ev.id)
             .bind(&ev.event_type)
             .bind(ev.occurred_at)
@@ -82,7 +82,7 @@ impl AuthEventRepo for PgAuthEventRepo {
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn list(

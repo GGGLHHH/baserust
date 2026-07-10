@@ -74,13 +74,13 @@ pub(crate) fn to_row(e: &NewAuthEvent) -> AuthEventRow {
 
 #[async_trait]
 impl AuthEventRepo for InMemoryAuthEventRepo {
-    async fn insert(&self, ev: &NewAuthEvent) -> Result<(), AppError> {
+    async fn insert(&self, ev: &NewAuthEvent) -> Result<bool, AppError> {
         let mut rows = self.rows.lock().unwrap();
         if rows.iter().any(|r| r.event_seq == ev.event_seq) {
-            return Ok(()); // 幂等
+            return Ok(false); // 幂等:重投不重复、不再发布
         }
         rows.push(ev.clone());
-        Ok(())
+        Ok(true)
     }
 
     async fn list(
