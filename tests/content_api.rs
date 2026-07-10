@@ -100,6 +100,17 @@ fn test_policy() -> Policy {
             vec![Perm::ContentRead, Perm::ContentWrite, Perm::ContentDelete],
         ),
         ("viewer".to_owned(), vec![Perm::ContentRead]),
+        // 跨用户管理位:验证 :all 是 ownership 的 mode 开关(非 gate)
+        (
+            "auditor".to_owned(),
+            vec![
+                Perm::ContentRead,
+                Perm::ContentReadAll,
+                Perm::ContentWrite,
+                Perm::ContentWriteAll,
+                Perm::ContentDelete,
+            ],
+        ),
     ])
 }
 
@@ -582,4 +593,66 @@ async fn two_step_endpoints_enforce_authz() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 行级 ownership:非 owner 的单条读写一律 404(不区分,防泄露存在);
+/// `contents:read:all` / `contents:write:all` 是 mode 开关 —— 持有者跨用户可读可删。
+#[tokio::test]
+async fn cross_user_content_is_404_unless_all_mode() {
+    let (app, admin, viewer) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "own.txt", "text/plain", b"secret"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = uploaded_content_id(resp).await;
+
+    // viewer(有 contents:read,无 :all)读他人的 → 404(不是 200,也不是 403)
+    for uri in [
+        format!("/api/v1/frontend/contents/{id}"),
+        format!("/api/v1/frontend/contents/{id}/download"),
+        format!("/api/v1/frontend/contents/{id}/objects"),
+        format!("/api/v1/frontend/contents/{id}/metadata"),
+    ] {
+        let resp = app.clone().oneshot(get(&uri, &viewer)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri} 非本人应 404");
+    }
+
+    // auditor(read:all + write:all)跨用户读 → 200,删 → 204
+    let signer = AppTokenSigner::dev();
+    let auditor = signer
+        .mint_scoped(
+            Uuid::from_u128(3),
+            "auditor",
+            vec!["auditor".to_owned()],
+            vec![],
+            900,
+        )
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/frontend/contents/{id}"), &auditor))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "read:all 应可读他人内容");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/frontend/contents/{id}"))
+                .header("authorization", format!("Bearer {auditor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "write:all 应可删他人内容"
+    );
+
+    // owner 本人始终可读自己的(已被删 → 404 属正常;此处验证的是删除前 admin 可读,上面用例已覆盖)
 }

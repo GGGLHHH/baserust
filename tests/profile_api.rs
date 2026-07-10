@@ -92,6 +92,8 @@ fn test_app() -> (
                     Perm::ProfileWriteAll,
                     Perm::ContentRead,
                     Perm::ContentWrite,
+                    // 跨用户删他人头像 content(悬空降级用例)→ 需 write 侧越权 mode
+                    Perm::ContentWriteAll,
                     Perm::ContentDelete,
                 ],
             ),

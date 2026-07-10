@@ -37,8 +37,14 @@ pub enum Perm {
     WidgetDelete,
     #[serde(rename = "contents:read")]
     ContentRead,
+    /// 越权读:看**所有人**的 content(否则只看自己 owner 的)。ownership 的 mode 开关,仿 widgets:read:all。
+    #[serde(rename = "contents:read:all")]
+    ContentReadAll,
     #[serde(rename = "contents:write")]
     ContentWrite,
+    /// 越权写:改/删**任何人**的 content。write 侧 ownership mode 开关,仿 profiles:write:all。
+    #[serde(rename = "contents:write:all")]
+    ContentWriteAll,
     #[serde(rename = "contents:delete")]
     ContentDelete,
     #[serde(rename = "users:admin")]
@@ -60,13 +66,15 @@ pub enum Perm {
 
 impl Perm {
     /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
-    pub const ALL: [Perm; 12] = [
+    pub const ALL: [Perm; 14] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
         Perm::WidgetDelete,
         Perm::ContentRead,
+        Perm::ContentReadAll,
         Perm::ContentWrite,
+        Perm::ContentWriteAll,
         Perm::ContentDelete,
         Perm::UsersAdmin,
         Perm::AdminLogin,
@@ -82,7 +90,11 @@ impl Perm {
             Perm::WidgetRead | Perm::WidgetReadAll | Perm::WidgetWrite | Perm::WidgetDelete => {
                 "widgets"
             }
-            Perm::ContentRead | Perm::ContentWrite | Perm::ContentDelete => "contents",
+            Perm::ContentRead
+            | Perm::ContentReadAll
+            | Perm::ContentWrite
+            | Perm::ContentWriteAll
+            | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
             Perm::AdminLogin => "admin",
             Perm::ProfileRead | Perm::ProfileWrite | Perm::ProfileWriteAll => "profiles",
@@ -95,8 +107,8 @@ impl Perm {
             Perm::WidgetRead | Perm::WidgetReadAll => "read",
             Perm::WidgetWrite => "write",
             Perm::WidgetDelete => "delete",
-            Perm::ContentRead => "read",
-            Perm::ContentWrite => "write",
+            Perm::ContentRead | Perm::ContentReadAll => "read",
+            Perm::ContentWrite | Perm::ContentWriteAll => "write",
             Perm::ContentDelete => "delete",
             Perm::UsersAdmin => "admin",
             Perm::AdminLogin => "login",
@@ -108,7 +120,7 @@ impl Perm {
     /// **第三段**(限定词,可选)。`read:all` 的 `all`;只读投影,**不是**存储字段、**不是** `read` 上的开关。
     pub fn qualifier(&self) -> Option<&'static str> {
         match self {
-            Perm::WidgetReadAll => Some("all"),
+            Perm::WidgetReadAll | Perm::ContentReadAll | Perm::ContentWriteAll => Some("all"),
             Perm::ProfileWriteAll => Some("all"),
             _ => None,
         }
@@ -130,6 +142,8 @@ impl Perm {
     pub fn implies(&self) -> &'static [Perm] {
         match self {
             Perm::WidgetReadAll => &[Perm::WidgetRead],
+            Perm::ContentReadAll => &[Perm::ContentRead],
+            Perm::ContentWriteAll => &[Perm::ContentWrite],
             Perm::ProfileWriteAll => &[Perm::ProfileWrite],
             _ => &[],
         }
@@ -144,7 +158,9 @@ impl Perm {
             Perm::WidgetWrite => "创建 / 修改 widget",
             Perm::WidgetDelete => "删除 widget",
             Perm::ContentRead => "查看内容 / 下载 / 列对象与元数据",
+            Perm::ContentReadAll => "查看所有人的内容(而非仅自己)",
             Perm::ContentWrite => "创建 / 上传 / 修改内容与元数据",
+            Perm::ContentWriteAll => "修改 / 删除任何人的内容(而非仅自己)",
             Perm::ContentDelete => "删除内容",
             Perm::UsersAdmin => "用户管理(superadmin 专属)",
             Perm::AdminLogin => {
@@ -203,7 +219,9 @@ impl RoleName {
                 Perm::WidgetWrite,
                 Perm::WidgetDelete,
                 Perm::ContentRead,
+                Perm::ContentReadAll,
                 Perm::ContentWrite,
+                Perm::ContentWriteAll,
                 Perm::ContentDelete,
                 Perm::ProfileRead,
                 Perm::ProfileWrite,

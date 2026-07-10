@@ -29,6 +29,28 @@ use crate::infra::extract::{Json, Multipart, Path};
 use content::{CreateContentInput, UploadContentInput};
 use garde::Validate;
 
+/// 行级 ownership(镜像 widget 的 get 范式):owner 本人或持越权 perm(`contents:read:all` /
+/// `contents:write:all`,经 `data_access` 判 mode)→ 放行并返回该行;否则 **404**。
+/// 读写同码 404:本模块读侧 owner-scoped(list 只回自己的),存在性敏感,403 会泄露"这 id 存在"。
+async fn fetch_content_owned(
+    state: &AppState,
+    user: &idm::AuthUser,
+    scope: &[Perm],
+    all_perm: Perm,
+    id: Uuid,
+) -> Result<content::Content, AppError> {
+    let c = state.contents.get_content(id).await?;
+    if state
+        .policy
+        .data_access(user, scope, all_perm)
+        .allows(c.owner_id)
+    {
+        Ok(c)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。
 #[utoipa::path(
     post,
@@ -199,7 +221,7 @@ pub async fn list_contents(
         (status = 200, description = "找到", body = ContentResponse),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody)
+        (status = 404, description = "不存在 / 非本人(不区分,防泄露存在;contents:read:all 可看全部)", body = ErrorBody)
     )
 )]
 pub async fn get_content(
@@ -211,7 +233,8 @@ pub async fn get_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    Ok(Json(state.contents.get_content(id).await?.into()))
+    let c = fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
+    Ok(Json(c.into()))
 }
 
 /// 全量更新内容可编辑字段(PUT)。需 `contents:write`。不存在 → 404。
@@ -241,6 +264,7 @@ pub async fn update_content(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
     input.validate()?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     let updated = state
         .contents
         .update_content(id, input.into_input(), ctx.audit_id())
@@ -271,6 +295,7 @@ pub async fn delete_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentDelete)?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     state.contents.delete_content(id, ctx.audit_id()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -300,6 +325,7 @@ pub async fn download_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
     // presign 可用 → 307(字节直达存储);不可用 → 走下面的代理现状。
     if let Some(url) = state.contents.download_url(id).await? {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
@@ -357,6 +383,8 @@ pub async fn preview_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    // 刻意**不做** ownership:preview 是头像等跨用户展示的稳定 URL(profile 富化指到这);
+    // 敏感内容不该走 preview 语义。收紧时按 read:all 放行、owner 之外 404。
     if let Some(url) = state.contents.preview_url(id).await? {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
         let mut resp = Redirect::temporary(&url).into_response();
@@ -395,7 +423,8 @@ pub async fn preview_content(
     responses(
         (status = 200, description = "对象列表", body = [ObjectResponse]),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 contents:read 权限", body = ErrorBody)
+        (status = 403, description = "无 contents:read 权限", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人(不区分,防泄露存在)", body = ErrorBody)
     )
 )]
 pub async fn list_content_objects(
@@ -407,6 +436,7 @@ pub async fn list_content_objects(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
     let objects = state.contents.get_objects(id).await?;
     Ok(Json(
         objects.into_iter().map(ObjectResponse::from).collect(),
@@ -435,6 +465,7 @@ pub async fn get_content_metadata(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
     Ok(Json(state.contents.get_content_metadata(id).await?.into()))
 }
 
@@ -464,6 +495,7 @@ pub async fn set_content_metadata(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
     input.validate()?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     state
         .contents
         .set_content_metadata(input.into_input(id))
@@ -543,6 +575,7 @@ pub async fn confirm_upload(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     let c = state.contents.confirm_upload(id, ctx.audit_id()).await?;
     Ok(Json(c.into()))
 }
