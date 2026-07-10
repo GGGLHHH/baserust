@@ -75,7 +75,7 @@ pub async fn create_content(
     post,
     path = "/contents/upload",
     tag = "contents",
-    request_body(content = inline(super::types::UploadResponse), content_type = "multipart/form-data"),
+    request_body(content = inline(super::types::UploadForm), content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "已上传(content + object 皆 uploaded)", body = UploadResponse),
         (status = 400, description = "multipart 解析失败", body = ErrorBody),

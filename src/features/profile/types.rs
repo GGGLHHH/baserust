@@ -34,6 +34,15 @@ pub struct PutProfileRequest {
     pub avatar_content_id: Option<Uuid>,
 }
 
+/// 传头像的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。
+#[derive(Debug, ToSchema)]
+#[allow(dead_code)] // 仅供 utoipa 生成 request_body schema,不实际反序列化
+pub struct AvatarForm {
+    /// 图片本体(必填,带 filename + content-type,须 image/*)。
+    #[schema(value_type = String, format = Binary)]
+    pub file: String,
+}
+
 /// 出参 = 行字段 + 富化的 `avatar_url`(相对 preview 路径;悬空/未就绪/探测故障 → null)。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProfileResponse {

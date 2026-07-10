@@ -44,6 +44,8 @@ pub struct AuthEventFilter {
         (status = 200, body = Page<AuthEventRow>),
         (status = 401, body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
+        (status = 422, description = "page 与 cursor 互斥", body = ErrorBody),
     )
 )]
 pub async fn list_user_auth_events(
@@ -79,6 +81,8 @@ pub async fn list_user_auth_events(
         (status = 200, body = Page<AuthEventRow>),
         (status = 401, body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
+        (status = 422, description = "page 与 cursor 互斥", body = ErrorBody),
     )
 )]
 pub async fn list_auth_events(
@@ -124,6 +128,7 @@ pub struct StatsQuery {
         (status = 200, body = AuthStats),
         (status = 401, body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
     )
 )]
 pub async fn stats_auth_events(
@@ -161,6 +166,7 @@ pub async fn stats_auth_events(
         (status = 200, description = "SSE 事件流;event = auth_event,data = AuthEventRow JSON", content_type = "text/event-stream", body = AuthEventRow),
         (status = 401, body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
     )
 )]
 pub async fn stream_auth_events(

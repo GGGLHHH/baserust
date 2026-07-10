@@ -16,7 +16,7 @@ use super::types::{
     SetRolesRequest, UpdateUserRequest, UserSortField,
 };
 use crate::app::state::AppState;
-use crate::features::profile::{ProfileResponse, PutProfileRequest};
+use crate::features::profile::{AvatarForm, ProfileResponse, PutProfileRequest};
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, Policy, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
@@ -217,7 +217,8 @@ pub async fn update_user(
         (status = 204, description = "已软删"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
-        (status = 404, description = "不存在 / 已软删", body = ErrorBody)
+        (status = 404, description = "不存在 / 已软删", body = ErrorBody),
+        (status = 409, description = "不能删除自己的账号", body = ErrorBody)
     )
 )]
 pub async fn delete_user(
@@ -248,6 +249,7 @@ pub async fn delete_user(
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody),
         (status = 404, description = "用户不存在", body = ErrorBody),
+        (status = 409, description = "不能移除自己的 admin 权限", body = ErrorBody),
         (status = 422, description = "未知角色名", body = ErrorBody)
     )
 )]
@@ -360,7 +362,7 @@ pub async fn set_user_profile(
     path = "/users/{id}/avatar",
     tag = "users",
     params(("id" = Uuid, Path, description = "user id")),
-    request_body(content = inline(ProfileResponse), content_type = "multipart/form-data"),
+    request_body(content = inline(AvatarForm), content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "头像已更新并绑定", body = ProfileResponse),
         (status = 400, description = "multipart 解析失败", body = ErrorBody),

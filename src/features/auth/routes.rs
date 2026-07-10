@@ -115,6 +115,7 @@ pub async fn register(
     responses(
         (status = 200, description = "登录成功,token 写入 httponly cookie", body = UserResponse),
         (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
 pub async fn login(
@@ -262,6 +263,7 @@ pub async fn get_me(
         (status = 200, body = UserResponse),
         (status = 409, description = "新用户名/邮箱已占用", body = ErrorBody),
         (status = 401, body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
 pub async fn update_me(
@@ -283,6 +285,7 @@ pub async fn update_me(
     responses(
         (status = 204, description = "已注销"),
         (status = 401, description = "密码错", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
 pub async fn delete_me(
@@ -313,6 +316,7 @@ pub async fn delete_me(
     responses(
         (status = 204, description = "已改密,撤销所有会话(需重新登录)"),
         (status = 401, description = "旧密码错", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
 pub async fn change_password(
@@ -343,6 +347,7 @@ pub async fn change_password(
         (status = 200, description = "后台登录成功,token 写入 httponly cookie", body = UserResponse),
         (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
         (status = 403, description = "凭据正确但无后台准入(admin:login),不发 token 不设 cookie", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
 pub async fn admin_login(

@@ -18,7 +18,7 @@ pub use repo::{
     ProfileFields, ProfileRepo,
 };
 pub use service::ProfileService;
-pub use types::{Profile, ProfileResponse, PutProfileRequest};
+pub use types::{AvatarForm, Profile, ProfileResponse, PutProfileRequest};
 
 /// 本模块路由 + OpenAPI,挂到主 router(/api/v1 由 nest 加)。
 pub fn router() -> OpenApiRouter<AppState> {

@@ -123,6 +123,20 @@ impl From<ContentMetadata> for ContentMetadataResponse {
     }
 }
 
+/// 一次性上传的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。
+#[derive(Debug, ToSchema)]
+#[allow(dead_code)] // 仅供 utoipa 生成 request_body schema,不实际反序列化
+pub struct UploadForm {
+    /// 文件本体(必填,带 filename + content-type)。
+    #[schema(value_type = String, format = Binary)]
+    pub file: String,
+    pub name: Option<String>,
+    /// 逗号分隔。
+    pub tags: Option<String>,
+    pub document_type: Option<String>,
+    pub tenant_id: Option<Uuid>,
+}
+
 /// 一次性上传的对外响应(内容 + 其主对象)。投影 `content::UploadOutcome`。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UploadResponse {
