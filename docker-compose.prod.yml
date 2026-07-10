@@ -68,14 +68,19 @@ services:
     environment:
       BIND_ADDR: 0.0.0.0:8080
       APP_ENV: prod
-      # idm 签发:持私钥 + 公钥(自验)。首次启动 seed superadmin(IDM_SEED_ON_START,见 .env 警示)。
+      # idm 签发:持私钥 + 公钥(自验)。
       JWT_PRIVATE_KEY_FILE: /keys/prod-ed25519.pem
       JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
       IDM_DB_HOST: pg
       IDM_DB_PORT: "5432"
+      # 启动 seed 超管:挂 seed.prod.toml(真账号/密码,gitignore 挡)+ 设 SEED_FILE。
+      # prod 检测到 SEED_FILE 即幂等建号(无需 IDM_SEED_ON_START);不挂则不建(不用嵌入 pwd 弱默认)。
+      # 部署前先 `cp seed.prod.toml.example seed.prod.toml` 填强密码(否则 bind mount 会建成空目录)。
+      SEED_FILE: /seed/seed.prod.toml
     volumes:
       - ./keys/prod-ed25519.pem:/keys/prod-ed25519.pem:ro
       - ./keys/prod-ed25519.pub.pem:/keys/prod-ed25519.pub.pem:ro
+      - ./seed.prod.toml:/seed/seed.prod.toml:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
       interval: 10s

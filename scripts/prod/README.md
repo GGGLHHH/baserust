@@ -50,7 +50,9 @@ vim .env                                     # 改 CHANGE-ME(DB/minio 密码、C
 
 1. `.env` 全部 CHANGE-ME 改成真密码 / 真前端域
 2. 外层 LB 配 HTTPS(prod cookie 带 Secure,HTTP 下浏览器不回传)
-3. 首启后立刻登录改 `superadmin` 密码(seed 默认 `superadmin/pwd` 是弱凭据),或部署前 `SEED_FILE` 挂自定义账号
+3. **超管账号**:`cp seed.prod.toml.example seed.prod.toml` 填强密码 —— compose.prod 已把它挂进
+   idm 容器(`SEED_FILE=/seed/seed.prod.toml`),启动即幂等建号。不建这个文件 → idm 不 seed 任何账号
+   (不会落 `superadmin/pwd` 弱默认);建了空文件 → bind mount 变目录、启动报错。幂等:改密后重启不回滚。
 4. `prod/keys/prod-ed25519.pem` 权限 600,别泄露
 
 ## 常用

@@ -27,6 +27,20 @@ if grep -q "CHANGE-ME" "$DIR/.env"; then
   read -r ans; [ "$ans" = "y" ] || { echo "已中止,先改 .env"; exit 1; }
 fi
 
+# seed.prod.toml 存在性(compose bind-mount 它;缺文件会被 docker 建成目录 → idm 启动崩)。
+# 不建 = idm 不 seed 任何账号(不落 pwd 弱默认);要建就得填真密码。
+if [ ! -f "$DIR/seed.prod.toml" ]; then
+  echo "⚠️ 缺 seed.prod.toml —— idm 启动不会建超管账号。"
+  echo "   要建号:cp seed.prod.toml.example seed.prod.toml 并填强密码,再重跑本脚本。"
+  echo "   确认无账号继续起服务? [y/N]"
+  read -r ans; [ "$ans" = "y" ] || { echo "已中止"; exit 1; }
+  # 占位空文件,避免 bind mount 把路径建成目录(idm 读它 = 空账号列表,不建号)。
+  : > "$DIR/seed.prod.toml"
+elif grep -q "CHANGE_ME" "$DIR/seed.prod.toml"; then
+  echo "⚠️ seed.prod.toml 仍有 CHANGE_ME 占位密码(弱凭据)。继续? [y/N]"
+  read -r ans; [ "$ans" = "y" ] || { echo "已中止,先填真密码"; exit 1; }
+fi
+
 echo "📥 load 镜像..."
 # docker load 原生支持压缩包;失败再回退 xz 解流
 if ! docker load -i "$ARCHIVE"; then
