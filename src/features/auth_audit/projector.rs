@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use super::events::AuthEventBus;
 use super::repo::{to_row, AuthEventRepo};
-use super::types::{AuthEventRow, NewAuthEvent};
+use super::types::{
+    AuthChannel, AuthEventRow, AuthEventType, AuthOutcome, FailureReason, NewAuthEvent,
+};
 use crate::infra::jetstream::STREAM_NAME;
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +185,20 @@ impl AuthEventProjector {
         }
         let d: AuthEventData = serde_json::from_value(env.data)
             .map_err(|e| ApplyError::Poison(format!("{} data: {e}", env.r#type)))?;
+        // 闭集校验在信任边界:wire 来的串必须落在枚举内,否则 Poison —— 不能等到
+        // to_row 的 expect 炸 panic(那些 expect 只为"本仓 emit 写入"的不变量背书)。
+        env.r#type
+            .parse::<AuthEventType>()
+            .map_err(ApplyError::Poison)?;
+        d.channel
+            .parse::<AuthChannel>()
+            .map_err(ApplyError::Poison)?;
+        d.outcome
+            .parse::<AuthOutcome>()
+            .map_err(ApplyError::Poison)?;
+        if let Some(r) = &d.failure_reason {
+            r.parse::<FailureReason>().map_err(ApplyError::Poison)?;
+        }
         let new = NewAuthEvent {
             id: Uuid::now_v7(),
             event_type: env.r#type,
@@ -259,29 +275,22 @@ mod tests {
         ));
         assert_eq!(repo.len(), 0);
     }
-}
-
-#[cfg(test)]
-mod scratch_probe {
-    use super::*;
-    use crate::features::auth_audit::InMemoryAuthEventRepo;
-    use serde_json::json;
-    use std::sync::Arc;
 
     #[tokio::test]
-    async fn bad_channel_value_currently_panics_instead_of_poison() {
+    async fn semantically_bad_enum_string_is_poison_not_panic() {
         let repo = Arc::new(InMemoryAuthEventRepo::new());
-        let payload = serde_json::to_vec(&json!({
-            "event_id": "idm-99", "schema": "idm", "type": "auth.login_succeeded",
-            "aggregate_id": "00000000-0000-0000-0000-000000000000", "seq": 99,
-            "data": {
+        // 类型上合法(String)但语义非法(不在闭集内)→ Poison,不落库、不 panic。
+        let payload = envelope(
+            99,
+            "auth.login_succeeded",
+            json!({
                 "occurred_at": "2026-07-08T10:00:00Z", "channel": "totally-bogus", "outcome": "success",
                 "user_id": null, "session_id": null, "identifier_attempted": null,
                 "failure_reason": null, "ip": null, "forwarded_chain": null, "user_agent": null, "request_id": null,
-            },
-        })).unwrap();
+            }),
+        );
         let r = AuthEventProjector::apply_message(repo.as_ref(), &payload).await;
-        // 期望:语义非法的 enum 字符串也该走 Poison,不该 panic。
         assert!(matches!(r, Err(ApplyError::Poison(_))));
+        assert_eq!(repo.len(), 0);
     }
 }
