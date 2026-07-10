@@ -155,7 +155,7 @@ impl Projector {
                     // (数据可经 bin/rebuild_search 回填)。
                     let mut attempt = 0u32;
                     let should_ack = 'retry: loop {
-                        match Self::apply_message(&*self.repo, &msg.payload).await {
+                        match Self::apply_with_progress(&*self.repo, &msg).await {
                             Ok(()) => break 'retry true,
                             Err(ApplyError::Poison(why)) => {
                                 tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
@@ -203,6 +203,27 @@ impl Projector {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `apply_message` 外套 ack_wait 续期:apply 期间每 ≤15s 发一次 `AckKind::Progress`。
+    /// 慢 apply(如 DB 故障切换时 sqlx 默认 acquire ~30s 阻塞)在存量 durable(get_or_create
+    /// 不更新已存在配置,仍是默认 ack_wait=30s)下会被判超时重投副本 —— 与 `run` 里退避 sleep
+    /// 段的续期同源防御,补上 apply 段这段窗口(见 review round-4)。
+    async fn apply_with_progress(
+        repo: &dyn SearchIndexRepo,
+        msg: &jetstream::Message,
+    ) -> Result<(), ApplyError> {
+        let mut apply = std::pin::pin!(Self::apply_message(repo, &msg.payload));
+        loop {
+            tokio::select! {
+                r = &mut apply => return r,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                    if let Err(e) = msg.ack_with(jetstream::AckKind::Progress).await {
+                        tracing::warn!(error = %e, "ack Progress 续期失败(apply 期间,重投风险)");
                     }
                 }
             }
