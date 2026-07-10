@@ -117,6 +117,12 @@ migrate-add schema name:
 seed:
     IDM_DB_HOST="{{pg_host}}" IDM_DB_PORT="{{pg_port}}" IDM_DB_DATABASE="{{pg_db}}" APP_DB_HOST="{{pg_host}}" APP_DB_PORT="{{pg_port}}" APP_DB_DATABASE="{{pg_db}}" cargo run --bin seed
 
+# prod seed:读外部账号文件(默认 seed.prod.toml,.gitignore 已挡,含真密码),不碰仓库里的 pwd 默认。
+# 先 `cp seed.prod.toml.example seed.prod.toml` 填强密码。DB 指向经 IDM_DB_*/APP_DB_* env 或此处覆盖。
+seed-prod file="seed.prod.toml":
+    @test -f "{{file}}" || (echo "缺 {{file}}:先 cp seed.prod.toml.example {{file}} 并填真密码" && exit 1)
+    SEED_FILE="{{file}}" cargo run --bin seed
+
 # 生成生产 JWT 密钥对(Ed25519)。dev 对已入库(keys/),这个目标给 prod 造新对。
 gen-keys out="./keys/prod-ed25519":
     openssl genpkey -algorithm ed25519 -out {{out}}.pem

@@ -14,3 +14,8 @@
 
 # 生产部署包(build-and-export.sh 产出):镜像 tar + 明文密码 .env + 私钥,绝不入库。
 /prod/
+
+# prod/staging seed 账号文件(含真密码,绝不入库):任意 seed.<env>.toml 自动挡,
+# 只放行 .example 模板。(入库的 dev 默认 `seed.toml` 不匹配 `seed.*.toml`,不受影响。)
+/seed.*.toml
+!/seed.*.toml.example
