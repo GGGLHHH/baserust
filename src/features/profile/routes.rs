@@ -194,6 +194,15 @@ pub async fn set_user_avatar(
     let file = crate::infra::extract::file_part(&mut multipart)
         .await?
         .ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
+    // 先校验后写(transactions skill):非 image/* 就不该产生任何持久化副作用 ——
+    // 否则 put 的三查 422 时,已落库的 content(owner=目标用户)成孤儿且无清理路径。
+    if !file
+        .mime_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"))
+    {
+        return Err(AppError::Validation("avatar must be image/*".into()));
+    }
 
     // content 归目标用户(是他的头像);单租户 tenant=nil。
     let input = UploadContentInput {

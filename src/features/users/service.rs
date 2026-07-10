@@ -211,7 +211,7 @@ impl UserAdminService {
             .filter(|id| seen.insert(*id))
             .collect();
         // 传入的是角色 id:校验都存在(未知 → 422),并取其名字组装视图。
-        let role_names = self.resolve_role_names(&role_ids).await?;
+        let role_names = self.role_names_by_ids(&role_ids).await?;
         let hash = self.hasher.hash(&req.password)?;
         let user = self
             .users
@@ -264,7 +264,7 @@ impl UserAdminService {
         // 发 outbox 事件,却仍在末尾 get() 才报 404(幽灵事件 + 清掉软删用户的角色行)。
         self.users.find_by_id(id).await?;
         // 校验 id 都存在(未知 → 422),再原子替换。get() 会重取名字组装视图。
-        let new_names = self.resolve_role_names(&req.roles).await?;
+        let new_names = self.role_names_by_ids(&req.roles).await?;
         // 读改写防丢:闭集外存量角色在读模型/目录里都不可见(parse_lossy 跳过),按所见全量
         // 替换会把它静默剥除且无从补选 —— fail-closed 409,提示先清数据(或显式带上该角色 id)。
         let stripped: Vec<String> = self
@@ -295,7 +295,7 @@ impl UserAdminService {
             .filter_map(|r| match RoleView::try_from(r) {
                 Ok(v) => Some(v),
                 Err(name) => {
-                    tracing::warn!(role = %name, "角色名不在 RoleName 闭集内,目录跳过");
+                    RoleName::warn_unknown(&name); // 与 parse_lossy 同口径(每进程每名一次)
                     None
                 }
             })
@@ -319,9 +319,10 @@ impl UserAdminService {
         Ok(())
     }
 
-    /// 角色 id → **原始**角色名(未过滤,未知 id 跳过;落库校验由 `resolve_role_names` 的 422 兜)。
-    /// 提权/自锁守卫用:守卫必须看见全部角色名(含闭集外存量角色)—— 若经闭集过滤的目录解析,
-    /// 脏角色会从守卫视野里消失,而 set_roles 仍按未过滤目录放行落库 → 提权闸被绕过。
+    /// 角色 id → **原始**角色名(未过滤目录;未知 id → 422)。handler 守卫(提权/自锁)与
+    /// service 落库校验共用**这一个**实现 —— 守卫与落库看不同目录曾造成提权闸失明,单一实现
+    /// 从结构上封死该分裂面;未知 id 在守卫处就 422,也不会让自锁闸抢先误报 409。
+    /// ponytail: 守卫与落库各调一次 = 每个管理写操作拉两次全量目录;目录极小,合并需把名字穿透 service 签名。
     pub async fn role_names_by_ids(&self, ids: &[Uuid]) -> Result<Vec<String>, AppError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -333,19 +334,11 @@ impl UserAdminService {
             .into_iter()
             .map(|r| (r.id, r.name))
             .collect();
-        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
-    }
-
-    /// 角色 id → name 解析。校验每个 id 都在存活目录里,未知 id → `Validation`(422)。
-    /// 返回名字集(顺序同入参),供 `AdminUserView.roles`(名字)组装 / 单纯校验。
-    async fn resolve_role_names(&self, ids: &[Uuid]) -> Result<Vec<String>, AppError> {
-        let catalog = self.roles.list().await?;
-        let by_id: HashMap<Uuid, &str> = catalog.iter().map(|r| (r.id, r.name.as_str())).collect();
         ids.iter()
             .map(|id| {
                 by_id
                     .get(id)
-                    .map(|n| n.to_string())
+                    .cloned()
                     .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))
             })
             .collect()

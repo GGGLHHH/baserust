@@ -75,13 +75,17 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     if needs_idm {
         public = public.merge(auth::public_router());
         frontend = frontend.merge(auth::me_router());
-        admin = admin.merge(auth::admin_router()).nest(
-            "/auth",
-            OpenApiRouter::new()
-                .merge(users::admin_router())
-                .merge(profile::admin_router())
-                .merge(auth_audit::admin_router()),
-        );
+        // 后台资料/头像端点写 app schema(profiles/contents):只在同进程也连了 app 侧
+        // (Mount::Both)时挂 —— 纯 idm 进程的 profiles/contents 是内存占位 repo,挂上去
+        // 写操作会 200 却静默丢失、重启蒸发(fail-closed:不挂 → 404,镜像 auth_audit 未接线范式)。
+        // ponytail: 分进程拓扑要启用它,需给 idm 进程连 app 库,或把路径挪出 /admin/auth 前缀归 app 进程。
+        let mut auth_admin = OpenApiRouter::new()
+            .merge(users::admin_router())
+            .merge(auth_audit::admin_router());
+        if needs_app {
+            auth_admin = auth_admin.merge(profile::admin_router());
+        }
+        admin = admin.merge(auth::admin_router()).nest("/auth", auth_admin);
         admin_open = admin_open.merge(auth::admin_login_router());
     }
     // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
@@ -287,14 +291,11 @@ impl KeyExtractor for TrustedIpKeyExtractor {
     type Key = std::net::IpAddr;
 
     fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
-        let headers = req.headers();
-        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        let real_ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
         let peer = req
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
-        crate::infra::client_context::resolve_client_ip(xff, real_ip, peer, self.trusted_hops)
+        crate::infra::client_context::client_ip_from_headers(req.headers(), peer, self.trusted_hops)
             .ok_or(GovernorError::UnableToExtractKey)
     }
 }

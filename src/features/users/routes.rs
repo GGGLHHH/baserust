@@ -64,13 +64,6 @@ fn assert_self_keeps_admin(
     Ok(())
 }
 
-/// 把角色 id 解析成**原始**名字(未过滤;未知 id 跳过,交 service 走 422)。
-/// 提权/自锁判定要角色名(→ 经 policy 展成权限);必须与 service 落库校验用同一份未过滤目录,
-/// 否则闭集外存量角色会从守卫视野消失、却照样落库 —— 提权闸被绕过。
-async fn role_names_of(state: &AppState, role_ids: &[Uuid]) -> Result<Vec<String>, AppError> {
-    state.user_admin.role_names_by_ids(role_ids).await
-}
-
 /// 分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。
 /// cursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。
 /// `q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;
@@ -132,8 +125,9 @@ pub async fn create_user(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    // 提权闸:不能建带"超出自己权限"角色的号。
-    let role_names = role_names_of(&state, &req.roles).await?;
+    // 提权闸:不能建带"超出自己权限"角色的号。名字经 service 的未过滤目录解析
+    // (与落库校验同一实现,未知 id 此处即 422)—— 守卫失明/落库分裂从结构上不可能。
+    let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
     let view = state.user_admin.create(req, ctx.audit_id()).await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -254,7 +248,8 @@ pub async fn set_user_roles(
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     // 提权闸 + 自锁:不能授超出自己的权;改自己的角色不能丢 users:admin。
-    let role_names = role_names_of(&state, &req.roles).await?;
+    // 名字经未过滤目录解析(未知 id 此处即 422,先于自锁 409,错误码不串台)。
+    let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
     assert_self_keeps_admin(&state.policy, user.0.id, id, &role_names)?;
     Ok(Json(

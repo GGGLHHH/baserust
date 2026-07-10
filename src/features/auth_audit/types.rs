@@ -40,6 +40,19 @@ pub enum AuthEventType {
 }
 
 impl AuthEventType {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
+    pub const ALL: [AuthEventType; 9] = [
+        AuthEventType::LoginSucceeded,
+        AuthEventType::LoginFailed,
+        AuthEventType::AdminAccessDenied,
+        AuthEventType::Refreshed,
+        AuthEventType::LoggedOut,
+        AuthEventType::LogoutAll,
+        AuthEventType::PasswordChanged,
+        AuthEventType::Registered,
+        AuthEventType::AccountDeleted,
+    ];
+
     /// 发射到 outbox 的线上串(`idm::OutboxRepo::emit` 只吃 `&str`)。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -61,18 +74,11 @@ impl AuthEventType {
 impl std::str::FromStr for AuthEventType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "auth.login_succeeded" => Self::LoginSucceeded,
-            "auth.login_failed" => Self::LoginFailed,
-            "auth.admin_access_denied" => Self::AdminAccessDenied,
-            "auth.refreshed" => Self::Refreshed,
-            "auth.logged_out" => Self::LoggedOut,
-            "auth.logout_all" => Self::LogoutAll,
-            "auth.password_changed" => Self::PasswordChanged,
-            "auth.registered" => Self::Registered,
-            "auth.account_deleted" => Self::AccountDeleted,
-            other => return Err(format!("未知 auth event_type: {other}")),
-        })
+        // 经 ALL × as_str 查表(镜像 RoleName::from_str):加变体只补 ALL,不再手写第三份映射。
+        Self::ALL
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| format!("未知 auth event_type: {s}"))
     }
 }
 
@@ -89,15 +95,27 @@ pub enum AuthChannel {
     Admin,
 }
 
+impl AuthChannel {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
+    pub const ALL: [AuthChannel; 2] = [AuthChannel::Public, AuthChannel::Admin];
+
+    /// wire 串(== serde/sqlx rename;`wire_matches` 测试钉死不漂移)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthChannel::Public => "public",
+            AuthChannel::Admin => "admin",
+        }
+    }
+}
+
 /// 见 `AuthEventType` 上同名 impl 的注释:内存 repo 读侧映射用,pg 侧走 `sqlx::Type` 走不到这里。
 impl std::str::FromStr for AuthChannel {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "public" => Self::Public,
-            "admin" => Self::Admin,
-            other => return Err(format!("未知 channel: {other}")),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| format!("未知 channel: {s}"))
     }
 }
 
@@ -114,6 +132,9 @@ pub enum AuthOutcome {
 }
 
 impl AuthOutcome {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
+    pub const ALL: [AuthOutcome; 2] = [AuthOutcome::Success, AuthOutcome::Failure];
+
     /// filter 下推(`apply_filters`)/内存 repo 过滤要跟 `NewAuthEvent.outcome`(仍是 `String`)比较。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -126,11 +147,10 @@ impl AuthOutcome {
 impl std::str::FromStr for AuthOutcome {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "success" => Self::Success,
-            "failure" => Self::Failure,
-            other => return Err(format!("未知 outcome: {other}")),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|o| o.as_str() == s)
+            .ok_or_else(|| format!("未知 outcome: {s}"))
     }
 }
 
@@ -166,17 +186,35 @@ impl From<&idm::CredentialFailure> for FailureReason {
     }
 }
 
+impl FailureReason {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
+    pub const ALL: [FailureReason; 5] = [
+        FailureReason::UnknownUser,
+        FailureReason::BadPassword,
+        FailureReason::NoAdminPerm,
+        FailureReason::AccountLocked,
+        FailureReason::RateLimited,
+    ];
+
+    /// wire 串(== serde/sqlx rename;`wire_matches` 测试钉死不漂移)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::UnknownUser => "unknown_user",
+            FailureReason::BadPassword => "bad_password",
+            FailureReason::NoAdminPerm => "no_admin_perm",
+            FailureReason::AccountLocked => "account_locked",
+            FailureReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
 impl std::str::FromStr for FailureReason {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "unknown_user" => Self::UnknownUser,
-            "bad_password" => Self::BadPassword,
-            "no_admin_perm" => Self::NoAdminPerm,
-            "account_locked" => Self::AccountLocked,
-            "rate_limited" => Self::RateLimited,
-            other => return Err(format!("未知 failure_reason: {other}")),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|r| r.as_str() == s)
+            .ok_or_else(|| format!("未知 failure_reason: {s}"))
     }
 }
 
@@ -323,4 +361,31 @@ pub struct AuthStats {
     pub types: Vec<TypeCount>,
     pub top_ips: Vec<IpStat>,
     pub kpi: AuthKpi,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// serde rename ↔ as_str ↔ FromStr 三方一致(加变体漏补 ALL/rename → 此测试挂,
+    /// 防 emit 正常序列化、to_row 却 Poison 静默丢审计事件的漂移)。
+    #[test]
+    fn closed_enum_wire_round_trips() {
+        for t in AuthEventType::ALL {
+            assert_eq!(serde_json::to_value(t).unwrap().as_str(), Some(t.as_str()));
+            assert_eq!(t.as_str().parse::<AuthEventType>().unwrap(), t);
+        }
+        for c in AuthChannel::ALL {
+            assert_eq!(serde_json::to_value(c).unwrap().as_str(), Some(c.as_str()));
+            assert_eq!(c.as_str().parse::<AuthChannel>().unwrap(), c);
+        }
+        for o in AuthOutcome::ALL {
+            assert_eq!(serde_json::to_value(o).unwrap().as_str(), Some(o.as_str()));
+            assert_eq!(o.as_str().parse::<AuthOutcome>().unwrap(), o);
+        }
+        for r in FailureReason::ALL {
+            assert_eq!(serde_json::to_value(r).unwrap().as_str(), Some(r.as_str()));
+            assert_eq!(r.as_str().parse::<FailureReason>().unwrap(), r);
+        }
+    }
 }

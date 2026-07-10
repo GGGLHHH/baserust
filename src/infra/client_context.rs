@@ -49,6 +49,17 @@ pub fn resolve_client_ip(
     real_ip.and_then(|r| r.parse::<IpAddr>().ok()).or(peer)
 }
 
+/// headers + peer → 可信客户端 IP(header 取值 + `resolve_client_ip` 一体)。
+/// 审计 `ClientContext` 与限流 `TrustedIpKeyExtractor` 共享**整个提取层**,不只末端解析。
+pub fn client_ip_from_headers(
+    headers: &axum::http::HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_hops: usize,
+) -> Option<IpAddr> {
+    let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    resolve_client_ip(get("x-forwarded-for"), get("x-real-ip"), peer, trusted_hops)
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for ClientContext {
     type Rejection = std::convert::Infallible;
 
@@ -65,12 +76,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientContext {
             .get::<TrustedHops>()
             .map(|t| t.0)
             .unwrap_or(1);
-        let ip = resolve_client_ip(
-            forwarded_chain.as_deref(),
-            header("x-real-ip"),
-            peer,
-            trusted_hops,
-        );
+        let ip = client_ip_from_headers(&parts.headers, peer, trusted_hops);
         Ok(Self {
             ip,
             forwarded_chain,

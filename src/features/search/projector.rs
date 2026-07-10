@@ -108,8 +108,9 @@ impl Projector {
                 pull::Config {
                     durable_name: Some(durable_name.to_owned()),
                     ack_policy: AckPolicy::Explicit,
-                    // 必须盖过 run() 退避梯子的单次最长 sleep(512s):默认 30s 会让服务端
-                    // 在原地重试期间判超时重投,副本绕过"保序"且末尾 ack 消不掉它们。
+                    // 盖过 run() 退避梯子的单次最长 sleep(512s)。注意:**只对新建 durable 生效**
+                    // (get_or_create 对已存在的 durable 只绑定、不更新配置)—— 存量部署仍是默认
+                    // 30s,故 run() 的退避另切 ≤15s 片、每片发 AckKind::Progress 续期兜底。
                     ack_wait: std::time::Duration::from_secs(600),
                     ..Default::default()
                 },
@@ -153,32 +154,42 @@ impl Projector {
                     // (共 ~17min,盖住常规 DB 抖动/故障切换),仍失败按毒消息跳过 + error 级告警
                     // (数据可经 bin/rebuild_search 回填)。
                     let mut attempt = 0u32;
-                    let should_ack = loop {
+                    let should_ack = 'retry: loop {
                         match Self::apply_message(&*self.repo, &msg.payload).await {
-                            Ok(()) => break true,
+                            Ok(()) => break 'retry true,
                             Err(ApplyError::Poison(why)) => {
                                 tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
-                                break true;
+                                break 'retry true;
                             }
                             Err(ApplyError::Transient(err)) if attempt >= 10 => {
                                 tracing::error!(error = %err, attempt, "projector 重试超限,按毒消息跳过(投影缺口需 rebuild_search 回填)");
-                                break true;
+                                break 'retry true;
                             }
                             Err(ApplyError::Transient(err)) => {
                                 let backoff = std::time::Duration::from_secs(1 << attempt.min(9));
                                 attempt += 1;
                                 tracing::warn!(error = %err, attempt, ?backoff, "projector apply 暂时失败,退避后原地重试(保序)");
-                                // 续期 ack_wait(WIP):告诉服务端"还在处理",跨多轮退避不被重投。
-                                if let Err(e) = msg.ack_with(jetstream::AckKind::Progress).await {
-                                    tracing::warn!(error = %e, "ack Progress 续期失败(重投风险,幂等守卫兜底)");
-                                }
-                                tokio::select! {
-                                    _ = tokio::time::sleep(backoff) => {}
-                                    changed = shutdown.changed() => {
-                                        if changed.is_err() || *shutdown.borrow() {
-                                            break false; // 关停:不 ack,留待重投
+                                // 退避切成 ≤15s 片、每片先发 AckKind::Progress 续期(WIP):
+                                // 不依赖服务端 ack_wait —— 存量 durable 的配置 get_or_create
+                                // 不会更新,仍是默认 30s,整段长 sleep 会被判超时重投副本。
+                                let mut remaining = backoff;
+                                while !remaining.is_zero() {
+                                    let slice =
+                                        remaining.min(std::time::Duration::from_secs(15));
+                                    if let Err(e) =
+                                        msg.ack_with(jetstream::AckKind::Progress).await
+                                    {
+                                        tracing::warn!(error = %e, "ack Progress 续期失败(重投风险,幂等守卫兜底)");
+                                    }
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(slice) => {}
+                                        changed = shutdown.changed() => {
+                                            if changed.is_err() || *shutdown.borrow() {
+                                                break 'retry false; // 关停:不 ack,留待重投
+                                            }
                                         }
                                     }
+                                    remaining -= slice;
                                 }
                             }
                         }
