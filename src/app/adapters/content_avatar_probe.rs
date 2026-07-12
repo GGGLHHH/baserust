@@ -37,6 +37,10 @@ impl AvatarProbe for ContentAvatarProbe {
             Err(ContentError::NotFound) => None,
             Err(e) => return Err(e.into()),
         };
-        Ok(Some(AvatarInfo { mime_type, ready }))
+        Ok(Some(AvatarInfo {
+            mime_type,
+            ready,
+            owner_id: c.owner_id,
+        }))
     }
 }

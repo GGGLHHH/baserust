@@ -30,10 +30,10 @@ impl ProfileDirectory for InProcessProfileDirectory {
         Ok(profiles
             .into_iter()
             .map(|p| {
-                // 相对 preview 路径(单域名哲学);无绑定 → None。悬空(content 已删)不在此校验 —— 列表富化不探测。
+                // 头像端点相对路径(按 user_id;单域名哲学);无绑定 → None。悬空(content 已删)不在此校验 —— 列表富化不探测。
                 let avatar_url = p
                     .avatar_content_id
-                    .map(|cid| format!("/api/v1/frontend/contents/{cid}/preview"));
+                    .map(|_cid| format!("/api/v1/frontend/profiles/{}/avatar", p.user_id));
                 (
                     p.user_id,
                     ProfileBrief {
@@ -82,7 +82,7 @@ mod tests {
         );
         assert_eq!(
             got.get(&with_avatar).unwrap().avatar_url.as_deref(),
-            Some(format!("/api/v1/frontend/contents/{cid}/preview").as_str())
+            Some(format!("/api/v1/frontend/profiles/{with_avatar}/avatar").as_str())
         );
         let brief = got.get(&no_avatar).unwrap();
         assert!(brief.display_name.is_none());

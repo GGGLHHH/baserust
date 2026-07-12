@@ -43,14 +43,15 @@ pub struct AvatarForm {
     pub file: String,
 }
 
-/// 出参 = 行字段 + 富化的 `avatar_url`(相对 preview 路径;悬空/未就绪/探测故障 → null)。
+/// 出参 = 行字段 + 富化的 `avatar_url`(相对头像端点路径;悬空/未就绪/探测故障 → null)。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
     pub display_name: Option<String>,
     pub phone: Option<String>,
     pub avatar_content_id: Option<Uuid>,
-    /// 相对路径 `/api/v1/frontend/contents/{id}/preview`(单域名哲学,无 base-url 变量)。
+    /// 相对路径 `/api/v1/frontend/profiles/{user_id}/avatar`(单域名哲学,无 base-url 变量;
+    /// 头像专用端点,只出本人的头像图 —— content 本体经 `contents/{id}/preview` 严格按 owner 隔离)。
     pub avatar_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,

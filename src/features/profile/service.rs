@@ -28,6 +28,15 @@ impl ProfileService {
         Ok(self.enrich(p).await)
     }
 
+    /// 该用户当前绑定的头像 content id(无资料 / 未绑定 → None)。头像展示端点用它定位要出的 content。
+    pub async fn avatar_content_id(&self, user_id: Uuid) -> Result<Option<Uuid>, AppError> {
+        Ok(self
+            .repo
+            .get(user_id)
+            .await?
+            .and_then(|p| p.avatar_content_id))
+    }
+
     /// 全量替换 upsert。bool = 新建(路由 201/200)。
     /// 头像**写前三查**(挡输入错误;读侧降级兜"绑定后被删"的竞态,各管一段):
     /// 不存在 / 未 confirm / 非 image → 422。
@@ -44,6 +53,13 @@ impl ProfileService {
                 .probe(cid)
                 .await? // 探测故障 → 500(写前校验必须可靠,不降级)
                 .ok_or_else(|| AppError::Validation("avatar_content_id: content 不存在".into()))?;
+            // 归属校验:头像 content 必须是**本人**的(owner==目标 user)。否则用户可把别人的
+            // 私有图片指成自己的 avatar_content_id,经头像端点跨用户泄露 —— fail-closed 422。
+            if info.owner_id != user_id {
+                return Err(AppError::Validation(
+                    "avatar_content_id: 头像必须是本人的 content".into(),
+                ));
+            }
             if !info.ready {
                 return Err(AppError::Validation(
                     "avatar_content_id: content 未完成上传(先 confirm)".into(),
@@ -68,11 +84,12 @@ impl ProfileService {
         Ok((created, self.enrich(p).await))
     }
 
-    /// 富化 avatar_url:就绪**且 image/\***→ 相对 preview 路径;悬空/未就绪/已非图片 → null;
+    /// 富化 avatar_url:就绪**且 image/\***→ 头像端点相对路径;悬空/未就绪/已非图片 → null;
     /// **探测故障也 → null + warn**(读路径不因旁路故障炸——与写前校验的 500 刻意相反)。
-    /// mime 口径与 content preview 的非 owner 守卫一致:owner 事后把 mime 改掉,别人本就取不到
-    /// 该 URL(404)—— 广播一个取不到的地址比广播 null 更糟(全站头像对他人静默破图)。
+    /// URL 指 `profiles/{user_id}/avatar`(头像专用端点,只服务本人 avatar);content 本体经
+    /// `contents/{id}/preview` 严格按 owner 隔离,不再对他人放行任意 image(见 content::preview_content)。
     async fn enrich(&self, p: Profile) -> ProfileResponse {
+        let user_id = p.user_id;
         let avatar_url = match p.avatar_content_id {
             None => None,
             Some(cid) => match self.avatars.probe(cid).await {
@@ -83,7 +100,7 @@ impl ProfileService {
                             .as_deref()
                             .is_some_and(|m| m.starts_with("image/")) =>
                 {
-                    Some(format!("/api/v1/frontend/contents/{cid}/preview"))
+                    Some(format!("/api/v1/frontend/profiles/{user_id}/avatar"))
                 }
                 Ok(_) => None,
                 Err(e) => {
@@ -156,18 +173,21 @@ mod tests {
         ));
     }
 
-    /// 头像三查:不存在 / 未就绪 / 非 image → 422(Validation)。
+    /// 头像四查:不存在 / 非本人 / 未就绪 / 非 image → 422(Validation)。
     #[tokio::test]
     async fn avatar_validation_rejects_bad_bindings() {
+        let uid = Uuid::now_v7();
         let ok_id = Uuid::now_v7();
         let raw_id = Uuid::now_v7();
         let txt_id = Uuid::now_v7();
+        let foreign_id = Uuid::now_v7(); // 就绪的 image,但 owner 是别人 → 也该 422
         let probe = StaticAvatarProbe(HashMap::from([
             (
                 ok_id,
                 AvatarInfo {
                     mime_type: Some("image/png".into()),
                     ready: true,
+                    owner_id: uid,
                 },
             ),
             (
@@ -175,6 +195,7 @@ mod tests {
                 AvatarInfo {
                     mime_type: Some("image/png".into()),
                     ready: false,
+                    owner_id: uid,
                 },
             ),
             (
@@ -182,12 +203,20 @@ mod tests {
                 AvatarInfo {
                     mime_type: Some("text/plain".into()),
                     ready: true,
+                    owner_id: uid,
+                },
+            ),
+            (
+                foreign_id,
+                AvatarInfo {
+                    mime_type: Some("image/png".into()),
+                    ready: true,
+                    owner_id: Uuid::now_v7(),
                 },
             ),
         ]));
         let svc = svc_with(probe);
-        let uid = Uuid::now_v7();
-        for bad in [Uuid::now_v7(), raw_id, txt_id] {
+        for bad in [Uuid::now_v7(), foreign_id, raw_id, txt_id] {
             assert!(
                 matches!(
                     svc.put(uid, req(Some(bad)), &ctx()).await,
@@ -196,11 +225,11 @@ mod tests {
                 "{bad} 应被 422 拒"
             );
         }
-        // 合法绑定:通过且富化出相对 preview 路径
+        // 合法绑定(本人、就绪、image):通过且富化出头像端点路径
         let (_, r) = svc.put(uid, req(Some(ok_id)), &ctx()).await.unwrap();
         assert_eq!(
             r.avatar_url.as_deref(),
-            Some(format!("/api/v1/frontend/contents/{ok_id}/preview").as_str())
+            Some(format!("/api/v1/frontend/profiles/{uid}/avatar").as_str())
         );
     }
 
@@ -216,15 +245,16 @@ mod tests {
         }
         // 先用"就绪"探针绑定成功,再换故障探针读 —— 模拟旁路故障
         let cid = Uuid::now_v7();
+        let uid = Uuid::now_v7();
         let repo = Arc::new(InMemoryProfileRepo::new());
         let ok_probe = StaticAvatarProbe(HashMap::from([(
             cid,
             AvatarInfo {
                 mime_type: Some("image/png".into()),
                 ready: true,
+                owner_id: uid,
             },
         )]));
-        let uid = Uuid::now_v7();
         ProfileService::new(repo.clone(), Arc::new(ok_probe))
             .put(uid, req(Some(cid)), &ctx())
             .await

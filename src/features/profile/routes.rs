@@ -3,8 +3,11 @@
 //! 越权失败给 **403 而非 404** —— profile 本就任意可读,存在性不敏感,藏 404 无意义
 //! (对比 widget GET 的 404:那里 ownership 是可见性,这里只是写权)。
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use uuid::Uuid;
 
 use super::types::{AvatarForm, ProfileResponse, PutProfileRequest};
@@ -73,7 +76,7 @@ pub async fn get_my_profile(
         (status = 201, description = "首次建立", body = ProfileResponse),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 profiles:write / 改别人无 write:all", body = ErrorBody),
-        (status = 422, description = "校验失败(超长 / 头像不存在 / 未 confirm / 非 image)", body = ErrorBody)
+        (status = 422, description = "校验失败(超长 / 头像不存在或非本人 / 未 confirm / 非 image)", body = ErrorBody)
     )
 )]
 pub async fn put_profile(
@@ -102,6 +105,59 @@ pub async fn put_profile(
         StatusCode::OK
     };
     Ok((status, Json(resp)))
+}
+
+/// 用户头像展示端点(**跨用户可见**:任意登录用户都能看别人的头像 —— 头像是 profile 刻意暴露
+/// 的单张公开图,与"content 本体严格按 owner 隔离"分开)。读该用户的 avatar_content_id → 出字节。
+/// 无资料 / 未绑定头像 / 头像 content 已删或未就绪 → 404。
+/// **只服务被指定为头像的那个 content**(且 put 已校验 owner==本人、image/*),故不重开
+/// `contents/{id}/preview` 那种"任意 image 越权读"的面。仅需登录(头像非敏感展示数据,不额外要 contents:read)。
+#[utoipa::path(
+    get,
+    path = "/profiles/{user_id}/avatar",
+    tag = "profiles",
+    params(("user_id" = Uuid, Path, description = "idm user id(1:1)")),
+    responses(
+        (status = 307, description = "跳转到短时效签名 URL(presign 后端)"),
+        (status = 200, description = "inline 图片字节(代理回退)", content_type = "application/octet-stream"),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 404, description = "无资料 / 未绑定头像 / 头像不可用", body = ErrorBody)
+    )
+)]
+pub async fn get_user_avatar(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path(user_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let cid = state
+        .profiles
+        .avatar_content_id(user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // 出字节:presign 后端 → 307 到签名 URL;内存 backend → 代理 inline。刻意重复
+    // content::preview_content 的服务段(去掉 owner 闸 —— 本端点契约就是"这个用户的公开头像"),
+    // 而非跨 feature 复用其 handler(维持业务模块彼此零 import,胶水只在组合根)。
+    if let Some(url) = state.contents.preview_url(cid).await? {
+        // 307 默认不可缓存(RFC 9110);no-store 防错配 CDN/代理缓存 5min 签名 URL。
+        let mut resp = Redirect::temporary(&url).into_response();
+        resp.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(resp);
+    }
+    let p = state.contents.preview_content(cid).await?;
+    let mime = p
+        .metadata
+        .as_ref()
+        .and_then(|m| m.mime_type.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    Response::builder()
+        .header(CONTENT_TYPE, mime)
+        .header(CONTENT_DISPOSITION, "inline")
+        // 用户可控 mime(svg/html)+ inline = 同源执行面;CSP sandbox 全禁脚本/表单/同源访问,
+        // 图片照常渲染(put 已限 image/*,此为双保险)。
+        .header("content-security-policy", "sandbox")
+        .body(Body::from(p.data))
+        .map_err(|e| AppError::Internal(e.into()))
 }
 
 // ── 后台资料管理(admin 组,路径仍在 /users/{id} 下、归 users:admin 授权面;
@@ -223,22 +279,41 @@ pub async fn set_user_avatar(
     let content_id = outcome.content.id;
 
     // auto-bind:保留现有 display_name/phone(无资料行 → None),换上新头像。
-    let (display_name, phone) = match state.profiles.get(id).await {
-        Ok(p) => (p.display_name, p.phone),
-        Err(AppError::NotFound) => (None, None),
-        Err(e) => return Err(e),
+    // content(app.contents)与 profile(app.profiles)跨表写,不共享一个事务:绑定任一步
+    // 失败(get/put 报错)则 best-effort 软删刚上传的 content(owner=目标用户、尚无引用),
+    // 避免留下无法回收的孤儿行/对象字节。清理失败只 warn,不掩盖原始错误。
+    let bind: Result<(bool, ProfileResponse), AppError> = async {
+        let (display_name, phone) = match state.profiles.get(id).await {
+            Ok(p) => (p.display_name, p.phone),
+            Err(AppError::NotFound) => (None, None),
+            Err(e) => return Err(e),
+        };
+        state
+            .profiles
+            .put(
+                id,
+                PutProfileRequest {
+                    avatar_content_id: Some(content_id),
+                    display_name,
+                    phone,
+                },
+                &ctx,
+            )
+            .await
+    }
+    .await;
+    let (_created, resp) = match bind {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(cleanup) = state
+                .contents
+                .delete_content(content_id, ctx.audit_id())
+                .await
+            {
+                tracing::warn!(error = %cleanup, %content_id, "头像绑定失败后清理孤儿 content 失败(软删)");
+            }
+            return Err(e);
+        }
     };
-    let (_created, resp) = state
-        .profiles
-        .put(
-            id,
-            PutProfileRequest {
-                avatar_content_id: Some(content_id),
-                display_name,
-                phone,
-            },
-            &ctx,
-        )
-        .await?;
     Ok(Json(resp))
 }

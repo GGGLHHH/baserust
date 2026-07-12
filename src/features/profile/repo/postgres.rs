@@ -95,11 +95,11 @@ impl ProfileRepo for PgProfileRepo {
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
 
-        // avatar_url:同 service::enrich 的相对 preview 口径,但**不探测就绪性**——那是读侧关注
-        // (探测要 import content 模块,repo 层不做);这里只记录写入意图,悬空/未就绪由后续
-        // relay/读侧消费者各自决定语义。
+        // avatar_url:同 service::enrich 的头像端点口径(按 user_id,非 content id),但**不探测
+        // 就绪性**——那是读侧关注(探测要 import content 模块,repo 层不做);这里只记录写入意图,
+        // 悬空/未就绪由读侧消费者各自决定语义。
         let avatar_url =
-            avatar_content_id.map(|cid| format!("/api/v1/frontend/contents/{cid}/preview"));
+            avatar_content_id.map(|_cid| format!("/api/v1/frontend/profiles/{user_id}/avatar"));
         emit_outbox(
             &mut tx,
             "profile.updated",

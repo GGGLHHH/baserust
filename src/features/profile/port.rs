@@ -8,12 +8,14 @@ use uuid::Uuid;
 
 use crate::infra::error::AppError;
 
-/// 头像探测的瘦快照 —— 只含 profile 要的两个事实(窄接口)。
+/// 头像探测的瘦快照 —— 只含 profile 要的三个事实(窄接口)。
 #[derive(Clone, Debug)]
 pub struct AvatarInfo {
     pub mime_type: Option<String>,
     /// 已 confirm 可读(Uploaded/Processed/Archived);false = prepare 了没传完(两步上传中途)。
     pub ready: bool,
+    /// content 的属主 —— 头像绑定必须是**本人**的 content(防把别人私图"洗"成自己头像)。
+    pub owner_id: Uuid,
 }
 
 /// 探测端口。`Ok(None)` = content 不存在/已删(能力性缺席,交调用方定语义)。

@@ -25,6 +25,7 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::get_my_profile))
         .routes(routes!(routes::get_profile, routes::put_profile))
+        .routes(routes!(routes::get_user_avatar))
 }
 
 /// 后台资料管理(admin 组;路径在 /users/{id} 下,与 users::admin_router 并挂)。

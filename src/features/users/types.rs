@@ -24,7 +24,7 @@ pub struct AdminUserView {
     pub roles: Vec<RoleName>,
     /// 富化:app.profiles 的显示名(悬空/分进程 → null)。
     pub display_name: Option<String>,
-    /// 富化:相对 preview 路径(悬空/分进程 → null)。
+    /// 富化:相对头像端点路径(悬空/分进程 → null)。
     pub avatar_url: Option<String>,
 }
 

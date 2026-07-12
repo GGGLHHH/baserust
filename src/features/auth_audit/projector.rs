@@ -109,7 +109,10 @@ impl AuthEventProjector {
     }
 
     /// 后台循环:拉消息 → `apply_message` → 成功 ack,失败留待重投;`shutdown` 置位即退出。
-    /// 逐字镜像 `features::search::projector::Projector::run`。
+    /// **与 `search::projector::Projector::run` 的差异**:审计事件 append-only(`insert` 按
+    /// `event_seq` 幂等),无 per-user 水位覆盖问题,故这里**刻意不做**保序退避重试 / ack_wait
+    /// 续期(search 侧那套是为防"跳过本条→更大 seq 推高水位→本条重投被丢弃"的字段丢失)。
+    /// 慢 apply 触发的 ack_wait 重投由 `event_seq` 幂等吞掉(重复无害),无需续期。
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut messages = match self.consumer.messages().await {
             Ok(messages) => messages,

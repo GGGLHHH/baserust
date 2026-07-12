@@ -136,6 +136,11 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "put_profile",
         perm: PermReq::All(&[Perm::ProfileWrite]),
     },
+    // 头像展示端点:仅登录(头像是公开展示数据;只出被指定为头像、owner 本人的那张图)
+    OpAuthz {
+        operation_id: "get_user_avatar",
+        perm: PermReq::LoginOnly,
+    },
     OpAuthz {
         operation_id: "get_me",
         perm: PermReq::LoginOnly,

@@ -386,7 +386,7 @@ pub async fn download_content(
         (status = 200, description = "inline 字节(代理回退,Content-Type 取自元数据)", content_type = "application/octet-stream"),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 contents:read 权限", body = ErrorBody),
-        (status = 404, description = "不存在 / 非 owner 且非 image/*(头像跨用户展示例外;不区分,防泄露存在)", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人且无 contents:read:all(不区分,防泄露存在)", body = ErrorBody),
         (status = 409, description = "内容未就绪", body = ErrorBody)
     )
 )]
@@ -399,24 +399,10 @@ pub async fn preview_content(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    // ownership 折中:preview 与 download 指向同一原始对象字节,全开会让 404 守卫被
-    // 兄弟端点整体绕过(任意文档可越权拉取)。头像跨用户展示又必须保留 —— 故:
-    // owner / read:all → 任意类型可预览;其他人只放行 image/*(头像场景),其余 404。
-    // owner 事后改/清 metadata.mime → 对他人即刻收回可见性(profile 富化同口径,见 enrich)。
-    let (_c, owned) =
-        fetch_content_with_access(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
-    if !owned {
-        // 只把 NotFound 折叠成"非图片";瞬时故障(池耗尽/切换)必须 5xx 上抛,
-        // 折成 404 会让前端把头像当"不存在"缓存、运维丢告警。
-        let is_image = match state.contents.get_content_metadata(id).await {
-            Ok(m) => m.mime_type.is_some_and(|m| m.starts_with("image/")),
-            Err(content::ContentError::NotFound) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !is_image {
-            return Err(AppError::NotFound); // 同 get/download:不泄露存在
-        }
-    }
+    // 严格 owner 隔离(同 get/download):非 owner 且无 contents:read:all → 404。
+    // 头像跨用户展示不再从这里"放行任意 image"(那会让 owner 隔离被整体绕过)——
+    // 改由 `profiles/{user_id}/avatar` 专用端点服务:只出被指定为头像、且属主本人的那一张图。
+    fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
     if let Some(url) = state.contents.preview_url(id).await? {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
         let mut resp = Redirect::temporary(&url).into_response();

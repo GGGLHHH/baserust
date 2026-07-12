@@ -291,7 +291,7 @@ async fn ownership_gate_and_write_all() {
 /// 头像全链路:两步上传 image/png → 绑定 → avatar_url 富化;删 content → GET 降级 null。
 #[tokio::test]
 async fn avatar_bind_enrich_and_dangling_degrade() {
-    let (app, store, admin, alice, _bob) = test_app();
+    let (app, store, admin, alice, bob) = test_app();
     let cid = seed_content(&app, &store, &alice, "image/png", true).await;
     let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
 
@@ -306,9 +306,29 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v = body_json(resp).await;
+    let avatar_uri = format!("/api/v1/frontend/profiles/{ALICE_ID}/avatar");
+    assert_eq!(v["avatar_url"].as_str().unwrap(), avatar_uri);
+
+    // 头像端点出图:内存 backend 无 presign → 代理 200 图片字节。alice 本人 + 跨用户 bob 都能看
+    // (头像是刻意暴露的公开展示图)。
+    for tok in [&alice, &bob] {
+        let resp = app.clone().oneshot(get(&avatar_uri, tok)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "头像端点应出图(含跨用户)");
+    }
+    // 而 content 本体经 contents/{id}/preview 严格按 owner 隔离:非 owner bob 直读 → 404
+    // (即"腿 2":头像展示不再让任意 image 被越权直读)。
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{cid}/preview"),
+            &bob,
+        ))
+        .await
+        .unwrap();
     assert_eq!(
-        v["avatar_url"].as_str().unwrap(),
-        format!("/api/v1/frontend/contents/{cid}/preview")
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "非 owner 直读 content preview 应 404"
     );
 
     // 删 content(admin 有 contents:delete)→ 悬空:GET 降级 avatar_url=null,不炸
@@ -333,6 +353,13 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
         v["avatar_content_id"].as_str().unwrap(),
         cid,
         "原始引用保留"
+    );
+    // 头像端点在悬空(content 已删)时 → 404(不再出图)。
+    let resp = app.clone().oneshot(get(&avatar_uri, &alice)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "头像 content 已删 → 头像端点 404"
     );
 }
 
@@ -359,6 +386,50 @@ async fn avatar_bad_bindings_rejected_422() {
             "{bad} 应 422"
         );
     }
+}
+
+/// 腿 1:头像 content 必须是**本人**的 —— 绑定别人 owner 的 content → 422(防把私图"洗"成头像)。
+#[tokio::test]
+async fn avatar_bind_foreign_content_rejected_422() {
+    let (app, store, _admin, alice, bob) = test_app();
+    // bob 上传自己的 image content(owner = BOB)
+    let bob_cid = seed_content(&app, &store, &bob, "image/png", true).await;
+    // alice 想把 bob 的 content 设成自己的头像 → 422(非本人)
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/profiles/{ALICE_ID}"),
+            &format!(r#"{{"avatar_content_id":"{bob_cid}"}}"#),
+            &alice,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "绑定别人 owner 的 content 应 422"
+    );
+}
+
+/// 无资料 / 未绑定头像 → 头像端点 404(不泄露、不炸)。
+#[tokio::test]
+async fn avatar_endpoint_404_when_unset() {
+    let (app, _store, _admin, alice, _bob) = test_app();
+    let avatar_uri = format!("/api/v1/frontend/profiles/{ALICE_ID}/avatar");
+    // 无资料
+    let resp = app.clone().oneshot(get(&avatar_uri, &alice)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "无资料 → 404");
+    // 建资料但不带头像
+    app.clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/profiles/{ALICE_ID}"),
+            r#"{"display_name":"San"}"#,
+            &alice,
+        ))
+        .await
+        .unwrap();
+    let resp = app.clone().oneshot(get(&avatar_uri, &alice)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未绑定头像 → 404");
 }
 
 /// 401:无 token 读/写皆拒(scope 矩阵归 openapi_authz_test 自动覆盖,这里只钉登录闸)。

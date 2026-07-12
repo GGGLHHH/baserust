@@ -633,7 +633,8 @@ async fn cross_user_content_is_404_unless_all_mode() {
         StatusCode::NOT_FOUND,
         "非 owner 预览非图片应 404"
     );
-    // 非 owner 的 image/* 保持可预览(头像跨用户展示场景)
+    // 非 owner 的 image/* 也 404:preview 严格按 owner 隔离,不再放行任意图片。
+    // 头像跨用户展示改走 /profiles/{id}/avatar 专用端点(见 profile_api),不从这里绕过。
     let resp = app
         .clone()
         .oneshot(upload_req(&admin, "a.png", "image/png", b"\x89PNG"))
@@ -648,7 +649,11 @@ async fn cross_user_content_is_404_unless_all_mode() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "非 owner 预览图片应放行");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "非 owner 预览图片也应 404(严格 owner 隔离)"
+    );
 
     // auditor(read:all + write:all)跨用户读 → 200,删 → 204
     let signer = AppTokenSigner::dev();

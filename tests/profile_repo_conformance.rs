@@ -76,7 +76,7 @@ async fn memory_profile_upsert_emits_profile_updated_outbox_event() {
         "初始应无残留事件"
     );
 
-    // ── 建(有头像):payload.avatar_url = 相对 preview 路径 ──
+    // ── 建(有头像):payload.avatar_url = 相对头像端点路径(按 user_id)──
     let uid = Uuid::now_v7();
     let avatar = Uuid::now_v7();
     let f = ProfileFields {
@@ -96,7 +96,7 @@ async fn memory_profile_upsert_emits_profile_updated_outbox_event() {
     assert_eq!(rows[0].payload["display_name"], "A Z");
     assert_eq!(
         rows[0].payload["avatar_url"],
-        format!("/api/v1/frontend/contents/{avatar}/preview")
+        format!("/api/v1/frontend/profiles/{uid}/avatar")
     );
     outbox.mark_published(&[rows[0].id]).await.unwrap();
     assert!(
@@ -166,7 +166,7 @@ mod pg {
             "初始应无残留事件"
         );
 
-        // ── 建(有头像):payload.avatar_url = 相对 preview 路径 ──
+        // ── 建(有头像):payload.avatar_url = 相对头像端点路径(按 user_id)──
         let uid = Uuid::now_v7();
         let avatar = Uuid::now_v7();
         let f = ProfileFields {
@@ -186,7 +186,7 @@ mod pg {
         assert_eq!(rows[0].payload["display_name"], "A Z");
         assert_eq!(
             rows[0].payload["avatar_url"],
-            format!("/api/v1/frontend/contents/{avatar}/preview")
+            format!("/api/v1/frontend/profiles/{uid}/avatar")
         );
         outbox.mark_published(&[rows[0].id]).await.unwrap();
         assert!(
