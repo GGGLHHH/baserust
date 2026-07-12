@@ -97,39 +97,61 @@ pub async fn apply(
         role_ids.insert(r.as_str(), id);
     }
 
-    // 2. 账号(幂等:已存在则取,否则建)+ 授予角色(幂等)。
+    // 2. 账号(幂等:已存在则取,否则建)。新建走 **create_with_roles** —— 让 `user.created`
+    //    事件**带上角色**,CQRS 投影(search projector)据此落 `admin_user_index.roles`。
+    //    旧写法 `create` + `grant` 有 bug:`create` 发的 user.created 是空 roles、`grant` 又不发
+    //    任何事件,导致 seed 出来的账号在搜索投影里角色恒为空(admin 用户列表 roles=[])。
     for a in &data.accounts {
         let username = a.username.trim().to_lowercase();
         let email = a.email.as_deref().map(|e| e.trim().to_lowercase());
-        let user = match users.find_by_identifier(&username).await? {
-            Some(uwh) => uwh.user,
+        // 账号引用的角色名 → id(未声明角色即报错)。create_with_roles 与幂等补授共用。
+        let account_role_ids: Vec<uuid::Uuid> = a
+            .roles
+            .iter()
+            .map(|role_name| {
+                role_ids
+                    .get(role_name.as_str())
+                    .copied()
+                    .with_context(|| format!("账号 {username} 引用了未声明的角色 {role_name}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        match users.find_by_identifier(&username).await? {
+            // 已存在(幂等再跑):补齐角色(grant 幂等;首建时角色已随 user.created 落库并投影)。
+            Some(uwh) => {
+                for &role_id in &account_role_ids {
+                    roles.grant(uwh.user.id, role_id, by.clone()).await?;
+                }
+            }
             None => {
                 let hash = hasher
                     .hash(&a.password)
                     .map_err(|e| anyhow::anyhow!("argon2 hash 失败: {e:?}"))?;
                 match users
-                    .create(&username, email.as_deref(), &hash, by.clone())
+                    .create_with_roles(
+                        &username,
+                        email.as_deref(),
+                        &hash,
+                        &account_role_ids,
+                        by.clone(),
+                    )
                     .await
                 {
-                    Ok(u) => u,
-                    // 并发 seed:另一实例已抢先建 → 退回查已存在的(幂等收敛)。
+                    Ok(_) => {}
+                    // 并发 seed:另一实例已抢先建 → 退回补齐角色(幂等收敛)。
                     Err(IdmError::Conflict(_)) => {
-                        users
+                        let user = users
                             .find_by_identifier(&username)
                             .await?
                             .context("并发 seed 冲突后仍查不到用户")?
-                            .user
+                            .user;
+                        for &role_id in &account_role_ids {
+                            roles.grant(user.id, role_id, by.clone()).await?;
+                        }
                     }
                     Err(e) => return Err(anyhow::anyhow!("seed account {username} 失败: {e:?}")),
                 }
             }
-        };
-        for role_name in &a.roles {
-            let role_id = role_ids
-                .get(role_name.as_str())
-                .copied()
-                .with_context(|| format!("账号 {username} 引用了未声明的角色 {role_name}"))?;
-            roles.grant(user.id, role_id, by.clone()).await?;
         }
     }
 
