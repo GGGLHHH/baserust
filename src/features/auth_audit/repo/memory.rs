@@ -77,11 +77,35 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
         page: PageParams,
     ) -> Result<Page<AuthEventRow>, AppError> {
         let rows = self.rows.lock().unwrap();
+        // 联合模糊搜的针(小写);与 pg 的 ILIKE 子串同口径(parity)。
+        let q_needle =
+            f.q.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_lowercase);
         let mut items: Vec<&NewAuthEvent> = rows
             .iter()
             .filter(|r| f.user_id.is_none_or(|u| r.user_id == Some(u)))
             .filter(|r| f.event_type.is_none_or(|t| r.event_type == t.as_str()))
             .filter(|r| f.outcome.is_none_or(|o| r.outcome == o.as_str()))
+            .filter(|r| {
+                q_needle.as_deref().is_none_or(|needle| {
+                    let has = |s: &Option<String>| {
+                        s.as_deref()
+                            .is_some_and(|v| v.to_lowercase().contains(needle))
+                    };
+                    has(&r.actor)
+                        || has(&r.identifier_attempted)
+                        || r.ip
+                            .is_some_and(|i| i.to_string().to_lowercase().contains(needle))
+                })
+            })
+            .filter(|r| {
+                f.ip.as_deref()
+                    .is_none_or(|ip| r.ip.is_some_and(|i| i.to_string() == ip))
+            })
+            .filter(|r| f.from.is_none_or(|from| r.occurred_at >= from))
+            .filter(|r| f.to.is_none_or(|to| r.occurred_at < to))
             .collect();
         items.sort_by(|a, b| b.id.cmp(&a.id)); // id v7 DESC
         let out: Vec<AuthEventRow> = items

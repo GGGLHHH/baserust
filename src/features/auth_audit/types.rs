@@ -269,6 +269,10 @@ pub struct AuthEventFilter {
     /// 事件类型(闭集;未知值在 Query 提取器被拒 → 400 bad_request,而非静默空结果)。
     pub event_type: Option<AuthEventType>,
     pub outcome: Option<AuthOutcome>,
+    /// 联合模糊搜:`actor`(展示用户名/标识)+ `identifier_attempted`(失败场景提交的用户名/邮箱)
+    /// + `ip`(文本),大小写不敏感子串。**下推到库**(全历史检索),取代前端内存过滤。空 = 不搜。
+    pub q: Option<String>,
+    /// 精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。
     pub ip: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub from: Option<OffsetDateTime>,
@@ -283,6 +287,7 @@ impl AuthEventFilter {
             user_id,
             event_type: self.event_type,
             outcome: self.outcome,
+            q: self.q,
             ip: self.ip,
             from: self.from,
             to: self.to,
@@ -307,6 +312,8 @@ pub struct AuthEventQuery {
     pub user_id: Option<Uuid>,
     pub event_type: Option<AuthEventType>,
     pub outcome: Option<AuthOutcome>,
+    /// 联合模糊搜(actor + identifier_attempted + ip 文本,大小写不敏感子串)。
+    pub q: Option<String>,
     pub ip: Option<String>,
     pub from: Option<OffsetDateTime>,
     pub to: Option<OffsetDateTime>,

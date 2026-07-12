@@ -213,6 +213,82 @@ async fn auth_events_authz_matrix() {
     assert_eq!(v["items"].as_array().unwrap().len(), 1, "应命中手插的 1 行");
 }
 
+// ── q 联合模糊搜(actor + identifier_attempted + ip 子串)下推到库,全历史检索(取代前端内存过滤)──
+#[tokio::test]
+async fn list_q_searches_actor_ip_identifier_server_side() {
+    let (app, repo, superadmin, _admin) = test_app().await;
+    let mk = |seq: i64, actor: &str, ip: &str, ident: Option<&str>| NewAuthEvent {
+        id: Uuid::now_v7(),
+        event_type: "auth.login_succeeded".into(),
+        occurred_at: time::OffsetDateTime::now_utc(),
+        channel: "public".into(),
+        auth_method: "password".into(),
+        user_id: Some(Uuid::now_v7()),
+        identifier_attempted: ident.map(str::to_owned),
+        session_id: None,
+        actor: Some(actor.to_owned()),
+        outcome: "success".into(),
+        failure_reason: None,
+        ip: ip.parse().ok(),
+        forwarded_chain: None,
+        user_agent: None,
+        request_id: None,
+        event_seq: seq,
+    };
+    repo.insert(&mk(10, "alice", "10.1.1.1", None))
+        .await
+        .unwrap();
+    repo.insert(&mk(11, "bob", "10.2.2.2", Some("bob@example.com")))
+        .await
+        .unwrap();
+
+    let actors = |v: serde_json::Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["actor"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // actor 子串
+    let r = app
+        .clone()
+        .oneshot(get("/api/v1/admin/auth/auth-events?q=alic", &superadmin))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        actors(json_body(r).await),
+        vec!["alice".to_owned()],
+        "q=alic → 命中 actor 子串"
+    );
+
+    // ip 子串
+    let r = app
+        .clone()
+        .oneshot(get("/api/v1/admin/auth/auth-events?q=10.2", &superadmin))
+        .await
+        .unwrap();
+    assert_eq!(
+        actors(json_body(r).await),
+        vec!["bob".to_owned()],
+        "q=10.2 → 命中 ip 子串"
+    );
+
+    // identifier_attempted 子串
+    let r = app
+        .clone()
+        .oneshot(get("/api/v1/admin/auth/auth-events?q=example", &superadmin))
+        .await
+        .unwrap();
+    assert_eq!(
+        actors(json_body(r).await),
+        vec!["bob".to_owned()],
+        "q=example → 命中 identifier_attempted 子串"
+    );
+}
+
 // ── 授权矩阵 + 响应体形状:GET /admin/auth-events/stats ──
 
 #[tokio::test]

@@ -31,6 +31,15 @@ impl PgAuthEventRepo {
     }
 }
 
+/// 转义 LIKE 元字符(`\ % _`)+ 包 `%...%`(镜像 search repo 的 `ilike_contains`,与内存 `contains` parity)。
+fn ilike_contains(term: &str) -> String {
+    let esc = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{esc}%")
+}
+
 fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
     if let Some(u) = f.user_id {
         q.and_where(Expr::col(AuthEvent::UserId).eq(u));
@@ -40,6 +49,14 @@ fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
     }
     if let Some(o) = &f.outcome {
         q.and_where(Expr::col(AuthEvent::Outcome).eq(o.as_str()));
+    }
+    // 联合模糊搜:actor + identifier_attempted + ip(文本),大小写不敏感子串。ip 是 inet,cast 成 text 再 ILIKE。
+    if let Some(term) = f.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let pat = ilike_contains(term);
+        q.and_where(Expr::cust_with_values(
+            r#"("actor" ILIKE $1 OR "identifier_attempted" ILIKE $2 OR "ip"::text ILIKE $3)"#,
+            [pat.clone(), pat.clone(), pat],
+        ));
     }
     if let Some(ip) = &f.ip {
         q.and_where(Expr::cust_with_values(r#""ip" = $1::inet"#, [ip.clone()]));
