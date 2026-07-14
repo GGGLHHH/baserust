@@ -153,7 +153,7 @@ mod tests {
     use crate::features::widget::{MemoryEventBus, StaticUserDirectory, UserBrief};
 
     fn ctx() -> AuditContext {
-        AuditContext::anonymous(None)
+        AuditContext::anonymous()
     }
     fn first_page() -> PageQuery {
         PageQuery {

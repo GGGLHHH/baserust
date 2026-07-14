@@ -10,7 +10,7 @@ use super::super::types::{
 };
 use super::AuthEventRepo;
 use crate::infra::error::AppError;
-use crate::infra::pagination::{Page, PageParams};
+use crate::infra::pagination::{encode_cursor, Page, PageParams};
 
 #[derive(Default)]
 pub struct InMemoryAuthEventRepo {
@@ -100,10 +100,7 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
                             .is_some_and(|i| i.to_string().to_lowercase().contains(needle))
                 })
             })
-            .filter(|r| {
-                f.ip.as_deref()
-                    .is_none_or(|ip| r.ip.is_some_and(|i| i.to_string() == ip))
-            })
+            .filter(|r| f.ip.is_none_or(|ip| r.ip == Some(ip)))
             .filter(|r| f.from.is_none_or(|from| r.occurred_at >= from))
             .filter(|r| f.to.is_none_or(|to| r.occurred_at < to))
             .collect();
@@ -127,9 +124,21 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
                 let slice = out.into_iter().skip(start).take(size as usize).collect();
                 Ok(Page::offset(slice, page, size, total))
             }
-            PageParams::Cursor { limit, .. } => {
-                let slice: Vec<_> = out.into_iter().take(limit as usize).collect();
-                Ok(Page::cursor(slice, limit, None))
+            PageParams::Cursor { after, limit } => {
+                // keyset 恒按 id DESC(v7 id 即创建序倒序);id < after 配 ORDER BY id DESC(parity 于 PG)。
+                let mut rows: Vec<AuthEventRow> = out
+                    .into_iter()
+                    .filter(|r| after.is_none_or(|a| r.id < a))
+                    .take(limit as usize + 1)
+                    .collect();
+                let has_more = rows.len() as u64 > limit;
+                let next = if has_more {
+                    rows.truncate(limit as usize);
+                    rows.last().map(|r| encode_cursor(r.id))
+                } else {
+                    None
+                };
+                Ok(Page::cursor(rows, limit, next))
             }
         }
     }

@@ -41,28 +41,16 @@ async fn fetch_content_owned(
     all_perm: Perm,
     id: Uuid,
 ) -> Result<content::Content, AppError> {
-    let (c, owned) = fetch_content_with_access(state, user, scope, all_perm, id).await?;
-    if owned {
-        Ok(c)
-    } else {
-        Err(AppError::NotFound)
-    }
-}
-
-/// 同上,但把 ownership 判定交还调用方(preview 需要"非 owner 但 image 放行"的折中)。
-async fn fetch_content_with_access(
-    state: &AppState,
-    user: &idm::AuthUser,
-    scope: &[Perm],
-    all_perm: Perm,
-    id: Uuid,
-) -> Result<(content::Content, bool), AppError> {
     let c = state.contents.get_content(id).await?;
     let owned = state
         .policy
         .data_access(user, scope, all_perm)
         .allows(c.owner_id);
-    Ok((c, owned))
+    if owned {
+        Ok(c)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。

@@ -106,7 +106,8 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     openapi::inject_operation_security(&mut api);
 
     let router = router
-        // 中间件栈(外→内,请求时外层先执行)。
+        // 中间件栈:按 tower 语义"后 .layer() 的更外层、请求最先过",故本列表**自内向外**书写 ——
+        // 首行 Trace 最内(贴近 handler),末行 SetRequestId 最外(请求最先过、响应最后离开)。
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)

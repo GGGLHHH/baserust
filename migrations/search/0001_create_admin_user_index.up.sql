@@ -13,8 +13,8 @@ create table admin_user_index (
     profile_seq    bigint,
     updated_at     timestamptz not null default (now() at time zone 'utc')
 );
--- 前缀/模糊搜索(P4 用):username/display_name 加 text_pattern_ops 支持 LIKE 'x%';roles 用 GIN;created_at 区间。
-create index admin_user_index_username_idx on admin_user_index (username text_pattern_ops);
-create index admin_user_index_display_name_idx on admin_user_index (display_name text_pattern_ops);
+-- 搜索走 ILIKE '%term%'(大小写不敏感 + 前导通配),text_pattern_ops/B-tree 均无法命中 → username/display_name
+-- 不建文本索引:admin_user_index 是有界读模型(用户量级),管理端搜索 seq-scan 可接受。真要子串加速,
+-- 则 `CREATE EXTENSION pg_trgm` 后对 username/display_name 建 GIN(gin_trgm_ops)。roles 用 GIN;created_at 区间。
 create index admin_user_index_roles_idx on admin_user_index using gin (roles);
 create index admin_user_index_created_at_idx on admin_user_index (created_at);

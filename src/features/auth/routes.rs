@@ -11,7 +11,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use garde::Validate;
 use uuid::Uuid;
 
-use super::emit::{emit_auth_event, failure_data, session_event_data, success_data};
+use super::emit::{emit_auth_event, failure_data, success_data};
 use super::types::{
     ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
     UserResponse,
@@ -213,7 +213,13 @@ pub async fn logout(
                 &state.idm_outbox,
                 AuthEventType::LoggedOut,
                 session.user_id,
-                session_event_data(&ctx, AuthChannel::Public, session.user_id, session.id, None),
+                success_data(
+                    &ctx,
+                    AuthChannel::Public,
+                    session.user_id,
+                    Some(session.id),
+                    None,
+                ),
             )
             .await;
         }

@@ -272,8 +272,11 @@ pub struct AuthEventFilter {
     /// 联合模糊搜:`actor`(展示用户名/标识)+ `identifier_attempted`(失败场景提交的用户名/邮箱)
     /// + `ip`(文本),大小写不敏感子串。**下推到库**(全历史检索),取代前端内存过滤。空 = 不搜。
     pub q: Option<String>,
-    /// 精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。
-    pub ip: Option<String>,
+    /// 精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。强类型 `IpAddr`:
+    /// 非法值在 Query 提取器被拒 → 400(而非把裸串 cast 成 `::inet` 让 PG 抛 500;亦对齐内存侧规范化比较)。
+    /// OpenAPI 里仍呈现为 string(utoipa 无 `IpAddr` schema)。
+    #[param(value_type = String)]
+    pub ip: Option<std::net::IpAddr>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub from: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -314,7 +317,7 @@ pub struct AuthEventQuery {
     pub outcome: Option<AuthOutcome>,
     /// 联合模糊搜(actor + identifier_attempted + ip 文本,大小写不敏感子串)。
     pub q: Option<String>,
-    pub ip: Option<String>,
+    pub ip: Option<std::net::IpAddr>,
     pub from: Option<OffsetDateTime>,
     pub to: Option<OffsetDateTime>,
 }

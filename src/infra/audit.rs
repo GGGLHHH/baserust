@@ -39,9 +39,6 @@ impl Actor {
 #[derive(Clone, Debug)]
 pub struct AuditContext {
     pub actor: Actor,
-    /// 关联日志的 request-id(来自 tower-http 设的 x-request-id)。预留:接审计落库/日志关联时消费。
-    #[allow(dead_code)]
-    pub request_id: Option<String>,
 }
 
 impl AuditContext {
@@ -49,14 +46,12 @@ impl AuditContext {
     pub fn system() -> Self {
         Self {
             actor: Actor::System,
-            request_id: None,
         }
     }
 
-    pub fn anonymous(request_id: Option<String>) -> Self {
+    pub fn anonymous() -> Self {
         Self {
             actor: Actor::Anonymous,
-            request_id,
         }
     }
 
@@ -72,18 +67,13 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        let request_id = parts
-            .headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
         let actor = match parts.extensions.get::<AuthUser>() {
             Some(u) => Actor::User {
                 id: u.id.to_string(),
             },
             None => Actor::Anonymous,
         };
-        Ok(Self { actor, request_id })
+        Ok(Self { actor })
     }
 }
 

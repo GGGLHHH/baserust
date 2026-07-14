@@ -330,6 +330,24 @@ impl Default for Config {
     }
 }
 
+/// 百分号编码连接串里的 user/password/database。生成的密码(如 `openssl rand -base64`)常含
+/// `/ + @ ? #` 等 URL 保留字符,直接插值进 `postgres://user:pass@host/db` 会破坏 authority 解析
+/// (`/` 提前结束 authority),或让形如 `%XX` 的子串被 sqlx 误 percent-decode 成别的密码 —— 都表现为
+/// opaque 的启动期连接失败。这里只保留 RFC3986 unreserved 字符,其余全编码;sqlx 连接时 percent-decode
+/// 还原,过度编码(把 unreserved 也编码)无害。host 不编码(避免破坏 IPv6 `[::1]` 的方括号/冒号)。
+fn enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 impl Config {
     /// 从环境变量加载(调用方先 load 过 .env)。**全部环境变量的读取/默认值收口在本文件**:
     /// 加变量 = 加字段(figment 变量名转小写匹配),别在别处 `std::env::var`。
@@ -347,11 +365,11 @@ impl Config {
         self.app_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.app_db_user,
-                self.app_db_password,
+                enc(&self.app_db_user),
+                enc(&self.app_db_password),
                 host,
                 self.app_db_port,
-                self.app_db_database,
+                enc(&self.app_db_database),
                 self.app_db_sslmode,
             )
         })
@@ -362,11 +380,11 @@ impl Config {
         self.idm_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.idm_db_user,
-                self.idm_db_password,
+                enc(&self.idm_db_user),
+                enc(&self.idm_db_password),
                 host,
                 self.idm_db_port,
-                self.idm_db_database,
+                enc(&self.idm_db_database),
                 self.idm_db_sslmode,
             )
         })
@@ -377,11 +395,11 @@ impl Config {
         self.content_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.content_db_user,
-                self.content_db_password,
+                enc(&self.content_db_user),
+                enc(&self.content_db_password),
                 host,
                 self.content_db_port,
-                self.content_db_database,
+                enc(&self.content_db_database),
                 self.content_db_sslmode,
             )
         })
@@ -392,11 +410,11 @@ impl Config {
         self.search_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.search_db_user,
-                self.search_db_password,
+                enc(&self.search_db_user),
+                enc(&self.search_db_password),
                 host,
                 self.search_db_port,
-                self.search_db_database,
+                enc(&self.search_db_database),
                 self.search_db_sslmode,
             )
         })
@@ -480,6 +498,18 @@ mod tests {
             cfg(Some("h")).app_database_url().unwrap(),
             "postgres://app:pw@h:6000/db?sslmode=require"
         );
+    }
+
+    #[test]
+    fn url_percent_encodes_reserved_userinfo() {
+        // 生成的密码常含 URL 保留字符;原样插值会在 '/' 处截断 authority → 连接失败。
+        // 编码后 sqlx 的 URL 解析器应能正确解析(且 password 里不再有裸 '/')。
+        let mut c = cfg(Some("h"));
+        c.app_db_password = "p/w@x?y#z ".into();
+        let url = c.app_database_url().unwrap();
+        assert!(!url.contains("p/w"), "保留字符必须被编码: {url}");
+        url.parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("编码后的连接串必须可解析");
     }
 
     #[test]
