@@ -330,6 +330,39 @@ async fn preview_proxies_bytes_inline_on_memory_backend() {
     assert_eq!(body_bytes(resp).await, b"png-bytes".to_vec());
 }
 
+/// 活动内容(text/html、svg 等)预览必须**降级 attachment**,绝不 inline —— presign 拓扑下 app 加不了
+/// CSP 且与 app 同源,inline 渲染即同源无 CSP 的存储型 XSS。栅格图仍 inline(见上一测试)。
+#[tokio::test]
+async fn preview_forces_attachment_for_active_content() {
+    let (app, admin, _) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(upload_req(
+            &admin,
+            "x.html",
+            "text/html",
+            b"<script>alert(1)</script>",
+        ))
+        .await
+        .unwrap();
+    let id = uploaded_content_id(resp).await;
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment"),
+        "活动内容必须降级 attachment,不能 inline 渲染"
+    );
+}
+
 /// presign 路径:注入覆写 URL 方法的 store → 307 + Location;download 的 Location 带 filename
 /// (上传后改名,Location 必须签新名,证伪 metadata 优先决议)。
 #[tokio::test]

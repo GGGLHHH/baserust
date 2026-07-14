@@ -53,6 +53,21 @@ async fn fetch_content_owned(
     }
 }
 
+/// 可安全 inline 渲染的 MIME 白名单(浏览器不执行脚本):栅格图 / 视频 / 音频 / PDF / 纯文本。
+/// **排除活动内容**(image/svg+xml、text/html、application/xml…):它们 inline + 同源 + 无 CSP =
+/// 存储型 XSS。presign 分支 app 加不了 CSP,且 relative-presign 拓扑(见 compose/nginx)下 presign
+/// 与 app **同源** —— 故不能靠"presign 天然异源"兜底。不在白名单 → 强制 attachment(浏览器下载不渲染)。
+fn is_safe_inline_mime(mime: &str) -> bool {
+    if mime == "image/svg+xml" {
+        return false; // 唯一的"活动"图片类型,单独排除
+    }
+    mime.starts_with("image/")
+        || mime.starts_with("video/")
+        || mime.starts_with("audio/")
+        || mime == "application/pdf"
+        || mime == "text/plain"
+}
+
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。
 #[utoipa::path(
     post,
@@ -351,23 +366,8 @@ pub async fn download_content(
         .as_ref()
         .and_then(|m| m.file_name.clone())
         .unwrap_or_else(|| id.to_string());
-    // RFC 6266:非 ASCII / 控制字符不能直接进 header —— 控制字符会让 HeaderValue 构造失败(→ 500),
-    // 非 ASCII 会被浏览器按 latin-1 解成乱码。`filename*` 用 UTF-8 百分号编码承载真实名;`filename=`
-    // 留净化后的 ASCII 兜底(老客户端)。
-    let ascii_fallback: String = file_name
-        .chars()
-        .map(|c| {
-            if (c.is_ascii_graphic() && c != '"') || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let disposition = format!(
-        "attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{}",
-        crate::infra::percent::encode(&file_name)
-    );
+    // RFC 6266 文件名(ascii 兜底 + filename*),与 presign 下载路径同口径(见 percent 模块)。
+    let disposition = crate::infra::percent::content_disposition_attachment(&file_name);
     Response::builder()
         .header(CONTENT_TYPE, mime)
         .header(CONTENT_DISPOSITION, disposition)
@@ -405,7 +405,24 @@ pub async fn preview_content(
     // 头像跨用户展示不再从这里"放行任意 image"(那会让 owner 隔离被整体绕过)——
     // 改由 `profiles/{user_id}/avatar` 专用端点服务:只出被指定为头像、且属主本人的那一张图。
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
-    if let Some(url) = state.contents.preview_url(id).await? {
+    // inline 是否安全:活动内容(html/svg/xml…)绝不 inline。presign 分支 app 加不了 CSP,relative-presign
+    // 拓扑下又与 app 同源 —— 不安全类型强制 attachment(浏览器下载不执行),安全类型才 inline 预览。
+    let safe_inline = state
+        .contents
+        .get_content_metadata(id)
+        .await
+        .ok()
+        .and_then(|m| m.mime_type)
+        .as_deref()
+        .is_some_and(is_safe_inline_mime);
+
+    // presign 分支(prod 默认):安全 → inline 预览凭证;不安全 → attachment 下载凭证(不渲染活动内容)。
+    let presigned = if safe_inline {
+        state.contents.preview_url(id).await?
+    } else {
+        state.contents.download_url(id).await?
+    };
+    if let Some(url) = presigned {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
         let mut resp = Redirect::temporary(&url).into_response();
         resp.headers_mut().insert(
@@ -414,21 +431,19 @@ pub async fn preview_content(
         );
         return Ok(resp);
     }
-    // 代理回退:Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
+    // 代理回退(memory 后端):Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
     let p = state.contents.preview_content(id).await?;
     let mime = p
         .metadata
         .as_ref()
         .and_then(|m| m.mime_type.clone())
         .unwrap_or_else(|| "application/octet-stream".to_owned());
+    // 安全类型 inline 渲染;活动类型已降级 attachment(不渲染即不执行)。CSP sandbox 再兜一层:
+    // 禁脚本/表单/同源访问,即便 inline 的用户可控 mime 也拿不到 app origin 的任何东西。
+    let disposition = if safe_inline { "inline" } else { "attachment" };
     Response::builder()
         .header(CONTENT_TYPE, mime)
-        .header(CONTENT_DISPOSITION, "inline")
-        // inline + 用户可控 mime(上传/元数据均可声明 text/html、svg)= 同源执行面。
-        // CSP sandbox:本响应里脚本/表单/同源访问全禁 —— 图片/视频照常渲染;
-        // 恶意 html/svg 拿不到 app origin 的任何东西。注意 sandbox 管不到浏览器 PDF
-        // 阅读器自带的 JS action 模型(要彻底 → mime 白名单外回退 attachment)。
-        // presign 路径天然异源,无此问题。
+        .header(CONTENT_DISPOSITION, disposition)
         .header("content-security-policy", "sandbox")
         .body(Body::from(p.data))
         .map_err(|e| AppError::Internal(e.into()))
