@@ -108,6 +108,15 @@ impl Projector {
                 pull::Config {
                     durable_name: Some(durable_name.to_owned()),
                     ack_policy: AckPolicy::Explicit,
+                    // 只订阅本 projector 的域:idm 用户事件(events.idm.user.>)+ app profile
+                    // 事件(events.app.>)。**排除 events.idm.auth.>** —— 那是 auth_audit projector
+                    // 的域(同一 stream 平行消费)。注意同 ack_wait:只对**新建** durable 生效
+                    // (get_or_create 对已存在的只绑定不更新),存量 durable 仍会收到 auth.*,
+                    // 由 apply_message 顶部显式跳过兜底。
+                    filter_subjects: vec![
+                        "events.idm.user.>".to_owned(),
+                        "events.app.>".to_owned(),
+                    ],
                     // 盖过 run() 退避梯子的单次最长 sleep(512s)。注意:**只对新建 durable 生效**
                     // (get_or_create 对已存在的 durable 只绑定、不更新配置)—— 存量部署仍是默认
                     // 30s,故 run() 的退避另切 ≤15s 片、每片发 AckKind::Progress 续期兜底。
@@ -237,6 +246,13 @@ impl Projector {
     async fn apply_message(repo: &dyn SearchIndexRepo, payload: &[u8]) -> Result<(), ApplyError> {
         let env: Envelope = serde_json::from_slice(payload)
             .map_err(|e| ApplyError::Poison(format!("envelope 反序列化: {e}")))?;
+
+        // auth.* 是 auth_audit projector 的域(同一 stream,它按 events.idm.auth.> 过滤消费)。
+        // 本(user-search)projector 只管 user.*/profile.*;存量 durable 没设 filter_subjects
+        // 时会一并收到 auth.* —— 显式静默跳过(ack),不当"未知类型"刷 debug。
+        if env.r#type.starts_with("auth.") {
+            return Ok(());
+        }
 
         match env.r#type.as_str() {
             "user.created" => {
@@ -411,6 +427,27 @@ mod tests {
             "aggregate_id": user_id,
             "seq": 1,
             "data": { "whatever": "value" }
+        });
+
+        Projector::apply_message(&repo, &serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
+
+        assert!(repo.get(user_id).await.unwrap().is_none());
+    }
+
+    /// auth.* 属 auth_audit projector 的域(同一 stream 平行消费):user-search projector
+    /// 顶部显式跳过 —— 不落库、不当"未知类型"刷 debug(存量 durable 无 filter_subjects 时的兜底)。
+    #[tokio::test]
+    async fn auth_events_are_skipped_noop() {
+        let repo = InMemorySearchIndexRepo::new();
+        let user_id = Uuid::now_v7();
+        let envelope = json!({
+            "schema": "idm",
+            "type": "auth.login_succeeded",
+            "aggregate_id": user_id,
+            "seq": 1,
+            "data": { "occurred_at": "2026-07-12T10:00:00Z", "channel": "public", "outcome": "success" }
         });
 
         Projector::apply_message(&repo, &serde_json::to_vec(&envelope).unwrap())
