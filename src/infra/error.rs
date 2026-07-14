@@ -202,8 +202,9 @@ impl From<idm::IdmError> for AppError {
 
 /// content 库的领域错误 `ContentError` 接进 app 错误体系 —— **HTTP 状态码 / wire 形状在此边界决定**。
 /// content 是零 HTTP 的纯库,只暴露领域语义;映射对齐其文档分组(见 content::error):
-/// not-found→404;not-ready / invalid-state / conflict→409(状态/冲突类);invalid-status→422(校验);
-/// storage / internal→500(原始 source 含 key/backend,只进日志、绝不进响应体)。
+/// not-found→404;not-ready / invalid-state / conflict→409(状态/冲突类);
+/// invalid-status / storage / internal→500(invalid-status = DB 存了无法解析的状态串,是数据完整性
+/// 故障而非客户端可修的校验错;原始值/source 含 key/backend/脏值,只进日志、绝不进响应体)。
 /// 校验(422)/坏请求(400)是 app 边界产物(garde / 提取器 → Validation/BadRequest),不经此映射。
 impl From<content::ContentError> for AppError {
     fn from(e: content::ContentError) -> Self {
@@ -211,7 +212,10 @@ impl From<content::ContentError> for AppError {
         match e {
             CE::NotFound => AppError::NotFound,
             CE::NotReady(m) | CE::InvalidState(m) | CE::Conflict(m) => AppError::Conflict(m),
-            CE::InvalidStatus(m) => AppError::Validation(m),
+            // DB 边界解析失败(脏状态串):内部数据完整性故障 → 500,原始脏值只进日志不回传。
+            CE::InvalidStatus(m) => {
+                AppError::Internal(anyhow::anyhow!("content status 解析失败(DB 脏值): {m}"))
+            }
             CE::Storage(e) | CE::Internal(e) => AppError::Internal(e),
         }
     }

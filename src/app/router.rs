@@ -106,8 +106,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     openapi::inject_operation_security(&mut api);
 
     let router = router
-        // 中间件栈:按 tower 语义"后 .layer() 的更外层、请求最先过",故本列表**自内向外**书写 ——
-        // 首行 Trace 最内(贴近 handler),末行 SetRequestId 最外(请求最先过、响应最后离开)。
+        // 内层中间件栈(tower 语义:后 .layer() 更外、请求最先过,故**自内向外**书写:首行 Trace
+        // 最内贴近 handler)。CORS / 安全响应头 / 限流刻意包在此栈**之外**(见下),好让限流 429、
+        // panic 500 等短路响应也带上 CORS 与安全头 —— 否则浏览器读不到跨域的错误响应。
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)
@@ -117,21 +118,6 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         .layer(middleware::from_fn(timeout_middleware))
         // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
         .layer(CatchPanicLayer::custom(handle_panic))
-        // 安全响应头(基础 web 安全基线;HSTS 留给 nginx/TLS 终止处加)
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("no-referrer"),
-        ))
-        // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
-        .layer(cors_layer(config))
         // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
         .layer(axum::Extension(crate::infra::client_context::TrustedHops(
             config.trusted_proxy_hops,
@@ -161,6 +147,23 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     } else {
         router
     };
+
+    // CORS + 安全响应头包在**最外**(限流之外):限流 429 / panic 500 等短路响应也带上它们
+    // —— 否则浏览器读不到跨域的错误响应(429 body 被 CORS 挡),且这些响应缺安全头。
+    let router = router
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(cors_layer(config));
 
     // 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露,prod 收起减少攻击面。
     let router = if config.app_env.expose_docs() {

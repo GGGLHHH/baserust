@@ -351,12 +351,26 @@ pub async fn download_content(
         .as_ref()
         .and_then(|m| m.file_name.clone())
         .unwrap_or_else(|| id.to_string());
+    // RFC 6266:非 ASCII / 控制字符不能直接进 header —— 控制字符会让 HeaderValue 构造失败(→ 500),
+    // 非 ASCII 会被浏览器按 latin-1 解成乱码。`filename*` 用 UTF-8 百分号编码承载真实名;`filename=`
+    // 留净化后的 ASCII 兜底(老客户端)。
+    let ascii_fallback: String = file_name
+        .chars()
+        .map(|c| {
+            if (c.is_ascii_graphic() && c != '"') || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let disposition = format!(
+        "attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{}",
+        crate::infra::percent::encode(&file_name)
+    );
     Response::builder()
         .header(CONTENT_TYPE, mime)
-        .header(
-            CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", file_name.replace('"', "")),
-        )
+        .header(CONTENT_DISPOSITION, disposition)
         .body(Body::from(bytes))
         .map_err(|e| AppError::Internal(e.into()))
 }

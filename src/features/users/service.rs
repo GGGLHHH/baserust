@@ -311,6 +311,10 @@ impl UserAdminService {
         req: ResetPasswordRequest,
     ) -> Result<(), AppError> {
         req.validate()?;
+        // 存在性守卫(镜像 set_roles):缺失/软删用户 → 404,且不白算 hash / 撤会话。pinned idm 的 PG
+        // update_password 不自校验存在(不查 rows_affected / deleted_at),不守则内存↔PG 分叉:PG 会对
+        // 幽灵/软删用户返 204 并改写其 password_hash,违背文档的 404 契约。
+        self.users.find_by_id(id).await?;
         let hash = self.hasher.hash(&req.new_password)?;
         self.users.update_password(id, &hash).await?;
         // 撤会话 fail-closed(区别于 delete 的 best-effort):refresh 路径不验密码,撤失败=旧 refresh

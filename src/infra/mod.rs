@@ -13,4 +13,5 @@ pub mod op_perms;
 pub mod openapi;
 pub mod outbox;
 pub mod pagination;
+pub mod percent;
 pub mod sort;

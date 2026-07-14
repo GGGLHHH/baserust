@@ -333,19 +333,10 @@ impl Default for Config {
 /// 百分号编码连接串里的 user/password/database。生成的密码(如 `openssl rand -base64`)常含
 /// `/ + @ ? #` 等 URL 保留字符,直接插值进 `postgres://user:pass@host/db` 会破坏 authority 解析
 /// (`/` 提前结束 authority),或让形如 `%XX` 的子串被 sqlx 误 percent-decode 成别的密码 —— 都表现为
-/// opaque 的启动期连接失败。这里只保留 RFC3986 unreserved 字符,其余全编码;sqlx 连接时 percent-decode
-/// 还原,过度编码(把 unreserved 也编码)无害。host 不编码(避免破坏 IPv6 `[::1]` 的方括号/冒号)。
+/// opaque 的启动期连接失败。编码后 sqlx 连接时 percent-decode 还原。host 不编码(避免破坏 IPv6
+/// `[::1]` 的方括号/冒号)。机制收口在 [`crate::infra::percent`](super::percent)。
 fn enc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{b:02X}"));
-        }
-    }
-    out
+    super::percent::encode(s)
 }
 
 impl Config {

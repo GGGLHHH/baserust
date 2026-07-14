@@ -153,8 +153,9 @@ pub async fn get_user_avatar(
     Response::builder()
         .header(CONTENT_TYPE, mime)
         .header(CONTENT_DISPOSITION, "inline")
-        // 用户可控 mime(svg/html)+ inline = 同源执行面;CSP sandbox 全禁脚本/表单/同源访问,
-        // 图片照常渲染(put 已限 image/*,此为双保险)。
+        // CSP sandbox 全禁脚本/表单/同源访问,栅格图照常渲染。纵深防御:上传已限栅格白名单
+        // (service::is_allowed_avatar_mime 排除 SVG),此 header 再兜一层(代理分支专有;presign
+        // 分支直连存储、加不了 CSP —— 故防线必须在上传白名单,不能靠出字节时补)。
         .header("content-security-policy", "sandbox")
         .body(Body::from(p.data))
         .map_err(|e| AppError::Internal(e.into()))
@@ -250,14 +251,17 @@ pub async fn set_user_avatar(
     let file = crate::infra::extract::file_part(&mut multipart)
         .await?
         .ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
-    // 先校验后写(transactions skill):非 image/* 就不该产生任何持久化副作用 ——
+    // 先校验后写(transactions skill):非白名单 mime 就不该产生任何持久化副作用 ——
     // 否则 put 的三查 422 时,已落库的 content(owner=目标用户)成孤儿且无清理路径。
+    // 栅格白名单(排除 SVG 活动内容),口径收口在 service::is_allowed_avatar_mime。
     if !file
         .mime_type
         .as_deref()
-        .is_some_and(|m| m.starts_with("image/"))
+        .is_some_and(super::service::is_allowed_avatar_mime)
     {
-        return Err(AppError::Validation("avatar must be image/*".into()));
+        return Err(AppError::Validation(
+            "avatar must be a raster image (png/jpeg/gif/webp)".into(),
+        ));
     }
 
     // content 归目标用户(是他的头像);单租户 tenant=nil。

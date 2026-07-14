@@ -11,6 +11,17 @@ use super::types::{Profile, ProfileResponse, PutProfileRequest};
 use crate::infra::audit::AuditContext;
 use crate::infra::error::AppError;
 
+/// 头像准入 MIME 白名单:只收**栅格图**。刻意**排除 `image/svg+xml`**(及其他非栅格 `image/*`)——
+/// SVG 是活动内容(可内联脚本);presign 后端把头像 307 直连存储出字节、**无 CSP sandbox**(只有代理
+/// 回退分支才加 sandbox),而头像端点任何登录用户跨用户可达 → 恶意 SVG 头像 = 存储型 XSS。收口在上传
+/// 边界(两处),从源头挡住,而非依赖出字节时的 `image/*` 前缀"双保险"(它并不排除 SVG)。
+pub(crate) fn is_allowed_avatar_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
 #[derive(Clone)]
 pub struct ProfileService {
     repo: Arc<dyn ProfileRepo>,
@@ -68,10 +79,10 @@ impl ProfileService {
             if !info
                 .mime_type
                 .as_deref()
-                .is_some_and(|m| m.starts_with("image/"))
+                .is_some_and(is_allowed_avatar_mime)
             {
                 return Err(AppError::Validation(
-                    "avatar_content_id: 头像必须是 image/*".into(),
+                    "avatar_content_id: 头像必须是栅格图(png/jpeg/gif/webp)".into(),
                 ));
             }
         }
