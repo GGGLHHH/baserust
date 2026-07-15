@@ -27,15 +27,15 @@ if grep -q "CHANGE-ME" "$DIR/.env"; then
   read -r ans; [ "$ans" = "y" ] || { echo "已中止,先改 .env"; exit 1; }
 fi
 
-# seed.prod.toml 存在性(compose bind-mount 它;缺文件会被 docker 建成目录 → idm 启动崩)。
-# 不建 = idm 不 seed 任何账号(不落 pwd 弱默认);要建就得填真密码。
-if [ ! -f "$DIR/seed.prod.toml" ]; then
-  echo "⚠️ 缺 seed.prod.toml —— idm 启动不会建超管账号。"
+# seed.prod.toml:compose bind-mount 它,缺文件会被 docker 建成目录 → idm 启动崩,故必须占位。
+# 无 [[accounts]](缺文件 or 上次留下的占位空文件)= idm 不 seed 任何账号(不落 pwd 弱默认)。
+if ! grep -q '^\[\[accounts\]\]' "$DIR/seed.prod.toml" 2>/dev/null; then
+  echo "⚠️ seed.prod.toml 没有账号 —— idm 启动不会建超管账号。"
   echo "   要建号:cp seed.prod.toml.example seed.prod.toml 并填强密码,再重跑本脚本。"
   echo "   确认无账号继续起服务? [y/N]"
   read -r ans; [ "$ans" = "y" ] || { echo "已中止"; exit 1; }
   # 占位空文件,避免 bind mount 把路径建成目录(idm 读它 = 空账号列表,不建号)。
-  : > "$DIR/seed.prod.toml"
+  [ -f "$DIR/seed.prod.toml" ] || : > "$DIR/seed.prod.toml"
 elif grep -q "CHANGE_ME" "$DIR/seed.prod.toml"; then
   echo "⚠️ seed.prod.toml 仍有 CHANGE_ME 占位密码(弱凭据)。继续? [y/N]"
   read -r ans; [ "$ans" = "y" ] || { echo "已中止,先填真密码"; exit 1; }
@@ -60,5 +60,3 @@ docker image prune -f >/dev/null 2>&1 || true
 echo "═══ 完成 ═══"
 echo "状态: docker compose -f docker-compose.prod.yml ps"
 echo "日志: docker compose -f docker-compose.prod.yml logs -f app idm"
-echo ""
-echo "⚠️ 首启后立刻登录改 superadmin 密码(seed 默认 superadmin/pwd 是弱凭据)。"
