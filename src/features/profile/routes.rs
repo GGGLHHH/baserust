@@ -134,6 +134,21 @@ pub async fn get_user_avatar(
         .avatar_content_id(user_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    // **出字节前再验栅格**(纵深,不只信绑定时那次):presign 分支 307 直连存储,浏览器拿到的
+    // Content-Type 是对象上传时存进 S3 的那个、且 app 加不了 CSP —— 非栅格从这里出去 = 存储型 XSS,
+    // 且本端点任何登录用户跨用户可达。mime 现已不可改(见 SetContentMetadataRequest),故它与 S3
+    // 那份恒一致;这层兜住"绑定早于该约束的历史数据"。不可用 → 404(同本端点其余不可用分支)。
+    if !state
+        .contents
+        .get_content_metadata(cid)
+        .await
+        .ok()
+        .and_then(|m| m.mime_type)
+        .as_deref()
+        .is_some_and(super::service::is_allowed_avatar_mime)
+    {
+        return Err(AppError::NotFound);
+    }
     // 出字节:presign 后端 → 307 到签名 URL;内存 backend → 代理 inline。刻意重复
     // content::preview_content 的服务段(去掉 owner 闸 —— 本端点契约就是"这个用户的公开头像"),
     // 而非跨 feature 复用其 handler(维持业务模块彼此零 import,胶水只在组合根)。

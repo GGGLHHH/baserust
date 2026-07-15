@@ -725,3 +725,80 @@ async fn cross_user_content_is_404_unless_all_mode() {
 
     // owner 本人始终可读自己的(已被删 → 404 属正常;此处验证的是删除前 admin 可读,上面用例已覆盖)
 }
+
+/// **mime 是服务端所有物**:上传后 `PUT /metadata` 改不动它。
+///
+/// 这是 presign 分支存储型 XSS 的根因闸:presign 出的 URL 只 override disposition,浏览器拿到的
+/// Content-Type 恒是**上传时存进对象存储的那个**;而 inline 安全闸读的是 DB 里的 mime。两者能分叉,
+/// 攻击者就能 `text/html` 上传 → 改 mime 成 `image/png` 骗过闸门 → presign 拿回 text/html + inline。
+/// 让 mime 不可改,分叉不存在。
+#[tokio::test]
+async fn metadata_put_cannot_mutate_mime_so_gate_and_stored_ct_cannot_diverge() {
+    let (app, admin, _viewer) =
+        test_app_with_store(Arc::new(PresignStore(content::InMemoryObjectStore::new())));
+    // 以 text/html 上传(存储里的 Content-Type 自此固定成 text/html)
+    let up = app
+        .clone()
+        .oneshot(upload_req(
+            &admin,
+            "evil.html",
+            "text/html",
+            b"<script>x</script>",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(up.status(), StatusCode::CREATED);
+    let id = uploaded_content_id(up).await;
+
+    // 攻击动作:把 mime 改成惰性类型骗闸门 —— 必须无效
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/api/v1/frontend/contents/{id}/metadata"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::from(
+                    r#"{"tags":[],"file_name":"evil.html","mime_type":"image/png"}"#.to_owned(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // mime 未被改写(仍是上传时那个 = 存储里那个)
+    let meta = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/frontend/contents/{id}/metadata"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(meta).await).unwrap();
+    assert_eq!(
+        v["mime_type"].as_str(),
+        Some("text/html"),
+        "mime 必须仍是上传时的值;可改 = 能与存储里的 Content-Type 分叉"
+    );
+
+    // 闸门据此仍判"不可 inline" → 强制 attachment(presign 分支给的是下载凭证,不是 ?inline)
+    let prev = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/frontend/contents/{id}/preview"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prev.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = prev.headers()["location"].to_str().unwrap().to_owned();
+    assert!(
+        !loc.contains("?inline"),
+        "活动内容绝不能拿到 inline 预览凭证: {loc}"
+    );
+}

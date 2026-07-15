@@ -17,7 +17,7 @@ async fn expect_deleted(
         .expect("5s 内应收到事件")
         .expect("总线不应关闭");
     match got {
-        WidgetEvent::Deleted { id } => assert_eq!(id, expected),
+        WidgetEvent::Deleted { id, .. } => assert_eq!(id, expected),
         other => panic!("期待 Deleted,得到 {other:?}"),
     }
 }
@@ -29,21 +29,33 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     // 1. 订阅后发布 → 收到
     let mut sub = bus.subscribe().await.expect("订阅应成功");
     let id1 = Uuid::now_v7();
-    bus.publish(WidgetEvent::Deleted { id: id1 }).await;
+    bus.publish(WidgetEvent::Deleted {
+        id: id1,
+        created_by: None,
+    })
+    .await;
     expect_deleted(&mut sub, id1).await;
 
     // 2. 两个订阅各收一份(广播,非竞争消费)
     let mut a = bus.subscribe().await.unwrap();
     let mut b = bus.subscribe().await.unwrap();
     let id2 = Uuid::now_v7();
-    bus.publish(WidgetEvent::Deleted { id: id2 }).await;
+    bus.publish(WidgetEvent::Deleted {
+        id: id2,
+        created_by: None,
+    })
+    .await;
     expect_deleted(&mut a, id2).await;
     expect_deleted(&mut b, id2).await;
 
     // 3. 无回放:晚订阅者收不到旧事件 —— 新订阅后发 id3,第一条即 id3(而非 id1/id2)
     let mut late = bus.subscribe().await.unwrap();
     let id3 = Uuid::now_v7();
-    bus.publish(WidgetEvent::Deleted { id: id3 }).await;
+    bus.publish(WidgetEvent::Deleted {
+        id: id3,
+        created_by: None,
+    })
+    .await;
     expect_deleted(&mut late, id3).await;
 }
 
@@ -60,15 +72,22 @@ async fn memory_lagged_subscriber_skips_and_continues() {
     let mut sub = bus.subscribe().await.unwrap();
     let last = Uuid::now_v7();
     for _ in 0..199 {
-        bus.publish(WidgetEvent::Deleted { id: Uuid::now_v7() })
-            .await;
+        bus.publish(WidgetEvent::Deleted {
+            id: Uuid::now_v7(),
+            created_by: None,
+        })
+        .await;
     }
-    bus.publish(WidgetEvent::Deleted { id: last }).await;
+    bus.publish(WidgetEvent::Deleted {
+        id: last,
+        created_by: None,
+    })
+    .await;
     // 前 136 条被挤掉;能一路读到最后一条 = 掉队后仍在流上
     let mut got_last = false;
     for _ in 0..64 {
         match timeout(Duration::from_secs(5), sub.recv()).await.unwrap() {
-            Some(WidgetEvent::Deleted { id }) if id == last => {
+            Some(WidgetEvent::Deleted { id, .. }) if id == last => {
                 got_last = true;
                 break;
             }

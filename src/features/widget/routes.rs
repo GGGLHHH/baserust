@@ -317,6 +317,12 @@ pub async fn admin_list_widgets(
 /// 订阅 widget 变更事件流(SSE)。需登录 + `widgets:read` —— 与列表同权:能看列表就能看变更。
 /// EventSource 不能自定义 header,凭据靠 httponly cookie(Bearer 兜底给 curl/测试)。
 /// best-effort 无回放:断线期间的事件丢失,EventSource 自动重连拿新订阅。
+///
+/// **行级 ownership 与 list 同口径**:总线是广播(不分频道),过滤落在本 handler —— 逐帧
+/// `allows_created_by`,不过就跳帧(`continue`),**不**结束流。没这层,无 `read:all` 的 `user`
+/// 能从流里读到 `list_widgets`/`get_widget` 都不给他看的**别人的 widget**(名字等全量 `Widget`)。
+/// `Access` 在开流时刻算定并随流存活 —— 同下面的鉴权时刻取舍。
+///
 /// 鉴权只在开流时刻评估:流存活期间 token 过期/吊销不会断流(SSE 惯例取舍;低敏数据可接受)。
 /// 要收紧:按 claim 的 exp 到点结束流,EventSource 重连即重新鉴权。
 #[utoipa::path(
@@ -337,15 +343,25 @@ pub async fn widget_events(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+    // ownership:无 read:all → 只收自己创建的那些 widget 的事件(与 list_widgets 同一判定)。
+    let access = state
+        .policy
+        .data_access(&user.0, &scope.0, Perm::WidgetReadAll);
     let sub = state.widget_events.subscribe().await?;
     // recv() → SSE 帧;None(总线关)→ 流结束。json_data 对我们的类型不会失败,失败即结束流(ok()?)。
-    let stream = futures_util::stream::unfold(sub, |mut sub| async move {
-        let event = sub.recv().await?;
-        let frame = Event::default()
-            .event(event.name())
-            .json_data(&event)
-            .ok()?;
-        Some((Ok::<_, Infallible>(frame), sub))
+    // 不在可见域内的帧:continue 跳过(丢帧 ≠ 断流 —— 广播里本就混着别人的事件)。
+    let stream = futures_util::stream::unfold((sub, access), |(mut sub, access)| async move {
+        loop {
+            let event = sub.recv().await?;
+            if !access.allows_created_by(event.owner()) {
+                continue;
+            }
+            let frame = Event::default()
+                .event(event.name())
+                .json_data(&event)
+                .ok()?;
+            return Some((Ok::<_, Infallible>(frame), (sub, access)));
+        }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

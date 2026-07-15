@@ -135,9 +135,14 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     // 键提取复用 resolve_client_ip 的"信 N 层反代"语义 —— SmartIpKeyExtractor 信 XFF 最左
     // (客户端可伪造,每请求换一个假 IP 即绕过限流),不可用。
     let router = if config.rate_limit_enabled {
+        // `period` = **补一个令牌的间隔**,不是速率 —— `per_second(n)` 是 `period = n 秒`(补一个/n 秒),
+        // 与 `RATE_LIMIT_PER_SEC`("每秒补 n 个")正好互为倒数:直接喂会慢 n² 倍(默认 10 → 0.1 req/s)。
+        // 故取倒数 `1s / n`。`max(1)`:period/burst 为零时 `finish()` 返 None → 启动 panic;
+        // 配 0 应退化成"最严但能跑",不是炸进程。
+        let per_sec = config.rate_limit_per_sec.max(1);
         let gov = GovernorConfigBuilder::default()
-            .per_second(config.rate_limit_per_sec as u64)
-            .burst_size(config.rate_limit_burst)
+            .period(Duration::from_secs(1) / per_sec)
+            .burst_size(config.rate_limit_burst.max(1))
             .key_extractor(TrustedIpKeyExtractor {
                 trusted_hops: config.trusted_proxy_hops,
             })

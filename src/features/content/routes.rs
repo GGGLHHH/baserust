@@ -57,15 +57,30 @@ async fn fetch_content_owned(
 /// **排除活动内容**(image/svg+xml、text/html、application/xml…):它们 inline + 同源 + 无 CSP =
 /// 存储型 XSS。presign 分支 app 加不了 CSP,且 relative-presign 拓扑(见 compose/nginx)下 presign
 /// 与 app **同源** —— 故不能靠"presign 天然异源"兜底。不在白名单 → 强制 attachment(浏览器下载不渲染)。
+///
+/// **形状必须是"白名单 + 精确匹配",不能是"前缀放行 + 逐个排除活动类型"**:后者对新的/带参数的活动
+/// 类型恒 fail-open(`image/svg+xml; charset=utf-8` 曾绕过 `== "image/svg+xml"` 再被 `starts_with("image/")`
+/// 放行)。mime 是**用户上传时自报**的原样串(axum 保留参数),故先归一:切掉 `;` 参数、trim、小写。
 fn is_safe_inline_mime(mime: &str) -> bool {
-    if mime == "image/svg+xml" {
-        return false; // 唯一的"活动"图片类型,单独排除
-    }
-    mime.starts_with("image/")
-        || mime.starts_with("video/")
-        || mime.starts_with("audio/")
-        || mime == "application/pdf"
-        || mime == "text/plain"
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/avif"
+            | "application/pdf"
+            | "text/plain"
+    ) || base.starts_with("video/")
+        || base.starts_with("audio/")
 }
 
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。
@@ -531,9 +546,18 @@ pub async fn set_content_metadata(
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
     input.validate()?;
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
+    // mime 服务端所有:原样回填现有值(库端全量替换,不带 = 清空)。**不能让客户端改** ——
+    // 改了就能与 S3 里那份 Content-Type 分叉,骗过 inline 闸门(见 SetContentMetadataRequest)。
+    // 无元数据行(upsert 建首行,如 create_content 未上传字节)→ None,不因此 404。
+    let mime_type = state
+        .contents
+        .get_content_metadata(id)
+        .await
+        .ok()
+        .and_then(|m| m.mime_type);
     state
         .contents
-        .set_content_metadata(input.into_input(id))
+        .set_content_metadata(input.into_input(id, mime_type))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -613,4 +637,45 @@ pub async fn confirm_upload(
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     let c = state.contents.confirm_upload(id, ctx.audit_id()).await?;
     Ok(Json(c.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_inline_mime;
+
+    /// 闸门必须 **fail-closed**:活动内容(可执行脚本)一律不 inline —— 带 MIME 参数、
+    /// 大小写变形、前后空白都不能把它绕过去(mime 是上传方自报的原样串)。
+    #[test]
+    fn active_content_never_inlines_despite_parameters_or_case() {
+        for bad in [
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8", // 参数曾绕过 `== "image/svg+xml"` 再被前缀放行
+            "IMAGE/SVG+XML",
+            "  image/svg+xml  ",
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xml",
+            "application/xhtml+xml",
+            "image/svg+xml;foo=bar",
+        ] {
+            assert!(!is_safe_inline_mime(bad), "{bad} 绝不能 inline");
+        }
+    }
+
+    /// 惰性类型照常 inline(别把闸门收成全拒),含带参数/大小写变形的正常写法。
+    #[test]
+    fn inert_types_still_inline() {
+        for ok in [
+            "image/png",
+            "image/jpeg",
+            "IMAGE/PNG",
+            "image/jpeg; charset=binary",
+            "application/pdf",
+            "text/plain; charset=utf-8",
+            "video/mp4",
+            "audio/mpeg",
+        ] {
+            assert!(is_safe_inline_mime(ok), "{ok} 应可 inline");
+        }
+    }
 }

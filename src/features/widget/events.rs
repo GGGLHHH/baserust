@@ -25,12 +25,23 @@ use super::types::Widget;
 use crate::infra::error::AppError;
 
 /// widget 变更事件。SSE 帧的 event name = serde tag(created/updated/deleted)。
+///
+/// **每个变体都带得出 owner**([`WidgetEvent::owner`])—— SSE handler 要按 `Access` 逐帧过滤,
+/// 没 owner 的帧无法判定:放行=泄露、丢弃=owner 收不到自己的删除。`Deleted` 因此单带 `created_by`
+/// (删除后行已软删,订阅侧无从回查)。
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WidgetEvent {
-    Created { widget: Widget },
-    Updated { widget: Widget },
-    Deleted { id: Uuid },
+    Created {
+        widget: Widget,
+    },
+    Updated {
+        widget: Widget,
+    },
+    Deleted {
+        id: Uuid,
+        created_by: Option<String>,
+    },
 }
 
 impl WidgetEvent {
@@ -40,6 +51,18 @@ impl WidgetEvent {
             WidgetEvent::Created { .. } => "created",
             WidgetEvent::Updated { .. } => "updated",
             WidgetEvent::Deleted { .. } => "deleted",
+        }
+    }
+
+    /// 该事件所指 widget 的 `created_by`(行级 ownership 判定用)。
+    /// 喂 [`Access::allows_created_by`](crate::infra::authz::Access::allows_created_by):
+    /// `None` / 非 UUID 脏值在 `Own` 下一律不可见 —— 与 list 的 `owner_filter`(`created_by = me`)同口径。
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            WidgetEvent::Created { widget } | WidgetEvent::Updated { widget } => {
+                widget.created_by.as_deref()
+            }
+            WidgetEvent::Deleted { created_by, .. } => created_by.as_deref(),
         }
     }
 }
