@@ -177,7 +177,22 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         router
     };
 
-    router.with_state(state)
+    // 兜底:未知路径 / 方法不对也要出统一 `ErrorBody`。axum 默认给的是**裸状态码 + 空 body** ——
+    // 客户端只要无条件解错误体,就会在 404/405 上炸,而 401/403/408/429/500 全都正常,
+    // 正好破掉"每个错误都是 {code,error}"这条契约(本模块头注的核心承诺)。
+    // 404 用 NotFound;405 归 BadRequest(错误码是闭集,不为此单开一个)。
+    router
+        .fallback(|| async {
+            error_response(StatusCode::NOT_FOUND, ErrorCode::NotFound, "未找到")
+        })
+        .method_not_allowed_fallback(|| async {
+            error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorCode::BadRequest,
+                "该路径不支持此方法",
+            )
+        })
+        .with_state(state)
 }
 
 /// 合并后的 OpenAPI 规范(`Both` 全量)。运行时 doc 端点与契约测试**同源**复用此装配

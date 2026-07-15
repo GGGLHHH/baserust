@@ -201,6 +201,23 @@ pub async fn upload_content(
     }
 
     let data = data.ok_or_else(|| AppError::Validation("missing `file` part".to_owned()))?;
+    // multipart 是手解的,没有 `Json<T>` 那层 derive 校验 —— 本端点原本是**唯一**不 validate 的写
+    // handler,同样的领域字段在 JSON 两步上传(`PrepareUploadRequest`)上全都有上限,这条路一个没有。
+    let fields = UploadFields {
+        name,
+        document_type,
+        file_name,
+        mime_type,
+        tags,
+    };
+    fields.validate()?;
+    let UploadFields {
+        name,
+        document_type,
+        file_name,
+        mime_type,
+        tags,
+    } = fields;
     let input = UploadContentInput {
         tenant_id,
         owner_id: user.0.id,
@@ -564,6 +581,27 @@ pub async fn set_content_metadata(
         .set_content_metadata(input.into_input(id, mime_type))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 一次性上传(multipart)手解出来的字段 —— 上闸用,上限**与 `PrepareUploadRequest` 逐条对齐**:
+/// 同样的领域字段走 JSON(两步上传)还是 multipart(一步上传),不该有两套契约。
+///
+/// `file_name` 尤其不能不封顶:它会被原样编进 `Content-Disposition` 当作 S3 PUT 的**请求头**
+/// (见 infra::objectstore::upload),几十 KB 的文件名足以让后端拒绝 —— 而 2MB 的 body 上限
+/// 随手就塞得下。(`UploadForm` 是纯文档 schema、不参与反序列化,且不含 file_name/mime_type
+/// 这两个来自 part 头的字段,故另立此结构而非给它加 derive。)
+#[derive(Validate)]
+struct UploadFields {
+    #[garde(inner(length(max = 255)))]
+    name: Option<String>,
+    #[garde(inner(length(max = 64)))]
+    document_type: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    file_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    mime_type: Option<String>,
+    #[garde(length(max = 64))]
+    tags: Vec<String>,
 }
 
 /// multipart 标量字段读成 String(失败 → 400)。

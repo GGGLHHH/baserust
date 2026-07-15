@@ -802,3 +802,45 @@ async fn metadata_put_cannot_mutate_mime_so_gate_and_stored_ct_cannot_diverge() 
         "活动内容绝不能拿到 inline 预览凭证: {loc}"
     );
 }
+
+/// **一步上传也要校验**:multipart 是手解的,没有 `Json<T>` 那层 derive 校验 —— 本端点曾是唯一
+/// 不 validate 的写 handler。上限与 JSON 两步上传(`PrepareUploadRequest`)对齐。
+/// `file_name` 尤其要封顶:它会被编进 `Content-Disposition` 当 S3 PUT 的**请求头**,
+/// 几十 KB 的文件名足以让后端拒绝,而 2MB body 上限随手塞得下。
+#[tokio::test]
+async fn upload_rejects_oversized_fields() {
+    let (app, admin, _viewer) = test_app();
+
+    // 超长 file_name(> 255)→ 422,而不是带着几十 KB 的头去打对象存储
+    let long_name = format!("{}.txt", "a".repeat(300));
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, &long_name, "text/plain", b"x"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "超长 file_name 应 422"
+    );
+
+    // 超长 mime_type(> 255)同理
+    let long_mime = format!("text/{}", "b".repeat(300));
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "ok.txt", &long_mime, b"x"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "超长 mime_type 应 422"
+    );
+
+    // 正常的照常 201(别把闸收成谁都传不了)
+    let resp = app
+        .oneshot(upload_req(&admin, "fine.txt", "text/plain", b"x"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "正常上传应 201");
+}

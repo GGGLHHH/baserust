@@ -83,11 +83,46 @@ async fn frontend_group_requires_login() {
 
 /// 组内未知路径 → 404 不过闸(axum `.layer()` 只包已注册路由,不包 fallback;spec 实证修正后钉死)。
 /// 已注册路由未登录仍 401 —— 这两条合起来钉住"闸只管注册路由"的真实语义。
+/// **且 404 也得出统一 `ErrorBody`**:axum 默认兜底是裸状态码 + 空 body,客户端无条件解错误体
+/// 就会在这炸(而 401/403 都正常)—— 原来这条只断言状态码、没看 body,所以一直没发现。
 #[tokio::test]
 async fn frontend_unknown_path_is_404_not_gated() {
     let (app, _state) = setup().await;
-    let (s, _) = get(&app, "/api/v1/frontend/no-such-thing", None).await;
+    let (s, body) = get(&app, "/api/v1/frontend/no-such-thing", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("\"code\":\"not_found\""),
+        "404 也必须走统一 ErrorBody 契约: {body}"
+    );
+}
+
+/// 方法不对 → 405,同样出统一 `ErrorBody`(默认兜底是空 body)。
+#[tokio::test]
+async fn wrong_method_is_405_with_error_body() {
+    let (app, _state) = setup().await;
+    // /health 只注册了 GET
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("\"code\""),
+        "405 也必须走统一 ErrorBody 契约: {body}"
+    );
 }
 
 /// admin 组闸:401(未登录)/ 403(user 无 admin:login)/ 200(admin + superadmin 皆有后台准入)。

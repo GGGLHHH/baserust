@@ -23,7 +23,12 @@ pub struct RegisterRequest {
 /// 登录请求(公开)。`identifier` = username 或 email,由 idm 自动识别。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct LoginRequest {
-    #[garde(length(min = 1))]
+    /// 上限 320 = email 的最大合法长度(64 local + @ + 255 domain);username 上限 32 更窄,取宽的那个。
+    /// **必须有上限**:登录失败时本字段被原样写进审计事件(`identifier_attempted`),经 outbox →
+    /// NATS → 投影落 `auth_events`,而这条路是**未认证**可达的。没上限时唯一的界是 axum 的 2MB
+    /// body 上限(限流还是 opt-in),等于放任匿名者每次瞎登录就持久化 ~2MB 攻击者可控文本;
+    /// 这些行之后还会被后台 `q` 过滤 ILIKE 全表扫,成本反复付。
+    #[garde(length(min = 1, max = 320))]
     pub identifier: String,
     #[garde(length(min = 1))]
     pub password: String,
