@@ -155,6 +155,25 @@ impl SearchIndexRepo for InMemorySearchIndexRepo {
         Ok(())
     }
 
+    async fn mark_deleted_except(&self, alive: &[Uuid], p_idm: i64) -> Result<usize, AppError> {
+        let alive: std::collections::HashSet<Uuid> = alive.iter().copied().collect();
+        let mut store = self.store.lock().expect("锁未中毒");
+        let mut swept = 0usize;
+        for row in store.values_mut() {
+            // 已是 deleted 的不重复计数;idm_seq > p_idm 的比快照新,不动(镜像 PG 的 WHERE 守卫)。
+            if alive.contains(&row.user_id)
+                || row.deleted
+                || row.idm_seq.is_some_and(|seq| seq > p_idm)
+            {
+                continue;
+            }
+            row.deleted = true;
+            row.idm_seq = Some(p_idm);
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
     async fn get(&self, user_id: Uuid) -> Result<Option<AdminUserIndexRow>, AppError> {
         Ok(self.store.lock().expect("锁未中毒").get(&user_id).cloned())
     }

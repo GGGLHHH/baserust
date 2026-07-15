@@ -1,7 +1,9 @@
 //! 全量回填/重建(bootstrap + 漂移恢复)——从**当前状态**(idm `UserRepo::list` + profile
 //! `ProfileRepo::find_by_ids`)灌注 `admin_user_index`,而非从事件流。用途两个:
 //! 1) bootstrap:项目上线前已存在的用户(早于事件投影接线)需要一次性建索引;
-//! 2) 漂移恢复:projector 挂了 / 消息丢失后,用它把读模型拉回与源真相一致。
+//! 2) 漂移恢复:projector 挂了 / 消息丢失后,用它把读模型拉回与源真相一致 —— **双向**:
+//!    存活用户 upsert 覆写(修"索引说已删、源里还活着"),快照外的残留行扫成已删
+//!    (修"源里已删、索引还活着" —— 丢了 `user.deleted` 的那类缺口)。
 //!
 //! 供 `src/bin/rebuild_search.rs` 装配调用;核心逻辑抽在这里以便零 DB 单测(内存三仓储)。
 
@@ -32,8 +34,13 @@ const PAGE_LIMIT: u64 = 500;
 /// 之后 id>P 的新事件才会再覆写,旧重投被 projector 的守卫挡住。**先读 P、再读数据**(P 是下界,
 /// 数据集只会比快照时刻更新,保守收敛不会漏)。
 ///
-/// 只回填**存活**用户(`UserRepo::list` 本就只返存活行)——已删用户不进投影,搜索里本就不该出现。
-/// 返回写入的行数。
+/// 只回填**存活**用户(`UserRepo::list` 本就只返存活行),回填完再把**不在快照里**的索引行扫成
+/// 已删(`mark_deleted_except`)—— 两步才双向收敛:少了扫这一刀,"源里已删、索引还活着"永远修不掉
+/// (`list` 不返已删用户 → 那行根本不被触及),而丢一条 `user.deleted` 正是 projector 指名要靠本
+/// bin 补的缺口。返回写入的行数(不含扫删的,那条单独记日志)。
+///
+/// ponytail: 存活 id 全收进内存再一次性扫(百万用户 = 十几 MB Vec,脚手架量级够用);
+/// 真到扫不动时改成"给本次 rebuild 打 run_id、扫 run_id 不匹配的行",不必全量攒 id。
 pub async fn rebuild(
     users: &dyn UserRepo,
     profiles: &dyn DisplayNameSource,
@@ -43,6 +50,7 @@ pub async fn rebuild(
 ) -> Result<usize, AppError> {
     let mut written = 0usize;
     let mut offset = 0u64;
+    let mut alive: Vec<Uuid> = Vec::new();
     loop {
         let page = users
             .list(
@@ -63,6 +71,7 @@ pub async fn rebuild(
 
         // 批量取 display_name(端口内一条 SQL 解 N+1);缺失 id → None。
         let ids: Vec<Uuid> = page.rows.iter().map(|row| row.id).collect();
+        alive.extend_from_slice(&ids); // 扫删用:快照里的存活集
         let display_names = profiles.display_names_by_ids(&ids).await?;
 
         for row in page.rows {
@@ -89,6 +98,12 @@ pub async fn rebuild(
             break;
         }
         offset += PAGE_LIMIT;
+    }
+
+    // 反向收敛:索引里有、快照里没有的 → 源里已删(或从来就不该在),扫成 deleted。
+    let swept = index.mark_deleted_except(&alive, p_idm).await?;
+    if swept > 0 {
+        tracing::info!(swept, "rebuild_search 扫掉快照外的残留行(源已删/丢事件)");
     }
     Ok(written)
 }
@@ -153,6 +168,102 @@ mod tests {
         assert_eq!(row2.display_name, None, "无 profile 的用户应回填 None");
         assert_eq!(row2.idm_seq, Some(100));
         assert_eq!(row2.profile_seq, Some(200));
+    }
+
+    /// **漂移恢复对删除也得成立**:丢了 `user.deleted`(projector 毒消息跳过 / 流保留期过期,
+    /// 两者模块注释都点名了要靠本 bin 补)后,索引里那行还 `deleted=false`、还能被搜到。
+    /// rebuild 必须把它扫掉 —— 只 upsert 存活用户的话,`list` 压根不返已删用户,那行永远不被触及,
+    /// 重跑多少次都还在(而反向漂移是能修的,这个不对称正说明是漏,不是设计)。
+    #[tokio::test]
+    async fn rebuild_sweeps_rows_deleted_at_source_but_still_alive_in_index() {
+        let users = InMemoryUserRepo::new();
+        let profiles = Arc::new(InMemoryProfileRepo::new());
+        let index = InMemorySearchIndexRepo::new();
+
+        let alive = users
+            .create("alice", Some("alice@x"), "hash", None)
+            .await
+            .unwrap();
+        let ghost = users
+            .create("bob", Some("bob@x"), "hash", None)
+            .await
+            .unwrap();
+
+        // 先建好索引(两人都在、都存活)
+        rebuild(
+            &users,
+            &ProfileDisplayNames::new(profiles.clone()),
+            &index,
+            100,
+            200,
+        )
+        .await
+        .unwrap();
+        assert!(!index.get(ghost.id).await.unwrap().unwrap().deleted);
+
+        // bob 在源里被删,但 user.deleted 事件丢了 → 索引仍是 deleted=false
+        users.soft_delete(ghost.id, None).await.unwrap();
+
+        // 重跑 rebuild:alice 照常回填,bob 应被扫成 deleted
+        let written = rebuild(
+            &users,
+            &ProfileDisplayNames::new(profiles),
+            &index,
+            300,
+            400,
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, 1, "只回填存活的 alice");
+        assert!(
+            !index.get(alive.id).await.unwrap().unwrap().deleted,
+            "存活用户不该被扫"
+        );
+        let ghost_row = index.get(ghost.id).await.unwrap().unwrap();
+        assert!(ghost_row.deleted, "源里已删的残留行必须被扫成 deleted");
+        assert_eq!(ghost_row.idm_seq, Some(300), "扫删水位设为本次快照 p_idm");
+    }
+
+    /// 扫删守卫:比快照**新**的行(rebuild 期间刚由 projector 投影进来的新用户)不能被扫掉 ——
+    /// 否则 rebuild 会把并发投影的新用户误判成"快照外的残留"删掉。
+    #[tokio::test]
+    async fn sweep_does_not_touch_rows_newer_than_the_snapshot() {
+        let users = InMemoryUserRepo::new();
+        let profiles = Arc::new(InMemoryProfileRepo::new());
+        let index = InMemorySearchIndexRepo::new();
+
+        // 索引里有一行,水位比本次快照 p_idm(100)新 —— 模拟 rebuild 期间刚投影进来的用户
+        let newcomer = Uuid::now_v7();
+        index
+            .rebuild_upsert(AdminUserIndexRow {
+                user_id: newcomer,
+                username: Some("carol".to_owned()),
+                email: None,
+                email_verified: false,
+                display_name: None,
+                roles: vec![],
+                created_at: None,
+                deleted: false,
+                idm_seq: Some(999), // > p_idm
+                profile_seq: None,
+            })
+            .await
+            .unwrap();
+
+        rebuild(
+            &users,
+            &ProfileDisplayNames::new(profiles),
+            &index,
+            100,
+            200,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !index.get(newcomer).await.unwrap().unwrap().deleted,
+            "水位比快照新的行不该被扫(并发投影的新用户)"
+        );
     }
 
     #[tokio::test]

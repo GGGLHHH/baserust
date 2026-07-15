@@ -69,6 +69,17 @@ pub trait SearchIndexRepo: Send + Sync {
     /// 重建 bin 用:**无守卫**全量覆写一行(idm+profile 列一次填全,水位设为快照 max outbox id)。
     async fn rebuild_upsert(&self, row: AdminUserIndexRow) -> Result<(), AppError>;
 
+    /// 重建 bin 用:把**不在快照里**的行扫成 `deleted=true`(+ `idm_seq = p_idm`),返回扫中行数。
+    ///
+    /// 没有它,rebuild 只能单向收敛:`rebuild_upsert` 能把"索引说已删、源里还活着"改回来,
+    /// 却修不了反向的"源里已删、索引还活着"(`UserRepo::list` 不返已删用户 → 那行根本不被触及,
+    /// 重跑多少次都还在搜索结果里)。而丢一条 `user.deleted` 正是 projector 明说要靠 rebuild_search
+    /// 补的缺口(毒消息跳过 / 流保留期过期),不扫这一刀,"漂移恢复"对删除就是假的。
+    ///
+    /// 守卫 `idm_seq <= p_idm`:比快照新的行(rebuild 期间刚投影进来的)不动 —— 同"先读 P、再读
+    /// 数据"的保守收敛口径。`alive` 为空 = 源里一个存活用户都没有 → 全扫(合法,别当成"没数据别动")。
+    async fn mark_deleted_except(&self, alive: &[Uuid], p_idm: i64) -> Result<usize, AppError>;
+
     /// 测试/P4 用:按 user_id 读一行;不存在 → `None`。
     async fn get(&self, user_id: Uuid) -> Result<Option<AdminUserIndexRow>, AppError>;
 

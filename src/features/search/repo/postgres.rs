@@ -195,6 +195,15 @@ const APPLY_PROFILE_UPDATED_SQL: &str =
        updated_at = (now() at time zone 'utc') \
      where admin_user_index.profile_seq is null or admin_user_index.profile_seq < excluded.profile_seq";
 
+/// 重建 bin 用:把不在快照(`$1` = 存活 id 数组)里的行扫成已删。
+/// `<> all($1)` 对空数组恒真 → 源里没存活用户就全扫(合法语义,见 trait 注)。
+/// `idm_seq <= $2` 守卫:比快照新的行(rebuild 期间刚投影进来)不动;`is null` 也扫(没水位 =
+/// 早于任何快照)。已 `deleted` 的排除掉,返回行数才等于"这次真扫了几行"。
+const MARK_DELETED_EXCEPT_SQL: &str = "update admin_user_index set \
+       deleted = true, idm_seq = $2, updated_at = (now() at time zone 'utc') \
+     where user_id <> all($1) and deleted = false \
+       and (idm_seq is null or idm_seq <= $2)";
+
 /// 重建 bin 用:全列 upsert,**无 WHERE 守卫**——无条件覆写(快照重建语义,非事件回放)。
 const REBUILD_UPSERT_SQL: &str = "insert into admin_user_index \
      (user_id, username, email, email_verified, display_name, roles, created_at, deleted, \
@@ -317,6 +326,16 @@ impl SearchIndexRepo for PgSearchIndexRepo {
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
         Ok(())
+    }
+
+    async fn mark_deleted_except(&self, alive: &[Uuid], p_idm: i64) -> Result<usize, AppError> {
+        let r = sqlx::query(MARK_DELETED_EXCEPT_SQL)
+            .bind(alive)
+            .bind(p_idm)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(r.rows_affected() as usize)
     }
 
     async fn get(&self, user_id: Uuid) -> Result<Option<AdminUserIndexRow>, AppError> {

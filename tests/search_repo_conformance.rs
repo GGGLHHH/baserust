@@ -124,6 +124,51 @@ async fn search_index_contract(repo: &dyn SearchIndexRepo) {
     assert_eq!(row.profile_seq, Some(100));
 }
 
+/// `mark_deleted_except` 契约(rebuild 的**反向收敛**:源里已删/丢了 `user.deleted` 的残留行)。
+/// 三条断言:快照外的扫成 deleted、快照内的不动、水位比快照新的不动(并发投影进来的新用户)。
+///
+/// **本契约按设计会扫到表里其余行**(端口语义就是"不在这份快照里的都算已删")—— PG 侧因此必须与
+/// 其他契约**串行**跑,见 pg 模块的锁;内存侧各自 `new()` 一份,天然隔离。
+async fn search_index_sweep_contract(repo: &dyn SearchIndexRepo) {
+    let keep = Uuid::now_v7();
+    let ghost = Uuid::now_v7();
+    let newer = Uuid::now_v7();
+    let row = |id: Uuid, seq: i64| AdminUserIndexRow {
+        user_id: id,
+        username: Some("sweep".to_owned()),
+        email: None,
+        email_verified: false,
+        display_name: None,
+        roles: vec![],
+        created_at: None,
+        deleted: false,
+        idm_seq: Some(seq),
+        profile_seq: None,
+    };
+    for (id, seq) in [(keep, 5i64), (ghost, 5), (newer, 9)] {
+        repo.rebuild_upsert(row(id, seq)).await.unwrap();
+    }
+
+    // 快照 = [keep],水位 5:ghost(不在快照、seq<=5)该扫;newer(seq 9 > 5)不该动。
+    let swept = repo.mark_deleted_except(&[keep], 5).await.unwrap();
+    assert!(swept >= 1, "快照外的 ghost 应被扫到");
+    assert!(
+        !repo.get(keep).await.unwrap().unwrap().deleted,
+        "快照内的行不动"
+    );
+    let ghost_row = repo.get(ghost).await.unwrap().unwrap();
+    assert!(ghost_row.deleted, "快照外的行应扫成 deleted");
+    assert_eq!(ghost_row.idm_seq, Some(5), "扫删水位设为 p_idm");
+    assert!(
+        !repo.get(newer).await.unwrap().unwrap().deleted,
+        "水位比快照新的行不动(rebuild 期间并发投影进来的新用户)"
+    );
+
+    // 幂等:已 deleted 的不再计数(重跑 rebuild 不该反复"扫到"同一批)。
+    let again = repo.mark_deleted_except(&[keep], 5).await.unwrap();
+    assert_eq!(again, 0, "已扫过的行不重复计数");
+}
+
 /// `SearchIndexRepo::query` 契约(P4 读路径):filter(q 跨 username/display_name、roles_any/none、
 /// created 区间)+ 排序(选定键、None 落最后)+ 分页(offset 带 total、cursor keyset)—— 且半行
 /// (username 未落地)/ 软删行永不出现在任何结果里。同 `search_index_contract`,memory 与 pg 共跑
@@ -673,14 +718,26 @@ async fn memory_satisfies_search_index_query_contract() {
     search_index_query_contract(&InMemorySearchIndexRepo::new()).await;
 }
 
+#[tokio::test]
+async fn memory_satisfies_search_index_sweep_contract() {
+    use baserust::features::search::InMemorySearchIndexRepo;
+    search_index_sweep_contract(&InMemorySearchIndexRepo::new()).await;
+}
+
 // ── 入口 2:PG(需 --features pg-conformance + search role 跑着的 pg)──
 // **不用 `#[sqlx::test]`**:它建临时库并用 `DATABASE_URL`(`just test-pg` 里连的是 app role),
 // 而 admin_user_index 在 search schema、须以 search role 连接 —— 显式建池,读 SEARCH_DATABASE_URL
 // (缺省回退本地 compose 的 search role)。
 #[cfg(feature = "pg-conformance")]
 mod pg {
-    use super::{search_index_contract, search_index_query_contract};
+    use super::{search_index_contract, search_index_query_contract, search_index_sweep_contract};
     use baserust::features::search::PgSearchIndexRepo;
+
+    /// PG 侧契约**串行跑**。`admin_user_index` 是跨测试共享的真表(无临时库隔离,见文件头),
+    /// 而 sweep 契约按端口语义会扫掉"快照外的所有行" —— 与 query 契约并行就会把它的行
+    /// (`idm_seq=1`、以及 profile-only 的 `idm_seq is null` 那行)扫成 deleted,断言随机变红。
+    /// 内存侧各自 `new()` 一份,不需要这把锁。
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn connect() -> sqlx::PgPool {
         let url = std::env::var("SEARCH_DATABASE_URL").unwrap_or_else(|_| {
@@ -698,13 +755,22 @@ mod pg {
 
     #[tokio::test]
     async fn pg_satisfies_search_index_contract() {
+        let _serial = LOCK.lock().await;
         let repo = PgSearchIndexRepo::new(connect().await);
         search_index_contract(&repo).await;
     }
 
     #[tokio::test]
     async fn pg_satisfies_search_index_query_contract() {
+        let _serial = LOCK.lock().await;
         let repo = PgSearchIndexRepo::new(connect().await);
         search_index_query_contract(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn pg_satisfies_search_index_sweep_contract() {
+        let _serial = LOCK.lock().await;
+        let repo = PgSearchIndexRepo::new(connect().await);
+        search_index_sweep_contract(&repo).await;
     }
 }

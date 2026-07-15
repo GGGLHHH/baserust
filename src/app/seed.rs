@@ -78,7 +78,50 @@ impl SeedData {
     }
 }
 
-/// 幂等应用 seed:upsert role → find-or-create account → grant。`by` = 审计主体(seeder 用 "system")。
+/// 已存在账号的**幂等补授**。写**并集**(现有 ∪ seed 声明),经 `set_roles` 落。
+///
+/// 为什么不是 `grant`:`grant` 只往 `user_roles` 插一行、**不发任何事件** —— idm 库里角色对了,
+/// 但 CQRS 投影(`admin_user_index.roles`)收不到通知,会永久停在旧值(后台列表角色显示错、
+/// `roles_any`/`roles_none` 过滤漏人),只能手工跑 rebuild_search 自愈。这与首建路径当初从
+/// `create` + `grant` 改成 `create_with_roles` 是**同一个 bug**,当时只修了兄弟分支。
+/// `set_roles` 在事务内 emit `user.roles_set`,投影据此收敛。
+///
+/// 为什么是并集而非直接写声明集:`set_roles` 是**原子全量替换** —— 直接写声明集会把运行期
+/// admin 授予的角色清掉(重启即掉权,另一个 bug)。`grant` 的加性语义是刻意的,这里保住它。
+/// 并集与现有相同 → 不写不发事件(幂等重跑无副作用)。
+async fn ensure_roles_with_event(
+    roles: &dyn RoleRepo,
+    user_id: uuid::Uuid,
+    declared: &[String],
+    by: Option<String>,
+) -> anyhow::Result<()> {
+    let current = roles.roles_for_user(user_id).await?;
+    if !declared.iter().any(|d| !current.contains(d)) {
+        return Ok(()); // 声明的角色都已在身 → 幂等:无写、无事件
+    }
+    // name → id 走 list()(**不是**闭集 role_ids):`current` 可能含闭集外的历史/手工角色,
+    // 映射不到就会被并集漏掉 —— 那等于把它清掉,正是上面要避免的。
+    let by_name: HashMap<String, uuid::Uuid> = roles
+        .list()
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.id))
+        .collect();
+    let mut union: Vec<uuid::Uuid> = Vec::new();
+    for name in current.iter().chain(declared.iter()) {
+        match by_name.get(name) {
+            Some(&id) if !union.contains(&id) => union.push(id),
+            Some(_) => {}
+            // 存活角色恒在 list() 里(roles_for_user 同样只回存活的),故走不到;
+            // 真走到了说明目录与授予不一致 —— 宁可报错也不静默把该角色从并集里丢掉。
+            None => anyhow::bail!("角色 {name} 在 user_roles 里但不在角色目录中"),
+        }
+    }
+    roles.set_roles(user_id, &union, by).await?;
+    Ok(())
+}
+
+/// 幂等应用 seed:upsert role → find-or-create account → 补授角色。`by` = 审计主体(seeder 用 "system")。
 /// **并发安全**:账号 create 撞唯一约束(另一实例已建)→ 退回查已存在的,收敛不报错。
 pub async fn apply(
     users: &dyn UserRepo,
@@ -117,11 +160,10 @@ pub async fn apply(
             .collect::<anyhow::Result<_>>()?;
 
         match users.find_by_identifier(&username).await? {
-            // 已存在(幂等再跑):补齐角色(grant 幂等;首建时角色已随 user.created 落库并投影)。
+            // 已存在(幂等再跑):补齐角色 —— 走 set_roles(并集)而非 grant,否则补出来的角色
+            // 不发事件、投影永久陈旧(见 ensure_roles_with_event)。
             Some(uwh) => {
-                for &role_id in &account_role_ids {
-                    roles.grant(uwh.user.id, role_id, by.clone()).await?;
-                }
+                ensure_roles_with_event(roles, uwh.user.id, &a.roles, by.clone()).await?;
             }
             None => {
                 let hash = hasher
@@ -138,16 +180,14 @@ pub async fn apply(
                     .await
                 {
                     Ok(_) => {}
-                    // 并发 seed:另一实例已抢先建 → 退回补齐角色(幂等收敛)。
+                    // 并发 seed:另一实例已抢先建 → 退回补齐角色(幂等收敛,同上走 set_roles)。
                     Err(IdmError::Conflict(_)) => {
                         let user = users
                             .find_by_identifier(&username)
                             .await?
                             .context("并发 seed 冲突后仍查不到用户")?
                             .user;
-                        for &role_id in &account_role_ids {
-                            roles.grant(user.id, role_id, by.clone()).await?;
-                        }
+                        ensure_roles_with_event(roles, user.id, &a.roles, by.clone()).await?;
                     }
                     Err(e) => return Err(anyhow::anyhow!("seed account {username} 失败: {e:?}")),
                 }
@@ -188,5 +228,120 @@ mod tests {
         for p in Perm::ALL {
             assert!(perms.contains(&p), "{p:?} superadmin 应持有");
         }
+    }
+
+    fn account(username: &str, roles: &[&str]) -> AccountSeed {
+        AccountSeed {
+            username: username.to_owned(),
+            email: None,
+            password: "pwd".to_owned(),
+            roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    async fn role_names(roles: &idm::InMemoryRoleRepo, uid: uuid::Uuid) -> Vec<String> {
+        let mut v = roles.roles_for_user(uid).await.unwrap();
+        v.sort();
+        v
+    }
+
+    /// 幂等重跑补授**必须发事件**(旧写法用 `grant`,只插 user_roles、零事件 → 搜索投影
+    /// `admin_user_index.roles` 永久陈旧),且必须写**并集** —— `set_roles` 是全量替换,
+    /// 直接写声明集会把运行期 admin 授予、seed.toml 没声明的角色清掉(重启即掉权)。
+    #[tokio::test]
+    async fn rerun_emits_roles_set_and_keeps_runtime_grants() {
+        use idm::OutboxRepo;
+        let users = idm::InMemoryUserRepo::new();
+        // 共享角色/授予/发件箱存储:内存双 repo 才等价于 PG 的共表语义(独立 new() 各自一份,
+        // create_with_roles 会看不见这边 upsert 的角色,发件箱也各记各的)。
+        let roles = idm::InMemoryRoleRepo::sharing_with(&users);
+        let outbox = idm::InMemoryOutboxRepo::sharing_with(&users);
+        let hasher = idm::FakeHasher;
+        let by = Some("system".to_owned());
+
+        // 首建:只声明 user
+        let data = SeedData {
+            accounts: vec![account("alice", &["user"])],
+        };
+        apply(&users, &roles, &hasher, &data, by.clone())
+            .await
+            .unwrap();
+        let uid = users
+            .find_by_identifier("alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .user
+            .id;
+        assert_eq!(role_names(&roles, uid).await, vec!["user".to_owned()]);
+
+        // 运行期 admin 手工授予 superadmin(seed.toml 里没有)
+        let sa = roles
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "superadmin")
+            .unwrap()
+            .id;
+        roles.grant(uid, sa, by.clone()).await.unwrap();
+
+        // 重跑 seed,声明里多加一个 admin:应补上 admin,且**不动**运行期的 superadmin
+        let data = SeedData {
+            accounts: vec![account("alice", &["user", "admin"])],
+        };
+        apply(&users, &roles, &hasher, &data, by.clone())
+            .await
+            .unwrap();
+        // 事件是重点:没有它,idm 里角色对了但投影永远停在旧值(只能手工 rebuild_search 自愈)。
+        let roles_set: Vec<_> = outbox
+            .poll_unpublished(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "user.roles_set")
+            .collect();
+        assert_eq!(
+            roles_set.len(),
+            1,
+            "补授必须发一条 user.roles_set(grant 不发事件 → 投影永久陈旧)"
+        );
+        assert_eq!(
+            roles_set[0].payload["roles"],
+            serde_json::json!(["admin", "superadmin", "user"]),
+            "事件载荷应是并集(投影据此落 roles)"
+        );
+        assert_eq!(
+            role_names(&roles, uid).await,
+            vec![
+                "admin".to_owned(),
+                "superadmin".to_owned(),
+                "user".to_owned()
+            ],
+            "并集:补上声明的 admin,保留运行期授予的 superadmin"
+        );
+
+        // 再重跑(声明集已全在身)→ 收敛:不写、**不再发事件**(否则每次重启都刷一条噪声)
+        apply(&users, &roles, &hasher, &data, by).await.unwrap();
+        assert_eq!(
+            role_names(&roles, uid).await,
+            vec![
+                "admin".to_owned(),
+                "superadmin".to_owned(),
+                "user".to_owned()
+            ],
+            "幂等:重跑结果稳定"
+        );
+        assert_eq!(
+            outbox
+                .poll_unpublished(100)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "user.roles_set")
+                .count(),
+            1,
+            "幂等重跑不应再发事件"
+        );
     }
 }
