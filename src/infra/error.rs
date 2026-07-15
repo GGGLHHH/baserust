@@ -119,7 +119,14 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 全部变体(wire round-trip 测试用)。加变体必补这里(忘了 → 测试挂),镜像 `Perm::ALL`。
+    /// 全部变体(wire round-trip 测试用)。镜像 `Perm::ALL`。
+    ///
+    /// **加变体必补这里,但漏了没人拦** —— `ALL` 是数组字面量,加变体不会让它编译失败;
+    /// round-trip 测试遍历的正是 `ALL`,漏掉的变体只是从不被测(那条测试就是为了钉住
+    /// `as_str()` 与 serde rename 不漂移,漏项恰好绕过它)。真正逼你回来的是 `as_str()`
+    /// 的穷尽 match(编译不过),但它只让你**手写**一个 wire 串,不校验它等于 serde 的 rename。
+    /// 后果:日志字段 `code`(as_str)与出参 `code`(serde)对新变体可能对不上。
+    /// 要根治:声明宏单源展开 enum + `ALL` + `as_str`,让漏项不可表达。
     pub const ALL: [ErrorCode; 9] = [
         ErrorCode::NotFound,
         ErrorCode::Validation,

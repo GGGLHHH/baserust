@@ -77,9 +77,11 @@ fn test_contents() -> content::ContentService {
     )
 }
 
-/// 测试授权策略:admin 角色拿全部 widget 权限(含 read:all → 看全部)。
-/// `user` 角色**刻意不给 read:all** → `Access::Own`(只看自己创建的),供 ownership 断言用;
-/// 给 write 是为了让它能造出"自己的"行(线上 seed 里 user 无 write,与此无关)。
+/// 测试授权策略:admin 角色拿全部 widget 权限(含 read:all / write:all → 跨用户读写)。
+///
+/// `user` = **"用户管理自己的 widget"** 这种最自然的配法:read + write + delete,**一个 `:all` 都不给**
+/// → `Access::Own`(读写都只及自己创建的)。ownership 断言(读侧/写侧/SSE)都靠它。
+/// 线上 seed 里 user 没有 write/delete,但 role→perm 运行期可改,这正是闸必须成立的那种配置。
 fn test_policy() -> Policy {
     Policy::from_roles([
         (
@@ -88,10 +90,14 @@ fn test_policy() -> Policy {
                 Perm::WidgetRead,
                 Perm::WidgetReadAll,
                 Perm::WidgetWrite,
+                Perm::WidgetWriteAll,
                 Perm::WidgetDelete,
             ],
         ),
-        ("user".to_owned(), vec![Perm::WidgetRead, Perm::WidgetWrite]),
+        (
+            "user".to_owned(),
+            vec![Perm::WidgetRead, Perm::WidgetWrite, Perm::WidgetDelete],
+        ),
     ])
 }
 
@@ -364,6 +370,102 @@ async fn delete_soft_deletes_returns_204_then_404() {
         .await
         .unwrap();
     assert_eq!(got.status(), StatusCode::NOT_FOUND, "软删后应 404");
+}
+
+/// **写侧 ownership**:无 `widgets:write:all` 的 user 改不动/删不掉**别人的** widget(404,同 GET)。
+/// 读侧一直有闸,写侧原本没有 → "读自己的、写所有人的":GET 别人的行 404,PUT/DELETE 却放行。
+/// widget 是 adding-a-feature 指定照抄的样板,抄出去的每个 CRUD 模块都会继承这个洞。
+#[tokio::test]
+async fn write_ownership_others_widget_is_404() {
+    let (app, admin) = test_app();
+    let (user, _uid) = user_token();
+
+    // admin 建一个**别人的** widget
+    let id = created_id(
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/frontend/widgets",
+                r#"{"name":"admins-widget"}"#,
+                &admin,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    // 对照:user 读它已经是 404(读侧闸,既有行为)
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/frontend/widgets/{id}"), &user))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "读别人的 → 404");
+
+    // 写:必须同样 404(不是 200)—— 读不到却改得动 = 越权写
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{id}"),
+            r#"{"name":"pwned"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "改别人的 widget 必须 404(读得到才改得动)"
+    );
+
+    // 删:同上
+    let resp = app
+        .clone()
+        .oneshot(delete_req(&format!("/api/v1/frontend/widgets/{id}"), &user))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "删别人的 widget 必须 404"
+    );
+
+    // 别把闸收成"谁都写不了":user 改自己的照常 200
+    let mine = created_id(
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/frontend/widgets",
+                r#"{"name":"users-widget"}"#,
+                &user,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{mine}"),
+            r#"{"name":"renamed-by-owner"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改自己的 widget 应放行");
+
+    // admin 有 read:all + write:all → 跨用户照常改得动
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{mine}"),
+            r#"{"name":"renamed-by-admin"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin 持 write:all,跨用户可改"
+    );
 }
 
 /// **SSE 行级 ownership**:流必须与 list 同口径 —— 无 `read:all` 的 user 收不到别人的 widget,

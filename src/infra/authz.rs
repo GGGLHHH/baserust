@@ -33,6 +33,11 @@ pub enum Perm {
     WidgetReadAll,
     #[serde(rename = "widgets:write")]
     WidgetWrite,
+    /// 越权写:改/删**任何人**的 widget(否则只动自己创建的)。write 侧 ownership mode 开关,
+    /// 与 `contents:write:all` / `profiles:write:all` 同范式 —— widget 是被照抄的样板模块,
+    /// 读侧有 `widgets:read:all` 而写侧没有,copy 出去的模块就会继承"读自己的、写所有人的"。
+    #[serde(rename = "widgets:write:all")]
+    WidgetWriteAll,
     #[serde(rename = "widgets:delete")]
     WidgetDelete,
     #[serde(rename = "contents:read")]
@@ -65,11 +70,21 @@ pub enum Perm {
 }
 
 impl Perm {
-    /// 全部变体(catalog / round-trip 测试用)。**加变体必须补这里**(忘了 → round-trip 测试挂)。
-    pub const ALL: [Perm; 14] = [
+    /// 全部变体(catalog / round-trip 测试用)。
+    ///
+    /// **加变体必须补这里,但没有任何东西会替你发现漏了** —— 说清楚免得误信:`ALL` 是数组字面量,
+    /// 加变体不会让它编译失败;round-trip 测试遍历的正是 `ALL`,漏掉的变体只是从不被测。
+    /// 真正会拦你的是 `resource()`/`action()`/`qualifier()`/`description()` 那几个**穷尽 match**
+    /// (编译不过)—— 它们逼你回来改这个 impl,但补 `ALL` 仍靠自觉。
+    /// 而 `ALL` 是**运行期**载荷:superadmin 全权(`default_permissions`)、OpenAPI scope 目录、
+    /// seed 权限词表都从它派生 —— 漏一个变体 = superadmin 静默缺权 + 该 scope 不进文档 + 不入库,
+    /// 且两个看似能拦住的测试都拦不住(它们两边都从 `ALL` 派生,自洽通过)。
+    /// 要根治:用声明宏单源展开 enum + `ALL` + 各投影,让"漏项"不可表达。
+    pub const ALL: [Perm; 15] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
+        Perm::WidgetWriteAll,
         Perm::WidgetDelete,
         Perm::ContentRead,
         Perm::ContentReadAll,
@@ -87,9 +102,11 @@ impl Perm {
     /// 这些投影是 permission 一等概念的"字段",按需派生、零存储;wire 串与内部比较都不靠它们。
     pub fn resource(&self) -> &'static str {
         match self {
-            Perm::WidgetRead | Perm::WidgetReadAll | Perm::WidgetWrite | Perm::WidgetDelete => {
-                "widgets"
-            }
+            Perm::WidgetRead
+            | Perm::WidgetReadAll
+            | Perm::WidgetWrite
+            | Perm::WidgetWriteAll
+            | Perm::WidgetDelete => "widgets",
             Perm::ContentRead
             | Perm::ContentReadAll
             | Perm::ContentWrite
@@ -105,7 +122,7 @@ impl Perm {
     pub fn action(&self) -> &'static str {
         match self {
             Perm::WidgetRead | Perm::WidgetReadAll => "read",
-            Perm::WidgetWrite => "write",
+            Perm::WidgetWrite | Perm::WidgetWriteAll => "write",
             Perm::WidgetDelete => "delete",
             Perm::ContentRead | Perm::ContentReadAll => "read",
             Perm::ContentWrite | Perm::ContentWriteAll => "write",
@@ -118,10 +135,15 @@ impl Perm {
     }
 
     /// **第三段**(限定词,可选)。`read:all` 的 `all`;只读投影,**不是**存储字段、**不是** `read` 上的开关。
+    /// 注意这里是 `_ => None` 兜底,**不穷尽** —— 加 `*All` 变体忘了列进来不会编译失败,
+    /// 只会让 `wire()` 少掉 `:all` 段、与 serde rename 对不上(`perm_wire_matches_projection` 会红)。
     pub fn qualifier(&self) -> Option<&'static str> {
         match self {
-            Perm::WidgetReadAll | Perm::ContentReadAll | Perm::ContentWriteAll => Some("all"),
-            Perm::ProfileWriteAll => Some("all"),
+            Perm::WidgetReadAll
+            | Perm::WidgetWriteAll
+            | Perm::ContentReadAll
+            | Perm::ContentWriteAll
+            | Perm::ProfileWriteAll => Some("all"),
             _ => None,
         }
     }
@@ -142,6 +164,7 @@ impl Perm {
     pub fn implies(&self) -> &'static [Perm] {
         match self {
             Perm::WidgetReadAll => &[Perm::WidgetRead],
+            Perm::WidgetWriteAll => &[Perm::WidgetWrite],
             Perm::ContentReadAll => &[Perm::ContentRead],
             Perm::ContentWriteAll => &[Perm::ContentWrite],
             Perm::ProfileWriteAll => &[Perm::ProfileWrite],
@@ -155,7 +178,8 @@ impl Perm {
         match self {
             Perm::WidgetRead => "查看自己创建的 widget",
             Perm::WidgetReadAll => "查看所有人的 widget(而非仅自己)",
-            Perm::WidgetWrite => "创建 / 修改 widget",
+            Perm::WidgetWrite => "创建 / 修改自己创建的 widget",
+            Perm::WidgetWriteAll => "修改 / 删除任何人的 widget(而非仅自己创建的)",
             Perm::WidgetDelete => "删除 widget",
             Perm::ContentRead => "查看内容 / 下载 / 列对象与元数据",
             Perm::ContentReadAll => "查看所有人的内容(而非仅自己)",
@@ -187,7 +211,9 @@ pub enum RoleName {
 }
 
 impl RoleName {
-    /// 全部变体(seed / 目录 / round-trip 测试用)。加变体必补这里。
+    /// 全部变体(seed / 目录 / round-trip 测试用)。
+    /// 加变体必补这里 —— 同 `Perm::ALL`,**漏了没有任何东西会发现**(数组字面量,不编译失败;
+    /// round-trip 测试遍历的就是它)。`as_str()` 的穷尽 match 会逼你回到本 impl,但补 `ALL` 靠自觉。
     pub const ALL: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
 
     /// wire 串(== serde `rename`;单一来源,`role_name_wire_matches` 测试钉死不漂移)。
@@ -217,6 +243,7 @@ impl RoleName {
                 Perm::WidgetRead,
                 Perm::WidgetReadAll,
                 Perm::WidgetWrite,
+                Perm::WidgetWriteAll,
                 Perm::WidgetDelete,
                 Perm::ContentRead,
                 Perm::ContentReadAll,

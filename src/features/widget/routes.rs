@@ -165,7 +165,34 @@ pub async fn update_widget(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
+    ensure_may_write(&state, &user, &scope, id).await?;
     Ok(Json(state.widgets.update(id, input, &ctx).await?))
+}
+
+/// 写侧 ownership 闸(update/delete 共用):无 `widgets:write:all` → 只能动**自己创建的**行,
+/// 否则 404(同 `get_widget`,不泄露存在)。
+///
+/// 读侧一直有闸(`get_widget` + SSE 逐帧),写侧原本没有 —— 于是"读自己的、写所有人的":
+/// 一个既有 `widgets:read` 又有 `widgets:write` 的角色(即"用户管理自己的 widget"这种最自然的配法)
+/// GET 别人的行 404,PUT/DELETE 却能改能删。线上 seed 恰好没这么配所以打不出来,但 role→perm
+/// 是运行期可改的(`role_permissions` 表),且 widget 是 adding-a-feature 指定照抄的样板模块 ——
+/// 抄出去的每个 CRUD 模块都继承这个洞。content/profile 早有 `*:write:all` 并逐个 gate,
+/// 范式是 widget(read) → profile(write) → content(write) 传下去的,唯独没回填 widget 自己的写侧。
+async fn ensure_may_write(
+    state: &AppState,
+    user: &CurrentUser,
+    scope: &TokenScope,
+    id: Uuid,
+) -> Result<(), AppError> {
+    let access = state
+        .policy
+        .data_access(&user.0, &scope.0, Perm::WidgetWriteAll);
+    let w = state.widgets.get(id).await?; // 不存在 → 404(先于 ownership,口径同 get_widget)
+    if access.allows_created_by(w.created_by.as_deref()) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// 软删除 widget(盖 deleted_at,需 `widgets:delete`)。
@@ -190,6 +217,7 @@ pub async fn delete_widget(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetDelete)?;
+    ensure_may_write(&state, &user, &scope, id).await?;
     state.widgets.delete(id, &ctx).await?;
     Ok(StatusCode::NO_CONTENT)
 }
