@@ -323,6 +323,19 @@ impl UserAdminService {
         Ok(())
     }
 
+    /// 目标用户**现有**的**原始**角色名(未过滤闭集;不存在/软删 → 404)。
+    ///
+    /// 守卫专用,**刻意不走** `get()` 的 `AdminUserView.roles` —— 那是 `RoleName::parse_lossy`
+    /// 的读模型,闭集外的角色名被静默丢掉。而 `Policy` 是从 `role_permissions` 表原样载入的
+    /// `HashMap<String, _>`,**不按闭集过滤**:存量/手工 INSERT 的角色(如带 content:delete 的
+    /// `editor`)确实持有真权限。拿 lossy 名喂提权闸 = 目标只持闭集外高权角色时闸空过,
+    /// 中间管理员照样能改它密码再登入 —— 正是 `role_names_by_ids` 上面那段注释说的
+    /// "守卫与落库看不同目录 → 提权闸失明",只不过换到了目标侧。
+    pub async fn raw_role_names(&self, id: Uuid) -> Result<Vec<String>, AppError> {
+        self.users.find_by_id(id).await?; // 保持 404 契约(不存在/软删)
+        Ok(self.roles.roles_for_user(id).await?)
+    }
+
     /// 角色 id → **原始**角色名(未过滤目录;未知 id → 422)。handler 守卫(提权/自锁)与
     /// service 落库校验共用**这一个**实现 —— 守卫与落库看不同目录曾造成提权闸失明,单一实现
     /// 从结构上封死该分裂面;未知 id 在守卫处就 422,也不会让自锁闸抢先误报 409。

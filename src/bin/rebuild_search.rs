@@ -57,16 +57,32 @@ async fn main() -> anyhow::Result<()> {
 /// 且再跑一次 rebuild 也修不回(除非那个用户又有新事件)。
 ///
 /// `lock table ... in exclusive mode` 与 INSERT 持的 ROW EXCLUSIVE 冲突:拿到锁 = 在途插入全部落定、
-/// 新插入被挡在门外,此刻的 max(id) 才是真下界。锁只持到这条主键聚合查询结束(很快),随事务提交释放。
+/// 新插入被挡在门外,此刻的 max(id) 才是真下界。锁只**持**到这条主键聚合查询结束(很快)。
+///
+/// 但危险的是**等**锁那半:写方在整个业务事务期间都握着 `outbox` 的 ROW EXCLUSIVE(锁到事务结束,
+/// 不只是 INSERT 那一瞬),只要有一个慢事务/idle-in-transaction,这个 EXCLUSIVE 请求就得排队;
+/// 而 PG 的锁队列是 **FIFO** —— 排队期间**新来的 INSERT 也得排在它后面**,哪怕彼此本不冲突。
+/// 即:不设超时的话,本 CLI 会把该 schema 的写入整体拖停(emit_outbox 在每条业务写的事务里)。
+/// 故 `set local lock_timeout`:等不到就**快速失败**退出,让运维等阻塞事务散了再重跑,
+/// 而不是把生产写入拽下水。`set local` = 只作用本事务,提交即还原。
 async fn read_outbox_watermark(pool: &sqlx::PgPool, what: &str) -> anyhow::Result<i64> {
     let mut tx = pool
         .begin()
         .await
         .with_context(|| format!("开启 {what} 水位事务失败"))?;
+    sqlx::query("set local lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("设 {what} lock_timeout 失败"))?;
     sqlx::query("lock table outbox in exclusive mode")
         .execute(&mut *tx)
         .await
-        .with_context(|| format!("锁 {what} outbox 失败(需 UPDATE 权限)"))?;
+        .with_context(|| {
+            format!(
+                "锁 {what} outbox 失败(需 UPDATE 权限;或 5s 内没等到锁 —— \
+                 有长事务占着 outbox,散了再重跑,别让本次重建拖停写入)"
+            )
+        })?;
     let p: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
         .fetch_one(&mut *tx)
         .await

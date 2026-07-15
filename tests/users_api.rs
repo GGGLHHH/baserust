@@ -833,3 +833,42 @@ async fn intermediate_admin_cannot_delete_a_superadmin() {
         "删普通用户是正常职权"
     );
 }
+
+/// 全量替换角色也得闸**目标现有角色**:中间管理员不能把 superadmin 降权/清空。
+/// 被授角色闸只管"授出去的",自锁闸只护 actor 自己 —— 少了这道,传一组"自己也有的角色"
+/// 就能剥掉 superadmin 的权;若那是唯一的 superadmin,系统再无人能改回来。
+#[tokio::test]
+async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "roles-target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "roles-target-user", &["user"]).await;
+    let user_ids = role_ids_json(&app, &sa, &["user"]).await;
+
+    // 把 superadmin 降成 user(被授角色 `user` 中间管理员自己够得着 → 只能靠目标闸拦)
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{victim}/roles"),
+            &format!(r#"{{"roles":{user_ids}}}"#),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能剥掉 superadmin 的角色"
+    );
+
+    // 改同级/更低权目标 → 照常放行
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{plain}/roles"),
+            &format!(r#"{{"roles":{user_ids}}}"#),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改普通用户角色是正常职权");
+}

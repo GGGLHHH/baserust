@@ -125,6 +125,39 @@ async fn wrong_method_is_405_with_error_body() {
     );
 }
 
+/// **兜底响应也得过中间件栈**:`Router::layer` 只包"调用时已存在"的路由,而 `Router::fallback`
+/// 会用全新未包装的 handler 覆盖 catch-all —— 注册晚于 `.layer()` 就等于让 404/405 绕过整个栈:
+/// 没 CORS(浏览器读不到跨域错误体)、没安全头、没 request-id。这里钉住注册顺序。
+#[tokio::test]
+async fn fallback_responses_still_pass_through_middleware() {
+    let (app, _state) = setup().await;
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/definitely-not-a-route")
+                .header("origin", "http://example.test")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let h = resp.headers();
+    assert!(
+        h.contains_key("x-request-id"),
+        "404 也该带 request-id(否则日志里对不回这条请求)"
+    );
+    assert!(
+        h.contains_key("x-content-type-options") && h.contains_key("x-frame-options"),
+        "404 也该带安全响应头"
+    );
+    assert!(
+        h.contains_key("access-control-allow-origin"),
+        "404 也该带 CORS —— 否则浏览器根本读不到这个错误体"
+    );
+}
+
 /// admin 组闸:401(未登录)/ 403(user 无 admin:login)/ 200(admin + superadmin 皆有后台准入)。
 /// 用 admin_get_me 探——它端点内 perm 为 None,403 只能来自组闸(闸的独立证据)。
 #[tokio::test]

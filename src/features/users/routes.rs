@@ -259,6 +259,16 @@ pub async fn set_user_roles(
     // 名字经未过滤目录解析(未知 id 此处即 422,先于自锁 409,错误码不串台)。
     let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
+    // 目标现有角色闸(同 delete_user / reset_user_password 口径):全量替换角色是对目标的破坏性
+    // 操作 —— 少了这道闸,中间管理员传一组"自己也有的角色"就能把 superadmin 整个降权/清空
+    // (被授角色闸放行、自锁闸只护 actor 自己),唯一的 superadmin 被剥权后系统再无人能改回。
+    // 本模块三个 destructive 端点里,这条曾是唯一没上闸的。
+    assert_no_escalation(
+        &state.policy,
+        &user.0,
+        &scope.0,
+        &target_role_names(&state, id).await?,
+    )?;
     assert_self_keeps_admin(&state.policy, user.0.id, id, &role_names)?;
     Ok(Json(
         state.user_admin.set_roles(id, req, ctx.audit_id()).await?,
@@ -330,16 +340,10 @@ pub async fn reset_user_password(
 }
 
 /// 目标用户**现有**角色名(供提权闸)。不存在 → 404(与端点契约一致)。
-/// `AdminUserView.roles` 是闭集 `RoleName`,闸吃 `&[String]`,这里转一道。
+/// 走 service 的**未过滤**取名(不是 `get()` 的闭集读模型)—— 详见 `raw_role_names`:
+/// lossy 会丢掉闭集外角色,而那些角色在 `Policy` 里确实持有真权限,闸会因此失明。
 async fn target_role_names(state: &AppState, id: Uuid) -> Result<Vec<String>, AppError> {
-    Ok(state
-        .user_admin
-        .get(id)
-        .await?
-        .roles
-        .iter()
-        .map(|r| r.as_str().to_owned())
-        .collect())
+    state.user_admin.raw_role_names(id).await
 }
 
 #[cfg(test)]
