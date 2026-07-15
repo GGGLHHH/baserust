@@ -60,12 +60,27 @@ pub fn client_ip_from_headers(
     resolve_client_ip(get("x-forwarded-for"), get("x-real-ip"), peer, trusted_hops)
 }
 
+/// 单条上下文文本入库的上限(字符数)。真实 UA 约 200 字符,512 宽裕得很。
+///
+/// **必须有上限**:这几个字段全是**原样的请求头**(攻击者可控),而登录失败会把它们写进审计事件
+/// (`user_agent` / `forwarded_chain`)经 outbox → NATS → 投影落 `auth_events` 的无界 text 列 ——
+/// **这条路未认证可达**(限流还是 opt-in)。不封顶时唯一的界是 hyper 的 header 缓冲(几百 KB),
+/// 等于匿名者每次瞎登录就能持久化几百 KB 可控文本。同 `LoginRequest.identifier` 的 320 上限,
+/// 那个是同一 payload、同一条匿名路径 —— 只封它一个而漏掉这几个,等于没封。
+/// 收在**捕获点**:每个 emit 站点自动继承,不靠各处自觉。
+const MAX_CTX_TEXT: usize = 512;
+
+/// 按**字符**截断(不是字节切片:多字节 UA 上按字节切会 panic)。
+fn truncate_ctx(s: &str) -> String {
+    s.chars().take(MAX_CTX_TEXT).collect()
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for ClientContext {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok());
-        let forwarded_chain = header("x-forwarded-for").map(str::to_owned);
+        let forwarded_chain = header("x-forwarded-for").map(truncate_ctx);
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
@@ -84,8 +99,8 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientContext {
                 .headers
                 .get(USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
-            request_id: header("x-request-id").map(str::to_owned),
+                .map(truncate_ctx),
+            request_id: header("x-request-id").map(truncate_ctx),
         })
     }
 }
@@ -96,11 +111,31 @@ pub struct TrustedHops(pub usize);
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_client_ip;
+    use super::{resolve_client_ip, truncate_ctx, MAX_CTX_TEXT};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// 上下文文本封顶:攻击者可控的头(UA / XFF)会经审计事件落库,且这条路匿名可达。
+    /// 按**字符**截断 —— 多字节内容上按字节切会 panic(真实 UA 里带中文/emoji 并不稀奇)。
+    #[test]
+    fn ctx_text_is_truncated_on_char_boundary() {
+        assert_eq!(truncate_ctx("Mozilla/5.0"), "Mozilla/5.0", "短的原样");
+
+        let long = "a".repeat(MAX_CTX_TEXT * 3);
+        assert_eq!(
+            truncate_ctx(&long).chars().count(),
+            MAX_CTX_TEXT,
+            "超长截断"
+        );
+
+        // 多字节:按字符数截断,且不 panic、不产生半个字符
+        let multi = "界".repeat(MAX_CTX_TEXT * 2);
+        let cut = truncate_ctx(&multi);
+        assert_eq!(cut.chars().count(), MAX_CTX_TEXT);
+        assert!(cut.chars().all(|c| c == '界'), "不该切出半个字符");
     }
 
     #[test]
