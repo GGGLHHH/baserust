@@ -216,6 +216,14 @@ pub async fn delete_user(
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     // 自锁:不能删自己的账号。
     assert_not_self(user.0.id, id)?;
+    // 提权闸(同 reset_password,闸目标现有角色):中间管理员不该能删掉比自己权大的账号。
+    // 这条是破坏而非接管,但同属"对更高权目标动手",与本模块的闸口径一致。
+    assert_no_escalation(
+        &state.policy,
+        &user.0,
+        &scope.0,
+        &target_role_names(&state, id).await?,
+    )?;
     state.user_admin.delete(id, ctx.audit_id()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -307,8 +315,31 @@ pub async fn reset_user_password(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+    // 提权闸,闸的是**目标现有的角色**(不是被授的角色):改谁的密码 = 能以谁的身份登录,
+    // 所以必须"自己已持有目标的全部权"才准改。少了这道闸,"有 users:admin 但非满权"的中间
+    // 管理员(role→perms 运行期可改,见 authz)虽被 set_roles 挡着授不出 superadmin,却能直接
+    // 把 superadmin 的密码改成自己知道的再登进去 —— 本模块辛苦建的提权闸从这个端点整个绕过。
+    assert_no_escalation(
+        &state.policy,
+        &user.0,
+        &scope.0,
+        &target_role_names(&state, id).await?,
+    )?;
     state.user_admin.reset_password(id, req).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 目标用户**现有**角色名(供提权闸)。不存在 → 404(与端点契约一致)。
+/// `AdminUserView.roles` 是闭集 `RoleName`,闸吃 `&[String]`,这里转一道。
+async fn target_role_names(state: &AppState, id: Uuid) -> Result<Vec<String>, AppError> {
+    Ok(state
+        .user_admin
+        .get(id)
+        .await?
+        .roles
+        .iter()
+        .map(|r| r.as_str().to_owned())
+        .collect())
 }
 
 #[cfg(test)]

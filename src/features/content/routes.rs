@@ -548,13 +548,17 @@ pub async fn set_content_metadata(
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     // mime 服务端所有:原样回填现有值(库端全量替换,不带 = 清空)。**不能让客户端改** ——
     // 改了就能与 S3 里那份 Content-Type 分叉,骗过 inline 闸门(见 SetContentMetadataRequest)。
-    // 无元数据行(upsert 建首行,如 create_content 未上传字节)→ None,不因此 404。
-    let mime_type = state
-        .contents
-        .get_content_metadata(id)
-        .await
-        .ok()
-        .and_then(|m| m.mime_type);
+    //
+    // **只有 NotFound 能降级成 None**(upsert 建首行,如 create_content 未上传字节 → 本就没 mime);
+    // 其余错误(连接抖动/池超时)必须上抛:`.ok()` 会把它们一起吞成 None,于是这次全量替换把好端端
+    // 的 mime 写成 NULL 还回 204 —— 而 mime 是服务端所有物,客户端再也没法把它写回来,只能重传整个
+    // content(preview 从此恒 attachment;若是头像,`get_user_avatar` 的栅格闸会让它永久 404)。
+    // 口径照抄库里同一调用的两处(content service.rs:441/460)。
+    let mime_type = match state.contents.get_content_metadata(id).await {
+        Ok(m) => m.mime_type,
+        Err(content::ContentError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
     state
         .contents
         .set_content_metadata(input.into_input(id, mime_type))

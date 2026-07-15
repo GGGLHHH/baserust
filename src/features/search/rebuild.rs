@@ -49,18 +49,21 @@ pub async fn rebuild(
     p_app: i64,
 ) -> Result<usize, AppError> {
     let mut written = 0usize;
-    let mut offset = 0u64;
+    let mut after: Option<Uuid> = None;
     let mut alive: Vec<Uuid> = Vec::new();
     loop {
+        // **keyset,不是 offset**:offset 翻页在并发删除下会左移窗口 —— 页 N 与 N+1 之间有人被删,
+        // 页 N+1 的末尾那个存活用户就永远不会被返回。它进不了 `alive`,随后被下面的 sweep 扫成
+        // deleted(`idm_seq <= p_idm` 守卫救不了它:那道守卫只挡比快照**新**的行)。
+        // 即"回填反而删掉活人",且恰好发生在你已经怀疑漂移、跑 rebuild 抢修的时候。
         let page = users
             .list(
                 &UserListFilter::default(),
                 UserSortBy::CreatedAt,
                 SortDir::Asc,
-                &ListPage::Offset {
-                    offset,
+                &ListPage::Cursor {
+                    after,
                     limit: PAGE_LIMIT,
-                    with_total: false,
                 },
             )
             .await?;
@@ -94,10 +97,11 @@ pub async fn rebuild(
         }
         tracing::info!(written, page_len, "rebuild_search 回填进度");
 
-        if (page_len as u64) < PAGE_LIMIT {
-            break;
+        // next_after 为 None = 没有下一页(keyset 的终止条件,不看页是否满)。
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
         }
-        offset += PAGE_LIMIT;
     }
 
     // 反向收敛:索引里有、快照里没有的 → 源里已删(或从来就不该在),扫成 deleted。
@@ -264,6 +268,50 @@ mod tests {
             !index.get(newcomer).await.unwrap().unwrap().deleted,
             "水位比快照新的行不该被扫(并发投影的新用户)"
         );
+    }
+
+    /// **翻页必须收全**:超过一页时,keyset 要把每一页都走到,`alive` 才完整 —— 漏掉任何一个
+    /// 存活用户,后面的 sweep 就会把它扫成 deleted(回填反而删活人)。这里跨 `PAGE_LIMIT` 边界,
+    /// 钉住循环的终止条件(`next_after.is_none()`,不是"页不满就停")。
+    #[tokio::test]
+    async fn multi_page_backfill_keeps_every_alive_user() {
+        let users = InMemoryUserRepo::new();
+        let profiles = Arc::new(InMemoryProfileRepo::new());
+        let index = InMemorySearchIndexRepo::new();
+
+        let n = PAGE_LIMIT as usize + 3; // 跨页:一整页 + 零头
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(
+                users
+                    .create(&format!("u{i}"), None, "hash", None)
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+
+        let written = rebuild(
+            &users,
+            &ProfileDisplayNames::new(profiles),
+            &index,
+            100,
+            200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            written, n,
+            "每一页的用户都该回填(翻页漏人 = 后面被扫成已删)"
+        );
+        for id in ids {
+            let row = index
+                .get(id)
+                .await
+                .unwrap()
+                .expect("每个存活用户都该有索引行");
+            assert!(!row.deleted, "存活用户不该被 sweep 扫掉");
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,9 @@
 //! `UserRepo` 解析成用户 id(组合根跨模块只读,绝不跨 schema join)。
 //!
 //! 默认来自仓库根 `mock.toml`(编译期 `include_str!` 嵌入),设 `MOCK_FILE` 读外部覆盖。
-//! 只在 dev(app+idm 同进程 + seed 开启)跑,**绝不进 prod**(无 demo 数据污染)——见 `AppState::new` 的 gate。
+//! 只在 **非 prod** + app/idm 同进程 + seed 开启时跑,**绝不进 prod**(无 demo 数据污染)——
+//! 见 `AppState::new` 的 gate。挡住它的是那道显式的 `!is_prod()`,**不是**"prod 都分进程"
+//! (`IDM_EMBEDDED` 默认 true,prod 单体默认就是 `Both`)。
 
 use std::collections::HashSet;
 
