@@ -872,3 +872,38 @@ async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "改普通用户角色是正常职权");
 }
+
+/// 改身份字段同样闸目标现有角色:改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username)。
+/// 本模块四个写端点(update/delete/reset_password/set_roles)口径必须一致。
+#[tokio::test]
+async fn intermediate_admin_cannot_rename_a_superadmin() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "rename-target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "rename-target-user", &["user"]).await;
+
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{victim}"),
+            r#"{"username":"hijacked","email":null}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能改 superadmin 的身份字段"
+    );
+
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{plain}"),
+            r#"{"username":"renamed-ok","email":null}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改普通用户是正常职权");
+}

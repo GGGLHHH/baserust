@@ -185,6 +185,15 @@ pub async fn update_user(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+    // 目标现有角色闸(同 delete / reset_password / set_roles):改身份字段也是对目标动手 ——
+    // 改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username/email)。
+    // 本模块四个写端点口径统一:够得着目标的全部权,才动得了它。
+    assert_no_escalation(
+        &state.policy,
+        &user.0,
+        &scope.0,
+        &target_role_names(&state, id).await?,
+    )?;
     Ok(Json(
         state.user_admin.update(id, req, ctx.audit_id()).await?,
     ))
