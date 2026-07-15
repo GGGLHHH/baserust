@@ -73,6 +73,15 @@ services:
       JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
       IDM_DB_HOST: pg
       IDM_DB_PORT: "5432"
+      # 分进程拓扑下 **idm relay 归本进程**(state.rs 的 build_outbox_relays:设了 NATS_URL 且
+      # 持有该 schema 的 pool 才起)。少了 NATS_URL → 0 个 relay,idm.outbox 只进不出。
+      NATS_URL: nats://nats:4222
+      # search pool:auth_audit 读句柄 + auth_event 投影器都要它(state.rs 的 auth_audit /
+      # auth_events_bus 都是 needs_idm && NATS_URL && search pool 三者齐才 Some)。
+      # 少了它 → /admin/auth/auth-events 返回 404「审计后端未接线」,前端 auth-log 页空转。
+      # 库/角色/密码走 env_file 的 SEARCH_DB_{USER,PASSWORD,DATABASE}。
+      SEARCH_DB_HOST: pg
+      SEARCH_DB_PORT: "5432"
       # 启动 seed 超管:挂 seed.prod.toml(真账号/密码,gitignore 挡)+ 设 SEED_FILE。
       # prod 检测到 SEED_FILE 即幂等建号(无需 IDM_SEED_ON_START);不挂则不建(不用嵌入 pwd 弱默认)。
       # 部署前先 `cp seed.prod.toml.example seed.prod.toml` 填强密码(否则 bind mount 会建成空目录)。
@@ -106,7 +115,7 @@ services:
     env_file: [.env]
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-      # 首次(空 volume)建 app/idm/content 的 role + schema(search_path 各指自己 schema)。
+      # 首次(空 volume)建 app/idm/content/search 的 role + schema(search_path 各指自己 schema)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]
@@ -140,7 +149,13 @@ services:
   nats:
     image: nats:alpine
     restart: unless-stopped
-    command: ["-m", "8222"]
+    # -js:app 的 JetStream 发布端(infra/jetstream.rs)启动即 ensure 流 USER_SEARCH_EVENTS,
+    # 不开 -js 则 app 起不来(jetstream unavailable)。dev compose 一直带着,prod 这边曾漏。
+    # -sd:JetStream 落盘目录。PG outbox 才是真相源,但 relay 发布拿到 ack 就 mark_published ——
+    # store 跟着容器没了 = 那批已发布、下游还没消费的事件永久丢(保留窗口 7 天)。故同 pg/minio 落 ./data。
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - ./data/nats:/data
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
       interval: 5s
