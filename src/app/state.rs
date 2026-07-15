@@ -278,9 +278,10 @@ impl AppState {
         }
 
         // mock 样本数据(dev/demo 专用):owner(username)经 idm 解析 → 幂等写 app widget/profile 仓储。
-        // 需 app+idm 同进程(才能解析 owner)+ seed 开启 → 即 dev `Both`;prod 分进程不跑(无 demo 数据污染)。
+        // 需 app+idm 同进程(才能解析 owner)+ seed 开启 + **非 prod**。
         // 跟在 idm seed 之后:此时 admin/user 已存在,owner 才解析得到。
-        if needs_app && needs_idm && config.seed_on_start() {
+        //
+        if should_apply_mock(config, needs_app, needs_idm) {
             let mock = super::mock::MockData::load(config.mock_file.as_deref())?;
             super::mock::apply(
                 widget_repo.as_ref(),
@@ -522,10 +523,46 @@ async fn connect_pool(url: &str) -> anyhow::Result<PgPool> {
         .context("连接 Postgres 失败")
 }
 
+/// demo 样本数据(`mock.toml`)该不该写:app/idm 同进程(才解析得到 owner)+ seed 开启 + **非 prod**。
+///
+/// `!is_prod()` 是唯一挡住 demo 数据污染生产库的东西,**不能靠"prod 都是分进程"**:
+/// `IDM_EMBEDDED` 默认 true(`config::default_idm_embedded`),prod 单体默认就是 `Both`;而 prod 挂
+/// `SEED_FILE`(真密码建号)恰是文档推荐用法,一挂 `seed_on_start()` 即为真。两条都真时,没有这道
+/// prod 门就会把 `admin-w1` / `Sam Superadmin` 之类写进生产库。
+/// **账号 seed 与 demo 数据的门必须分开**:prod 要建号,但绝不要 demo 数据。
+///
+/// 抽成函数是为了能直接断言:`AppState::new` 在 prod 下先因内嵌 dev JWT 钥拒启,测不到这道门。
+fn should_apply_mock(config: &Config, needs_app: bool, needs_idm: bool) -> bool {
+    needs_app && needs_idm && config.seed_on_start() && !config.app_env.is_prod()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infra::config::Profile;
+
+    /// **prod 单体 + SEED_FILE 必须建号但绝不写 demo 数据**。这正是文档推荐的 prod 用法
+    /// (`IDM_EMBEDDED` 默认 true → `Both`;`SEED_FILE` → `seed_on_start()` 真),
+    /// 也正是旧门(缺 `!is_prod()`)把 mock.toml 灌进生产库的那条路径。
+    #[test]
+    fn prod_monolith_with_seed_file_seeds_accounts_but_not_demo_data() {
+        let cfg = Config {
+            app_env: Profile::Prod,
+            seed_file: Some("seed.prod.toml".to_owned()),
+            ..Config::default()
+        };
+        assert!(cfg.seed_on_start(), "prod + SEED_FILE:账号 seed 该跑");
+        assert!(
+            !should_apply_mock(&cfg, true, true),
+            "但 demo 数据绝不能进生产库"
+        );
+    }
+
+    /// 非 prod 单体照常灌 demo 数据(别把门收成谁都不跑)。
+    #[test]
+    fn dev_monolith_applies_demo_data() {
+        assert!(should_apply_mock(&Config::default(), true, true));
+    }
 
     /// prod + 内嵌 dev 密钥 → 启动拒(公钥全进程;私钥仅 needs_idm)。
     #[tokio::test]

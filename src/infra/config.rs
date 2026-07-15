@@ -330,6 +330,38 @@ impl Default for Config {
     }
 }
 
+/// 百分号编码连接串里的 user/password/database。生成的密码(如 `openssl rand -base64`)常含
+/// `/ + @ ? #` 等 URL 保留字符,直接插值进 `postgres://user:pass@host/db` 会破坏 authority 解析
+/// (`/` 提前结束 authority),或让形如 `%XX` 的子串被 sqlx 误 percent-decode 成别的密码 —— 都表现为
+/// opaque 的启动期连接失败。编码后 sqlx 连接时 percent-decode 还原。host 不编码(避免破坏 IPv6
+/// `[::1]` 的方括号/冒号)。机制收口在 [`crate::infra::percent`](super::percent)。
+fn enc(s: &str) -> String {
+    super::percent::encode(s)
+}
+
+/// 把 figment 的解析错误**脱敏**成只含键路径的错误。
+///
+/// **绝不能把出错的值带进消息**:figment 的 Display 会原样打出来(`invalid type: found unsigned
+/// int 755, expected a string for key "APP_DB_PASSWORD"`)—— 那个值就是密钥本身。而 `Config::load()`
+/// 跑在 `init_tracing` **之前**(见 `app::runtime::run`),anyhow 链直接落**裸 stderr**,
+/// 等于把密钥打进控制台/容器日志 —— "原始细节只进日志"这条在这里是最粗暴的破法。
+///
+/// 顺带给个能诊断的提示:figment 会把纯数字 / true / false **预解析**成数字/布尔,落到 String
+/// 字段就是类型错 —— 全数字的密码(如 minio 默认 `12345678`、`20240101` 这种)会让进程直接起不来,
+/// 而原始报错只说"期望字符串",完全没提这回事,排查时极易卡住。
+fn redact_config_error(e: figment::Error) -> anyhow::Error {
+    let key = if e.path.is_empty() {
+        "(未知键)".to_owned()
+    } else {
+        e.path.join(".")
+    };
+    anyhow::anyhow!(
+        "解析环境变量配置失败:`{key}` 的值类型不符。\
+         注意纯数字 / true / false 会被预解析成数字/布尔,落到字符串字段即报此错 —— \
+         若它是全数字的密码/密钥,请改用含非数字字符的值。(值本身不打印:它可能是密钥)"
+    )
+}
+
 impl Config {
     /// 从环境变量加载(调用方先 load 过 .env)。**全部环境变量的读取/默认值收口在本文件**:
     /// 加变量 = 加字段(figment 变量名转小写匹配),别在别处 `std::env::var`。
@@ -337,7 +369,7 @@ impl Config {
         let mut cfg: Config = Figment::new()
             .merge(Env::raw())
             .extract()
-            .context("解析环境变量配置失败")?;
+            .map_err(redact_config_error)?;
         apply_jwt_key_file_overrides(&mut cfg)?;
         Ok(cfg)
     }
@@ -347,11 +379,11 @@ impl Config {
         self.app_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.app_db_user,
-                self.app_db_password,
+                enc(&self.app_db_user),
+                enc(&self.app_db_password),
                 host,
                 self.app_db_port,
-                self.app_db_database,
+                enc(&self.app_db_database),
                 self.app_db_sslmode,
             )
         })
@@ -362,11 +394,11 @@ impl Config {
         self.idm_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.idm_db_user,
-                self.idm_db_password,
+                enc(&self.idm_db_user),
+                enc(&self.idm_db_password),
                 host,
                 self.idm_db_port,
-                self.idm_db_database,
+                enc(&self.idm_db_database),
                 self.idm_db_sslmode,
             )
         })
@@ -377,11 +409,11 @@ impl Config {
         self.content_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.content_db_user,
-                self.content_db_password,
+                enc(&self.content_db_user),
+                enc(&self.content_db_password),
                 host,
                 self.content_db_port,
-                self.content_db_database,
+                enc(&self.content_db_database),
                 self.content_db_sslmode,
             )
         })
@@ -392,11 +424,11 @@ impl Config {
         self.search_db_host.as_ref().map(|host| {
             format!(
                 "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                self.search_db_user,
-                self.search_db_password,
+                enc(&self.search_db_user),
+                enc(&self.search_db_password),
                 host,
                 self.search_db_port,
-                self.search_db_database,
+                enc(&self.search_db_database),
                 self.search_db_sslmode,
             )
         })
@@ -457,6 +489,29 @@ fn apply_jwt_key_file_overrides(cfg: &mut Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// **启动期报错绝不能带上出错的值** —— 它可能就是密钥,而 `Config::load()` 跑在
+    /// `init_tracing` 之前,错误直接落裸 stderr。figment 的原始 Display 会原样打出该值,
+    /// 故必须脱敏成只留键路径。(用字面 provider 造错,不碰进程 env:那是全局状态、并行测试会打架。)
+    #[test]
+    fn config_parse_error_never_echoes_the_offending_value() {
+        // 全数字密码:figment 预解析成数字 → 落到 String 字段即类型错(正是 minio `12345678` 那类)
+        let secret = "12345678";
+        let err = Figment::new()
+            .merge(figment::providers::Serialized::default(
+                "app_db_password",
+                secret.parse::<u64>().unwrap(),
+            ))
+            .extract::<Config>()
+            .map_err(redact_config_error)
+            .expect_err("全数字密码落 String 字段应报错");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(secret), "报错里不能出现密钥本身: {msg}");
+        assert!(
+            msg.contains("app_db_password"),
+            "但要指明是哪个键,否则没法排查: {msg}"
+        );
+    }
+
     fn cfg(host: Option<&str>) -> Config {
         Config {
             app_db_host: host.map(Into::into),
@@ -480,6 +535,18 @@ mod tests {
             cfg(Some("h")).app_database_url().unwrap(),
             "postgres://app:pw@h:6000/db?sslmode=require"
         );
+    }
+
+    #[test]
+    fn url_percent_encodes_reserved_userinfo() {
+        // 生成的密码常含 URL 保留字符;原样插值会在 '/' 处截断 authority → 连接失败。
+        // 编码后 sqlx 的 URL 解析器应能正确解析(且 password 里不再有裸 '/')。
+        let mut c = cfg(Some("h"));
+        c.app_db_password = "p/w@x?y#z ".into();
+        let url = c.app_database_url().unwrap();
+        assert!(!url.contains("p/w"), "保留字符必须被编码: {url}");
+        url.parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("编码后的连接串必须可解析");
     }
 
     #[test]

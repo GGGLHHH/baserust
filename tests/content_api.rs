@@ -330,6 +330,39 @@ async fn preview_proxies_bytes_inline_on_memory_backend() {
     assert_eq!(body_bytes(resp).await, b"png-bytes".to_vec());
 }
 
+/// 活动内容(text/html、svg 等)预览必须**降级 attachment**,绝不 inline —— presign 拓扑下 app 加不了
+/// CSP 且与 app 同源,inline 渲染即同源无 CSP 的存储型 XSS。栅格图仍 inline(见上一测试)。
+#[tokio::test]
+async fn preview_forces_attachment_for_active_content() {
+    let (app, admin, _) = test_app();
+    let resp = app
+        .clone()
+        .oneshot(upload_req(
+            &admin,
+            "x.html",
+            "text/html",
+            b"<script>alert(1)</script>",
+        ))
+        .await
+        .unwrap();
+    let id = uploaded_content_id(resp).await;
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/frontend/contents/{id}/preview"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment"),
+        "活动内容必须降级 attachment,不能 inline 渲染"
+    );
+}
+
 /// presign 路径:注入覆写 URL 方法的 store → 307 + Location;download 的 Location 带 filename
 /// (上传后改名,Location 必须签新名,证伪 metadata 优先决议)。
 #[tokio::test]
@@ -691,4 +724,123 @@ async fn cross_user_content_is_404_unless_all_mode() {
     );
 
     // owner 本人始终可读自己的(已被删 → 404 属正常;此处验证的是删除前 admin 可读,上面用例已覆盖)
+}
+
+/// **mime 是服务端所有物**:上传后 `PUT /metadata` 改不动它。
+///
+/// 这是 presign 分支存储型 XSS 的根因闸:presign 出的 URL 只 override disposition,浏览器拿到的
+/// Content-Type 恒是**上传时存进对象存储的那个**;而 inline 安全闸读的是 DB 里的 mime。两者能分叉,
+/// 攻击者就能 `text/html` 上传 → 改 mime 成 `image/png` 骗过闸门 → presign 拿回 text/html + inline。
+/// 让 mime 不可改,分叉不存在。
+#[tokio::test]
+async fn metadata_put_cannot_mutate_mime_so_gate_and_stored_ct_cannot_diverge() {
+    let (app, admin, _viewer) =
+        test_app_with_store(Arc::new(PresignStore(content::InMemoryObjectStore::new())));
+    // 以 text/html 上传(存储里的 Content-Type 自此固定成 text/html)
+    let up = app
+        .clone()
+        .oneshot(upload_req(
+            &admin,
+            "evil.html",
+            "text/html",
+            b"<script>x</script>",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(up.status(), StatusCode::CREATED);
+    let id = uploaded_content_id(up).await;
+
+    // 攻击动作:把 mime 改成惰性类型骗闸门 —— 必须无效
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/api/v1/frontend/contents/{id}/metadata"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::from(
+                    r#"{"tags":[],"file_name":"evil.html","mime_type":"image/png"}"#.to_owned(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // mime 未被改写(仍是上传时那个 = 存储里那个)
+    let meta = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/frontend/contents/{id}/metadata"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(meta).await).unwrap();
+    assert_eq!(
+        v["mime_type"].as_str(),
+        Some("text/html"),
+        "mime 必须仍是上传时的值;可改 = 能与存储里的 Content-Type 分叉"
+    );
+
+    // 闸门据此仍判"不可 inline" → 强制 attachment(presign 分支给的是下载凭证,不是 ?inline)
+    let prev = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/frontend/contents/{id}/preview"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prev.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = prev.headers()["location"].to_str().unwrap().to_owned();
+    assert!(
+        !loc.contains("?inline"),
+        "活动内容绝不能拿到 inline 预览凭证: {loc}"
+    );
+}
+
+/// **一步上传也要校验**:multipart 是手解的,没有 `Json<T>` 那层 derive 校验 —— 本端点曾是唯一
+/// 不 validate 的写 handler。上限与 JSON 两步上传(`PrepareUploadRequest`)对齐。
+/// `file_name` 尤其要封顶:它会被编进 `Content-Disposition` 当 S3 PUT 的**请求头**,
+/// 几十 KB 的文件名足以让后端拒绝,而 2MB body 上限随手塞得下。
+#[tokio::test]
+async fn upload_rejects_oversized_fields() {
+    let (app, admin, _viewer) = test_app();
+
+    // 超长 file_name(> 255)→ 422,而不是带着几十 KB 的头去打对象存储
+    let long_name = format!("{}.txt", "a".repeat(300));
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, &long_name, "text/plain", b"x"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "超长 file_name 应 422"
+    );
+
+    // 超长 mime_type(> 255)同理
+    let long_mime = format!("text/{}", "b".repeat(300));
+    let resp = app
+        .clone()
+        .oneshot(upload_req(&admin, "ok.txt", &long_mime, b"x"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "超长 mime_type 应 422"
+    );
+
+    // 正常的照常 201(别把闸收成谁都传不了)
+    let resp = app
+        .oneshot(upload_req(&admin, "fine.txt", "text/plain", b"x"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "正常上传应 201");
 }

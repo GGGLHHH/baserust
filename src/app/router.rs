@@ -106,31 +106,44 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     openapi::inject_operation_security(&mut api);
 
     let router = router
-        // 中间件栈(外→内,请求时外层先执行)。
+        // 兜底:未知路径 / 方法不对也要出统一 `ErrorBody`。axum 默认给的是**裸状态码 + 空 body** ——
+        // 客户端只要无条件解错误体,就会在 404/405 上炸,而 401/403/408/429/500 全都正常,
+        // 正好破掉"每个错误都是 {code,error}"这条契约(本模块头注的核心承诺)。
+        // 404 用 NotFound;405 归 BadRequest(错误码是闭集,不为此单开一个)。
+        //
+        // **必须注册在整条 `.layer()` 链之前**:`Router::layer` 只包"调用时已存在"的路由(含
+        // fallback),而 `Router::fallback` 会用一个**全新未包装**的 handler 覆盖掉 catch-all ——
+        // 放到链尾等于让 404/405 绕过整个栈:没 CORS(浏览器读不到跨域错误体)、没安全头、没
+        // request-id。此处所有路由都已注册完毕,故也不影响 `method_not_allowed_fallback` 的遍历。
+        .fallback(|| async {
+            error_response(StatusCode::NOT_FOUND, ErrorCode::NotFound, "未找到")
+        })
+        .method_not_allowed_fallback(|| async {
+            error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorCode::BadRequest,
+                "该路径不支持此方法",
+            )
+        })
+        // 内层中间件栈(tower 语义:后 .layer() 更外、请求最先过,故**自内向外**书写)。
+        // CORS / 安全响应头 / 限流刻意包在此栈**之外**(见下),好让限流 429、panic 500 等短路响应
+        // 也带上 CORS 与安全头 —— 否则浏览器读不到跨域的错误响应。
+        //
+        // timeout:超时也走 ErrorBody JSON(tower-http TimeoutLayer 只给空体,故自己包一层)
+        .layer(middleware::from_fn(timeout_middleware))
+        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
+        .layer(CatchPanicLayer::custom(handle_panic))
+        // Trace 必须在 panic/timeout **之外**:span 在它们之内才进得去。
+        // 放最内(旧接法)时,`handle_panic` 的 error! 是在 unwind 过 Trace 之后才打的、
+        // `timeout_or_408` 的 warn! 同理 —— 两条日志都不带 method/path/request_id,
+        // 而"原始细节只进日志"的范式恰恰指望这些细节能对回某个请求;且 unwind/取消会让
+        // `DefaultOnResponse` 根本不触发 → panic 与超时的请求**一条访问日志都没有**,
+        // 偏偏它们正是你要翻日志找的那些。仍在 SetRequestId 之内(span 要读 x-request-id 头)。
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        // timeout:超时也走 ErrorBody JSON(tower-http TimeoutLayer 只给空体,故自己包一层)
-        .layer(middleware::from_fn(timeout_middleware))
-        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
-        .layer(CatchPanicLayer::custom(handle_panic))
-        // 安全响应头(基础 web 安全基线;HSTS 留给 nginx/TLS 终止处加)
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("no-referrer"),
-        ))
-        // CORS:prod 用白名单(CORS_ALLOWED_ORIGINS),dev/staging 宽松便于前端联调
-        .layer(cors_layer(config))
         // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
         .layer(axum::Extension(crate::infra::client_context::TrustedHops(
             config.trusted_proxy_hops,
@@ -148,9 +161,14 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     // 键提取复用 resolve_client_ip 的"信 N 层反代"语义 —— SmartIpKeyExtractor 信 XFF 最左
     // (客户端可伪造,每请求换一个假 IP 即绕过限流),不可用。
     let router = if config.rate_limit_enabled {
+        // `period` = **补一个令牌的间隔**,不是速率 —— `per_second(n)` 是 `period = n 秒`(补一个/n 秒),
+        // 与 `RATE_LIMIT_PER_SEC`("每秒补 n 个")正好互为倒数:直接喂会慢 n² 倍(默认 10 → 0.1 req/s)。
+        // 故取倒数 `1s / n`。`max(1)`:period/burst 为零时 `finish()` 返 None → 启动 panic;
+        // 配 0 应退化成"最严但能跑",不是炸进程。
+        let per_sec = config.rate_limit_per_sec.max(1);
         let gov = GovernorConfigBuilder::default()
-            .per_second(config.rate_limit_per_sec as u64)
-            .burst_size(config.rate_limit_burst)
+            .period(Duration::from_secs(1) / per_sec)
+            .burst_size(config.rate_limit_burst.max(1))
             .key_extractor(TrustedIpKeyExtractor {
                 trusted_hops: config.trusted_proxy_hops,
             })
@@ -160,6 +178,23 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     } else {
         router
     };
+
+    // CORS + 安全响应头包在**最外**(限流之外):限流 429 / panic 500 等短路响应也带上它们
+    // —— 否则浏览器读不到跨域的错误响应(429 body 被 CORS 挡),且这些响应缺安全头。
+    let router = router
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(cors_layer(config));
 
     // 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露,prod 收起减少攻击面。
     let router = if config.app_env.expose_docs() {

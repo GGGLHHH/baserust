@@ -195,3 +195,62 @@ async fn spec_security_matches_real_enforcement() {
         "应覆盖到全部受保护端点,实际只查了 {checked} 个"
     );
 }
+
+/// **`api_spec()` 必须与 `build_router` 实际装配的 spec 一致**。
+///
+/// 两者是**手抄的两份**同一棵 merge/nest 树(router.rs 自称"同源",却把每个 `.merge(xxx::router())`
+/// 又列了一遍),而 `op_perms.rs` 的招牌承诺"加端点漏了 → 覆盖测试 fail-closed 报红"完全押在
+/// `every_operation_classified` 上,那条测试读的是 `api_spec()`。于是:**新模块只 merge 进
+/// build_router**(router.rs 头注恰恰就是这么教的:"加业务模块:在 build_router 对应组里
+/// `.merge(xxx::router())` 一行"),api_spec 里没有它 → 覆盖测试遍历不到 → 全绿放行,
+/// 而端点已带着**空 security** 上线。加端点到既有模块没事(该模块的 router 两边都 merge 了),
+/// 加**模块**才是洞 —— 偏偏那是本脚手架的主要扩展点。
+///
+/// 这里不重构装配(把树抽成一个 fn 会破掉 per-group 组闸:gate 必须在 nest **之前**逐组上,
+/// nest 完就没法只给 frontend 子树加 require_login 了),只钉住两份的**操作集合**相等。
+#[tokio::test]
+async fn api_spec_matches_the_router_that_actually_ships() {
+    let config = Config::default(); // Dev → expose_docs() → 真路由挂 /api-docs/openapi.json
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
+    let app = build_router(state, &config, Mount::Both);
+
+    let resp = app
+        .oneshot(
+            Request::get("/api-docs/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "dev 应挂 /api-docs");
+    let served: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    /// method+path 集合(spec 的操作全集)。
+    fn ops(spec: &Value) -> std::collections::BTreeSet<String> {
+        spec["paths"]
+            .as_object()
+            .expect("paths")
+            .iter()
+            .flat_map(|(path, item)| {
+                item.as_object()
+                    .expect("path item")
+                    .keys()
+                    .map(move |m| format!("{} {path}", m.to_uppercase()))
+            })
+            .collect()
+    }
+
+    let from_spec_fn = ops(&serde_json::to_value(api_spec()).unwrap());
+    let from_router = ops(&served);
+    assert_eq!(
+        from_spec_fn, from_router,
+        "api_spec() 与 build_router 实际挂的路由必须一致 —— 不一致则 every_operation_classified \
+         遍历不到差集里的端点,op_perms 的 fail-closed 承诺对它们失效(会带着空 security 上线)"
+    );
+    assert!(!from_router.is_empty(), "别把两边都比成空集");
+}

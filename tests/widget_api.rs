@@ -77,17 +77,38 @@ fn test_contents() -> content::ContentService {
     )
 }
 
-/// 测试授权策略:admin 角色拿全部 widget 权限(含 read:all → 看全部)。
+/// 测试授权策略:admin 角色拿全部 widget 权限(含 read:all / write:all → 跨用户读写)。
+///
+/// `user` = **"用户管理自己的 widget"** 这种最自然的配法:read + write + delete,**一个 `:all` 都不给**
+/// → `Access::Own`(读写都只及自己创建的)。ownership 断言(读侧/写侧/SSE)都靠它。
+/// 线上 seed 里 user 没有 write/delete,但 role→perm 运行期可改,这正是闸必须成立的那种配置。
 fn test_policy() -> Policy {
-    Policy::from_roles([(
-        "admin".to_owned(),
-        vec![
-            Perm::WidgetRead,
-            Perm::WidgetReadAll,
-            Perm::WidgetWrite,
-            Perm::WidgetDelete,
-        ],
-    )])
+    Policy::from_roles([
+        (
+            "admin".to_owned(),
+            vec![
+                Perm::WidgetRead,
+                Perm::WidgetReadAll,
+                Perm::WidgetWrite,
+                Perm::WidgetWriteAll,
+                Perm::WidgetDelete,
+            ],
+        ),
+        (
+            "user".to_owned(),
+            vec![Perm::WidgetRead, Perm::WidgetWrite, Perm::WidgetDelete],
+        ),
+    ])
+}
+
+/// 普通 user 的令牌(与 `test_app` 的 admin 不同主体;`dev()` 是固定内嵌密钥对,故独立签的
+/// 令牌 app 侧照验)。返回 (token, user_id)。
+fn user_token() -> (String, Uuid) {
+    let uid = Uuid::now_v7();
+    let t = AppTokenSigner::dev()
+        .mint_scoped(uid, "user", vec!["user".to_owned()], vec![], 900)
+        .unwrap();
+    (t, uid)
 }
 
 /// 测试用 AuthService:FakeHasher + 内存 repo + **生产同款非对称签验**(claim 带 roles,中间件才认)。
@@ -349,6 +370,176 @@ async fn delete_soft_deletes_returns_204_then_404() {
         .await
         .unwrap();
     assert_eq!(got.status(), StatusCode::NOT_FOUND, "软删后应 404");
+}
+
+/// **写侧 ownership**:无 `widgets:write:all` 的 user 改不动/删不掉**别人的** widget(404,同 GET)。
+/// 读侧一直有闸,写侧原本没有 → "读自己的、写所有人的":GET 别人的行 404,PUT/DELETE 却放行。
+/// widget 是 adding-a-feature 指定照抄的样板,抄出去的每个 CRUD 模块都会继承这个洞。
+#[tokio::test]
+async fn write_ownership_others_widget_is_404() {
+    let (app, admin) = test_app();
+    let (user, _uid) = user_token();
+
+    // admin 建一个**别人的** widget
+    let id = created_id(
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/frontend/widgets",
+                r#"{"name":"admins-widget"}"#,
+                &admin,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    // 对照:user 读它已经是 404(读侧闸,既有行为)
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/frontend/widgets/{id}"), &user))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "读别人的 → 404");
+
+    // 写:必须同样 404(不是 200)—— 读不到却改得动 = 越权写
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{id}"),
+            r#"{"name":"pwned"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "改别人的 widget 必须 404(读得到才改得动)"
+    );
+
+    // 删:同上
+    let resp = app
+        .clone()
+        .oneshot(delete_req(&format!("/api/v1/frontend/widgets/{id}"), &user))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "删别人的 widget 必须 404"
+    );
+
+    // 别把闸收成"谁都写不了":user 改自己的照常 200
+    let mine = created_id(
+        app.clone()
+            .oneshot(post_json(
+                "/api/v1/frontend/widgets",
+                r#"{"name":"users-widget"}"#,
+                &user,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{mine}"),
+            r#"{"name":"renamed-by-owner"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改自己的 widget 应放行");
+
+    // admin 有 read:all + write:all → 跨用户照常改得动
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/frontend/widgets/{mine}"),
+            r#"{"name":"renamed-by-admin"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin 持 write:all,跨用户可改"
+    );
+}
+
+/// **SSE 行级 ownership**:流必须与 list 同口径 —— 无 `read:all` 的 user 收不到别人的 widget,
+/// 但照收自己的。总线是广播(admin 那条也进了同一频道),过滤在 handler 逐帧做。
+///
+/// 回归意义:漏了这层,任何登录 user 都能从流里实时读到**全站** widget(含名字),而
+/// `GET /widgets` / `GET /widgets/{id}` 对他一律过滤/404 —— 流成了 ownership 的绕行道。
+#[tokio::test]
+async fn sse_stream_filters_other_users_widgets() {
+    use futures_util::StreamExt;
+    let (app, admin) = test_app();
+    let (user, _uid) = user_token();
+
+    // user 开流(有 widgets:read → 200)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/frontend/widgets/events")
+                .header("authorization", format!("Bearer {user}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "user 有 widgets:read,应能开流"
+    );
+    let mut body = resp.into_body().into_data_stream();
+
+    // admin 先建一个**别人的** widget → 必须被 user 的流跳过
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/frontend/widgets")
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"admins-secret-widget"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    // user 再建**自己的** → 应该收到这条
+    let mine = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/frontend/widgets")
+                .header("authorization", format!("Bearer {user}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"users-own-widget"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mine.status(), StatusCode::CREATED);
+
+    // 两条按序发布,第一条被过滤 → 流上第一帧必是自己那条。
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("5s 内应收到自己的那帧")
+        .expect("流不应结束")
+        .unwrap();
+    let text = String::from_utf8(frame.to_vec()).unwrap();
+    assert!(
+        !text.contains("admins-secret-widget"),
+        "越权:别人的 widget 泄漏进了 user 的流: {text}"
+    );
+    assert!(
+        text.contains("users-own-widget"),
+        "自己的 widget 必须照收(别把流过滤成全丢): {text}"
+    );
 }
 
 /// SSE:开流 → create → 第一帧就是 created 事件(keep-alive 15s 远大于测试窗口,不会先到)。

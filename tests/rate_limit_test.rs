@@ -15,8 +15,8 @@ use baserust::infra::authz::Policy;
 use baserust::infra::config::Config;
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
-/// 内存 app + **限流开启**(burst=2,per_sec=1)。
-fn rate_limited_app() -> Router {
+/// 内存 app + **限流开启**,配额由参数给(`per_sec` = 每秒补的令牌数,`burst` = 桶容量)。
+fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
     let bus: Arc<dyn baserust::features::widget::EventBus> =
         Arc::new(baserust::features::widget::MemoryEventBus::new());
     let state = AppState {
@@ -67,16 +67,30 @@ fn rate_limited_app() -> Router {
     };
     let config = Config {
         rate_limit_enabled: true,
-        rate_limit_per_sec: 1,
-        rate_limit_burst: 2,
+        rate_limit_per_sec: per_sec,
+        rate_limit_burst: burst,
         ..Config::default()
     };
     build_router(state, &config, Mount::Both)
 }
 
+/// 打 /health,带固定 IP(oneshot 无 ConnectInfo,靠 XFF 给 key extractor 取键)。
+async fn hit(app: &Router) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::get("/health")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
 #[tokio::test]
 async fn over_burst_same_ip_gets_429_errorbody() {
-    let app = rate_limited_app();
+    let app = rate_limited_app(1, 2);
     let mut last_status = StatusCode::OK;
     let mut body_429 = String::new();
     // burst=2、同 IP 连发 5 次 → 必触 429
@@ -106,6 +120,41 @@ async fn over_burst_same_ip_gets_429_errorbody() {
     assert!(
         body_429.contains("\"code\":\"rate_limited\""),
         "429 必须走统一 ErrorBody 契约: {body_429}"
+    );
+}
+
+/// **单位钉死**:`RATE_LIMIT_PER_SEC` 是"每秒补 N 个令牌",不是"每 N 秒补一个"。
+/// 底层 `GovernorConfigBuilder::period` 要的是**补一个的间隔**,故接线必须取倒数(1s/N)。
+/// per_sec=10 → 100ms 补一个:耗干 burst 后等 300ms 必须放行。
+/// 曾经的 `per_second(10)` 把 period 设成 **10 秒**(慢 100 倍),这里会红;
+/// 原有的 per_sec=1 用例两种接线同解(1s/1 = 1s),照不出来 —— 所以要这条。
+#[tokio::test]
+async fn per_sec_is_a_rate_not_an_interval() {
+    let app = rate_limited_app(10, 1); // 容量 1,每 100ms 补一个
+    assert_eq!(hit(&app).await, StatusCode::OK, "首个请求吃掉 burst");
+    assert_eq!(
+        hit(&app).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "桶空,紧接着必 429"
+    );
+    // 300ms > 100ms 的补充间隔(留足余量抗抖动);若 period 被当成 10s,这里仍是 429 → 红。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        hit(&app).await,
+        StatusCode::OK,
+        "per_sec=10 → 100ms 应补回一个令牌;仍 429 说明 period 被当成了 10 秒(慢 100 倍)"
+    );
+}
+
+/// per_sec / burst 配 0 不应炸进程:`finish()` 对零 period/burst 返 None → `expect` panic。
+/// 钳到 1 = "最严但能跑"。零环境变量静默启动是本仓的硬约束,配错值不该是启动期 panic。
+#[tokio::test]
+async fn zero_quota_does_not_panic_at_build() {
+    let app = rate_limited_app(0, 0);
+    let s = hit(&app).await;
+    assert!(
+        s == StatusCode::OK || s == StatusCode::TOO_MANY_REQUESTS,
+        "配 0 应能起且正常限流,得到 {s}"
     );
 }
 

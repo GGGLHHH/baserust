@@ -311,12 +311,29 @@ impl UserAdminService {
         req: ResetPasswordRequest,
     ) -> Result<(), AppError> {
         req.validate()?;
+        // 存在性守卫(镜像 set_roles):缺失/软删用户 → 404,且不白算 hash / 撤会话。pinned idm 的 PG
+        // update_password 不自校验存在(不查 rows_affected / deleted_at),不守则内存↔PG 分叉:PG 会对
+        // 幽灵/软删用户返 204 并改写其 password_hash,违背文档的 404 契约。
+        self.users.find_by_id(id).await?;
         let hash = self.hasher.hash(&req.new_password)?;
         self.users.update_password(id, &hash).await?;
         // 撤会话 fail-closed(区别于 delete 的 best-effort):refresh 路径不验密码,撤失败=旧 refresh
         // 会话仍可续签 → 改密到 refresh TTL 才真生效。对齐 idm 自助 change_password(那边也 `?`)。
         self.sessions.revoke_all(id, None).await?;
         Ok(())
+    }
+
+    /// 目标用户**现有**的**原始**角色名(未过滤闭集;不存在/软删 → 404)。
+    ///
+    /// 守卫专用,**刻意不走** `get()` 的 `AdminUserView.roles` —— 那是 `RoleName::parse_lossy`
+    /// 的读模型,闭集外的角色名被静默丢掉。而 `Policy` 是从 `role_permissions` 表原样载入的
+    /// `HashMap<String, _>`,**不按闭集过滤**:存量/手工 INSERT 的角色(如带 content:delete 的
+    /// `editor`)确实持有真权限。拿 lossy 名喂提权闸 = 目标只持闭集外高权角色时闸空过,
+    /// 中间管理员照样能改它密码再登入 —— 正是 `role_names_by_ids` 上面那段注释说的
+    /// "守卫与落库看不同目录 → 提权闸失明",只不过换到了目标侧。
+    pub async fn raw_role_names(&self, id: Uuid) -> Result<Vec<String>, AppError> {
+        self.users.find_by_id(id).await?; // 保持 404 契约(不存在/软删)
+        Ok(self.roles.roles_for_user(id).await?)
     }
 
     /// 角色 id → **原始**角色名(未过滤目录;未知 id → 422)。handler 守卫(提权/自锁)与

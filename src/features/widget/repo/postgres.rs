@@ -13,6 +13,17 @@ use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
 use crate::infra::sort::SortOrder;
 
+/// 排序主键表达式:字符串列(`name`)加 `COLLATE "C"` 强制字节序,与内存 `str::cmp` parity —— 否则 PG
+/// 按列默认 collation(官方镜像多为 en_US.utf8 之类 locale)会大小写/locale 混排,与内存分叉,而
+/// widget_repo_conformance 只测默认排序,漂移静默(镜像 search::sort_expr 已确立的口径)。`created_at`
+/// 是时间戳,无 collation,直接列。
+fn sort_expr(sort: WidgetSortField) -> Expr {
+    match sort {
+        WidgetSortField::Name => Expr::cust(r#""widgets"."name" COLLATE "C""#),
+        other => Expr::col(other.column()),
+    }
+}
+
 pub struct PgWidgetRepo {
     pool: PgPool,
 }
@@ -55,7 +66,7 @@ impl WidgetRepo for PgWidgetRepo {
                 if let Some(o) = owner {
                     q.and_where(Expr::col(Widgets::CreatedBy).eq(o)); // ownership 过滤
                 }
-                q.order_by(sort_by.column(), order.into())
+                q.order_by_expr(sort_expr(sort_by), order.into())
                     .order_by(Widgets::Id, order.into())
                     .limit(*size)
                     .offset((page.saturating_sub(1)) * size);

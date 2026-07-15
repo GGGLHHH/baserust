@@ -250,6 +250,13 @@ impl UpdateContentRequest {
 }
 
 /// 设置内容元数据(全量替换,upsert)。
+///
+/// **无 `mime_type` 字段 —— 它是服务端所有物**(上传时由字节的实际 Content-Type 定,见
+/// `into_input`)。理由是安全而非洁癖:presign 出的 URL 只 override disposition,浏览器拿到的
+/// Content-Type 恒是**对象上传时存进 S3 的那个**;而 inline 安全闸(`is_safe_inline_mime`)与头像
+/// 栅格白名单读的都是**这张表**的 mime。两者若能分叉,攻击者就能 `text/html` 上传、改 mime 成
+/// `image/png` 骗过闸门,再经 presign 拿回 `Content-Type: text/html` + inline = 存储型 XSS。
+/// 让 mime 不可改,分叉就不存在。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct SetContentMetadataRequest {
     #[garde(length(max = 64))]
@@ -258,8 +265,6 @@ pub struct SetContentMetadataRequest {
     pub file_size: Option<i64>,
     #[garde(inner(length(max = 255)))]
     pub file_name: Option<String>,
-    #[garde(inner(length(max = 255)))]
-    pub mime_type: Option<String>,
     #[garde(inner(length(max = 255)))]
     pub checksum: Option<String>,
     #[garde(inner(length(max = 64)))]
@@ -271,13 +276,20 @@ pub struct SetContentMetadataRequest {
 }
 
 impl SetContentMetadataRequest {
-    pub fn into_input(self, content_id: Uuid) -> SetContentMetadataInput {
+    /// `mime_type` 由调用方从**现有元数据**取来原样回填(库端是全量替换,不带就等于清空)——
+    /// 客户端给不了,见类型头。无现有行(upsert 建首行)→ `None`:没有字节就没有 mime,
+    /// 且 `None` 在所有闸门下都是 fail-closed(不 inline)。
+    pub fn into_input(
+        self,
+        content_id: Uuid,
+        mime_type: Option<String>,
+    ) -> SetContentMetadataInput {
         SetContentMetadataInput {
             content_id,
             tags: self.tags,
             file_size: self.file_size,
             file_name: self.file_name,
-            mime_type: self.mime_type,
+            mime_type,
             checksum: self.checksum,
             checksum_algorithm: self.checksum_algorithm,
             metadata: self.metadata,

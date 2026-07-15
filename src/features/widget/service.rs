@@ -137,9 +137,15 @@ impl WidgetService {
     }
 
     /// 软删除(非物理 DELETE)。
+    /// 删前先 `get`:软删后行不可读,**只有这里能拿到 `created_by`** —— 事件带上它,订阅侧才能按
+    /// ownership 逐帧过滤(见 `WidgetEvent::owner`)。多一次读换事件可过滤;`get` 的 NotFound 与
+    /// `soft_delete` 的幂等 NotFound 同语义,不改对外契约。
     pub async fn delete(&self, id: Uuid, ctx: &AuditContext) -> Result<(), AppError> {
+        let created_by = self.repo.get(id).await?.created_by;
         self.repo.soft_delete(id, ctx.audit_id()).await?;
-        self.events.publish(WidgetEvent::Deleted { id }).await;
+        self.events
+            .publish(WidgetEvent::Deleted { id, created_by })
+            .await;
         Ok(())
     }
 }
@@ -153,7 +159,7 @@ mod tests {
     use crate::features::widget::{MemoryEventBus, StaticUserDirectory, UserBrief};
 
     fn ctx() -> AuditContext {
-        AuditContext::anonymous(None)
+        AuditContext::anonymous()
     }
     fn first_page() -> PageQuery {
         PageQuery {

@@ -5,9 +5,10 @@
 //! 内存入口:默认 `cargo test` 就跑(零 DB)。
 //! PG 入口:`cargo test --features pg-conformance`(需 DATABASE_URL 连 app role + 跑着的 pg),用 `just test-pg`。
 
-use baserust::features::widget::WidgetRepo;
+use baserust::features::widget::{WidgetRepo, WidgetSortField};
 use baserust::infra::error::AppError;
 use baserust::infra::pagination::{decode_cursor, PageInfo, PageParams};
+use baserust::infra::sort::SortOrder;
 use uuid::Uuid;
 
 /// 契约唯一真相源。内存与 PG 都调它 —— 加实现/加断言只改这一处。
@@ -277,6 +278,31 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         before.items.iter().map(|w| w.id).collect::<Vec<_>>(),
         after.items.iter().map(|w| w.id).collect::<Vec<_>>(),
         "事务失败必须全回滚:widget 父行不该出现"
+    );
+
+    // ── name 排序 parity:大小写混排必须字节序(PG COLLATE "C" == 内存 str::cmp)。否则 locale
+    //    collation(en_US.utf8 等)会把 "apple" 排到 "Banana" 前,内存↔PG 分叉。──
+    repo.create("Banana".into(), None).await.unwrap();
+    repo.create("apple".into(), None).await.unwrap();
+    let by_name = repo
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 100,
+                with_total: false,
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await
+        .unwrap();
+    let names: Vec<&str> = by_name.items.iter().map(|w| w.name.as_str()).collect();
+    let bi = names.iter().position(|n| *n == "Banana").unwrap();
+    let ai = names.iter().position(|n| *n == "apple").unwrap();
+    assert!(
+        bi < ai,
+        "name 排序必须字节序('B'=66 < 'a'=97 → Banana 在 apple 前),实际: {names:?}"
     );
 }
 

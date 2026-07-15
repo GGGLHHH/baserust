@@ -363,14 +363,15 @@ async fn avatar_bind_enrich_and_dangling_degrade() {
     );
 }
 
-/// 头像三拒:不存在 / prepare 未 confirm / mime 非 image → 422。
+/// 头像四拒:不存在 / prepare 未 confirm / mime 非栅格 / SVG(活动内容,防存储型 XSS)→ 422。
 #[tokio::test]
 async fn avatar_bad_bindings_rejected_422() {
     let (app, store, _admin, alice, _bob) = test_app();
     let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
     let unconfirmed = seed_content(&app, &store, &alice, "image/png", false).await;
     let not_image = seed_content(&app, &store, &alice, "text/plain", true).await;
-    for bad in [Uuid::now_v7().to_string(), unconfirmed, not_image] {
+    let svg = seed_content(&app, &store, &alice, "image/svg+xml", true).await;
+    for bad in [Uuid::now_v7().to_string(), unconfirmed, not_image, svg] {
         let resp = app
             .clone()
             .oneshot(put_json(

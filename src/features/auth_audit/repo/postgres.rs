@@ -59,7 +59,11 @@ fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
         ));
     }
     if let Some(ip) = &f.ip {
-        q.and_where(Expr::cust_with_values(r#""ip" = $1::inet"#, [ip.clone()]));
+        // 已在提取器校验为合法 IpAddr;绑其规范文本,`::inet` cast 恒合法(不会 500)。
+        q.and_where(Expr::cust_with_values(
+            r#""ip" = $1::inet"#,
+            [ip.to_string()],
+        ));
     }
     if let Some(from) = f.from {
         q.and_where(Expr::col(AuthEvent::OccurredAt).gte(from));

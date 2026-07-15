@@ -123,11 +123,10 @@ impl ObjectStore for S3ObjectStore {
             req = req.content_type(ct);
         }
         if let Some(name) = &params.file_name {
-            // 原始文件名进 Content-Disposition(下载时供浏览器命名);引号转义防注入。
-            req = req.content_disposition(format!(
-                "attachment; filename=\"{}\"",
-                name.replace('"', "")
-            ));
+            // 原始文件名进 Content-Disposition(下载时供浏览器命名):RFC 6266,ascii 兜底 + filename*
+            // 承载非 ASCII/控制字符/引号(裸插值会乱码或注入),与 download_url / 代理下载路径同口径。
+            req = req
+                .content_disposition(crate::infra::percent::content_disposition_attachment(name));
         }
         req.send().await.map_err(store_err)?;
         Ok(())
@@ -185,8 +184,8 @@ impl ObjectStore for S3ObjectStore {
         download_filename: Option<&str>,
     ) -> Result<Option<String>, ContentError> {
         let disposition = match download_filename {
-            // 引号转义防 header 注入(同 upload 侧 Content-Disposition)。
-            Some(name) => format!("attachment; filename=\"{}\"", name.replace('"', "")),
+            // RFC 6266(ascii 兜底 + filename*),同 upload 侧 / 代理下载路径 —— 见 percent::content_disposition_attachment。
+            Some(name) => crate::infra::percent::content_disposition_attachment(name),
             None => "attachment".to_owned(),
         };
         self.presign_get(object_key, disposition).await
@@ -258,8 +257,9 @@ mod tests {
             dl.contains("response-content-disposition=attachment"),
             "{dl}"
         );
-        // 真钉转义:内部引号被 replace 删掉 → URL 不该出现 %22final%22(删了 replace 这行就红)。
-        assert!(!dl.contains("%22final%22"), "内部引号应被转义删除: {dl}");
+        // RFC 6266:filename*(UTF-8 承载真实名)签进 disposition(SigV4 把 '*' 编成 %2A);
+        // filename= 的 ascii 兜底把非 ASCII/引号净化成 '_',不裸反射。
+        assert!(dl.contains("filename%2A"), "应带 RFC 6266 filename*: {dl}");
         assert!(dl.contains("X-Amz-Expires=300"), "TTL 应钉在 300s: {dl}");
 
         let pv = store.preview_url("k1/k2").await.unwrap().unwrap();

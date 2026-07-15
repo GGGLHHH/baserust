@@ -119,7 +119,14 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 全部变体(wire round-trip 测试用)。加变体必补这里(忘了 → 测试挂),镜像 `Perm::ALL`。
+    /// 全部变体(wire round-trip 测试用)。镜像 `Perm::ALL`。
+    ///
+    /// **加变体必补这里,但漏了没人拦** —— `ALL` 是数组字面量,加变体不会让它编译失败;
+    /// round-trip 测试遍历的正是 `ALL`,漏掉的变体只是从不被测(那条测试就是为了钉住
+    /// `as_str()` 与 serde rename 不漂移,漏项恰好绕过它)。真正逼你回来的是 `as_str()`
+    /// 的穷尽 match(编译不过),但它只让你**手写**一个 wire 串,不校验它等于 serde 的 rename。
+    /// 后果:日志字段 `code`(as_str)与出参 `code`(serde)对新变体可能对不上。
+    /// 要根治:声明宏单源展开 enum + `ALL` + `as_str`,让漏项不可表达。
     pub const ALL: [ErrorCode; 9] = [
         ErrorCode::NotFound,
         ErrorCode::Validation,
@@ -202,8 +209,9 @@ impl From<idm::IdmError> for AppError {
 
 /// content 库的领域错误 `ContentError` 接进 app 错误体系 —— **HTTP 状态码 / wire 形状在此边界决定**。
 /// content 是零 HTTP 的纯库,只暴露领域语义;映射对齐其文档分组(见 content::error):
-/// not-found→404;not-ready / invalid-state / conflict→409(状态/冲突类);invalid-status→422(校验);
-/// storage / internal→500(原始 source 含 key/backend,只进日志、绝不进响应体)。
+/// not-found→404;not-ready / invalid-state / conflict→409(状态/冲突类);
+/// invalid-status / storage / internal→500(invalid-status = DB 存了无法解析的状态串,是数据完整性
+/// 故障而非客户端可修的校验错;原始值/source 含 key/backend/脏值,只进日志、绝不进响应体)。
 /// 校验(422)/坏请求(400)是 app 边界产物(garde / 提取器 → Validation/BadRequest),不经此映射。
 impl From<content::ContentError> for AppError {
     fn from(e: content::ContentError) -> Self {
@@ -211,7 +219,10 @@ impl From<content::ContentError> for AppError {
         match e {
             CE::NotFound => AppError::NotFound,
             CE::NotReady(m) | CE::InvalidState(m) | CE::Conflict(m) => AppError::Conflict(m),
-            CE::InvalidStatus(m) => AppError::Validation(m),
+            // DB 边界解析失败(脏状态串):内部数据完整性故障 → 500,原始脏值只进日志不回传。
+            CE::InvalidStatus(m) => {
+                AppError::Internal(anyhow::anyhow!("content status 解析失败(DB 脏值): {m}"))
+            }
             CE::Storage(e) | CE::Internal(e) => AppError::Internal(e),
         }
     }

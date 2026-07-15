@@ -31,16 +31,10 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .context("需设 SEARCH_DB_HOST(重建写 admin_user_index)")?;
 
-    // 快照水位:**先读 P、再读数据**(P 是回填时刻各 outbox 的 max id,下界;之后 id>P 的新事件
+    // 快照水位:**先读 P、再读数据**(P 是回填时刻各 outbox 的水位,**下界**;之后 id>P 的新事件
     // 才会再覆写投影行,旧重投被 projector 的守卫挡住)。search_path 令 `outbox` 落各自 schema。
-    let p_idm: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
-        .fetch_one(&idm_pool)
-        .await
-        .context("读 idm outbox 水位失败")?;
-    let p_app: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
-        .fetch_one(&app_pool)
-        .await
-        .context("读 app outbox 水位失败")?;
+    let p_idm = read_outbox_watermark(&idm_pool, "idm").await?;
+    let p_app = read_outbox_watermark(&app_pool, "app").await?;
 
     let users = PgUserRepo::new(idm_pool);
     let profiles = ProfileDisplayNames::new(std::sync::Arc::new(PgProfileRepo::new(app_pool)));
@@ -49,4 +43,52 @@ async fn main() -> anyhow::Result<()> {
     let count = rebuild(&users, &profiles, &index, p_idm, p_app).await?;
     println!("✅ rebuild_search 完成:回填 {count} 条(idm_seq={p_idm}, profile_seq={p_app})");
     Ok(())
+}
+
+/// 读某 schema 的 outbox 水位 P,并保证 **P 真的是下界**:≤P 的 id 全部已提交,此后新分配的 id 必 >P。
+///
+/// 裸 `select max(id)` 给不了这个保证:`outbox.id` 是 `bigserial`,INSERT 时由 nextval 取号、
+/// **提交时才可见**。于是比 max(id) 小的 id 完全可能仍在未提交事务里、晚于本次读才落地 ——
+/// 而写方确实这么干(`PgProfileRepo::upsert` 在同一个事务里做业务 upsert + `emit_outbox`)。
+///
+/// 那种情况下会**永久丢事件**:Tx-A 取号 50 未提交,Tx-B 取号 51 提交,rebuild 读到 P=51;
+/// 回填时读 profile 又看不见 Tx-A 未提交的新值 → 写进旧值 + `profile_seq=51`;随后 Tx-A 提交、
+/// relay 发出 seq=50 的真事件,projector 的 `seq > profile_seq` 守卫把它丢弃 —— 投影永远停在旧值,
+/// 且再跑一次 rebuild 也修不回(除非那个用户又有新事件)。
+///
+/// `lock table ... in exclusive mode` 与 INSERT 持的 ROW EXCLUSIVE 冲突:拿到锁 = 在途插入全部落定、
+/// 新插入被挡在门外,此刻的 max(id) 才是真下界。锁只**持**到这条主键聚合查询结束(很快)。
+///
+/// 但危险的是**等**锁那半:写方在整个业务事务期间都握着 `outbox` 的 ROW EXCLUSIVE(锁到事务结束,
+/// 不只是 INSERT 那一瞬),只要有一个慢事务/idle-in-transaction,这个 EXCLUSIVE 请求就得排队;
+/// 而 PG 的锁队列是 **FIFO** —— 排队期间**新来的 INSERT 也得排在它后面**,哪怕彼此本不冲突。
+/// 即:不设超时的话,本 CLI 会把该 schema 的写入整体拖停(emit_outbox 在每条业务写的事务里)。
+/// 故 `set local lock_timeout`:等不到就**快速失败**退出,让运维等阻塞事务散了再重跑,
+/// 而不是把生产写入拽下水。`set local` = 只作用本事务,提交即还原。
+async fn read_outbox_watermark(pool: &sqlx::PgPool, what: &str) -> anyhow::Result<i64> {
+    let mut tx = pool
+        .begin()
+        .await
+        .with_context(|| format!("开启 {what} 水位事务失败"))?;
+    sqlx::query("set local lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("设 {what} lock_timeout 失败"))?;
+    sqlx::query("lock table outbox in exclusive mode")
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "锁 {what} outbox 失败(需 UPDATE 权限;或 5s 内没等到锁 —— \
+                 有长事务占着 outbox,散了再重跑,别让本次重建拖停写入)"
+            )
+        })?;
+    let p: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("读 {what} outbox 水位失败"))?;
+    tx.commit()
+        .await
+        .with_context(|| format!("提交 {what} 水位事务失败"))?;
+    Ok(p)
 }

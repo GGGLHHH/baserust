@@ -41,7 +41,11 @@ async fn fetch_content_owned(
     all_perm: Perm,
     id: Uuid,
 ) -> Result<content::Content, AppError> {
-    let (c, owned) = fetch_content_with_access(state, user, scope, all_perm, id).await?;
+    let c = state.contents.get_content(id).await?;
+    let owned = state
+        .policy
+        .data_access(user, scope, all_perm)
+        .allows(c.owner_id);
     if owned {
         Ok(c)
     } else {
@@ -49,20 +53,34 @@ async fn fetch_content_owned(
     }
 }
 
-/// 同上,但把 ownership 判定交还调用方(preview 需要"非 owner 但 image 放行"的折中)。
-async fn fetch_content_with_access(
-    state: &AppState,
-    user: &idm::AuthUser,
-    scope: &[Perm],
-    all_perm: Perm,
-    id: Uuid,
-) -> Result<(content::Content, bool), AppError> {
-    let c = state.contents.get_content(id).await?;
-    let owned = state
-        .policy
-        .data_access(user, scope, all_perm)
-        .allows(c.owner_id);
-    Ok((c, owned))
+/// 可安全 inline 渲染的 MIME 白名单(浏览器不执行脚本):栅格图 / 视频 / 音频 / PDF / 纯文本。
+/// **排除活动内容**(image/svg+xml、text/html、application/xml…):它们 inline + 同源 + 无 CSP =
+/// 存储型 XSS。presign 分支 app 加不了 CSP,且 relative-presign 拓扑(见 compose/nginx)下 presign
+/// 与 app **同源** —— 故不能靠"presign 天然异源"兜底。不在白名单 → 强制 attachment(浏览器下载不渲染)。
+///
+/// **形状必须是"白名单 + 精确匹配",不能是"前缀放行 + 逐个排除活动类型"**:后者对新的/带参数的活动
+/// 类型恒 fail-open(`image/svg+xml; charset=utf-8` 曾绕过 `== "image/svg+xml"` 再被 `starts_with("image/")`
+/// 放行)。mime 是**用户上传时自报**的原样串(axum 保留参数),故先归一:切掉 `;` 参数、trim、小写。
+fn is_safe_inline_mime(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/avif"
+            | "application/pdf"
+            | "text/plain"
+    ) || base.starts_with("video/")
+        || base.starts_with("audio/")
 }
 
 /// 建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。
@@ -183,6 +201,23 @@ pub async fn upload_content(
     }
 
     let data = data.ok_or_else(|| AppError::Validation("missing `file` part".to_owned()))?;
+    // multipart 是手解的,没有 `Json<T>` 那层 derive 校验 —— 本端点原本是**唯一**不 validate 的写
+    // handler,同样的领域字段在 JSON 两步上传(`PrepareUploadRequest`)上全都有上限,这条路一个没有。
+    let fields = UploadFields {
+        name,
+        document_type,
+        file_name,
+        mime_type,
+        tags,
+    };
+    fields.validate()?;
+    let UploadFields {
+        name,
+        document_type,
+        file_name,
+        mime_type,
+        tags,
+    } = fields;
     let input = UploadContentInput {
         tenant_id,
         owner_id: user.0.id,
@@ -363,12 +398,11 @@ pub async fn download_content(
         .as_ref()
         .and_then(|m| m.file_name.clone())
         .unwrap_or_else(|| id.to_string());
+    // RFC 6266 文件名(ascii 兜底 + filename*),与 presign 下载路径同口径(见 percent 模块)。
+    let disposition = crate::infra::percent::content_disposition_attachment(&file_name);
     Response::builder()
         .header(CONTENT_TYPE, mime)
-        .header(
-            CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", file_name.replace('"', "")),
-        )
+        .header(CONTENT_DISPOSITION, disposition)
         .body(Body::from(bytes))
         .map_err(|e| AppError::Internal(e.into()))
 }
@@ -403,7 +437,24 @@ pub async fn preview_content(
     // 头像跨用户展示不再从这里"放行任意 image"(那会让 owner 隔离被整体绕过)——
     // 改由 `profiles/{user_id}/avatar` 专用端点服务:只出被指定为头像、且属主本人的那一张图。
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
-    if let Some(url) = state.contents.preview_url(id).await? {
+    // inline 是否安全:活动内容(html/svg/xml…)绝不 inline。presign 分支 app 加不了 CSP,relative-presign
+    // 拓扑下又与 app 同源 —— 不安全类型强制 attachment(浏览器下载不执行),安全类型才 inline 预览。
+    let safe_inline = state
+        .contents
+        .get_content_metadata(id)
+        .await
+        .ok()
+        .and_then(|m| m.mime_type)
+        .as_deref()
+        .is_some_and(is_safe_inline_mime);
+
+    // presign 分支(prod 默认):安全 → inline 预览凭证;不安全 → attachment 下载凭证(不渲染活动内容)。
+    let presigned = if safe_inline {
+        state.contents.preview_url(id).await?
+    } else {
+        state.contents.download_url(id).await?
+    };
+    if let Some(url) = presigned {
         // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
         let mut resp = Redirect::temporary(&url).into_response();
         resp.headers_mut().insert(
@@ -412,21 +463,19 @@ pub async fn preview_content(
         );
         return Ok(resp);
     }
-    // 代理回退:Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
+    // 代理回退(memory 后端):Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
     let p = state.contents.preview_content(id).await?;
     let mime = p
         .metadata
         .as_ref()
         .and_then(|m| m.mime_type.clone())
         .unwrap_or_else(|| "application/octet-stream".to_owned());
+    // 安全类型 inline 渲染;活动类型已降级 attachment(不渲染即不执行)。CSP sandbox 再兜一层:
+    // 禁脚本/表单/同源访问,即便 inline 的用户可控 mime 也拿不到 app origin 的任何东西。
+    let disposition = if safe_inline { "inline" } else { "attachment" };
     Response::builder()
         .header(CONTENT_TYPE, mime)
-        .header(CONTENT_DISPOSITION, "inline")
-        // inline + 用户可控 mime(上传/元数据均可声明 text/html、svg)= 同源执行面。
-        // CSP sandbox:本响应里脚本/表单/同源访问全禁 —— 图片/视频照常渲染;
-        // 恶意 html/svg 拿不到 app origin 的任何东西。注意 sandbox 管不到浏览器 PDF
-        // 阅读器自带的 JS action 模型(要彻底 → mime 白名单外回退 attachment)。
-        // presign 路径天然异源,无此问题。
+        .header(CONTENT_DISPOSITION, disposition)
         .header("content-security-policy", "sandbox")
         .body(Body::from(p.data))
         .map_err(|e| AppError::Internal(e.into()))
@@ -514,11 +563,45 @@ pub async fn set_content_metadata(
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
     input.validate()?;
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
+    // mime 服务端所有:原样回填现有值(库端全量替换,不带 = 清空)。**不能让客户端改** ——
+    // 改了就能与 S3 里那份 Content-Type 分叉,骗过 inline 闸门(见 SetContentMetadataRequest)。
+    //
+    // **只有 NotFound 能降级成 None**(upsert 建首行,如 create_content 未上传字节 → 本就没 mime);
+    // 其余错误(连接抖动/池超时)必须上抛:`.ok()` 会把它们一起吞成 None,于是这次全量替换把好端端
+    // 的 mime 写成 NULL 还回 204 —— 而 mime 是服务端所有物,客户端再也没法把它写回来,只能重传整个
+    // content(preview 从此恒 attachment;若是头像,`get_user_avatar` 的栅格闸会让它永久 404)。
+    // 口径照抄库里同一调用的两处(content service.rs:441/460)。
+    let mime_type = match state.contents.get_content_metadata(id).await {
+        Ok(m) => m.mime_type,
+        Err(content::ContentError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
     state
         .contents
-        .set_content_metadata(input.into_input(id))
+        .set_content_metadata(input.into_input(id, mime_type))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 一次性上传(multipart)手解出来的字段 —— 上闸用,上限**与 `PrepareUploadRequest` 逐条对齐**:
+/// 同样的领域字段走 JSON(两步上传)还是 multipart(一步上传),不该有两套契约。
+///
+/// `file_name` 尤其不能不封顶:它会被原样编进 `Content-Disposition` 当作 S3 PUT 的**请求头**
+/// (见 infra::objectstore::upload),几十 KB 的文件名足以让后端拒绝 —— 而 2MB 的 body 上限
+/// 随手就塞得下。(`UploadForm` 是纯文档 schema、不参与反序列化,且不含 file_name/mime_type
+/// 这两个来自 part 头的字段,故另立此结构而非给它加 derive。)
+#[derive(Validate)]
+struct UploadFields {
+    #[garde(inner(length(max = 255)))]
+    name: Option<String>,
+    #[garde(inner(length(max = 64)))]
+    document_type: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    file_name: Option<String>,
+    #[garde(inner(length(max = 255)))]
+    mime_type: Option<String>,
+    #[garde(length(max = 64))]
+    tags: Vec<String>,
 }
 
 /// multipart 标量字段读成 String(失败 → 400)。
@@ -596,4 +679,45 @@ pub async fn confirm_upload(
     fetch_content_owned(&state, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
     let c = state.contents.confirm_upload(id, ctx.audit_id()).await?;
     Ok(Json(c.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_inline_mime;
+
+    /// 闸门必须 **fail-closed**:活动内容(可执行脚本)一律不 inline —— 带 MIME 参数、
+    /// 大小写变形、前后空白都不能把它绕过去(mime 是上传方自报的原样串)。
+    #[test]
+    fn active_content_never_inlines_despite_parameters_or_case() {
+        for bad in [
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8", // 参数曾绕过 `== "image/svg+xml"` 再被前缀放行
+            "IMAGE/SVG+XML",
+            "  image/svg+xml  ",
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xml",
+            "application/xhtml+xml",
+            "image/svg+xml;foo=bar",
+        ] {
+            assert!(!is_safe_inline_mime(bad), "{bad} 绝不能 inline");
+        }
+    }
+
+    /// 惰性类型照常 inline(别把闸门收成全拒),含带参数/大小写变形的正常写法。
+    #[test]
+    fn inert_types_still_inline() {
+        for ok in [
+            "image/png",
+            "image/jpeg",
+            "IMAGE/PNG",
+            "image/jpeg; charset=binary",
+            "application/pdf",
+            "text/plain; charset=utf-8",
+            "video/mp4",
+            "audio/mpeg",
+        ] {
+            assert!(is_safe_inline_mime(ok), "{ok} 应可 inline");
+        }
+    }
 }

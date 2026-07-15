@@ -60,29 +60,6 @@ pub fn success_data(
     })
 }
 
-/// 登出:`AuthService::logout` 现在连 `user_id` 一并返回(被撤会话本身携带),故与
-/// `success_data` 分开一个更窄的变体,但 `user_id`/`session_id` 都带,支持按用户查审计历史。
-pub fn session_event_data(
-    ctx: &ClientContext,
-    channel: AuthChannel,
-    user_id: Uuid,
-    session_id: Uuid,
-    actor: Option<&str>,
-) -> Value {
-    json!({
-        "occurred_at": now_rfc3339(),
-        "channel": channel,
-        "outcome": "success",
-        "user_id": user_id,
-        "session_id": session_id,
-        "actor": actor,
-        "ip": ctx.ip,
-        "forwarded_chain": ctx.forwarded_chain,
-        "user_agent": ctx.user_agent,
-        "request_id": ctx.request_id,
-    })
-}
-
 /// 失败类事件 payload。`user_id` 多数失败场景未知(防枚举,传 `None`);
 /// `admin_access_denied` 例外 —— 验密已过、有确定 user_id,传 `Some`。`actor` 复用
 /// `identifier`(提交的用户名/邮箱原文,失败场景没有更可信的展示名)。

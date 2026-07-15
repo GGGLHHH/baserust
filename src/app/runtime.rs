@@ -2,6 +2,8 @@
 //! app bin(main.rs)与 idm bin(src/bin/idm.rs)都调它,只差挂载范围
 //! (对应 Go 的 cmd/realestate 与 cmd/realestate-login:同一套 lib,两个瘦 main)。
 
+use std::future::IntoFuture;
+
 use anyhow::Context;
 
 use crate::app::{build_router, AppState, Mount};
@@ -69,7 +71,7 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
 
     // into_make_service_with_connect_info:给 SmartIpKeyExtractor 的 peer-IP fallback 提供 ConnectInfo
     // (生产 nginx 设 X-Forwarded-For 时走 header;直连/无代理时回落到对端 IP)。
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
@@ -77,8 +79,43 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     })
-    .await
-    .context("服务器异常退出")?;
+    .into_future();
+    serve_until_drained(server, shutdown_rx, DRAIN_TIMEOUT).await
+}
+
+/// 收到关闭信号后,最多再等这么久就放弃剩余连接。取值 < 容器 grace period(docker/k8s 默认 30s),
+/// 才轮得到我们自己善终 —— 超了就是 SIGKILL,等于没做优雅退出。
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 等 server 跑完,但给 drain **封顶**。
+///
+/// `with_graceful_shutdown` 停止 accept 后要等**所有**在途连接的 future 结束,而 SSE 流
+/// (`widget_events` / `auth_events`)只在总线关闭时才结束 —— 没人关它,浏览器挂着一个
+/// EventSource 就能让 drain 永不完成:等满 grace period 被 SIGKILL 硬杀、在途请求一起断
+/// (正是 [`shutdown_signal`] 头注要避免的失败模式,滚动发布每次都中)。keep-alive 还在持续
+/// 写帧,TCP 层也不会自己超时。故到点放弃剩余连接、主动善终。
+///
+/// 更彻底的做法是把 shutdown 信号送进 SSE handler 逐流 select 结束(要给 `AppState` 加字段);
+/// 封顶这层对**任何**长连接都成立,先要它。
+async fn serve_until_drained(
+    server: impl std::future::Future<Output = std::io::Result<()>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cap: std::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::pin!(server);
+    tokio::select! {
+        r = &mut server => r.context("服务器异常退出")?,
+        _ = async {
+            // 从**收到信号那刻**起算,不是从进程启动起算。
+            let _ = shutdown_rx.wait_for(|stopping| *stopping).await;
+            tokio::time::sleep(cap).await;
+        } => {
+            tracing::warn!(
+                timeout_secs = cap.as_secs(),
+                "优雅退出超时:仍有长连接(SSE?)未结束,放弃 drain 直接退出"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -148,4 +185,44 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("收到关闭信号,优雅退出");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::serve_until_drained;
+
+    /// **drain 不能无限等**:模拟"连接 future 永不结束"(SSE 流就是这样 —— 只在总线关闭时才完)。
+    /// 收到关闭信号后必须到点放弃返回;不封顶就会一直等到容器 grace period 用尽被 SIGKILL,
+    /// 优雅退出形同虚设(滚动发布每次都中)。
+    #[tokio::test]
+    async fn drain_is_capped_when_connections_never_finish() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let never_ending = std::future::pending::<std::io::Result<()>>();
+        tx.send(true).unwrap(); // 已收到 SIGTERM
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_until_drained(never_ending, rx, Duration::from_millis(50)),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "drain 必须封顶返回,而不是一直等长连接(不封顶这里会挂到 5s 超时)"
+        );
+        assert!(r.unwrap().is_ok(), "放弃 drain 是正常退出,不是错误");
+    }
+
+    /// server 自己先跑完(无长连接挂着)→ 照常返回,不等满封顶时长。
+    #[tokio::test]
+    async fn normal_shutdown_returns_immediately() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let done = async { Ok::<(), std::io::Error>(()) };
+        let r = tokio::time::timeout(
+            Duration::from_millis(500),
+            serve_until_drained(done, rx, Duration::from_secs(3600)),
+        )
+        .await;
+        assert!(r.is_ok() && r.unwrap().is_ok(), "正常结束不该被封顶拖住");
+    }
 }

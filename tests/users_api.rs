@@ -59,9 +59,16 @@ async fn test_app() -> (Router, String, String) {
     );
 
     // policy(归 app):superadmin 满权(含 users:admin + profiles:write:all);admin 仅后台准入。
+    // `useradmin` = **中间管理员**:有 users:admin 但非满权 —— 提权闸真正要拦的那类主体
+    // (见 users/routes.rs 头注)。线上 seed 里没有这个角色,但 role→perms 是运行期可改的
+    // (`role_permissions` 表),superadmin 随时能造出这类主体,故闸必须对它成立。
     let policy = Policy::from_roles([
         ("superadmin".to_owned(), Perm::ALL.to_vec()),
         ("admin".to_owned(), vec![Perm::AdminLogin]),
+        (
+            "useradmin".to_owned(),
+            vec![Perm::AdminLogin, Perm::UsersAdmin],
+        ),
     ]);
 
     let bus: Arc<dyn EventBus> = Arc::new(MemoryEventBus::new());
@@ -720,4 +727,183 @@ async fn admin_profile_get_put_under_users_admin() {
         StatusCode::FORBIDDEN,
         "无 users:admin 应 403"
     );
+}
+
+// ── 9. 提权闸:对**目标现有角色**的闸(改密码 / 删号) ──
+
+/// 中间管理员(users:admin 但非满权)的令牌。`dev()` 是固定内嵌密钥对,独立签的令牌 app 侧照验。
+fn useradmin_token() -> String {
+    AppTokenSigner::dev()
+        .mint_scoped(
+            Uuid::now_v7(),
+            "useradmin",
+            vec!["useradmin".to_owned()],
+            vec![],
+            900,
+        )
+        .unwrap()
+}
+
+/// **改密码 = 能以对方身份登录**,所以必须闸目标现有角色:中间管理员改不动 superadmin 的密码。
+/// 没这道闸,本模块辛苦建的提权闸(set_roles 挡着授不出 superadmin)就被这个端点整个绕过 ——
+/// 把 superadmin 密码改成自己知道的,登进去就是 Perm::ALL。
+#[tokio::test]
+async fn intermediate_admin_cannot_reset_a_superadmin_password() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "target-user", &["user"]).await;
+
+    // 打更高权目标 → 403
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/admin/auth/users/{victim}/password"),
+            r#"{"new_password":"pwned123456"}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能改 superadmin 的密码(改了就能登进去接管)"
+    );
+
+    // 打同级/更低权目标 → 照常放行(别把闸收成谁都改不了)
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/v1/admin/auth/users/{plain}/password"),
+            r#"{"new_password":"newpass123"}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "改普通用户密码是 users:admin 的正常职权"
+    );
+
+    // superadmin 自己打 superadmin → 恒过(满权者持有目标全部权)
+    let resp = app
+        .oneshot(post_json(
+            &format!("/api/v1/admin/auth/users/{victim}/password"),
+            r#"{"new_password":"newpass123"}"#,
+            &sa,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "superadmin 恒过闸");
+}
+
+/// 删号同理:中间管理员删不掉 superadmin(破坏而非接管,但同属"对更高权目标动手")。
+#[tokio::test]
+async fn intermediate_admin_cannot_delete_a_superadmin() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "del-target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "del-target-user", &["user"]).await;
+
+    let resp = app
+        .clone()
+        .oneshot(delete_req(
+            &format!("/api/v1/admin/auth/users/{victim}"),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能删 superadmin"
+    );
+
+    let resp = app
+        .oneshot(delete_req(
+            &format!("/api/v1/admin/auth/users/{plain}"),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "删普通用户是正常职权"
+    );
+}
+
+/// 全量替换角色也得闸**目标现有角色**:中间管理员不能把 superadmin 降权/清空。
+/// 被授角色闸只管"授出去的",自锁闸只护 actor 自己 —— 少了这道,传一组"自己也有的角色"
+/// 就能剥掉 superadmin 的权;若那是唯一的 superadmin,系统再无人能改回来。
+#[tokio::test]
+async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "roles-target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "roles-target-user", &["user"]).await;
+    let user_ids = role_ids_json(&app, &sa, &["user"]).await;
+
+    // 把 superadmin 降成 user(被授角色 `user` 中间管理员自己够得着 → 只能靠目标闸拦)
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{victim}/roles"),
+            &format!(r#"{{"roles":{user_ids}}}"#),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能剥掉 superadmin 的角色"
+    );
+
+    // 改同级/更低权目标 → 照常放行
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{plain}/roles"),
+            &format!(r#"{{"roles":{user_ids}}}"#),
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改普通用户角色是正常职权");
+}
+
+/// 改身份字段同样闸目标现有角色:改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username)。
+/// 本模块四个写端点(update/delete/reset_password/set_roles)口径必须一致。
+#[tokio::test]
+async fn intermediate_admin_cannot_rename_a_superadmin() {
+    let (app, sa, _admin) = test_app().await;
+    let ua = useradmin_token();
+    let victim = create_user(&app, &sa, "rename-target-sa", &["superadmin"]).await;
+    let plain = create_user(&app, &sa, "rename-target-user", &["user"]).await;
+
+    let resp = app
+        .clone()
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{victim}"),
+            r#"{"username":"hijacked","email":null}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "中间管理员不该能改 superadmin 的身份字段"
+    );
+
+    let resp = app
+        .oneshot(put_json(
+            &format!("/api/v1/admin/auth/users/{plain}"),
+            r#"{"username":"renamed-ok","email":null}"#,
+            &ua,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "改普通用户是正常职权");
 }

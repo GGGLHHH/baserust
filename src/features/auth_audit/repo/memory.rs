@@ -10,7 +10,7 @@ use super::super::types::{
 };
 use super::AuthEventRepo;
 use crate::infra::error::AppError;
-use crate::infra::pagination::{Page, PageParams};
+use crate::infra::pagination::{encode_cursor, Page, PageParams};
 
 #[derive(Default)]
 pub struct InMemoryAuthEventRepo {
@@ -32,7 +32,13 @@ impl InMemoryAuthEventRepo {
 }
 
 /// 按小时取整(镜像 SQL `date_trunc('hour', ...)`);projector 发布行也复用这份 to_row。
+///
+/// **先归一到 UTC 再截断**:截断是"抹掉分秒",结果取决于 `t` 自己带的时区偏移。而 `?from`/`?to`
+/// 经 rfc3339 反序列化会**保留客户端给的偏移**(`+05:30`),事件的 `occurred_at` 却恒是 UTC ——
+/// 不归一就会一边落在 `:30`、一边落在 `:00`,桶与事件永不相等(半小时制时区整条 activity 全零)。
+/// PG 侧 `date_trunc('hour', $1::timestamptz)` 在(UTC 的)会话时区里截断,与此同口径。
 pub(crate) fn floor_hour(t: OffsetDateTime) -> OffsetDateTime {
+    let t = t.to_offset(time::UtcOffset::UTC);
     t.replace_time(Time::from_hms(t.hour(), 0, 0).expect("hour 0-23 恒合法"))
 }
 
@@ -100,10 +106,7 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
                             .is_some_and(|i| i.to_string().to_lowercase().contains(needle))
                 })
             })
-            .filter(|r| {
-                f.ip.as_deref()
-                    .is_none_or(|ip| r.ip.is_some_and(|i| i.to_string() == ip))
-            })
+            .filter(|r| f.ip.is_none_or(|ip| r.ip == Some(ip)))
             .filter(|r| f.from.is_none_or(|from| r.occurred_at >= from))
             .filter(|r| f.to.is_none_or(|to| r.occurred_at < to))
             .collect();
@@ -127,9 +130,21 @@ impl AuthEventRepo for InMemoryAuthEventRepo {
                 let slice = out.into_iter().skip(start).take(size as usize).collect();
                 Ok(Page::offset(slice, page, size, total))
             }
-            PageParams::Cursor { limit, .. } => {
-                let slice: Vec<_> = out.into_iter().take(limit as usize).collect();
-                Ok(Page::cursor(slice, limit, None))
+            PageParams::Cursor { after, limit } => {
+                // keyset 恒按 id DESC(v7 id 即创建序倒序);id < after 配 ORDER BY id DESC(parity 于 PG)。
+                let mut rows: Vec<AuthEventRow> = out
+                    .into_iter()
+                    .filter(|r| after.is_none_or(|a| r.id < a))
+                    .take(limit as usize + 1)
+                    .collect();
+                let has_more = rows.len() as u64 > limit;
+                let next = if has_more {
+                    rows.truncate(limit as usize);
+                    rows.last().map(|r| encode_cursor(r.id))
+                } else {
+                    None
+                };
+                Ok(Page::cursor(rows, limit, next))
             }
         }
     }
@@ -427,5 +442,35 @@ mod tests {
         // 上个窗口(prev_window_ev)1 条、1 条失败;当前窗口 3 条、2 条失败。
         assert!((stats.kpi.total_delta - 2.0).abs() < 1e-9, "(3-1)/1 = 2.0");
         assert!((stats.kpi.failed_delta - 1.0).abs() < 1e-9, "(2-1)/1 = 1.0");
+    }
+
+    /// **半小时制时区的窗口不能把 activity 打成全零**。`?from`/`?to` 经 rfc3339 反序列化会保留
+    /// 客户端偏移(`+05:30`),而 `occurred_at` 恒 UTC:截断若在各自偏移里做,桶落 `:30`、事件落
+    /// `:00`,`floor_hour(occurred_at) == t` 永不成立 —— kpi 有数、activity 全零。
+    /// PG 的 `date_trunc` 在 UTC 会话时区截断,不受偏移影响,故这也是内存↔PG 的口径分叉。
+    #[tokio::test]
+    async fn stats_buckets_align_to_utc_hour_for_fractional_offset_bounds() {
+        let repo = InMemoryAuthEventRepo::new();
+        let hour = floor_hour(OffsetDateTime::now_utc());
+        let mut e = ev(1, Some(Uuid::now_v7()));
+        e.occurred_at = hour + time::Duration::minutes(5);
+        repo.insert(&e).await.unwrap();
+
+        // 同样的时刻,换成客户端的 +05:30 表示(仅偏移不同,instant 不变)。
+        let offset = time::UtcOffset::from_hms(5, 30, 0).unwrap();
+        let from = (hour - time::Duration::minutes(30)).to_offset(offset);
+        let to = (hour + time::Duration::hours(1)).to_offset(offset);
+        let stats = repo.stats(from, to).await.unwrap();
+
+        assert!(
+            stats.activity.iter().all(|b| b.t.minute() == 0),
+            "桶必须对齐整点(而非跟着 from 的 :30 偏移走): {:?}",
+            stats.activity.iter().map(|b| b.t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stats.activity.iter().map(|b| b.success).sum::<i64>(),
+            1,
+            "事件必须落进某个桶;全零 = 桶与事件因偏移错位对不上"
+        );
     }
 }
