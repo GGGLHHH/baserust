@@ -33,10 +33,24 @@ impl ProfileService {
         Self { repo, avatars }
     }
 
-    /// 读任意人的资料。未建 → 404。
+    /// 读任意人的资料。未建 → 404(那里存在性是真问题:问的是"某个 id 有没有资料")。
     pub async fn get(&self, user_id: Uuid) -> Result<ProfileResponse, AppError> {
         let p = self.repo.get(user_id).await?.ok_or(AppError::NotFound)?;
         Ok(self.enrich(p).await)
+    }
+
+    /// 读**自己**的资料 —— 未建 → **空资料(200)而非 404**:调用方已认证 ⇒ 账号必然存在 ⇒
+    /// "profile 行还没写" 是空资料,不是资源不存在(profile 1:1 挂 user,是账号的延伸段)。
+    ///
+    /// 为什么不能沿用 `get` 的 404:那会锁死前端 —— 建资料只能 PUT,而 PUT 的那个页面
+    /// (`/admin/profile`)的 loader 正是拿 me 的 404 抛错、根本渲染不出来。且没有任何路径
+    /// 会预建 profile 行(注册/后台建号都在 idm 进程,写不了 app schema),所以**每个**新账号
+    /// 都会撞上,不只 seed 出来的。
+    pub async fn get_or_empty(&self, user_id: Uuid) -> Result<ProfileResponse, AppError> {
+        match self.repo.get(user_id).await? {
+            Some(p) => Ok(self.enrich(p).await),
+            None => Ok(ProfileResponse::empty(user_id)),
+        }
     }
 
     /// 该用户当前绑定的头像 content id(无资料 / 未绑定 → None)。头像展示端点用它定位要出的 content。
@@ -182,6 +196,26 @@ mod tests {
             svc.get(Uuid::now_v7()).await,
             Err(AppError::NotFound)
         ));
+    }
+
+    /// `/me` 的读:未建 **不 404**,而是 user_id 归位、其余 null 的空资料(前端据此渲染空表单 → PUT 建行);
+    /// 建后与 `get` 等值。守住"读自己"与"读别人"的刻意分叉。
+    #[tokio::test]
+    async fn get_or_empty_returns_blank_then_real_row() {
+        let svc = svc_with(StaticAvatarProbe::empty());
+        let uid = Uuid::now_v7();
+        let blank = svc.get_or_empty(uid).await.unwrap();
+        assert_eq!(blank.user_id, uid, "空资料也要带本人 id(前端 PUT 要用)");
+        assert!(blank.display_name.is_none() && blank.phone.is_none());
+        assert!(
+            blank.created_at.is_none() && blank.updated_at.is_none(),
+            "行不存在 → 时间戳 null,不编 now()"
+        );
+
+        svc.put(uid, req(None), &ctx()).await.unwrap();
+        let real = svc.get_or_empty(uid).await.unwrap();
+        assert_eq!(real.display_name.as_deref(), Some("San Zhang"));
+        assert!(real.created_at.is_some(), "真行 → 真时间戳");
     }
 
     /// 头像四查:不存在 / 非本人 / 未就绪 / 非 image → 422(Validation)。

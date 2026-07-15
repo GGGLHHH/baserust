@@ -446,7 +446,9 @@ async fn unauthenticated_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// `/profiles/me`:未建 404(引导建资料);建后与按 id 读**逐字节等值**(同一 service 路径,me 只是身份别名)。
+/// `/profiles/me`:未建 → **200 空资料**(不是 404 —— 调用方已认证,账号必在,行没写而已;
+/// 404 会锁死前端:建资料只能 PUT,而 PUT 那个页面的 loader 正是拿 me 的 404 抛错打不开)。
+/// 建后与按 id 读**逐字节等值**(同一 service 路径,me 只是身份别名)。
 #[tokio::test]
 async fn my_profile_me_alias() {
     let (app, _store, _admin, alice, _bob) = test_app();
@@ -455,7 +457,29 @@ async fn my_profile_me_alias() {
         .oneshot(get("/api/v1/frontend/profiles/me", &alice))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未建资料应 404");
+    assert_eq!(resp.status(), StatusCode::OK, "未建资料应回空资料而非 404");
+    let blank = body_json(resp).await;
+    assert_eq!(
+        blank["user_id"],
+        ALICE_ID.to_string(),
+        "空资料带本人 id(前端 PUT 要用)"
+    );
+    assert!(blank["display_name"].is_null() && blank["created_at"].is_null());
+
+    // 读**别人**的资料仍 404:那里存在性是真问题(对比 me 的"自己的行还没写")。
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/frontend/profiles/{}", uuid::Uuid::now_v7()),
+            &alice,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "读别人未建的资料仍应 404"
+    );
 
     let uri = format!("/api/v1/frontend/profiles/{ALICE_ID}");
     let resp = app

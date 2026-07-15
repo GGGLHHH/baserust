@@ -4,17 +4,22 @@
 # 角色集 / 权限集 / role→权限默认 **不在这里** —— 它们是代码闭集(src/infra/authz.rs 的
 # `RoleName` / `Perm`,不做动态 CRUD)。role→权限的运行期改动落 app schema 的 `role_permissions` 表。
 # 账号引用的 role 必须是 `RoleName` 的已知变体(superadmin/admin/user),拼错启动/测试即挂。
+#
+# `display_name` 可选:建号时连带建初始 profile(app schema)。只在 app/idm 同进程时写;
+# 且**只在首建时写** —— 用户之后自己改的资料/头像,重跑 seed 不会按回去。
 
 [[accounts]]
 username = "superadmin"
 email = "superadmin@local" # 可选;登录用 username 或 email 都行
 password = "pwd"
 roles = ["superadmin"]
+display_name = "Super Admin"
 
 [[accounts]]
 username = "admin"
 password = "pwd"
 roles = ["admin"]
+display_name = "Admin"
 
 [[accounts]]
 username = "user"

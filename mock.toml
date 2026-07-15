@@ -15,7 +15,9 @@ owner = "admin"
 name = "user-w1"
 owner = "user"
 
-# 样本 profile(1:1 user)。三账号皆有 → 登录即 /profiles/me 200(不撞 404)。
+# 样本 profile(1:1 user)。跟在 seed 的初始 profile 之后跑、直接 upsert 覆盖它 —— demo 数据
+# (带 phone、像样的名字)优先于 seed 的 display_name。**不撞 404 不再靠这里**:`/profiles/me`
+# 资料未建时回空资料(见 profile::ProfileService::get_or_empty),这几行现在纯粹是样本内容。
 [[profiles]]
 owner = "superadmin"
 display_name = "Sam Superadmin"

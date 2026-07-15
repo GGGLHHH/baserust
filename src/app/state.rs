@@ -275,6 +275,18 @@ impl AppState {
                 Some("system".to_owned()),
             )
             .await?;
+            // 账号的初始 profile(app schema)。**额外要 needs_app**:纯 idm 进程的 profile_repo 是
+            // 内存占位,写进去静默丢、重启蒸发(同 router.rs 不给纯 idm 进程挂后台资料端点的理由)。
+            // 分进程拓扑下没有初始 profile 也不阻断 —— `/profiles/me` 未建时回空资料,用户 PUT 即建。
+            if needs_app {
+                super::seed::apply_profiles(
+                    profile_repo.as_ref(),
+                    idm_users.as_ref(),
+                    &seed,
+                    Some("system".to_owned()),
+                )
+                .await?;
+            }
         }
 
         // mock 样本数据(dev/demo 专用):owner(username)经 idm 解析 → 幂等写 app widget/profile 仓储。

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::features::profile::{ProfileFields, ProfileRepo};
 use crate::infra::authz::{Perm, Policy, RoleName};
 use idm::{IdmError, PwHasher, RoleRepo, UserRepo};
 
@@ -34,6 +35,10 @@ struct AccountSeed {
     password: String,
     #[serde(default)]
     roles: Vec<String>,
+    /// 初始 profile 的显示名(可选)。落 **app schema** 的 profiles 表,只在 app/idm 同进程
+    /// (`Mount::Both`)时写 —— 见 [`apply_profiles`]。不设 = 建一行各段为 null 的空资料。
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 impl SeedData {
@@ -203,6 +208,57 @@ pub async fn apply(
     Ok(())
 }
 
+/// seed 账号的**初始 profile**(1:1 挂 user)。跟在 [`apply`] 之后跑 —— 那时账号已在,username 才解析得到。
+///
+/// **跨模块、不跨 schema**:username → idm `UserRepo` 解析 user_id(标识引用),数据写 app `ProfileRepo`。
+/// 同 [`crate::app::mock::apply`] 的范式,组合根是唯一能同时握两边的地方。
+///
+/// **只在 app/idm 同进程(`Mount::Both`)调**:纯 idm 进程的 `profile_repo` 是内存占位
+/// (`app_pool=None`),写进去会静默丢、重启蒸发 —— 同 `router.rs` 不给纯 idm 进程挂后台资料端点的理由。
+/// 分进程拓扑下初始 profile 由用户自己 PUT 建(`/profiles/me` 未建时回空资料,不阻断)。
+///
+/// **find-or-create,已有行绝不覆盖**:`upsert` 是全量替换,而 seed 每次启动都跑 —— 直接 upsert
+/// 会把用户运行期改的 display_name/phone 清回 seed 值、连头像绑定一起解掉(每次重启资料重置)。
+/// 这与 `apply` 里账号"已存在则不动密码"、`ensure_roles_with_event` 写并集是同一条铁律:
+/// **seed 只负责把东西 bootstrap 出来,不负责把它按回初始值**。
+pub async fn apply_profiles(
+    profiles: &dyn ProfileRepo,
+    users: &dyn UserRepo,
+    data: &SeedData,
+    by: Option<String>,
+) -> anyhow::Result<()> {
+    let mut created = 0usize;
+    for a in &data.accounts {
+        let username = a.username.trim().to_lowercase();
+        let user = users
+            .find_by_identifier(&username)
+            .await?
+            .with_context(|| format!("seed profile 的账号 {username} 在 idm 不存在(apply 先跑)"))?
+            .user;
+        if profiles.get(user.id).await?.is_some() {
+            continue; // 幂等:已有资料 → 保持用户的现值,不按回 seed
+        }
+        profiles
+            .upsert(
+                user.id,
+                ProfileFields {
+                    display_name: a.display_name.clone(),
+                    ..Default::default()
+                },
+                by.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("建 seed profile({username})失败: {e:?}"))?;
+        created += 1;
+    }
+    tracing::info!(
+        accounts = data.accounts.len(),
+        profiles_created = created,
+        "seed 账号的初始 profile 已应用(幂等)"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -236,7 +292,72 @@ mod tests {
             email: None,
             password: "pwd".to_owned(),
             roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+            display_name: None,
         }
+    }
+
+    /// 初始 profile:建号后带出 display_name;**重跑绝不按回** —— `upsert` 是全量替换而 seed 每次
+    /// 启动都跑,不先查就写会把用户改过的资料清回 seed 值、连头像一起解绑(每次重启资料重置)。
+    #[tokio::test]
+    async fn profiles_created_once_and_never_reset_on_rerun() {
+        use crate::features::profile::InMemoryProfileRepo;
+
+        let users = idm::InMemoryUserRepo::new();
+        let roles = idm::InMemoryRoleRepo::sharing_with(&users);
+        let profiles = InMemoryProfileRepo::new();
+        let hasher = idm::FakeHasher;
+        let by = Some("system".to_owned());
+        let data = SeedData {
+            accounts: vec![AccountSeed {
+                display_name: Some("Alice".to_owned()),
+                ..account("alice", &["user"])
+            }],
+        };
+
+        apply(&users, &roles, &hasher, &data, by.clone())
+            .await
+            .unwrap();
+        apply_profiles(&profiles, &users, &data, by.clone())
+            .await
+            .unwrap();
+        let uid = users
+            .find_by_identifier("alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .user
+            .id;
+        let p = profiles
+            .get(uid)
+            .await
+            .unwrap()
+            .expect("初始 profile 应已建");
+        assert_eq!(p.display_name.as_deref(), Some("Alice"));
+
+        // 用户运行期改名 + 绑头像
+        let avatar = uuid::Uuid::now_v7();
+        profiles
+            .upsert(
+                uid,
+                ProfileFields {
+                    display_name: Some("Alice Liddell".to_owned()),
+                    phone: Some("13800000000".to_owned()),
+                    avatar_content_id: Some(avatar),
+                },
+                by.clone(),
+            )
+            .await
+            .unwrap();
+
+        // 重跑(= 每次容器重启)
+        apply_profiles(&profiles, &users, &data, by).await.unwrap();
+        let p = profiles.get(uid).await.unwrap().unwrap();
+        assert_eq!(
+            p.display_name.as_deref(),
+            Some("Alice Liddell"),
+            "重跑不得把用户改的名按回 seed 值"
+        );
+        assert_eq!(p.avatar_content_id, Some(avatar), "重跑不得解掉头像绑定");
     }
 
     async fn role_names(roles: &idm::InMemoryRoleRepo, uid: uuid::Uuid) -> Vec<String> {

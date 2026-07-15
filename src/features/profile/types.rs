@@ -44,6 +44,11 @@ pub struct AvatarForm {
 }
 
 /// 出参 = 行字段 + 富化的 `avatar_url`(相对头像端点路径;悬空/未就绪/探测故障 → null)。
+///
+/// 时间戳 `Option`:`/profiles/me` 在资料未建时回**空资料**(见 [`ProfileService::get_or_empty`]),
+/// 那一刻行还不存在、没有真时间戳 —— 回 null,而不是编一个 now() 冒充。其余端点回的都是真行,恒 `Some`。
+///
+/// [`ProfileService::get_or_empty`]: super::service::ProfileService::get_or_empty
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProfileResponse {
     pub user_id: Uuid,
@@ -53,10 +58,12 @@ pub struct ProfileResponse {
     /// 相对路径 `/api/v1/frontend/profiles/{user_id}/avatar`(单域名哲学,无 base-url 变量;
     /// 头像专用端点,只出本人的头像图 —— content 本体经 `contents/{id}/preview` 严格按 owner 隔离)。
     pub avatar_url: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
+    /// 资料未建(仅 `/profiles/me` 的空资料)→ null。
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+    /// 资料未建(仅 `/profiles/me` 的空资料)→ null。
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
 }
 
 impl ProfileResponse {
@@ -67,8 +74,22 @@ impl ProfileResponse {
             phone: p.phone,
             avatar_content_id: p.avatar_content_id,
             avatar_url,
-            created_at: p.created_at,
-            updated_at: p.updated_at,
+            created_at: Some(p.created_at),
+            updated_at: Some(p.updated_at),
+        }
+    }
+
+    /// 资料未建时的空壳(各段 null,`user_id` 是调用者本人 —— 前端据此 PUT 建资料)。
+    /// **只给 `/profiles/me`**:读别人仍 404(见 `ProfileService::get`)。
+    pub fn empty(user_id: Uuid) -> Self {
+        Self {
+            user_id,
+            display_name: None,
+            phone: None,
+            avatar_content_id: None,
+            avatar_url: None,
+            created_at: None,
+            updated_at: None,
         }
     }
 }
