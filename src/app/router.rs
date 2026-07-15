@@ -106,18 +106,25 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     openapi::inject_operation_security(&mut api);
 
     let router = router
-        // 内层中间件栈(tower 语义:后 .layer() 更外、请求最先过,故**自内向外**书写:首行 Trace
-        // 最内贴近 handler)。CORS / 安全响应头 / 限流刻意包在此栈**之外**(见下),好让限流 429、
-        // panic 500 等短路响应也带上 CORS 与安全头 —— 否则浏览器读不到跨域的错误响应。
+        // 内层中间件栈(tower 语义:后 .layer() 更外、请求最先过,故**自内向外**书写)。
+        // CORS / 安全响应头 / 限流刻意包在此栈**之外**(见下),好让限流 429、panic 500 等短路响应
+        // 也带上 CORS 与安全头 —— 否则浏览器读不到跨域的错误响应。
+        //
+        // timeout:超时也走 ErrorBody JSON(tower-http TimeoutLayer 只给空体,故自己包一层)
+        .layer(middleware::from_fn(timeout_middleware))
+        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
+        .layer(CatchPanicLayer::custom(handle_panic))
+        // Trace 必须在 panic/timeout **之外**:span 在它们之内才进得去。
+        // 放最内(旧接法)时,`handle_panic` 的 error! 是在 unwind 过 Trace 之后才打的、
+        // `timeout_or_408` 的 warn! 同理 —— 两条日志都不带 method/path/request_id,
+        // 而"原始细节只进日志"的范式恰恰指望这些细节能对回某个请求;且 unwind/取消会让
+        // `DefaultOnResponse` 根本不触发 → panic 与超时的请求**一条访问日志都没有**,
+        // 偏偏它们正是你要翻日志找的那些。仍在 SetRequestId 之内(span 要读 x-request-id 头)。
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        // timeout:超时也走 ErrorBody JSON(tower-http TimeoutLayer 只给空体,故自己包一层)
-        .layer(middleware::from_fn(timeout_middleware))
-        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
-        .layer(CatchPanicLayer::custom(handle_panic))
         // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
         .layer(axum::Extension(crate::infra::client_context::TrustedHops(
             config.trusted_proxy_hops,
