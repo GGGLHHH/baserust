@@ -85,15 +85,29 @@ impl AppError {
         }
     }
 
-    /// 响应里看不到、但排查需要的**原始细节** → 进日志。`None` = 无额外细节。
+    /// 排查需要的**原始细节** → 进日志。`None` = 无额外细节。
     /// 这是"原始错误一律落日志"的统一入口:BadRequest 落 rejection、Internal 落
     /// anyhow 的完整 source chain;将来 sqlx/io 错误经 `?` 进 Internal 也自动落这里。
+    ///
+    /// **落日志 ≠ 不进响应体**,两者由 [`Self::client_message`] 各自决定:BadRequest/Internal
+    /// 的细节**只**进日志(响应体给通用措辞);Validation 的细节**两边都去** —— 它本就写给调用方,
+    /// 同时运维也需要它。
+    ///
+    /// Validation 为什么必须落日志:`400`(serde 拒绝,缺字段)与 `422`(garde 拒绝,值不合法)
+    /// 本是同一类事 —— "调用方发来的东西不对",只是被不同的层拦下。以前只有前者落日志,
+    /// 于是**光看日志无法回溯任何 422**;而 `login` 这类公开端点的响应体在对方浏览器里,拿不到,
+    /// 日志是唯一的窗口(且 422 早于 `emit_auth_event`,`auth_events` 审计表也兜不住它)。
+    /// garde 的消息是规则级的(`identifier: length is lower than 1`),**只含字段名与规则、不含值**,
+    /// 故不引入 PII;`identifier` 等入参也都已封顶,灌不爆日志。
+    ///
+    /// Conflict 刻意仍不落:它的消息是我们自己写的业务语句(如 "cannot remove your own admin
+    /// access"),状态码 + 路径即可定位,落日志只是噪音。
     fn log_detail(&self) -> Option<String> {
         match self {
             AppError::BadRequest(detail) => Some(detail.clone()),
             AppError::Internal(err) => Some(format!("{err:?}")),
+            AppError::Validation(msg) => Some(msg.clone()),
             AppError::NotFound
-            | AppError::Validation(_)
             | AppError::Unauthorized
             | AppError::Conflict(_)
             | AppError::Forbidden => None,
@@ -167,7 +181,8 @@ pub struct ErrorBody {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        // 统一:任何带原始细节的错误都把原始内容写进日志(响应体永远看不到它)。
+        // 统一:任何带原始细节的错误都把原始内容写进日志(见 `log_detail`)。响应体里给什么由
+        // `client_message` 单独决定 —— 多数变体只给通用措辞,Validation 例外(细节两边都给)。
         // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
         if let Some(detail) = self.log_detail() {
             if status.is_server_error() {
@@ -250,14 +265,43 @@ mod tests {
 
     #[test]
     fn client_facing_errors_keep_useful_message() {
-        // NotFound / Validation 是写给客户端的,可回传;且无需额外日志细节
+        // NotFound 写给客户端、无额外细节可落
         assert_eq!(AppError::NotFound.client_message(), "Resource not found");
         assert!(AppError::NotFound.log_detail().is_none());
 
         let v = AppError::Validation("name: length is lower than 1".to_owned());
         assert!(v.client_message().contains("name"));
-        assert!(v.log_detail().is_none());
         assert_eq!(v.code().as_str(), "validation");
+    }
+
+    /// **422 的细节必须落日志**(而且照旧回传客户端 —— 两边都要)。
+    ///
+    /// 400(serde 拒绝,缺字段)与 422(garde 拒绝,值不合法)本是同一类事:"调用方发来的东西
+    /// 不对",只是被不同的层拦下。以前只有 400 落日志,于是**光看日志无法回溯任何 422** ——
+    /// 访问日志只有 `status=422`,原因全在响应体里;而 `login` 这类公开端点的响应体在对方浏览器
+    /// 里拿不到,且 422 早于 `emit_auth_event`、`auth_events` 审计表也兜不住 → 三条观测路径全漏。
+    #[test]
+    fn validation_detail_reaches_both_log_and_client() {
+        let v = AppError::Validation("identifier: length is lower than 1".to_owned());
+        assert_eq!(
+            v.log_detail().as_deref(),
+            Some("identifier: length is lower than 1"),
+            "422 的原因必须能从日志回溯(否则只剩一个光秃秃的 status=422)"
+        );
+        assert!(
+            v.client_message().contains("identifier"),
+            "同时照旧回传调用方 —— 这条细节本就是写给他的"
+        );
+
+        // 对照:400 一直落日志(同类事,口径必须一致)。
+        assert!(AppError::BadRequest("missing field `password`".to_owned())
+            .log_detail()
+            .is_some());
+
+        // 反面:Conflict 刻意不落 —— 消息是我们自己写的业务语句,状态码+路径即可定位。
+        assert!(AppError::Conflict("already registered".to_owned())
+            .log_detail()
+            .is_none());
     }
 
     #[test]
