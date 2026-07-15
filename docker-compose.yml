@@ -1,4 +1,5 @@
-# baserust 本地容器栈:nginx(反代) → app(Rust 服务) + pg(Postgres) + dbhub(数据库 MCP)。
+# baserust 本地容器栈:nginx(反代) → app(Rust 服务) + idm(认证服务) + pg(Postgres)
+#                    + minio(对象存储) + nats(事件总线) + dbhub(数据库 MCP)。
 #
 # 环境变量(都有默认值、可在同目录 .env 覆盖):
 #   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 baserust)
