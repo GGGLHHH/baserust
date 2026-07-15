@@ -211,6 +211,36 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
         assert_eq!(verifier.scope_of(&token), vec![Perm::WidgetRead]);
     }
 
+    /// **过期必拒** —— 这是 access token 唯一的"吊销"。
+    ///
+    /// `verify_with_scope` 从不拿 `jti` 去查会话表,中间件又只信它一家:logout 撤的是 refresh 会话,
+    /// **撤不掉已签发的 access token**,所以 `exp` 是它寿命的唯一终点。而这道检查完全是隐式的 ——
+    /// 靠 `Validation::new(EdDSA)` 继承库默认的 `validate_exp: true`。哪天 jsonwebtoken 大版本翻了
+    /// 这个默认,或有人在这手搓 `Validation`,所有令牌立刻永不过期,而原有三条测试(全是验签)照绿。
+    ///
+    /// **ttl 必须 < -60**:`Validation::new` 同时带 `leeway: 60`,`-1` 的令牌仍在宽限期内、
+    /// 会被**正常接受** —— 拿 -1 写这条测试只会红,让人误以为过期校验坏了(其实是宽限期在起作用)。
+    /// 实测过:-1 → verify 通过;-120 → 拒。别"顺手"把它改回 -1。
+    #[test]
+    fn expired_token_rejected() {
+        let signer = AppTokenSigner::dev();
+        let verifier = AppTokenVerifier::dev();
+        let token = signer
+            .mint_scoped(Uuid::nil(), "a", vec![], vec![Perm::WidgetRead], -120)
+            .unwrap();
+        assert!(verifier.verify(&token).is_err(), "过期令牌必须拒");
+        assert!(
+            verifier.scope_of(&token).is_empty(),
+            "过期令牌 scope 应空(空 scope 在本仓被读作'无限制',绝不能让它漏过去)"
+        );
+        // 对照:同一把钥匙、同样的 claim,只把 ttl 改成未来 → 必过。
+        // 这条排除掉"是别的原因拒的"(否则上面两条断言可能因为签名/解析问题而假绿)。
+        let fresh = signer
+            .mint_scoped(Uuid::nil(), "a", vec![], vec![Perm::WidgetRead], 900)
+            .unwrap();
+        assert!(verifier.verify(&fresh).is_ok(), "未过期的同款令牌应通过");
+    }
+
     /// 篡改 payload 一字节 → 验签拒(scope_of 同步归空)。
     #[test]
     fn tampered_token_rejected() {
