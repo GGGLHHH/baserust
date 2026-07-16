@@ -252,12 +252,14 @@ pub struct Membership {
 //! P1 只有存储层,**无 HTTP 端点** —— 切换/列表端点在 P2,且必须挂 `/auth/` 前缀
 //! (nginx 只把 `/{public,frontend,admin}/auth/` 分流进 idm 进程)。
 
-pub mod repo;
 pub mod types;
 
-pub use repo::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
-pub use types::{Membership, Tenant, TenantRole, TenantStatus};
+pub use types::{Membership, TenantRole, TenantStatus};
 ```
+
+> ⚠️ **本 Task 只有 `types`** —— `repo` 模块 Task 2 才建。现在就写 `pub mod repo;` 会让
+> `just check` 直接挂(模块不存在)。Task 2 的 Step 1 会把 `pub mod repo;` 和
+> `pub use repo::{..}` 加进来。
 
 修改 `src/features/mod.rs`,按字母序加一行:
 
@@ -295,6 +297,18 @@ git commit -m "feat(tenants): add tenants/members/active-tenant tables and types
 - Consumes: Task 1 的 `Membership` / `Tenant` / `TenantRole` / `TenantStatus`
 - Produces: `TenantRepo` trait(6 个方法,签名见 Step 1)、`InMemoryTenantRepo::new()`
 
+- [ ] **Step 0: 把 `repo` 挂进模块树**
+
+`src/features/tenants/mod.rs` 加两行(Task 1 刻意没加 —— 那时 `repo/` 还不存在):
+
+```rust
+pub mod repo;
+pub mod types;
+
+pub use repo::{InMemoryTenantRepo, TenantRepo};   // PgTenantRepo 在 Task 3 加
+pub use types::{Membership, TenantRole, TenantStatus};
+```
+
 - [ ] **Step 1: 写 trait 契约**
 
 创建 `src/features/tenants/repo/mod.rs`(照 `src/features/profile/repo/mod.rs` —— **const SQL 路子,不引 sea-query**):
@@ -306,7 +320,7 @@ git commit -m "feat(tenants): add tenants/members/active-tenant tables and types
 //! (与 profile/repo/mod.rs 同口径。)
 
 mod memory;
-mod postgres;
+// `mod postgres;` 在 Task 3 加 —— 现在加,文件不存在,编译挂。
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -315,7 +329,6 @@ use super::types::{Membership, TenantRole, TenantStatus};
 use crate::infra::error::AppError;
 
 pub use memory::InMemoryTenantRepo;
-pub use postgres::PgTenantRepo;
 
 /// 仓储端口。
 ///
@@ -631,14 +644,6 @@ impl TenantRepo for InMemoryTenantRepo {
 }
 ```
 
-**注**:`postgres.rs` 还不存在,`repo/mod.rs` 里的 `mod postgres;` 会编译失败。先建一个占位:
-
-```bash
-printf '//! Postgres 实现 —— Task 3 填。\n' > src/features/tenants/repo/postgres.rs
-```
-
-然后临时把 `repo/mod.rs` 里的 `mod postgres;` 和 `pub use postgres::PgTenantRepo;` 注释掉,Task 3 再放开。
-
 - [ ] **Step 5: 跑测试确认通过**
 
 ```bash
@@ -667,8 +672,9 @@ git commit -m "feat(tenants): add TenantRepo port with in-memory impl and contra
 ### Task 3: PG 实现 + PG 对拍入口 + justfile 接线
 
 **Files:**
-- Modify: `src/features/tenants/repo/postgres.rs`(Task 2 建的占位)
-- Modify: `src/features/tenants/repo/mod.rs`(放开 `mod postgres;`)
+- Create: `src/features/tenants/repo/postgres.rs`
+- Modify: `src/features/tenants/repo/mod.rs`(挂 `mod postgres;`)
+- Modify: `src/features/tenants/mod.rs`(导出 `PgTenantRepo`)
 - Modify: `tests/tenant_repo_conformance.rs`(加 PG 入口)
 - Modify: `justfile:47`
 
@@ -678,7 +684,7 @@ git commit -m "feat(tenants): add TenantRepo port with in-memory impl and contra
 
 - [ ] **Step 1: 写 PG 实现**
 
-覆盖 `src/features/tenants/repo/postgres.rs`(照 `profile/repo/postgres.rs`:const SQL):
+创建 `src/features/tenants/repo/postgres.rs`(照 `profile/repo/postgres.rs`:const SQL):
 
 ```rust
 //! Postgres 实现。固定语句 const SQL(sqlx 对 `&'static str` 天然 SqlSafe,无需 AssertSqlSafe)。
@@ -872,14 +878,22 @@ impl TenantRepo for PgTenantRepo {
 }
 ```
 
-- [ ] **Step 2: 放开 `mod postgres;`**
+- [ ] **Step 2: 挂进模块树**
 
-`src/features/tenants/repo/mod.rs` 里把 Task 2 注释掉的两行放开:
+`src/features/tenants/repo/mod.rs` —— 把 Task 2 留的那句注释换成真代码:
 
 ```rust
+mod memory;
 mod postgres;
 // ...
+pub use memory::InMemoryTenantRepo;
 pub use postgres::PgTenantRepo;
+```
+
+`src/features/tenants/mod.rs` —— 补上 `PgTenantRepo`:
+
+```rust
+pub use repo::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
 ```
 
 - [ ] **Step 3: 加 PG 对拍入口**
