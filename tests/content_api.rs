@@ -30,6 +30,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             Uuid::from_u128(1),
             "admin",
             vec!["admin".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -39,6 +40,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             Uuid::from_u128(2),
             "viewer",
             vec!["viewer".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -695,6 +697,7 @@ async fn cross_user_content_is_404_unless_all_mode() {
             Uuid::from_u128(3),
             "auditor",
             vec!["auditor".to_owned()],
+            None,
             vec![],
             900,
         )

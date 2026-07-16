@@ -36,7 +36,7 @@ fn test_app() -> (
     let verifier = Arc::new(AppTokenVerifier::dev());
     let mint = |id: Uuid, name: &str, role: &str| {
         signer
-            .mint_scoped(id, name, vec![role.to_owned()], vec![], 900)
+            .mint_scoped(id, name, vec![role.to_owned()], None, vec![], 900)
             .unwrap()
     };
     let admin = mint(ADMIN_ID, "admin", "admin");

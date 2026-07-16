@@ -90,6 +90,7 @@ async fn spec_security_matches_real_enforcement() {
                 su.user.id,
                 &su.user.username,
                 su.user.roles.clone(),
+                None,
                 scope,
                 900,
             )
@@ -127,7 +128,7 @@ async fn spec_security_matches_real_enforcement() {
             if union.is_empty() {
                 // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
                 let zero = signer
-                    .mint_scoped(su.user.id, "probe", vec![], vec![], 900)
+                    .mint_scoped(su.user.id, "probe", vec![], None, vec![], 900)
                     .unwrap();
                 let s = hit(&app, method, &uri, op_id, &zero).await;
                 assert!(

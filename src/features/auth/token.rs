@@ -28,9 +28,43 @@ struct AppClaims {
     /// 授权归 app,故 scope 用 app 的 `Perm` 闭集;旧 token 无此字段 `default` 兜底。
     #[serde(default)]
     scope: Vec<Perm>,
+    /// 当前激活租户。**必须是 Option** —— 0 租户是常规状态而非边角:
+    /// `POST /public/auth/register` 仍是公开自助注册,新用户 0 membership ⇒ 铸出的 token
+    /// 没有 tenant(spec §1.1)。`#[serde(default)]` 顺带让存量 token 解码不失败。
+    /// **绝不 nil 兜底** —— `Tenant` extractor 在缺席时 401。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<Uuid>,
     iat: i64,
     exp: i64,
-    // 自定义 claim 加在此(如 `tenant: String`),sign 从 TokenClaims/外部补、verify 读出。
+}
+
+/// 把 `TenantRoleRepo` 偷渡的 `t:{uuid}` 哨兵从 roles 里摘出来,还原成真正的 tenant claim。
+///
+/// **这是整个多租户设计唯一的信任转换点**(spec §4.2)。上游 `TokenClaims` 没有扩展字段
+/// (rust-idm/src/token.rs),`roles: Vec<String>` 是唯一能让租户信息穿过 idm 到达 signer 的通道。
+///
+/// 今天伪造不了:`idm.roles` 的行只来自 `seed.rs` 的 `for r in RoleName::PLATFORM`,全仓无建角色
+/// 端点,`PUT /users/{id}/roles` 收的是角色 **id** 不是 name。**但这个防御必须在** —— 它挡的是
+/// 未来某天有人加了建角色端点。
+fn split_tenant(roles: Vec<String>) -> Result<(Option<Uuid>, Vec<String>), IdmError> {
+    let (sentinels, rest): (Vec<_>, Vec<_>) = roles.into_iter().partition(|r| r.starts_with("t:"));
+    match sentinels.len() {
+        0 => Ok((None, rest)), // 0 租户,合法(spec §1.1)
+        1 => {
+            // strip_prefix 而非 split(':') —— uuid 里没有冒号,但别赌
+            let id = sentinels[0]
+                .strip_prefix("t:")
+                .expect("partition 已保证前缀")
+                .parse::<Uuid>()
+                .map_err(|_| IdmError::Internal(anyhow::anyhow!("租户哨兵不是合法 uuid")))?;
+            Ok((Some(id), rest))
+        }
+        // ≥2 只可能是平台角色表被污染(有人建了个叫 t:xxx 的平台角色)。
+        // **拒签,绝不"挑一个"** —— 挑哪个都是在替攻击者做选择。
+        n => Err(IdmError::Internal(anyhow::anyhow!(
+            "roles 里出现 {n} 个租户哨兵,平台角色表可能被污染 —— 拒签"
+        ))),
+    }
 }
 
 // ── 非对称(Ed25519):签发/验证物理分离。签发密钥只进 idm 进程,app 进程只持公钥 ——
@@ -55,11 +89,17 @@ impl AppTokenSigner {
     }
 
     /// 签一个**带 scope 的降权令牌**(PAT / 第三方授权 / 测试)。有效权限 = role ∩ scope。
+    ///
+    /// **`tenant` 是独立强类型入参,绝不从 `roles` 里解析**(spec §4.3)——
+    /// 这是**第二条铸币路径**,不经过 `sign()`。让它也去解析哨兵,等于把偷渡通道从
+    /// 「idm 端口的无奈」升格成「我们的 API 约定」,那才是真把 hack 扩散了。
+    /// `split_tenant` 只准在 `impl TokenSigner for AppTokenSigner::sign` 里调,一处。
     pub fn mint_scoped(
         &self,
         user_id: Uuid,
         username: &str,
         roles: Vec<String>,
+        tenant: Option<Uuid>,
         scope: Vec<Perm>,
         ttl_secs: i64,
     ) -> Result<String, IdmError> {
@@ -75,6 +115,7 @@ impl AppTokenSigner {
             email_verified: false,
             roles,
             scope,
+            tenant,
             iat: now,
             exp: now + ttl_secs,
         };
@@ -84,14 +125,18 @@ impl AppTokenSigner {
 
 impl TokenSigner for AppTokenSigner {
     fn sign(&self, c: &TokenClaims) -> Result<String, IdmError> {
+        // **唯一准调 split_tenant 的地方**:把 TenantRoleRepo 偷渡进 roles 的 `t:{uuid}` 哨兵
+        // 摘出来,签成真正的 tenant claim;`tn:*` 的租户角色留在 roles 里(Policy 按它查权限)。
+        let (tenant, roles) = split_tenant(c.roles.clone())?;
         let claims = AppClaims {
             sub: c.user_id.to_string(),
             jti: c.session_id.to_string(),
             username: c.username.clone(),
             email: c.email.clone(),
             email_verified: c.email_verified,
-            roles: c.roles.clone(),
+            roles,
             scope: Vec::new(), // 第一方满权令牌;降权走 mint_scoped
+            tenant,
             iat: c.issued_at.unix_timestamp(),
             exp: c.expires_at.unix_timestamp(),
         };
@@ -129,13 +174,26 @@ impl AppTokenVerifier {
     /// 读出令牌 scope claim(测试/工具用)。**验签**通过才信;失败 → 空(身份闸随后 401)。
     pub fn scope_of(&self, token: &str) -> Vec<Perm> {
         self.verify_with_scope(token)
-            .map(|(_, scope)| scope)
+            .map(|(_, scope, _)| scope)
             .unwrap_or_default()
     }
 
-    /// **单次 decode** 同时产出身份与 scope —— 鉴权中间件热路径专用,
+    /// 读出令牌 tenant claim(测试/工具用)。**验签**通过才信;失败/无 → `None`。
+    pub fn tenant_of(&self, token: &str) -> Option<Uuid> {
+        self.verify_with_scope(token)
+            .ok()
+            .and_then(|(_, _, tenant)| tenant)
+    }
+
+    /// **单次 decode** 同时产出身份、scope 与租户 —— 鉴权中间件热路径专用,
     /// 避免 authenticate_token + scope_of 各做一次完整 Ed25519 验签。
-    pub fn verify_with_scope(&self, token: &str) -> Result<(idm::AuthUser, Vec<Perm>), IdmError> {
+    ///
+    /// `tenant` 为 `None` 有两种合法来源:0 租户用户(register 的常规出口,spec §1.1)、
+    /// 或存量的无该字段的 token。两者中间件都译成「无 `Tenant` extension」⇒ 下游 401。
+    pub fn verify_with_scope(
+        &self,
+        token: &str,
+    ) -> Result<(idm::AuthUser, Vec<Perm>, Option<Uuid>), IdmError> {
         let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
         let claims = jsonwebtoken::decode::<AppClaims>(token, &self.decoding, &validation)
             .map(|d| d.claims)
@@ -151,14 +209,16 @@ impl AppTokenVerifier {
                 roles: claims.roles,
             },
             claims.scope,
+            claims.tenant,
         ))
     }
 }
 
 impl TokenVerifier for AppTokenVerifier {
     fn verify(&self, token: &str) -> Result<VerifiedToken, IdmError> {
-        // 复用 verify_with_scope 的单次 decode,丢弃 scope(镜像 scope_of 的委托姿势)。
-        let (user, _scope) = self.verify_with_scope(token)?;
+        // 复用 verify_with_scope 的单次 decode,丢弃 scope/tenant(镜像 scope_of 的委托姿势)——
+        // 这是 idm 端口的形状,它不认识租户。租户走 app 自己的 `Tenant` extractor。
+        let (user, _scope, _tenant) = self.verify_with_scope(token)?;
         Ok(VerifiedToken {
             user_id: user.id,
             username: user.username,
@@ -201,6 +261,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 Uuid::nil(),
                 "alice",
                 vec!["admin".to_owned()],
+                None,
                 vec![Perm::WidgetRead],
                 900,
             )
@@ -226,7 +287,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
         let signer = AppTokenSigner::dev();
         let verifier = AppTokenVerifier::dev();
         let token = signer
-            .mint_scoped(Uuid::nil(), "a", vec![], vec![Perm::WidgetRead], -120)
+            .mint_scoped(Uuid::nil(), "a", vec![], None, vec![Perm::WidgetRead], -120)
             .unwrap();
         assert!(verifier.verify(&token).is_err(), "过期令牌必须拒");
         assert!(
@@ -236,7 +297,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
         // 对照:同一把钥匙、同样的 claim,只把 ttl 改成未来 → 必过。
         // 这条排除掉"是别的原因拒的"(否则上面两条断言可能因为签名/解析问题而假绿)。
         let fresh = signer
-            .mint_scoped(Uuid::nil(), "a", vec![], vec![Perm::WidgetRead], 900)
+            .mint_scoped(Uuid::nil(), "a", vec![], None, vec![Perm::WidgetRead], 900)
             .unwrap();
         assert!(verifier.verify(&fresh).is_ok(), "未过期的同款令牌应通过");
     }
@@ -247,7 +308,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
         let signer = AppTokenSigner::dev();
         let verifier = AppTokenVerifier::dev();
         let token = signer
-            .mint_scoped(Uuid::nil(), "a", vec![], vec![Perm::WidgetRead], 900)
+            .mint_scoped(Uuid::nil(), "a", vec![], None, vec![Perm::WidgetRead], 900)
             .unwrap();
         let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
         // 换掉 payload 首字符(base64url 域内换字符,保证仍可解析结构)
@@ -272,6 +333,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 Uuid::nil(),
                 "evil",
                 vec!["superadmin".to_owned()],
+                None,
                 vec![],
                 900,
             )
@@ -284,7 +346,7 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
         let dev_signer = AppTokenSigner::dev();
         let rogue_verifier = AppTokenVerifier::from_pem(ROGUE_PUBLIC).unwrap();
         let token = dev_signer
-            .mint_scoped(Uuid::nil(), "a", vec![], vec![], 900)
+            .mint_scoped(Uuid::nil(), "a", vec![], None, vec![], 900)
             .unwrap();
         assert!(
             rogue_verifier.verify(&token).is_err(),
@@ -307,5 +369,107 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
             expires_at: time::OffsetDateTime::now_utc(),
         };
         let _ = NoopSigner.sign(&c);
+    }
+
+    // ── split_tenant:全设计唯一的信任转换点(spec §4.2)。三态各钉一条。 ──
+
+    fn claims_with_roles(roles: Vec<String>) -> TokenClaims {
+        TokenClaims {
+            user_id: Uuid::now_v7(),
+            session_id: Uuid::now_v7(),
+            username: "u".into(),
+            email: None,
+            email_verified: false,
+            roles,
+            issued_at: time::OffsetDateTime::now_utc(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(900),
+        }
+    }
+
+    /// 0 哨兵 → tenant 缺席,**不是错误**:register 的常规出口(0 租户,spec §1.1)。
+    /// 且平台角色原样留在 roles 里。
+    #[test]
+    fn split_tenant_absent_is_legal() {
+        let (tenant, roles) = split_tenant(vec!["superadmin".into(), "user".into()]).unwrap();
+        assert_eq!(tenant, None, "0 租户是常规状态,不该报错");
+        assert_eq!(roles, vec!["superadmin".to_owned(), "user".to_owned()]);
+    }
+
+    /// 1 哨兵 → 摘出真 tenant;`tn:*` 的租户角色**留在 roles 里**(Policy 按它查权限)。
+    #[test]
+    fn split_tenant_extracts_and_keeps_tn_roles() {
+        let t = Uuid::now_v7();
+        let (tenant, roles) =
+            split_tenant(vec!["user".into(), format!("t:{t}"), "tn:admin".into()]).unwrap();
+        assert_eq!(tenant, Some(t));
+        assert_eq!(
+            roles,
+            vec!["user".to_owned(), "tn:admin".to_owned()],
+            "哨兵被摘走,平台角色与 tn:* 租户角色都留下"
+        );
+    }
+
+    /// ≥2 哨兵 → **拒签**,绝不"挑一个"。只可能是平台角色表被污染
+    /// (有人建了个叫 `t:xxx` 的平台角色)—— 挑哪个都是在替攻击者做选择。
+    #[test]
+    fn split_tenant_rejects_multiple_sentinels() {
+        let e = split_tenant(vec![
+            format!("t:{}", Uuid::now_v7()),
+            format!("t:{}", Uuid::now_v7()),
+        ])
+        .unwrap_err();
+        assert!(matches!(e, IdmError::Internal(_)), "多哨兵必须拒签");
+    }
+
+    /// 哨兵不是合法 uuid → 拒签(而非静默当成没有租户)。
+    #[test]
+    fn split_tenant_rejects_malformed_sentinel() {
+        let e = split_tenant(vec!["t:not-a-uuid".into()]).unwrap_err();
+        assert!(matches!(e, IdmError::Internal(_)));
+    }
+
+    /// **端到端**:sign 把哨兵签成 tenant claim,verify 读回来 —— 且 claim 里**没有**哨兵残留。
+    #[test]
+    fn sign_translates_sentinel_to_tenant_claim() {
+        let t = Uuid::now_v7();
+        let token = AppTokenSigner::dev()
+            .sign(&claims_with_roles(vec![
+                "user".into(),
+                format!("t:{t}"),
+                "tn:member".into(),
+            ]))
+            .unwrap();
+        let (user, _scope, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        assert_eq!(tenant, Some(t), "哨兵必须被签成真正的 tenant claim");
+        assert_eq!(
+            user.roles,
+            vec!["user".to_owned(), "tn:member".to_owned()],
+            "**哨兵绝不能残留在 roles 里** —— 否则会泄漏到 /me 与 /permissions/me"
+        );
+    }
+
+    /// `mint_scoped` 是**第二条铸币路径**:tenant 只能经独立入参进,
+    /// **绝不从 roles 解析**(spec §4.3)—— 传个像哨兵的 roles 也不该被当成租户。
+    #[test]
+    fn mint_scoped_never_parses_sentinel_from_roles() {
+        let fake = Uuid::now_v7();
+        let real = Uuid::now_v7();
+        let token = AppTokenSigner::dev()
+            .mint_scoped(
+                Uuid::now_v7(),
+                "pat",
+                vec![format!("t:{fake}")], // 像哨兵,但 mint_scoped 不该理它
+                Some(real),                // 真租户只走这里
+                vec![],
+                900,
+            )
+            .unwrap();
+        let (user, _s, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        assert_eq!(tenant, Some(real), "tenant 只认独立入参");
+        assert_eq!(
+            user.roles,
+            vec![format!("t:{fake}")],
+            "roles 原样保留 —— mint_scoped 不解析哨兵,那是 sign() 一处的职责"
+        );
     }
 }

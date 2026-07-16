@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use super::adapters::{
     ContentAvatarProbe, IdmOutboxSource, InProcessProfileDirectory, InProcessUserDirectory,
-    SearchIndexAdapter,
+    SearchIndexAdapter, TenantRoleRepo,
 };
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
@@ -18,6 +18,7 @@ use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
 };
 use crate::features::search::{projector::Projector, PgSearchIndexRepo, SearchIndexRepo};
+use crate::features::tenants::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
 use crate::features::users::{self, UserAdminService, UserSearchIndex};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
@@ -240,6 +241,13 @@ impl AppState {
                 )
             }
         };
+        // 租户仓储:三张表同在 **idm schema**(铸 token 的进程只有 idm_pool,见 spec §2.1),
+        // 故跟着 idm_pool 二选一 —— 不是跟 app_pool。
+        let tenants: Arc<dyn TenantRepo> = match &idm_pool {
+            Some(pool) => Arc::new(PgTenantRepo::new(pool.clone())),
+            None => Arc::new(InMemoryTenantRepo::new()),
+        };
+
         // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
 
@@ -348,7 +356,14 @@ impl AppState {
             user_search,
         );
 
-        let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
+        // ⚠️ **包装点唯一**(spec §2.4):`TenantRoleRepo` 只包给 `AuthService::builder` ——
+        // 只有铸币路径需要 `t:{uuid}` 哨兵。上面的 `user_admin`(平台角色 CRUD/目录)与
+        // 前面的 `seed::apply` 都拿**未包装的** `idm_roles`:seed 会把 roles_for_user 的结果与
+        // 角色目录比对,哨兵不在目录里 → `bail!("角色 ... 不在角色目录中")` → dev 启动就崩;
+        // user_admin 包了则会把哨兵显示给后台。
+        let tenant_roles: Arc<dyn RoleRepo> =
+            Arc::new(TenantRoleRepo::new(idm_roles, tenants.clone()));
+        let auth = AuthService::builder(idm_users, idm_sessions, tenant_roles)
             .hasher(Arc::new(Argon2Hasher))
             .signer(signer_port)
             .verifier(token_verifier.clone())

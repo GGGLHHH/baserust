@@ -167,6 +167,7 @@ async fn scope_downscopes_below_role_grant() {
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
+            None,
             vec![Perm::WidgetRead],
             900,
         )
@@ -391,6 +392,7 @@ async fn scope_without_read_all_narrows_admin_to_own() {
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
+            None,
             vec![Perm::WidgetRead],
             900,
         )
@@ -421,7 +423,7 @@ async fn my_permissions_reflect_role_and_scope() {
     let signer = AppTokenSigner::dev();
     let mint = |roles: Vec<String>, scope: Vec<Perm>| {
         signer
-            .mint_scoped(admin.user.id, "probe", roles, scope, 900)
+            .mint_scoped(admin.user.id, "probe", roles, None, scope, 900)
             .unwrap()
     };
     let fetch = |token: String| {

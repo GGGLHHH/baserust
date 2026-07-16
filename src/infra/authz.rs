@@ -481,6 +481,44 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenScope {
     }
 }
 
+/// 租户标识。**唯一生产构造点 = 已验签的 tenant claim**(`from_claim`,只有 `auth/token.rs` 该调)。
+///
+/// 刻意**没有** `Default` / `From<Uuid>` / nil 兜底 —— 想凭空造一个租户过滤条件,得写出
+/// `TenantId::from_claim(..)` 这个名字:review 一眼看见,`grep` 一次全中。
+/// 这是整套隔离的**主防线**(spec §5.1):测试只能证明你想到的路径,类型系统能挡住你没想到的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TenantId(Uuid);
+
+impl TenantId {
+    /// 从**已验签**的 claim 造。名字刻意刺眼 —— 见 `TenantId` 的 doc。
+    pub fn from_claim(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+/// 请求的租户上下文。extractor 只读 extension(中间件是唯一真相源,不重复验签)。
+///
+/// **无 → 401**:与 `TokenScope` 的「空 = 无限制」**刻意相反** —— 空租户绝不等于全租户。
+/// 缺席有两种合法来源:0 租户用户(register 的常规出口,spec §1.1)、存量无该字段的 token。
+#[derive(Clone, Copy, Debug)]
+pub struct Tenant(pub TenantId);
+
+impl<S: Send + Sync> FromRequestParts<S> for Tenant {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Tenant>()
+            .copied()
+            .ok_or(AppError::Unauthorized)
+    }
+}
+
 /// 组闸:需登录(`/api/v1/frontend` 组)。粗过滤:extensions 无 `AuthUser`(`auth::authenticate`
 /// 没验出人)→ 401 统一 `ErrorBody`。细粒度(perm/scope/ownership)仍归端点内三轴 ——
 /// 本闸只是防御纵深第一层。注:axum `.layer()` 只包已注册路由,组内未知路径仍走 fallback 404、不过闸。

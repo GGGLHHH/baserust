@@ -25,7 +25,14 @@ fn test_app() -> (Router, String) {
     let verifier = Arc::new(AppTokenVerifier::dev());
     // admin 满权令牌(roles=[admin],scope 空):mint 即可,不必走真实登录。
     let admin = signer
-        .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
+        .mint_scoped(
+            Uuid::nil(),
+            "admin",
+            vec!["admin".to_owned()],
+            None,
+            vec![],
+            900,
+        )
         .unwrap();
     let bus: Arc<dyn baserust::features::widget::EventBus> =
         Arc::new(baserust::features::widget::MemoryEventBus::new());
@@ -106,7 +113,7 @@ fn test_policy() -> Policy {
 fn user_token() -> (String, Uuid) {
     let uid = Uuid::now_v7();
     let t = AppTokenSigner::dev()
-        .mint_scoped(uid, "user", vec!["user".to_owned()], vec![], 900)
+        .mint_scoped(uid, "user", vec!["user".to_owned()], None, vec![], 900)
         .unwrap();
     (t, uid)
 }
@@ -613,6 +620,7 @@ async fn sse_requires_read_scope() {
             Uuid::nil(),
             "admin",
             vec!["admin".to_owned()],
+            None,
             vec![Perm::WidgetWrite],
             900,
         )
@@ -637,7 +645,14 @@ async fn multi_perm_and_or_endpoints() {
     let signer = AppTokenSigner::dev(); // 与 fixture 同 dev 密钥,可自铸降权令牌
     let narrowed = |scope: Vec<Perm>| {
         signer
-            .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], scope, 900)
+            .mint_scoped(
+                Uuid::nil(),
+                "admin",
+                vec!["admin".to_owned()],
+                None,
+                scope,
+                900,
+            )
             .unwrap()
     };
 
