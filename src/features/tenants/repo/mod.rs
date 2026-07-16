@@ -4,7 +4,7 @@
 //! (与 profile/repo/mod.rs 同口径。)
 
 mod memory;
-// `mod postgres;` 在 Task 3 加 —— 现在加,文件不存在,编译挂。
+mod postgres;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -13,6 +13,7 @@ use super::types::{Membership, TenantRole, TenantStatus};
 use crate::infra::error::AppError;
 
 pub use memory::InMemoryTenantRepo;
+pub use postgres::PgTenantRepo;
 
 /// 仓储端口。
 ///

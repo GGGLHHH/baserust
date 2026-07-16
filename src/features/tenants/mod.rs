@@ -9,5 +9,5 @@
 pub mod repo;
 pub mod types;
 
-pub use repo::{InMemoryTenantRepo, TenantRepo};
+pub use repo::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
 pub use types::{Membership, TenantRole, TenantStatus};
