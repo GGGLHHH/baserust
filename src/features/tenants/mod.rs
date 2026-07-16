@@ -6,6 +6,8 @@
 //! P1 只有存储层,**无 HTTP 端点** —— 切换/列表端点在 P2,且必须挂 `/auth/` 前缀
 //! (nginx 只把 `/{public,frontend,admin}/auth/` 分流进 idm 进程)。
 
+pub mod repo;
 pub mod types;
 
+pub use repo::{InMemoryTenantRepo, TenantRepo};
 pub use types::{Membership, TenantRole, TenantStatus};
