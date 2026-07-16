@@ -55,8 +55,12 @@ impl MemStore {
     /// 镜像 PG 的 `join tenants where deleted_at is null and status = 'active'`。
     /// 这是契约,不是优化 —— 见 repo/mod.rs 的 `memberships` doc。
     ///
-    /// 收**已持有的** `&MemberRow`(而非再按 key 查一遍):两个调用点手上都已经有它了。
-    fn alive_membership(&self, tenant_id: Uuid, m: &MemberRow) -> Option<Membership> {
+    /// 收 `(user_id, tenant_id)` 自己查,**不收调用方已持有的 `&MemberRow`**:那样能省一次
+    /// HashMap 查找,但 tenant_id 与 MemberRow 就被解耦了 —— 传错组合能编译过,产出一个
+    /// 张冠李戴的 `Membership`。这里 N 小到那次查找无所谓(见 `memberships` 的 ponytail 注),
+    /// 不值当拿类型安全换。
+    fn alive_membership(&self, user_id: Uuid, tenant_id: Uuid) -> Option<Membership> {
+        let m = self.members.get(&(user_id, tenant_id))?;
         let t = self.tenants.get(&tenant_id)?;
         if t.deleted_at.is_some() || t.status != TenantStatus::Active {
             return None;
@@ -80,7 +84,7 @@ impl TenantRepo for InMemoryTenantRepo {
             .members
             .iter()
             .filter(|((u, _), _)| *u == user_id)
-            .filter_map(|((_, t), m)| store.alive_membership(*t, m).map(|ms| (m.granted_at, ms)))
+            .filter_map(|((u, t), m)| store.alive_membership(*u, *t).map(|ms| (m.granted_at, ms)))
             .collect();
         // granted_at 升序;同刻用 tenant_id 兜底,保证确定性(镜像 PG 的 ORDER BY granted_at, tenant_id)
         rows.sort_by(|a, b| {
@@ -96,10 +100,7 @@ impl TenantRepo for InMemoryTenantRepo {
         tenant_id: Uuid,
     ) -> Result<Option<Membership>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
-        let Some(m) = store.members.get(&(user_id, tenant_id)) else {
-            return Ok(None);
-        };
-        Ok(store.alive_membership(tenant_id, m))
+        Ok(store.alive_membership(user_id, tenant_id))
     }
 
     async fn active(&self, user_id: Uuid) -> Result<Option<Uuid>, AppError> {

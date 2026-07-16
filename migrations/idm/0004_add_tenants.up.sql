@@ -32,12 +32,19 @@ alter table tenants add constraint tenants_status_ck
 -- tenant_id **不挂 cascade** —— 租户只软删、不硬删(spec §4.4 拿软删当安全控制)。
 -- 没有 cascade 意味着 `delete from tenants` 在还有成员时会被 FK 拒绝,这正是想要的:
 -- 别顺手给它补 cascade,那会让一次误删 tenants 行静默清空全部成员资格、绕过软删这道闸。
+-- **granted_at 刻意用 clock_timestamp() 而非全仓通用的 now()** —— 它是**排序键**,不是审计时间戳。
+-- now() = transaction_timestamp(),同一事务内恒返回事务开始时刻:一旦有人(如 P2 的 seed)把多条
+-- upsert_member 包进一个事务(本仓有 transactions skill、widget 的 create_with_tags 就是活样板),
+-- 该事务内全部成员的 granted_at 会完全相等 → memberships 的 `order by granted_at, tenant_id`
+-- 退化成按 tenant_id 排 → TenantRoleRepo 的 `.or(ms.first())` 回退目标从「最早加入的租户」
+-- 静默变成「uuid 最小的租户」,即用户默认落进哪家公司变了。clock_timestamp() 在事务内会推进。
+-- 内存实现的 OffsetDateTime::now_utc() 天然是「当前时刻」语义,这样两侧才对齐。
 create table tenant_members (
     user_id    uuid        not null references users (id) on delete cascade,
     tenant_id  uuid        not null references tenants (id),
     role       text        not null,              -- 'admin' | 'member';租户级,见 types.rs::TenantRole
     granted_by text,
-    granted_at timestamptz not null default (now() at time zone 'utc'),
+    granted_at timestamptz not null default (clock_timestamp() at time zone 'utc'),
     primary key (user_id, tenant_id)
 );
 create index tenant_members_tenant_id_idx on tenant_members (tenant_id);  -- 按租户反查成员

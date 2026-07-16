@@ -1,23 +1,35 @@
 //! TenantRepo 契约一致性:同一批断言对 InMemory 与 Pg 各跑一遍(镜像 widget_repo_conformance)。
-//! 钉:memberships 过滤停用租户(status=suspended)、granted_at 升序、membership 非成员回 None、
-//!    set_active upsert、active 回环。
-//! 注:软删租户(deleted_at)的过滤同样在契约里,但 TenantRepo 无「软删租户」方法,
-//!    内存侧此处造不出该状态 → 由 Task 3 的 PG 入口用 raw SQL 直接 update deleted_at 补验。
+//!
+//! **共享契约钉**(两侧同跑):memberships 过滤停用租户(status=suspended)、granted_at 升序
+//! 且不因改角色而重置、membership 非成员回 None、set_active upsert、active 回环。
+//!
+//! **只 PG 侧能验的**(`TenantRepo` 无「软删租户」方法、`MemStore` 私有,内存造不出该状态,
+//! PG 可用 raw SQL 绕过 trait 造):
+//! - `pg_memberships_filters_soft_deleted_tenant` —— 软删的租户不出现在 memberships
+//! - `pg_upsert_tenant_does_not_revive_soft_deleted` —— upsert 不把 deleted_at 改回 null
+//!
+//! **两侧刻意不同、各自钉住的**(见 `repo/mod.rs` trait doc 的「已知分歧」):
+//! - `memory_does_not_enforce_referential_integrity` / `pg_enforces_referential_integrity_and_name_uniqueness`
+//!   —— FK 与 name 唯一性只在 PG 侧强制。两条一起守着 doc,任一侧行为变了就红。
 //!
 //! **本测试连 idm role**(非 `#[sqlx::test]` 默认的 app role/`DATABASE_URL`)——
 //! tenants 表在 idm schema,app role 的 search_path=app 物理碰不到。形状照
 //! `search_repo_conformance.rs`,不是 widget/profile。
 //!
-//! **无每测试隔离的临时库**(表跨测试运行共享)⇒ 契约里恒用全新 `Uuid::now_v7()` 造数据,
-//! 且**绝不断言全表 count/total**。
+//! **无每测试隔离的临时库**(表跨测试运行共享)⇒ 契约里恒用全新 `Uuid::now_v7()` 造数据、
+//! **绝不断言全表 count/total**,且 PG 入口跑完自己 `cleanup`(断言失败时故意不清,留现场)。
 
 use baserust::features::tenants::{Membership, TenantRepo, TenantRole, TenantStatus};
 use uuid::Uuid;
 
-/// `granted_at` 取自墙钟(内存 `OffsetDateTime::now_utc()` / PG `now()`),两者都**不是**
-/// 单调钟。相邻两次授予若落进同一时刻,排序会掉到 tenant_id tiebreak —— 而下面的顺序
+/// `granted_at` 取自墙钟(内存 `OffsetDateTime::now_utc()` / PG `clock_timestamp()`),两者都
+/// **不是**单调钟。相邻两次授予若落进同一时刻,排序会掉到 tenant_id tiebreak —— 而下面的顺序
 /// 用例刻意让 tenant_id 序与授予序**相反**,平局会让断言必然失败而不是降级。
 /// 故授予之间留一个远大于时钟分辨率的真实间隔(PG 的 timestamptz 是微秒级)。
+///
+/// 用 `std::thread::sleep` 而非 `tokio::time::sleep`:`Cargo.toml` 的 tokio **没开 `time`
+/// feature**,后者根本编译不过。`#[tokio::test]` 是 current_thread runtime、本测试内无并发
+/// 任务,阻塞 2ms 无影响 —— 别"顺手改成" async sleep。
 fn tick() {
     std::thread::sleep(std::time::Duration::from_millis(2));
 }
@@ -172,6 +184,40 @@ async fn memory_satisfies_tenant_contract() {
     let _ = tenant_repo_contract(&repo, Uuid::now_v7()).await;
 }
 
+/// 「已知分歧」的内存侧守卫 —— 与 `pg_enforces_referential_integrity_and_name_uniqueness` 成对。
+/// `repo/mod.rs` 的 trait doc 白纸黑字断言「内存 → 静默成功 / 静默接受」;没有测试守着,
+/// 哪天有人觉得「内存该更严谨」补上校验,那段 doc 就静默变成谎言而 CI 全绿。
+#[tokio::test]
+async fn memory_does_not_enforce_referential_integrity() {
+    let repo = baserust::features::tenants::InMemoryTenantRepo::new();
+
+    // 不存在的 user / tenant:内存不校验(PG 侧是 FK 违约,见成对的 pg 用例)
+    assert!(
+        repo.set_active(Uuid::now_v7(), Uuid::now_v7())
+            .await
+            .is_ok(),
+        "内存不校验引用完整性 —— 若这条红了,trait doc 的「已知分歧」要跟着改"
+    );
+    assert!(
+        repo.upsert_member(Uuid::now_v7(), Uuid::now_v7(), TenantRole::Admin, None)
+            .await
+            .is_ok(),
+        "同上"
+    );
+
+    // 同名两个存活租户:内存允许(PG 侧是 tenants_name_alive_uidx 违约)
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    repo.upsert_tenant(a, "dup", "A", TenantStatus::Active, None)
+        .await
+        .unwrap();
+    assert!(
+        repo.upsert_tenant(b, "dup", "B", TenantStatus::Active, None)
+            .await
+            .is_ok(),
+        "内存不校验 name 唯一性 —— 若这条红了,trait doc 的「已知分歧」要跟着改"
+    );
+}
+
 // ── 入口 2:PG(需 --features pg-conformance + idm role 跑着的 pg)──
 // **不用 `#[sqlx::test]`**:它建临时库并用 `DATABASE_URL`(`just test-pg` 里连的是 app role),
 // 而 tenants 在 idm schema、须以 idm role 连接 —— 显式建池,读 IDM_DATABASE_URL
@@ -213,13 +259,16 @@ mod pg {
     /// 永久留下一批 `tenant-contract-*` 用户和 `acme-*`/`dead-*` 租户。
     /// 顺序:先删 user —— `tenant_members.user_id` 与 `user_active_tenant.user_id` 都是
     /// `on delete cascade`,连带清掉引用;租户才不再被引用、可删(tenant_id 侧刻意无 cascade)。
+    /// **这个顺序是唯一的清理入口** —— 没建 user 的用例传 `None`,别在别处手抄一遍 delete。
     /// 断言失败时 panic 会跳过清理 —— 那正好:现场留给你查。
-    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, tenant_ids: &[Uuid]) {
-        sqlx::query("delete from users where id = $1")
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("清理测试 user 失败");
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Option<Uuid>, tenant_ids: &[Uuid]) {
+        if let Some(id) = user_id {
+            sqlx::query("delete from users where id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("清理测试 user 失败");
+        }
         sqlx::query("delete from tenants where id = any($1)")
             .bind(tenant_ids)
             .execute(pool)
@@ -233,7 +282,62 @@ mod pg {
         let user_id = seed_user(&pool).await;
         let repo = PgTenantRepo::new(pool.clone());
         let tenants = tenant_repo_contract(&repo, user_id).await;
-        cleanup(&pool, user_id, &tenants).await;
+        cleanup(&pool, Some(user_id), &tenants).await;
+    }
+
+    /// 「已知分歧」的 PG 侧对照 —— 与 `memory_does_not_enforce_referential_integrity` 成对。
+    /// 两条一起把 `repo/mod.rs` trait doc 的「PG → 违约;内存 → 静默成功」钉住:
+    /// 任一侧行为漂了,对应那条就红,doc 不会静默变谎。
+    #[tokio::test]
+    async fn pg_enforces_referential_integrity_and_name_uniqueness() {
+        let pool = connect().await;
+        let repo = PgTenantRepo::new(pool.clone());
+
+        // 不存在的 user / tenant → FK 违约(内存侧是静默成功)
+        assert!(
+            repo.set_active(Uuid::now_v7(), Uuid::now_v7())
+                .await
+                .is_err(),
+            "PG 靠 FK 拒绝不存在的 user/tenant"
+        );
+        assert!(
+            repo.upsert_member(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                baserust::features::tenants::TenantRole::Admin,
+                None
+            )
+            .await
+            .is_err(),
+            "同上"
+        );
+
+        // 同名两个存活租户 → tenants_name_alive_uidx 违约(内存侧允许重名)
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let name = format!("dup-{a}");
+        repo.upsert_tenant(
+            a,
+            &name,
+            "A",
+            baserust::features::tenants::TenantStatus::Active,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.upsert_tenant(
+                b,
+                &name,
+                "B",
+                baserust::features::tenants::TenantStatus::Active,
+                None
+            )
+            .await
+            .is_err(),
+            "PG 的 partial unique index 拒绝同名存活租户"
+        );
+
+        cleanup(&pool, None, &[a, b]).await;
     }
 
     /// **软删过滤补验(只 PG 侧)** —— 内存契约验不了这一半:`TenantRepo` 没有「软删租户」
@@ -291,7 +395,7 @@ mod pg {
             "软删的租户不得出现在 memberships 里"
         );
 
-        cleanup(&pool, user_id, &[t]).await;
+        cleanup(&pool, Some(user_id), &[t]).await;
     }
 
     /// **`upsert_tenant` 不复活软删租户(只 PG 侧)** —— 软删是 spec §4.4 当作安全控制的
@@ -345,11 +449,6 @@ mod pg {
             "upsert_tenant 不得静默复活软删租户(deleted_at 被清空了)"
         );
 
-        // 本测试没建 user,只需删租户(无成员引用它)
-        sqlx::query("delete from tenants where id = $1")
-            .bind(t)
-            .execute(&pool)
-            .await
-            .expect("清理测试 tenant 失败");
+        cleanup(&pool, None, &[t]).await; // 本测试没建 user
     }
 }
