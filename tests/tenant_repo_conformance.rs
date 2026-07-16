@@ -1,6 +1,8 @@
 //! TenantRepo 契约一致性:同一批断言对 InMemory 与 Pg 各跑一遍(镜像 widget_repo_conformance)。
-//! 钉:memberships 过滤停用/软删租户、granted_at 升序、membership 非成员回 None、
+//! 钉:memberships 过滤停用租户(status=suspended)、granted_at 升序、membership 非成员回 None、
 //!    set_active upsert、active 回环。
+//! 注:软删租户(deleted_at)的过滤同样在契约里,但 TenantRepo 无「软删租户」方法,
+//!    内存侧此处造不出该状态 → 由 Task 3 的 PG 入口用 raw SQL 直接 update deleted_at 补验。
 //!
 //! **本测试连 idm role**(非 `#[sqlx::test]` 默认的 app role/`DATABASE_URL`)——
 //! tenants 表在 idm schema,app role 的 search_path=app 物理碰不到。形状照
