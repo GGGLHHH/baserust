@@ -21,6 +21,21 @@ pub use postgres::PgTenantRepo;
 /// 1. `TenantRoleRepo`(P2,组合根) —— 铸币时读 `memberships` / `active`
 /// 2. 切换端点(P2)—— `membership` 校验 + `set_active`
 /// 3. `seed::apply`(P2)—— `upsert_tenant` / `upsert_member`
+///
+/// # 两侧行为的**已知分歧**(不属于端口契约)
+///
+/// 下面这些约束**只在 PG 侧强制**,内存实现一概不检查 —— 它们是 DB 约束,
+/// 不是端口语义。调用方**不得**依赖任一侧的行为,必须自己保证前置条件:
+///
+/// - **引用完整性**:`tenant_members.{user_id,tenant_id}` 与
+///   `user_active_tenant.{user_id,tenant_id}` 都有真 FK(见
+///   `migrations/idm/0004_add_tenants.up.sql`)。给 `set_active` / `upsert_member`
+///   传一个不存在的 user 或 tenant:**PG → FK 违约 → `Internal`(500);内存 → 静默成功**。
+/// - **`tenants.name` 唯一性**:仅对存活行(partial unique index)。同名建两个租户:
+///   **PG → 唯一违约 → `Internal`;内存 → 静默接受**。
+///
+/// 后果:只跑内存模式(CI 默认)的代码看不见这两类错误。碰这些方法的新代码,
+/// PG conformance(`just test-pg`)是唯一能暴露它的地方。
 #[async_trait]
 pub trait TenantRepo: Send + Sync {
     /// 该用户的全部**有效**成员资格。
@@ -48,6 +63,7 @@ pub trait TenantRepo: Send + Sync {
     async fn active(&self, user_id: Uuid) -> Result<Option<Uuid>, AppError>;
 
     /// 设置激活租户(upsert)。**不校验成员资格** —— 调用方必须先 `membership()` 校验。
+    /// 租户/用户是否存在同样不校验(PG 侧靠 FK 兜、内存侧不兜,见 trait 头的「已知分歧」)。
     async fn set_active(&self, user_id: Uuid, tenant_id: Uuid) -> Result<(), AppError>;
 
     /// 建/替租户(seed 用)。按 `id` upsert。
@@ -57,9 +73,7 @@ pub trait TenantRepo: Send + Sync {
     /// 切断访问),而 `seed::apply`(P2)每次启动都会重跑,不能让一次重启就无声撤销
     /// 运维手工做的停用决定。要恢复必须走显式操作(P1 无此方法,YAGNI)。
     ///
-    /// **`name` 唯一性只在 PG 侧强制**(仅对存活行,见
-    /// `migrations/idm/0004_add_tenants.up.sql` 的 partial unique index)——
-    /// 不属于端口契约,内存实现不检查、允许重名。
+    /// `name` 唯一性只在 PG 侧强制 —— 见 trait 头的「已知分歧」。
     async fn upsert_tenant(
         &self,
         id: Uuid,

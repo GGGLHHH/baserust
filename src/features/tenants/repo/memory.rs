@@ -12,7 +12,6 @@ use super::TenantRepo;
 use crate::features::tenants::types::{Membership, TenantRole, TenantStatus};
 use crate::infra::error::AppError;
 
-#[derive(Clone)]
 struct TenantRow {
     name: String,
     display_name: String,
@@ -20,7 +19,6 @@ struct TenantRow {
     deleted_at: Option<OffsetDateTime>,
 }
 
-#[derive(Clone)]
 struct MemberRow {
     role: TenantRole,
     granted_at: OffsetDateTime,
@@ -56,8 +54,9 @@ impl Default for InMemoryTenantRepo {
 impl MemStore {
     /// 镜像 PG 的 `join tenants where deleted_at is null and status = 'active'`。
     /// 这是契约,不是优化 —— 见 repo/mod.rs 的 `memberships` doc。
-    fn alive_membership(&self, user_id: Uuid, tenant_id: Uuid) -> Option<Membership> {
-        let m = self.members.get(&(user_id, tenant_id))?;
+    ///
+    /// 收**已持有的** `&MemberRow`(而非再按 key 查一遍):两个调用点手上都已经有它了。
+    fn alive_membership(&self, tenant_id: Uuid, m: &MemberRow) -> Option<Membership> {
         let t = self.tenants.get(&tenant_id)?;
         if t.deleted_at.is_some() || t.status != TenantStatus::Active {
             return None;
@@ -75,11 +74,13 @@ impl MemStore {
 impl TenantRepo for InMemoryTenantRepo {
     async fn memberships(&self, user_id: Uuid) -> Result<Vec<Membership>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
+        // ponytail: O(全库成员数) 全扫。内存实现只跑 dev/测试(prod 恒 PG),N 小到无所谓;
+        // 真要 O(该用户成员数),把 members 改成 HashMap<Uuid, HashMap<Uuid, MemberRow>> 分桶。
         let mut rows: Vec<(OffsetDateTime, Membership)> = store
             .members
             .iter()
             .filter(|((u, _), _)| *u == user_id)
-            .filter_map(|((u, t), m)| store.alive_membership(*u, *t).map(|ms| (m.granted_at, ms)))
+            .filter_map(|((_, t), m)| store.alive_membership(*t, m).map(|ms| (m.granted_at, ms)))
             .collect();
         // granted_at 升序;同刻用 tenant_id 兜底,保证确定性(镜像 PG 的 ORDER BY granted_at, tenant_id)
         rows.sort_by(|a, b| {
@@ -95,7 +96,10 @@ impl TenantRepo for InMemoryTenantRepo {
         tenant_id: Uuid,
     ) -> Result<Option<Membership>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
-        Ok(store.alive_membership(user_id, tenant_id))
+        let Some(m) = store.members.get(&(user_id, tenant_id)) else {
+            return Ok(None);
+        };
+        Ok(store.alive_membership(tenant_id, m))
     }
 
     async fn active(&self, user_id: Uuid) -> Result<Option<Uuid>, AppError> {

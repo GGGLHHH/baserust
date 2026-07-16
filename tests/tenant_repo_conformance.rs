@@ -14,10 +14,18 @@
 use baserust::features::tenants::{Membership, TenantRepo, TenantRole, TenantStatus};
 use uuid::Uuid;
 
-/// 契约本体。
+/// `granted_at` 取自墙钟(内存 `OffsetDateTime::now_utc()` / PG `now()`),两者都**不是**
+/// 单调钟。相邻两次授予若落进同一时刻,排序会掉到 tenant_id tiebreak —— 而下面的顺序
+/// 用例刻意让 tenant_id 序与授予序**相反**,平局会让断言必然失败而不是降级。
+/// 故授予之间留一个远大于时钟分辨率的真实间隔(PG 的 timestamptz 是微秒级)。
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(2));
+}
+
+/// 契约本体。返回它建的租户 id —— PG 入口据此清理(表跨运行共享,见文件头)。
 /// `user_id` 由调用方准备 —— PG 侧 `tenant_members.user_id` 有 FK 到 `users`,
 /// 必须先插一行真 user;内存侧没有 FK,随便一个 uuid 即可。
-async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) {
+async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) -> Vec<Uuid> {
     // ── 全新 id:表跨运行共享,不能撞行 ──
     let t_alive = Uuid::now_v7();
     let t_suspended = Uuid::now_v7();
@@ -116,6 +124,7 @@ async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) {
     repo.upsert_member(user_id, t_early, TenantRole::Member, None)
         .await
         .unwrap();
+    tick(); // 见 tick() 的 doc:平局会让下面的断言必然红,不能靠时钟侥幸
     repo.upsert_member(user_id, t_late, TenantRole::Member, None)
         .await
         .unwrap();
@@ -132,6 +141,7 @@ async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) {
     //   (重置后的时间戳仍早于之后才加入的第二个成员)。破法:把 re-upsert 挪到
     //   t_late 已经存在、已经被授予**之后**——若 upsert_member 重置了 t_early 的
     //   granted_at,它会晚于 t_late 的授予时间,顺序翻转,可被观察到。
+    tick(); // 同上:重置若发生,新 granted_at 必须可分辨地晚于 t_late 的
     repo.upsert_member(user_id, t_early, TenantRole::Admin, None)
         .await
         .unwrap();
@@ -150,13 +160,16 @@ async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) {
         pos(&ms, t_early) < pos(&ms, t_late),
         "upsert_member 替换角色不得重置 granted_at(顺序不该因为改角色而翻转)"
     );
+
+    vec![t_alive, t_suspended, t_early, t_late]
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
 #[tokio::test]
 async fn memory_satisfies_tenant_contract() {
     let repo = baserust::features::tenants::InMemoryTenantRepo::new();
-    tenant_repo_contract(&repo, Uuid::now_v7()).await;
+    // 返回的租户 id 只有 PG 入口要(清理用),内存进程结束即散
+    let _ = tenant_repo_contract(&repo, Uuid::now_v7()).await;
 }
 
 // ── 入口 2:PG(需 --features pg-conformance + idm role 跑着的 pg)──
@@ -196,12 +209,31 @@ mod pg {
         id
     }
 
+    /// 表跨测试运行共享(见文件头)⇒ 不清理就是每跑一次 `just test-pg` 往 dev 的 idm 库
+    /// 永久留下一批 `tenant-contract-*` 用户和 `acme-*`/`dead-*` 租户。
+    /// 顺序:先删 user —— `tenant_members.user_id` 与 `user_active_tenant.user_id` 都是
+    /// `on delete cascade`,连带清掉引用;租户才不再被引用、可删(tenant_id 侧刻意无 cascade)。
+    /// 断言失败时 panic 会跳过清理 —— 那正好:现场留给你查。
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid, tenant_ids: &[Uuid]) {
+        sqlx::query("delete from users where id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("清理测试 user 失败");
+        sqlx::query("delete from tenants where id = any($1)")
+            .bind(tenant_ids)
+            .execute(pool)
+            .await
+            .expect("清理测试 tenants 失败");
+    }
+
     #[tokio::test]
     async fn pg_satisfies_tenant_contract() {
         let pool = connect().await;
         let user_id = seed_user(&pool).await;
-        let repo = PgTenantRepo::new(pool);
-        tenant_repo_contract(&repo, user_id).await;
+        let repo = PgTenantRepo::new(pool.clone());
+        let tenants = tenant_repo_contract(&repo, user_id).await;
+        cleanup(&pool, user_id, &tenants).await;
     }
 
     /// **软删过滤补验(只 PG 侧)** —— 内存契约验不了这一半:`TenantRepo` 没有「软删租户」
@@ -258,6 +290,8 @@ mod pg {
                 .all(|m| m.tenant_id != t),
             "软删的租户不得出现在 memberships 里"
         );
+
+        cleanup(&pool, user_id, &[t]).await;
     }
 
     /// **`upsert_tenant` 不复活软删租户(只 PG 侧)** —— 软删是 spec §4.4 当作安全控制的
@@ -310,5 +344,12 @@ mod pg {
             deleted_at.is_some(),
             "upsert_tenant 不得静默复活软删租户(deleted_at 被清空了)"
         );
+
+        // 本测试没建 user,只需删租户(无成员引用它)
+        sqlx::query("delete from tenants where id = $1")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .expect("清理测试 tenant 失败");
     }
 }

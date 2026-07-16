@@ -35,11 +35,12 @@ const MEMBERSHIP_SQL: &str = "select m.tenant_id, t.name, t.display_name, m.role
 
 const ACTIVE_SQL: &str = "select tenant_id from user_active_tenant where user_id = $1";
 
+/// `updated_at` **不在 do update 集里** —— 归 `user_active_tenant_set_updated_at` 触发器
+/// (与 profile/repo/postgres.rs 的 UPSERT_SQL 同口径:全仓凡有 updated_at 的表都靠触发器)。
 const SET_ACTIVE_SQL: &str = "insert into user_active_tenant (user_id, tenant_id) \
      values ($1, $2) \
      on conflict (user_id) do update set \
-       tenant_id = excluded.tenant_id, \
-       updated_at = (now() at time zone 'utc')";
+       tenant_id = excluded.tenant_id";
 
 /// `deleted_at` **不在 do update 集里** —— 见 repo/mod.rs 的 `upsert_tenant` doc:
 /// 软删是 spec §4.4 当作安全控制的机制,seed 每次启动都跑,不能让 upsert 静默把它

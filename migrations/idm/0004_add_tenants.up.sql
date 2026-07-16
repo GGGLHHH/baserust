@@ -28,6 +28,10 @@ alter table tenants add constraint tenants_status_ck
 -- 一行 = 一句"用户 X 在租户 Y 里是 Z 角色";撤销 = 删行。故不套 base-entity(镜像 user_roles)。
 -- **primary key (user_id, tenant_id) 就是 1:N 多租户的全部代价** —— 对照 idm.user_roles 的
 -- (user_id, role_id),少的正是 tenant 这一维,所以那张表表达不了"同一人在两租户同角色"。
+-- **FK 策略刻意不对称**:user_id 挂 cascade(用户没了,成员资格自然没意义),
+-- tenant_id **不挂 cascade** —— 租户只软删、不硬删(spec §4.4 拿软删当安全控制)。
+-- 没有 cascade 意味着 `delete from tenants` 在还有成员时会被 FK 拒绝,这正是想要的:
+-- 别顺手给它补 cascade,那会让一次误删 tenants 行静默清空全部成员资格、绕过软删这道闸。
 create table tenant_members (
     user_id    uuid        not null references users (id) on delete cascade,
     tenant_id  uuid        not null references tenants (id),
@@ -44,8 +48,14 @@ alter table tenant_members add constraint tenant_members_role_ck
 -- ── user_active_tenant:当前激活租户(**状态**,一人一行)──
 -- 为什么要状态化:idm 的 RoleRepo::roles_for_user 只收 user_id,收不到"哪个租户"
 -- → per-request 的租户选择不可能在 idm 内部发生 → 只能落表。见 spec §4.1。
+-- tenant_id 同样刻意不挂 cascade,理由同 tenant_members。
 create table user_active_tenant (
     user_id    uuid        primary key references users (id) on delete cascade,
     tenant_id  uuid        not null references tenants (id),
     updated_at timestamptz not null default (now() at time zone 'utc')
 );
+-- updated_at 归触发器,不归写方 —— 全仓凡有 updated_at 的表都是这个范式
+-- (users/sessions/roles/widgets/profiles 无一例外)。写方手写 `updated_at = now()`
+-- 会让任何忘了写的路径静默留下陈旧时间戳。
+create trigger user_active_tenant_set_updated_at
+    before update on user_active_tenant for each row execute function set_updated_at_utc();
