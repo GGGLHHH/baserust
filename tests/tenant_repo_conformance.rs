@@ -11,7 +11,7 @@
 //! **无每测试隔离的临时库**(表跨测试运行共享)⇒ 契约里恒用全新 `Uuid::now_v7()` 造数据,
 //! 且**绝不断言全表 count/total**。
 
-use baserust::features::tenants::{TenantRepo, TenantRole, TenantStatus};
+use baserust::features::tenants::{Membership, TenantRepo, TenantRole, TenantStatus};
 use uuid::Uuid;
 
 /// 契约本体。
@@ -85,27 +85,71 @@ async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) {
     assert_eq!(ms.len(), 1, "同 (user,tenant) 再 upsert 必须替换而非新增");
     assert_eq!(ms[0].role, TenantRole::Member);
 
-    // ── granted_at 升序(TenantRoleRepo 的 .or(ms.first()) 回退依赖它)──
-    let t_second = Uuid::now_v7();
+    // ── granted_at 升序,且不能是同义反复(TenantRoleRepo 的 .or(ms.first()) 回退依赖它)──
+    // 陷阱 1:`Uuid::now_v7()` 按生成顺序单调递增 —— 若按生成顺序把新 uuid 的租户排在
+    //   后面才授予成员资格,`order by granted_at` 与 `order by tenant_id` 结论恒一致,
+    //   测不出真按 granted_at 排序。破法:生成两个 uuid、比较大小,**故意让 uuid 更大
+    //   的那个先被授予成员资格**——granted_at 序与 tenant_id 序因此相反,
+    //   `order by tenant_id` 单独就会给出错误结果。
+    let x = Uuid::now_v7();
+    let y = Uuid::now_v7();
+    let (t_early, t_late) = if x > y { (x, y) } else { (y, x) };
+    // t_early:tenant_id 更大,但先被授予成员资格 → granted_at 更早,契约要求它排前面
     repo.upsert_tenant(
-        t_second,
-        &format!("beta-{t_second}"),
-        "Beta",
+        t_early,
+        &format!("early-{t_early}"),
+        "Early",
         TenantStatus::Active,
         None,
     )
     .await
     .unwrap();
-    repo.upsert_member(user_id, t_second, TenantRole::Member, None)
+    repo.upsert_tenant(
+        t_late,
+        &format!("late-{t_late}"),
+        "Late",
+        TenantStatus::Active,
+        None,
+    )
+    .await
+    .unwrap();
+    repo.upsert_member(user_id, t_early, TenantRole::Member, None)
+        .await
+        .unwrap();
+    repo.upsert_member(user_id, t_late, TenantRole::Member, None)
+        .await
+        .unwrap();
+
+    let pos = |ms: &[Membership], id: Uuid| ms.iter().position(|m| m.tenant_id == id).unwrap();
+    let ms = repo.memberships(user_id).await.unwrap();
+    assert!(
+        pos(&ms, t_early) < pos(&ms, t_late),
+        "granted_at 升序:先授予的必须排在前,即便它的 tenant_id 更大\
+         (排除 order by tenant_id 的同义反复)"
+    );
+
+    // 陷阱 2:若在只有一个存活成员时重置它的 granted_at,顺序断言观察不到差异
+    //   (重置后的时间戳仍早于之后才加入的第二个成员)。破法:把 re-upsert 挪到
+    //   t_late 已经存在、已经被授予**之后**——若 upsert_member 重置了 t_early 的
+    //   granted_at,它会晚于 t_late 的授予时间,顺序翻转,可被观察到。
+    repo.upsert_member(user_id, t_early, TenantRole::Admin, None)
         .await
         .unwrap();
     let ms = repo.memberships(user_id).await.unwrap();
-    assert_eq!(ms.len(), 2);
     assert_eq!(
-        ms[0].tenant_id, t_alive,
-        "先加入的必须在前(granted_at 升序)"
+        ms.len(),
+        3,
+        "t_alive + t_early + t_late,t_suspended 仍被过滤"
     );
-    assert_eq!(ms[1].tenant_id, t_second);
+    assert_eq!(
+        ms.iter().find(|m| m.tenant_id == t_early).unwrap().role,
+        TenantRole::Admin,
+        "角色必须被替换"
+    );
+    assert!(
+        pos(&ms, t_early) < pos(&ms, t_late),
+        "upsert_member 替换角色不得重置 granted_at(顺序不该因为改角色而翻转)"
+    );
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
@@ -213,6 +257,58 @@ mod pg {
                 .iter()
                 .all(|m| m.tenant_id != t),
             "软删的租户不得出现在 memberships 里"
+        );
+    }
+
+    /// **`upsert_tenant` 不复活软删租户(只 PG 侧)** —— 软删是 spec §4.4 当作安全控制的
+    /// 机制,而 P2 的 `seed::apply` 每次启动都会按 id 重新 `upsert_tenant`;若 upsert 把
+    /// `deleted_at` 悄悄改回 null,运维手工做的停用决定会在下次重启被无声撤销。
+    /// 内存侧验不了(同上,MemStore 私有、trait 无软删方法),故 raw SQL 直接查
+    /// `deleted_at` 列绕过 trait 断言。
+    #[tokio::test]
+    async fn pg_upsert_tenant_does_not_revive_soft_deleted() {
+        let pool = connect().await;
+        let repo = PgTenantRepo::new(pool.clone());
+
+        let t = Uuid::now_v7();
+        repo.upsert_tenant(
+            t,
+            &format!("revive-{t}"),
+            "Maybe Revived",
+            baserust::features::tenants::TenantStatus::Active,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // raw SQL 直接软删
+        sqlx::query("update tenants set deleted_at = (now() at time zone 'utc') where id = $1")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .expect("软删 tenant 失败");
+
+        // 模拟 seed::apply 每次启动都重跑的 upsert_tenant(同 id,内容不变)
+        repo.upsert_tenant(
+            t,
+            &format!("revive-{t}"),
+            "Maybe Revived",
+            baserust::features::tenants::TenantStatus::Active,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 直接查列:必须仍是软删的,upsert_tenant 不得把 deleted_at 改回 null
+        let deleted_at: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("select deleted_at from tenants where id = $1")
+                .bind(t)
+                .fetch_one(&pool)
+                .await
+                .expect("查 deleted_at 失败");
+        assert!(
+            deleted_at.is_some(),
+            "upsert_tenant 不得静默复活软删租户(deleted_at 被清空了)"
         );
     }
 }

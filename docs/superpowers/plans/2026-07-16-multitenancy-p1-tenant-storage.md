@@ -341,7 +341,7 @@ pub use memory::InMemoryTenantRepo;
 
 /// 仓储端口。
 ///
-/// **消费方只有两个**,别加第三个的方法(YAGNI):
+/// **消费方只有三个**,别加第四个的方法(YAGNI):
 /// 1. `TenantRoleRepo`(P2,组合根)—— 铸币时读 `memberships` / `active`
 /// 2. 切换端点(P2)—— `membership` 校验 + `set_active`
 /// 3. `seed::apply`(P2)—— `upsert_tenant` / `upsert_member`

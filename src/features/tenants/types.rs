@@ -6,7 +6,11 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// 租户状态。DB 侧有 `tenants_status_ck` check 约束双保险。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// **只 `Deserialize`,没有 `Serialize`/`ToSchema`**:spec §4.9 的 `GET /auth/tenants`
+/// 返回 `{id, name, display_name, role, active}`,不带 status,`Membership` 也不带它 ——
+/// `Serialize`/`ToSchema` 目前没有消费方。`Deserialize` 是挣来的:spec §9 的
+/// `seed.toml` 要解析 `status = "active"`。等真有端点要序列化它再挣回来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantStatus {
     Active,

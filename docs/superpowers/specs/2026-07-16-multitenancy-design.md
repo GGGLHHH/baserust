@@ -327,7 +327,11 @@ pub fn mint_scoped(user_id: Uuid, username: &str, roles: Vec<String>,
 async fn memberships(&self, user_id: Uuid) -> Result<Vec<Membership>, AppError>;
 ```
 
-`active(user_id)` 同。§8 加用例:停用租户后 refresh → 该 tenant 不再进 claim(若是唯一租户则进 §1.1 的 0 租户态)。
+`active(user_id)` **不同**:它只读 `user_active_tenant` 的原始值,不做任何过滤 —— 调用方
+可能已经不是该租户的有效成员。真正的过滤发生在调用方,由 §4.1 的组合逻辑
+`active.and_then(|t| ms.iter().find(..)).or(ms.first())` 在已被 `memberships` 过滤过的
+列表上再筛一遍完成。§8 加用例:停用租户后 refresh → 该 tenant 不再进 claim(若是唯一租户则
+进 §1.1 的 0 租户态)。
 
 ### 4.5 两级角色:命名空间隔离 + `RoleName::ALL` 一拆为二 ⚠️
 

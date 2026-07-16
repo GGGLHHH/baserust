@@ -41,6 +41,10 @@ const SET_ACTIVE_SQL: &str = "insert into user_active_tenant (user_id, tenant_id
        tenant_id = excluded.tenant_id, \
        updated_at = (now() at time zone 'utc')";
 
+/// `deleted_at` **不在 do update 集里** —— 见 repo/mod.rs 的 `upsert_tenant` doc:
+/// 软删是 spec §4.4 当作安全控制的机制,seed 每次启动都跑,不能让 upsert 静默把它
+/// 改回 null、无声撤销运维手工做的停用决定。内存实现镜像了这条(memory.rs::upsert_tenant
+/// 保留既有 deleted_at),conformance 用 `pg_upsert_tenant_does_not_revive_soft_deleted` 钉住。
 const UPSERT_TENANT_SQL: &str = "insert into tenants \
      (id, name, display_name, status, created_by, updated_by) \
      values ($1, $2, $3, $4, $5, $5) \
@@ -48,8 +52,7 @@ const UPSERT_TENANT_SQL: &str = "insert into tenants \
        name = excluded.name, \
        display_name = excluded.display_name, \
        status = excluded.status, \
-       updated_by = excluded.updated_by, \
-       deleted_at = null";
+       updated_by = excluded.updated_by";
 
 /// `granted_at` **不在 do update 集里** —— 改角色不该让成员"重新加入"(会打乱
 /// memberships 的升序,进而改变 TenantRoleRepo 的 .or(ms.first()) 回退目标)。

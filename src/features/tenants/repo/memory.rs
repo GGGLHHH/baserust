@@ -125,13 +125,17 @@ impl TenantRepo for InMemoryTenantRepo {
         status: TenantStatus,
         _by: Option<String>,
     ) -> Result<(), AppError> {
-        self.store.lock().expect("锁未中毒").tenants.insert(
+        let mut store = self.store.lock().expect("锁未中毒");
+        // deleted_at:新建为 None;已存在则**保留原值**,不因重跑 upsert 静默复活软删租户
+        // (镜像 PG 的 UPSERT_TENANT_SQL —— conflict 分支不再碰 deleted_at 列,见 repo/mod.rs doc)。
+        let deleted_at = store.tenants.get(&id).and_then(|t| t.deleted_at);
+        store.tenants.insert(
             id,
             TenantRow {
                 name: name.to_string(),
                 display_name: display_name.to_string(),
                 status,
-                deleted_at: None,
+                deleted_at,
             },
         );
         Ok(())

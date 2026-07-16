@@ -51,6 +51,15 @@ pub trait TenantRepo: Send + Sync {
     async fn set_active(&self, user_id: Uuid, tenant_id: Uuid) -> Result<(), AppError>;
 
     /// 建/替租户(seed 用)。按 `id` upsert。
+    ///
+    /// **不复活软删行**:已被软删的租户(`deleted_at` 非空)保持软删,`upsert_tenant`
+    /// 不会把它悄悄改回 null —— 软删是 spec §4.4 当作安全控制的机制(停用租户必须真的
+    /// 切断访问),而 `seed::apply`(P2)每次启动都会重跑,不能让一次重启就无声撤销
+    /// 运维手工做的停用决定。要恢复必须走显式操作(P1 无此方法,YAGNI)。
+    ///
+    /// **`name` 唯一性只在 PG 侧强制**(仅对存活行,见
+    /// `migrations/idm/0004_add_tenants.up.sql` 的 partial unique index)——
+    /// 不属于端口契约,内存实现不检查、允许重名。
     async fn upsert_tenant(
         &self,
         id: Uuid,
