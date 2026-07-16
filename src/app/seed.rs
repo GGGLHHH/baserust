@@ -136,8 +136,12 @@ pub async fn apply(
     by: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. 角色(幂等 upsert),记 name -> id 供账号授予引用。角色集是代码闭集(`RoleName`)。
+    // ⚠️ **`PLATFORM` 而非 `ALL`** —— `idm.roles` 是**可授予的平台角色目录**:进了这里的角色
+    // 就能经 `GET /admin/auth/roles` 出现在后台候选集、经 `PUT /users/{id}/roles` 授给任意用户。
+    // 租户角色(`tn:*`)只能靠 `tenant_members` 的成员资格获得,进了目录就是跨租户提权。
+    // 见 `RoleName::PLATFORM` 的 doc(那里有完整的提权链路)。
     let mut role_ids: HashMap<&'static str, uuid::Uuid> = HashMap::new();
-    for r in RoleName::ALL {
+    for r in RoleName::PLATFORM {
         let id = roles
             .upsert(r.as_str(), r.display_name(), by.clone())
             .await
@@ -201,7 +205,8 @@ pub async fn apply(
     }
 
     tracing::info!(
-        roles = RoleName::ALL.len(),
+        // PLATFORM 而非 ALL —— 上面 upsert 进目录的就是它,日志得说实话
+        roles = RoleName::PLATFORM.len(),
         accounts = data.accounts.len(),
         "idm seed 已应用(幂等)"
     );
@@ -265,14 +270,22 @@ mod tests {
 
     use super::*;
 
-    /// 嵌入的 seed.toml 能解析,且账号引用的角色都是已知 `RoleName`(拼错 → 这里挂)。
+    /// 嵌入的 seed.toml 能解析,且账号引用的角色都是已知的**平台**角色(拼错 → 这里挂)。
     /// 角色集/权限集已是代码闭集,其自身正确性由 `authz::role_name_wire_matches` 等守;这里只守账号引用。
+    ///
+    /// **`PLATFORM` 而非 `ALL`**:seed 的 account 授的是平台角色(落 `idm.user_roles`)。
+    /// 若 seed.toml 写了 `roles = ["tn:admin"]`,`apply` 会在 `role_ids` 里查不到它而报错 ——
+    /// 这条断言让那个错误在**测试期**就出现,而不是等到某次部署启动时。
+    /// 租户角色只能靠 `tenant_members` 的成员资格获得,不经 seed 的 account.roles。
     #[test]
-    fn embedded_seed_accounts_reference_known_roles() {
+    fn embedded_seed_accounts_reference_known_platform_roles() {
         let data = SeedData::load(None).unwrap();
-        let known: HashSet<&str> = RoleName::ALL.iter().map(|r| r.as_str()).collect();
+        let known: HashSet<&str> = RoleName::PLATFORM.iter().map(|r| r.as_str()).collect();
         for role in data.granted_roles() {
-            assert!(known.contains(role), "账号引用了未知角色 `{role}`");
+            assert!(
+                known.contains(role),
+                "账号引用了未知或非平台角色 `{role}` —— 租户角色靠 tenant_members 获得,不经 seed"
+            );
         }
     }
 

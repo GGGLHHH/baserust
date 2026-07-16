@@ -116,7 +116,73 @@ impl From<idm::UserView> for UserResponse {
             username: u.username,
             email: u.email,
             email_verified: u.email_verified,
-            roles: RoleName::parse_lossy(u.roles),
+            roles: RoleName::parse_lossy(strip_tenant_sentinel(u.roles)),
         }
+    }
+}
+
+/// 剥掉 `TenantRoleRepo` 塞的 `t:{uuid}` 哨兵 —— **roles 泄漏到 API 的收口点**(spec §4.8)。
+///
+/// # 为什么这里非有不可
+///
+/// 哨兵**确实会走到这**:`AuthService` 用同一个 `RoleRepo` 服务两条路径 ——
+/// - `issue_session` → `sign()` → `split_tenant` 摘掉它(JWT 里干净);
+/// - **`me()`** → `UserView.roles` → 本转换 → HTTP 响应(`rust-idm/src/service.rs:153`)。
+///
+/// 后者不经过 `sign()`。§2.4 的「只包给铸币路径」在 `AuthService` 这一层做不到 ——
+/// 它内部两条路径共用同一个注入的 repo。
+///
+/// # 为什么不能靠 parse_lossy 兜
+///
+/// `parse_lossy` 确实会把哨兵当未知角色丢掉 —— 但那是**巧合不是设计**,而且它会打一条
+/// `角色名不在 RoleName 闭集内(存量脏数据?)` 的 warn:**那句话是错的**(这不是脏数据,
+/// 是我们自己按设计塞的),它会把真正的存量脏数据告警淹掉,也会误导排查的人。
+/// 更危险的是:哪天有人给 `RoleName` 加了个 `t:` 开头的变体,哨兵就会**直接泄漏进响应**。
+fn strip_tenant_sentinel(roles: Vec<String>) -> Vec<String> {
+    roles.into_iter().filter(|r| !r.starts_with("t:")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **收口点**:哨兵不得泄漏进 API 响应,而租户角色(`tn:*`)要保留 ——
+    /// 后者是用户在当前租户里的真实角色,前端要靠它渲染。
+    ///
+    /// 这条钉的是 `strip_tenant_sentinel` 的**显式**剥离。没有它,哨兵只是被
+    /// `parse_lossy` 当未知值意外丢掉(还附带一句「存量脏数据?」的错误告警)——
+    /// 而那个巧合会在有人给 `RoleName` 加 `t:` 开头变体的那天失效。
+    #[test]
+    fn user_response_strips_sentinel_keeps_tenant_role() {
+        let t = Uuid::now_v7();
+        let view = idm::UserView {
+            id: Uuid::now_v7(),
+            username: "u".into(),
+            email: None,
+            email_verified: false,
+            roles: vec![
+                "user".into(),
+                format!("t:{t}"),  // TenantRoleRepo 的哨兵 —— 必须剥掉
+                "tn:admin".into(), // 真实的租户角色 —— 必须保留
+            ],
+        };
+        let resp: UserResponse = view.into();
+        assert_eq!(
+            resp.roles,
+            vec![RoleName::User, RoleName::TenantAdmin],
+            "哨兵必须剥掉;tn:* 是真角色要留下"
+        );
+    }
+
+    /// 剥离是**按前缀**而非按「解析不出来」—— 后者是 parse_lossy 的兜底,不是本函数的职责。
+    #[test]
+    fn strip_only_touches_sentinel_prefix() {
+        let out = strip_tenant_sentinel(vec![
+            "user".into(),
+            "t:whatever".into(), // 前缀命中即剥,不管后面是不是合法 uuid
+            "tn:admin".into(),   // tn: 不是 t: —— 别误伤
+            "trusted".into(),    // 以 t 开头但不是 t: —— 别误伤
+        ]);
+        assert_eq!(out, vec!["user", "tn:admin", "trusted"]);
     }
 }
