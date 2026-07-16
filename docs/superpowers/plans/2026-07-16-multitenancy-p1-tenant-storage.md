@@ -62,14 +62,23 @@
 **Interfaces:**
 - Produces: `TenantStatus::{Active, Suspended}`、`TenantRole::{Admin, Member}`(含 `wire()` / `as_db()` / `parse_db()`)、`Membership { tenant_id, name, display_name, role }`
 
-- [ ] **Step 1: 用 just 生成迁移骨架(别手建文件)**
+- [ ] **Step 1: 手建迁移文件 —— ⚠️ 不要用 `just migrate-add`**
 
 ```bash
-just migrate-add idm add_tenants
+ls migrations/idm/          # 确认当前最大编号(应为 0003)
+touch migrations/idm/0004_add_tenants.up.sql migrations/idm/0004_add_tenants.down.sql
 ```
 
-Expected: 生成 `migrations/idm/0004_add_tenants.up.sql` 和 `.down.sql` 两个空文件。
-若生成的编号不是 0004,以实际为准 —— **编号取 `ls migrations/idm/ | tail -1` 的下一个,别硬套本文的数字。**
+> ⚠️ **`just migrate-add idm add_tenants` 会生成时间戳前缀**(`20260716064856_add_tenants.up.sql`),
+> 违反本仓四个 schema 目录无一例外的 4 位顺序编号约定。仓库自己的 skill 早就记了这个坑:
+> `.claude/skills/adding-a-feature/SKILL.md:41` —— *"just migrate-add makes a timestamp prefix"
+> → "Hand-write `000N_create_<name>s.{up,down}.sql` to keep the sequential 000N convention"*。
+>
+> **这不是洁癖,是地雷**:时间戳一旦被应用进 `_sqlx_migrations`,将来任何人正常建的
+> `0005_xxx`(version `5`)版本号都**低于**已应用的 `20260716064856` → 撞 sqlx 的乱序守卫,
+> 把下一个迁移任务直接卡死。
+>
+> 编号取 `ls migrations/idm/ | tail -1` 的下一个,**别硬套本文的数字**。
 
 - [ ] **Step 2: 写 up 迁移**
 

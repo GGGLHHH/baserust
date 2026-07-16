@@ -165,6 +165,11 @@ create table user_active_tenant (
 
 **编号是 0005,不是 0004** —— `migrations/app/0004_create_outbox` 已占用。新迁移编号一律取 `ls migrations/<schema>/ | tail -1` 的下一个,**别照抄本文的数字**。两个 schema 的编号各自独立,不要求对齐。
 
+> ⚠️ **手写文件名,不要用 `just migrate-add`** —— 它生成时间戳前缀,违反本仓的 4 位顺序编号约定
+> (`.claude/skills/adding-a-feature/SKILL.md:41` 已记录此坑)。时间戳一旦应用进 `_sqlx_migrations`,
+> 后续正常建的顺序编号迁移版本号会**低于**它 → 撞 sqlx 乱序守卫,卡死下一个迁移。
+> P1 实施时真踩到了这个坑,已修。
+
 ```sql
 -- migrations/app/0005_widgets_tenant.up.sql —— 只加列,可空、无 default
 alter table widgets add column tenant_id uuid;
