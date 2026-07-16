@@ -142,8 +142,9 @@ create table tenant_members (
   user_id    uuid not null references users(id) on delete cascade,
   tenant_id  uuid not null references tenants(id),
   role       text not null,                -- 'admin' | 'member';与 RoleName::TenantAdmin/TenantMember 同源,见 §4.2
+  seq        uuid not null,                -- Uuid::now_v7();**排序键**,见下
   granted_by text,
-  granted_at timestamptz not null default now(),
+  granted_at timestamptz not null default now(),  -- 审计:何时加入。**不是排序键**
   primary key (user_id, tenant_id)         -- ← R2 的全部代价,就是这一维
 );
 -- role 取值约束:DB 侧 check + 应用侧 TenantRole enum 双保险(§4.2)
@@ -158,8 +159,30 @@ create table user_active_tenant (
 ```
 
 对照 `idm.user_roles primary key (user_id, role_id)`(`rust-idm/migrations/0002_add_roles.up.sql:24-30`)—— 少的就是 `tenant_id`。`tenant_members` 把它补回来,**补在 baserust 自己的 migration 里,不动上游**。
+(注:baserust 的 `migrations/idm/0001-0003` 是从 rust-idm 逐份拷来的;**0004 是本仓自有、不回填上游** —— 这条隐含约定自此分叉,迁移文件里已写明。)
 
 三张表同 schema、同 role、同 pool → `TenantRepo` 内部 join 合法,**不违反禁跨 schema join**。
+
+> ⚠️ **`seq` 是排序键,`granted_at` 只是审计时间戳 —— 两个职责刻意分离。**
+> 别拿 `granted_at` 排序:它是墙钟,既会被 NTP 回拨、也可能在同一微秒内打平,而这个顺序决定
+> §4.1 的 `.or(ms.first())` 回退目标,即**用户默认落进哪家公司**。`seq` 是应用侧
+> `Uuid::now_v7()`,照搬 `widgets.id` 的既有范式(`widget/repo/postgres.rs` 注释原文:
+> 「v7 单列严格全序」),uuid crate 保证同进程内按创建序单调 —— 不打平、不受 NTP 影响。
+> `upsert_member` 改角色时 **`seq` / `granted_at` / `granted_by` 三者全冻结**:它们共同描述
+> 「何时、被谁加进来」这一次事件,改角色不让它重新发生。
+>
+> **本表的时间戳用裸 `now()`,不用全仓其他迁移的 `(now() at time zone 'utc')`** —— 后者是双重
+> 转换(timestamptz → naive → 按 session TimeZone 解释回来),而 timestamptz 本就与时区无关。
+>
+> **但它在本仓不是 bug**:sqlx 在每条连接的 startup packet 里无条件硬编码 `TimeZone=UTC`
+> (`sqlx-postgres/src/connection/establish.rs:33`),该 packet 是 `PGC_S_CLIENT`,优先级压过
+> `ALTER ROLE SET` 与 `postgresql.conf`。app / seed / migrate / 测试全经 sqlx ⇒ 老写法恒等于 `now()`。
+> 实测(同一时刻,`alter role idm set timezone='Asia/Shanghai'` 之下):
+> `psql: TimeZone=Asia/Shanghai, source=user, 偏移 8:00:00` vs `sqlx: TimeZone=UTC, source=client, 偏移 0`。
+>
+> 裸 `now()` 只是少绕一圈 + 不把正确性押在「写入方恰好是 sqlx」上(非 sqlx 的写入方 —— 手工 psql
+> 运维、外部 ETL、换驱动 —— 会真的偏 8 小时)。**其余 11 个迁移的老写法是可读性债,不是正确性
+> bug,该单独 cleanup、不必急。**
 
 ### 3.2 app schema
 
@@ -258,14 +281,16 @@ update app.widgets set tenant_id = '<seed.toml 里 [[tenants]] 声明的那个 i
 impl idm::RoleRepo for TenantRoleRepo {
     async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
         let mut roles = self.inner.roles_for_user(user_id).await?;   // 平台角色
+        // 一次读拿全:有效成员资格 + 哪条是激活的(is_active)。**不是两次独立查** ——
+        // 那样每次铸币多一次往返,且两次读非同一快照(并发 set_active 会读到不一致的组合)。
         let ms = self.tenants.memberships(user_id).await?;           // 已过滤停用/软删租户,见 §4.4
-        let active = self.tenants.active(user_id).await?;
-        // active 指向已撤销的成员资格 → find 落空 → 回退最早加入的租户。
+        // 「active 未设」与「active 指向已失效租户」坍缩成同一结果(没有任何 is_active),
+        // 两者的处理本就相同:回退到最早加入的那个(ms 按 seq 升序)。
         // 成员被踢 / 租户被停用,下次 refresh 自动掉出。
         // 0 租户(register 的常规出口,见 §1.1)→ 不 push 任何东西 → claim 无 tenant。
-        if let Some(m) = active.and_then(|t| ms.iter().find(|m| m.tenant_id == t)).or(ms.first()) {
+        if let Some(m) = ms.iter().find(|m| m.is_active).or(ms.first()) {
             roles.push(format!("t:{}", m.tenant_id));       // 哨兵,由 split_tenant 解回
-            roles.push(m.role.wire().to_string());          // "tn:admin" / "tn:member",见 §4.2
+            roles.push(m.role.claim().to_string());         // "tn:admin" / "tn:member",见 §4.2
         }
         Ok(roles)
     }
@@ -319,19 +344,24 @@ pub fn mint_scoped(user_id: Uuid, username: &str, roles: Vec<String>,
 **停用/软删租户必须真的切断访问。** `memberships` 是 `base_select()` 的同位物,把过滤写死在契约里:
 
 ```rust
-/// 该用户的全部**有效**成员资格。
+/// 该用户的全部**有效**成员资格,含「哪条是当前激活的」(`Membership::is_active`)。
 /// 恒 join tenants 并过滤 `t.deleted_at is null and t.status = 'active'` ——
 /// 三张表同 schema,内部 join 合法(§3.1)。
 /// 这样"停用租户"复用「成员被踢,下次 refresh 自动掉出」的同一机制:
 /// ≤ IDM_ACCESS_TTL_SECS 内自动失效,无需撤销名单。
+/// 顺序:按 `seq` 升序(最早加入的在前)—— §4.1 的 `.or(ms.first())` 回退依赖它。
 async fn memberships(&self, user_id: Uuid) -> Result<Vec<Membership>, AppError>;
 ```
 
-`active(user_id)` **不同**:它只读 `user_active_tenant` 的原始值,不做任何过滤 —— 调用方
-可能已经不是该租户的有效成员。真正的过滤发生在调用方,由 §4.1 的组合逻辑
-`active.and_then(|t| ms.iter().find(..)).or(ms.first())` 在已被 `memberships` 过滤过的
-列表上再筛一遍完成。§8 加用例:停用租户后 refresh → 该 tenant 不再进 claim(若是唯一租户则
-进 §1.1 的 0 租户态)。
+**`active` 刻意不是独立方法。** 它由同一条查询 `left join user_active_tenant` 算成每条的
+`is_active`。理由:两个已知消费方(§4.1 铸币、§4.9 租户列表)都同时要「成员资格 + 谁激活」,
+**从没有单独查 active 的场景** —— 拆开只会让每次铸币多一次往返,且两次读非同一快照
+(并发 set_active 时铸币路径会读到不一致的组合)。
+
+「active 未设」与「active 指向一个已失效(停用/软删/已退出)的租户」**刻意坍缩**成同一结果:
+没有任何一条 `is_active = true`。§4.1 的回退逻辑对两者处理本就相同(都退到 `.first()`)。
+
+§8 加用例:停用租户后 refresh → 该 tenant 不再进 claim(若是唯一租户则进 §1.1 的 0 租户态)。
 
 ### 4.5 两级角色:命名空间隔离 + `RoleName::ALL` 一拆为二 ⚠️
 
@@ -375,13 +405,20 @@ pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, Ro
 加变体的四个连带,一个都不能漏:
 
 1. `ALL` 是**定长数组** `[RoleName; 3]`(注释自己写着"漏了没有任何东西会发现")→ 改 `[RoleName; 5]`
-2. `as_str()` 必须返回 `"tn:admin"` / `"tn:member"` —— 与 §4.1 的 `m.role.wire()` **同源,这是等式不是巧合**
+2. `as_str()` 必须返回 `"tn:admin"` / `"tn:member"` —— 与 §4.1 的 `m.role.claim()` **同源,这是等式不是巧合**
+   (P1 里那个方法**刻意不叫 `wire()`**:本仓 `Perm::wire()` 的既有语义是「与 serde 输出逐字相等」
+   且有测试钉住,而 `TenantRole` 的 claim 串恰恰**不**等于它的 serde 输出(`admin`),同名会误导)
 3. `seed.rs:140` 的循环改 `for r in RoleName::PLATFORM`
 4. `users` 模块的 `list_roles` / `set_user_roles` 入参校验同样只认 `PLATFORM`
 
 `default_permissions()` 给 `tn:*` 的权限里**绝不含任何平台级 perm**(尤其 `users:admin` / `admin:login`)。
 
-**测试断言(必须有)**:`list_roles()` 的返回集 ∩ `{TenantAdmin, TenantMember}` = ∅。
+**测试断言(P2 必须有,两条)**:
+
+1. `list_roles()` 的返回集 ∩ `{TenantAdmin, TenantMember}` = ∅ —— 提权闸。
+2. `TenantRole::Admin.claim() == RoleName::TenantAdmin.as_str()`(Member 同)—— **P1 钉不住这条**:
+   等式的另一端此刻还不存在,`claim()` 也零调用方,所以 `"tn:admin"` 里一个拼写错误会一路静默到
+   P2 接线才炸。P1 只能把它记在这里(实施者会逐条过的清单),rustdoc 里的 TODO 没人跑。
 
 ### 4.6 角色定义保持全局(Clerk 模型)
 
