@@ -55,6 +55,18 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "my_widget_count",
         perm: PermReq::LoginOnly,
     },
+    // 租户切换(spec §4.9):**仅登录,不设专门的 perm** —— 授权靠成员资格本身,
+    // 不是靠角色:能不能列出/切进某租户,取决于你是不是它的成员(`TenantRepo::membership`),
+    // 而那是数据事实、不是 RBAC 判定。给它发一个 `tenants:switch` 之类的 perm 反而会造出
+    // 「有 perm 但不是成员」的荒谬状态。非成员 → 404(不是 403,不泄露该租户存在)。
+    OpAuthz {
+        operation_id: "list_my_tenants",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "put_active_tenant",
+        perm: PermReq::LoginOnly,
+    },
     // superadmin-only:gate 一个只 superadmin 持有的 perm(users:admin)
     OpAuthz {
         operation_id: "admin_list_widgets",

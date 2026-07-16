@@ -13,13 +13,14 @@ use uuid::Uuid;
 
 use super::emit::{emit_auth_event, failure_data, success_data};
 use super::types::{
-    ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
-    UserResponse,
+    ChangePasswordRequest, DeleteMeRequest, LoginRequest, MyTenantResponse, RegisterRequest,
+    SetActiveTenantRequest, UpdateMeRequest, UserResponse,
 };
 use crate::app::state::AppState;
 use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
+use crate::features::tenants::TenantRepo;
 use crate::infra::audit::{AuditContext, CurrentUser};
-use crate::infra::authz::Perm;
+use crate::infra::authz::{Perm, Tenant};
 use crate::infra::client_context::ClientContext;
 use crate::infra::error::{AppError, ErrorBody};
 use crate::infra::extract::Json;
@@ -449,4 +450,161 @@ pub async fn admin_get_me(
 ) -> Result<Json<UserResponse>, AppError> {
     let view = state.auth.me(user.0.id).await?;
     Ok(Json(view.into()))
+}
+
+// ── 租户切换(spec §4.9)──
+//
+// ⚠️ **这两个端点必须挂 `/auth/` 前缀**,不是直觉上的 `/frontend/tenants`。
+// `deploy/nginx.conf` 的 `^/api/v1/(public|frontend|admin)/auth/` 是唯一把请求分流进 idm
+// 进程的规则 —— 只有那里读得到 `tenant_members`、也只有那里握着签名私钥。路由到 app 进程
+// 则一签名就 panic(`NoopSigner`)。它们写在本文件而非新模块,是因为 `set_auth_cookies`
+// 是模块私有 fn;而且切租户本就是认证域的动作(它改的是铸币的输入)。
+
+/// 取本进程的租户仓储。`Mount::App` 恒 `None`(见 `AppState::tenants` 的 doc)——
+/// 但这两个端点只挂 needs_idm 组,走到这就是 wiring bug,故 500 而非静默空列表。
+fn tenants_of(state: &AppState) -> Result<&std::sync::Arc<dyn TenantRepo>, AppError> {
+    state.tenants.as_ref().ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "租户端点挂到了没有 idm_pool 的进程上 —— 它们必须只挂 needs_idm 组(spec §2.3)"
+        ))
+    })
+}
+
+#[utoipa::path(
+    get, path = "/auth/tenants", tag = "me",
+    responses(
+        (status = 200, description = "我的租户列表(按加入顺序)", body = Vec<MyTenantResponse>),
+        (status = 401, body = ErrorBody),
+    )
+)]
+pub async fn list_my_tenants(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    // `Option<Tenant>` 而非裸 `Tenant`:**0 租户该返回空数组,不是 401**
+    // (register 的常规出口,spec §1.1 —— 前端据此渲染「你还没有租户」)。
+    tenant: Option<Tenant>,
+) -> Result<Json<Vec<MyTenantResponse>>, AppError> {
+    // memberships 已过滤停用/软删租户(TenantRepo 契约,spec §4.4)、按 seq 升序(最早加入在前)。
+    let items = tenants_of(&state)?.memberships(user.0.id).await?;
+
+    // ⚠️ **`is_active` 以 claim 为准,不用 `Membership::is_active`** —— 两者不是一回事:
+    // - `Membership::is_active` = `user_active_tenant` 里**显式设过**的那个;
+    // - claim 的 tenant = 本会话**实际生效**的那个,可能来自回退(`.or(ms.first())`,spec §4.1)。
+    //
+    // 从没切过的用户(**每个人的初始状态**)`user_active_tenant` 是空的 ⇒ 直接用
+    // `Membership::is_active` 会让整个列表全是 false,而他的 token 明明落在某个租户里 ——
+    // 前端渲染成「一个都没选中」。前端要的是「我现在在哪」,那只有 claim 知道。
+    let active = tenant.map(|t| t.0.get());
+    let items = items
+        .into_iter()
+        .map(|m| {
+            let is_active = Some(m.tenant_id) == active;
+            MyTenantResponse {
+                is_active,
+                ..m.into()
+            }
+        })
+        .collect();
+    Ok(Json(items))
+}
+
+#[utoipa::path(
+    put, path = "/auth/active-tenant", tag = "me",
+    request_body = SetActiveTenantRequest,
+    responses(
+        (status = 200, description = "切换成功,**新 token 已写入 cookie**", body = UserResponse),
+        (status = 401, description = "未登录 / refresh cookie 无效", body = ErrorBody),
+        (status = 404, description = "非本人成员(**不是 403** —— 不泄露该租户是否存在)", body = ErrorBody),
+    )
+)]
+pub async fn put_active_tenant(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    user: CurrentUser,
+    // 审计的 `from_tenant` 用它。`Option`:0 租户的用户也能切(被邀请后的第一次),此时确实没有「从」。
+    from: Option<Tenant>,
+    jar: CookieJar,
+    Json(req): Json<SetActiveTenantRequest>,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    req.validate()?;
+    let tenants = tenants_of(&state)?;
+
+    // ── 1. **副作用前置检查**:refresh cookie 必须在 set_active **之前**取。 ──
+    // 反了的话会出现「active 已改、token 没换」的不一致:用户下次刷新才切过去,
+    // 而本次响应还是旧租户 —— 一个没人能解释的中间态。
+    let refresh = jar
+        .get(REFRESH_COOKIE)
+        .map(|c| c.value().to_owned())
+        .ok_or(AppError::Unauthorized)?;
+
+    // ── 2. 安全支点:membership 校验。 ──
+    // **客户端说的 tenant 只是一个「请求」,不是断言** —— 它只到达签发方(本进程)且必须
+    // 过这一关;资源 API 永远只读已签名的 claim,绝不从 header/query/body 读 active tenant。
+    // 非成员 → 404(不是 403):403 等于承认「这个租户存在,只是你不在里面」。
+    // membership 同样过滤停用/软删租户,所以「租户被停用」与「你不是成员」对外同样是 404。
+    if tenants
+        .membership(user.0.id, req.tenant_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+
+    // ── 3. 改状态。 ──
+    // 租户选择必须状态化:idm 的 `roles_for_user` 只收 user_id,收不到「哪个租户」,
+    // per-request 的选择不可能在 idm 内部发生(spec §4.1)。
+    tenants.set_active(user.0.id, req.tenant_id).await?;
+
+    // ── 4. 重新铸币 —— 这是 idm 唯一公开的「重新发 token」API(issue_session 是私有的)。 ──
+    // refresh() 会:撤旧 session → 建新 session(**新 jti**)→ 重跑 TenantRoleRepo::roles_for_user
+    // (此时读到的 active 已是新租户)→ 拿新租户的角色 → 重签 access(带新 tenant claim)+ 新 refresh。
+    // 失败(refresh 过期)→ 401 → 前端重新登录;但 active 已改,重登即落新租户(状态化的意外好处)。
+    let outcome = state.auth.refresh(&refresh).await?;
+
+    // ⚠️ **必须用 `success_data` 组 payload,别手搓 json!** —— 投影器的 `AuthEventData`
+    // 要求 `occurred_at` / `channel` / `outcome` 等字段,缺一个就整条被当**毒消息 ack 丢弃**
+    // (`projector 跳过不可投的毒消息`),事件进得了 outbox 却永远进不了 `auth_events` 读模型
+    // ⇒ 后台审计界面看不到它,而且**没有任何测试会红**。这是本仓所有 auth 事件的统一口径。
+    // channel 用 Public:与同在 `/frontend/auth/` 下的 `logout_all` 一致(闭集只有 Public/Admin)。
+    let mut data = success_data(
+        &ctx,
+        AuthChannel::Public,
+        outcome.user.id,
+        Some(outcome.session_id),
+        Some(&outcome.user.username),
+    );
+    // 租户专属字段合并进 payload。
+    //
+    // ⚠️ **`from_tenant` 取 claim(`Option<Tenant>`),不查 `Membership::is_active`** —— 同
+    // `list_my_tenants` 的口径,理由也同:`user_active_tenant` 里显式设过的那个 ≠ 本会话实际
+    // 生效的那个(后者可能来自 `.or(ms.first())` 回退)。从没切过的用户 —— **每个人的初始
+    // 状态** —— 查库会得到 null,于是审计记成「从 null 切到 Globex」,而真相是「从 Acme 切到
+    // Globex」。这条事件的全部价值就是 from→to,记错等于没记。顺带省掉一次库往返。
+    // 真 null 只剩一种:0 租户的用户被邀请后第一次切进来 —— 那时确实没有「从」。
+    //
+    // ponytail: **这两个字段目前只到 outbox,进不了 `auth_event` 读模型** —— 后者是固定 schema
+    // (无 raw/JSON 列),投影器只映射它认识的列,额外字段静默丢弃。⇒ 后台审计现在只看得到
+    // 「某人在某时切了租户」,看不到「从哪切到哪」,而那正是这个事件的价值所在。
+    // 补法有先例:`identifier_attempted`/`failure_reason` 就是事件类型专属列(对其他事件恒 NULL)——
+    // 照它加 `from_tenant`/`to_tenant` 两列,要动 8 个文件(migration + projector + 两个 repo +
+    // types + API DTO + 测试)。见 spec §4.9 的收尾项。
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "from_tenant".into(),
+            serde_json::json!(from.map(|t| t.0.get())),
+        );
+        obj.insert("to_tenant".into(), serde_json::json!(req.tenant_id));
+    }
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::TenantSwitched,
+        outcome.user.id,
+        data,
+    )
+    .await;
+
+    // ── 5. **refresh cookie 必须整条轮换** ——旧 refresh 一次性、已被 idm 撤销,
+    //    前端留着下次必 401。 ──
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user.into())))
 }

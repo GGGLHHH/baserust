@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::features::tenants::{Membership, TenantRole};
 use crate::infra::authz::RoleName;
 
 /// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。
@@ -68,6 +69,41 @@ pub struct UserResponse {
     pub email_verified: bool,
     /// 角色名(闭集,生成前端 union)。
     pub roles: Vec<RoleName>,
+}
+
+/// 我的一个租户(`GET /auth/tenants` 的一行)。
+///
+/// `name` 是机器码 slug(与 `idm.tenants.name` 同名,**不叫 slug**);`role` 是 DB 裸值
+/// (`admin`/`member`),**不是** JWT claim 里那个带 `tn:` 前缀的串 —— 见 `TenantRole::claim`。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MyTenantResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
+    /// 我在这个租户里的角色(闭集,生成前端 union)。
+    pub role: TenantRole,
+    /// 是不是当前激活的那个。
+    pub is_active: bool,
+}
+
+impl From<Membership> for MyTenantResponse {
+    fn from(m: Membership) -> Self {
+        Self {
+            id: m.tenant_id,
+            name: m.name,
+            display_name: m.display_name,
+            role: m.role,
+            is_active: m.is_active,
+        }
+    }
+}
+
+/// 切换激活租户(`PUT /auth/active-tenant`)。**PUT 全量替换**,不是 PATCH。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct SetActiveTenantRequest {
+    /// 目标租户。**非本人成员 → 404**(不是 403 —— 不泄露该租户是否存在)。
+    #[garde(skip)]
+    pub tenant_id: Uuid,
 }
 
 // ── 边界转换:app DTO ↔ idm 领域类型 ──

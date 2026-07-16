@@ -467,7 +467,10 @@ pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, Ro
 4. `tenants.set_active(user.id, tenant_id)` upsert `user_active_tenant`
 5. `state.auth.refresh(&refresh)`:idm 撤旧 session → 建新 session(**新 jti**)→ 重跑 `TenantRoleRepo::roles_for_user` → 拿新租户角色 → 重签 access(带新 tenant claim)+ **新 refresh**
 6. `set_auth_cookies(jar, &outcome, state.cookie_secure)` —— **refresh cookie 必须整条轮换**,旧 refresh 一次性、已被 revoke
-7. `emit(&state.idm_outbox, AuthEventType::TenantSwitched, ...)` —— payload 带 `from_tenant` / `to_tenant` / `user_id` / 新 `session_id`,照 `success_data` 的形状。
+7. `emit(&state.idm_outbox, AuthEventType::TenantSwitched, ...)` —— **必须用 `success_data(..)` 组 payload 再合并租户字段,别手搓 `json!`**:投影器的 `AuthEventData` 要求 `occurred_at`/`channel`/`outcome`,缺一个整条被当**毒消息 ack 丢弃**(事件进得了 outbox 却永不进 `auth_events` 读模型,且**没有任何测试会红** —— P2 实施时真踩到了,是冒烟的日志抓的)。
+   >
+   > ⚠️ **未完:`from_tenant`/`to_tenant` 目前只到 outbox,进不了读模型。** `auth_event` 表是固定 schema(无 raw/JSON 列),投影器只映射它认识的列,额外字段静默丢弃 ⇒ 后台审计只看得到「某人在某时切了租户」,看不到「从哪切到哪」—— 而那正是这个事件的价值。
+   > 补法有先例:`identifier_attempted`/`failure_reason` 就是事件类型专属列(对其他事件恒 NULL)。照它加两列,要动 8 个文件:`migrations/search/0002_create_auth_event.up.sql`、`auth_audit/projector.rs`、`auth_audit/repo/{memory,postgres}.rs`、`auth_audit/types.rs`、`auth/types.rs`、`auth/emit.rs`、`tests/auth_audit_api.rs`。
    **理由**:auth 模块每条状态变更路径都 emit(`routes.rs` 里 11 个调用点),而"用户跨越组织边界"是审计价值最高的事件之一。`emit.rs:20` 的 `event_type` 是闭集枚举 → 要加一个 `TenantSwitched` 变体
 8. 返回新 `AuthResponse`
 

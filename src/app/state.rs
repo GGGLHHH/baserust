@@ -80,6 +80,10 @@ pub struct AppState {
     pub token_verifier: Arc<AppTokenVerifier>,
     /// JWT 签发半边(私钥)。**仅 needs_idm 进程 Some**;`Mount::App` = None(app 被攻破铸不出 token)。
     pub token_signer: Option<Arc<AppTokenSigner>>,
+    /// 租户成员资格(idm schema)。**仅 needs_idm 进程 Some** —— 与 `token_signer` 同口径:
+    /// 租户是铸币侧的事,`Mount::App` 没有 idm_pool、auth 路由也不挂,本就够不着。
+    /// 给它一个**空的**内存实现比 None 更坏:误挂到 app 组的租户端点会静默「查无此租户」而不是炸。
+    pub tenants: Option<Arc<dyn TenantRepo>>,
     /// idm.outbox 写句柄(仅 needs_idm 进程 Some):auth handler 发审计事件用(fire-and-forget)。
     pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
     /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
@@ -243,10 +247,16 @@ impl AppState {
         };
         // 租户仓储:三张表同在 **idm schema**(铸 token 的进程只有 idm_pool,见 spec §2.1),
         // 故跟着 idm_pool 二选一 —— 不是跟 app_pool。
-        let tenants: Arc<dyn TenantRepo> = match &idm_pool {
-            Some(pool) => Arc::new(PgTenantRepo::new(pool.clone())),
-            None => Arc::new(InMemoryTenantRepo::new()),
-        };
+        //
+        // ⚠️ **`Mount::App` 必须是 `None`,不能 fallback 到内存** —— 与 `token_signer` 同口径。
+        // 租户是铸币侧的事:app 进程没有 idm_pool、auth 路由也不挂,本就够不着。若给它一个
+        // **空的**内存租户库,任何将来误挂到 app 组的租户端点都会静默返回「查无此租户」
+        // 而不是炸 —— 那是最坏的失败模式(看起来在工作,其实永远查不到)。
+        // 内层的 Some/None 才是「PG 还是内存」:needs_idm 但没配 IDM_DB_HOST = dev 内存模式,合法。
+        let tenants: Option<Arc<dyn TenantRepo>> = needs_idm.then(|| match &idm_pool {
+            Some(pool) => Arc::new(PgTenantRepo::new(pool.clone())) as Arc<dyn TenantRepo>,
+            None => Arc::new(InMemoryTenantRepo::new()) as Arc<dyn TenantRepo>,
+        });
 
         // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
@@ -361,9 +371,14 @@ impl AppState {
         // 前面的 `seed::apply` 都拿**未包装的** `idm_roles`:seed 会把 roles_for_user 的结果与
         // 角色目录比对,哨兵不在目录里 → `bail!("角色 ... 不在角色目录中")` → dev 启动就崩;
         // user_admin 包了则会把哨兵显示给后台。
-        let tenant_roles: Arc<dyn RoleRepo> =
-            Arc::new(TenantRoleRepo::new(idm_roles, tenants.clone()));
-        let auth = AuthService::builder(idm_users, idm_sessions, tenant_roles)
+        //
+        // `Mount::App`(tenants=None)不包:那个进程铸不了币(NoopSigner)、auth 路由也不挂,
+        // 包了只是徒增一层永不生效的装饰。
+        let auth_roles: Arc<dyn RoleRepo> = match &tenants {
+            Some(t) => Arc::new(TenantRoleRepo::new(idm_roles, t.clone())),
+            None => idm_roles,
+        };
+        let auth = AuthService::builder(idm_users, idm_sessions, auth_roles)
             .hasher(Arc::new(Argon2Hasher))
             .signer(signer_port)
             .verifier(token_verifier.clone())
@@ -420,6 +435,7 @@ impl AppState {
                 policy,
                 token_verifier,
                 token_signer,
+                tenants,
                 idm_outbox,
                 auth_audit,
                 auth_events_bus,

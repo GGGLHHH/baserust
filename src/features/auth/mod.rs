@@ -38,6 +38,10 @@ pub fn me_router() -> OpenApiRouter<AppState> {
             routes::delete_me
         ))
         .routes(routes!(routes::change_password))
+        // 租户切换:**必须在 /auth/ 前缀下**(nginx 只把 /{public,frontend,admin}/auth/
+        // 分流进 idm 进程,而只有那里读得到 tenant_members + 握着签名私钥)。见 spec §2.3。
+        .routes(routes!(routes::list_my_tenants))
+        .routes(routes!(routes::put_active_tenant))
 }
 
 /// admin 组闸内:当前管理员。

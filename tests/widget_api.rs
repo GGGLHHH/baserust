@@ -62,6 +62,7 @@ fn test_app() -> (Router, String) {
         policy: Arc::new(test_policy()),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,

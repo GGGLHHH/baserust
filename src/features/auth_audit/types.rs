@@ -37,11 +37,16 @@ pub enum AuthEventType {
     #[serde(rename = "auth.account_deleted")]
     #[sqlx(rename = "auth.account_deleted")]
     AccountDeleted,
+    /// 切换激活租户。**审计价值最高的事件之一** —— 它是用户跨越组织边界的那一刻,
+    /// payload 带 from/to 两个租户(见 `auth/routes.rs` 的 `put_active_tenant`)。
+    #[serde(rename = "auth.tenant_switched")]
+    #[sqlx(rename = "auth.tenant_switched")]
+    TenantSwitched,
 }
 
 impl AuthEventType {
     /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
-    pub const ALL: [AuthEventType; 9] = [
+    pub const ALL: [AuthEventType; 10] = [
         AuthEventType::LoginSucceeded,
         AuthEventType::LoginFailed,
         AuthEventType::AdminAccessDenied,
@@ -51,6 +56,7 @@ impl AuthEventType {
         AuthEventType::PasswordChanged,
         AuthEventType::Registered,
         AuthEventType::AccountDeleted,
+        AuthEventType::TenantSwitched,
     ];
 
     /// 发射到 outbox 的线上串(`idm::OutboxRepo::emit` 只吃 `&str`)。
@@ -65,6 +71,7 @@ impl AuthEventType {
             AuthEventType::PasswordChanged => "auth.password_changed",
             AuthEventType::Registered => "auth.registered",
             AuthEventType::AccountDeleted => "auth.account_deleted",
+            AuthEventType::TenantSwitched => "auth.tenant_switched",
         }
     }
 }

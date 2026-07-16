@@ -99,6 +99,7 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         policy: Arc::new(policy),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
         idm_outbox: None,
         auth_audit: Some(AuthAuditService::new(
             auth_events.clone() as Arc<dyn AuthEventRepo>
@@ -407,6 +408,7 @@ async fn no_auth_events_backend_is_404_not_panic() {
         policy: Arc::new(policy),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,

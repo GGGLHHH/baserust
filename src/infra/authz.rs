@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -595,6 +595,16 @@ impl<S: Send + Sync> FromRequestParts<S> for Tenant {
             .get::<Tenant>()
             .copied()
             .ok_or(AppError::Unauthorized)
+    }
+}
+
+/// `Option<Tenant>`:**允许 0 租户**的端点用(如 `GET /auth/tenants` —— 0 租户该返回空数组
+/// 而不是 401)。碰租户数据的端点用裸 `Tenant`(缺席即 401),别用这个。
+impl<S: Send + Sync> OptionalFromRequestParts<S> for Tenant {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Tenant>().copied())
     }
 }
 

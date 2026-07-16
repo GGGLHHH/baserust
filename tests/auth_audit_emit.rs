@@ -88,6 +88,7 @@ async fn test_app_with_config(
         policy: Arc::new(policy),
         token_signer: Some(signer),
         token_verifier: verifier,
+        tenants: None,
         idm_outbox: Some(outbox.clone() as Arc<dyn OutboxRepo>),
         auth_audit: None,
         auth_events_bus: None,
