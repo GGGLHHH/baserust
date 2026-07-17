@@ -22,6 +22,7 @@
 //! **绝不断言全表 count/total**,且 PG 入口跑完自己 `cleanup`(断言失败时故意不清,留现场)。
 
 use baserust::features::tenants::{Membership, TenantRepo, TenantRole, TenantStatus};
+use baserust::infra::error::AppError;
 use uuid::Uuid;
 
 /// 建租户的 setup helper —— 契约里建 4 个租户,每个 7 行样板不值得手抄 4 遍。
@@ -173,7 +174,87 @@ async fn tenant_repo_contract(repo: &dyn TenantRepo, user_id: Uuid) -> Vec<Uuid>
         "upsert_member 替换角色不得重置 seq(顺序不该因为改角色而翻转)"
     );
 
-    vec![t_alive, t_suspended, t_early, t_late]
+    // ── P6 平台管理 + 成员管理的对拍 ──
+    let t_new = Uuid::now_v7();
+    let new_name = format!("p6-{t_new}");
+
+    // create_tenant:返回整行,status 恒 active
+    let created = repo
+        .create_tenant(t_new, &new_name, "P6 Co", Some("sa".into()))
+        .await
+        .unwrap();
+    assert_eq!(created.id, t_new);
+    assert_eq!(created.name, new_name);
+    assert_eq!(created.status, TenantStatus::Active);
+    assert!(created.updated_at >= created.created_at);
+
+    // **重名 → Conflict(409)**,不是静默改掉已有租户(这是 create 与 upsert 的区别)
+    assert!(
+        matches!(
+            repo.create_tenant(Uuid::now_v7(), &new_name, "Dup", None)
+                .await,
+            Err(AppError::Conflict(_))
+        ),
+        "create_tenant 重名必须 Conflict"
+    );
+
+    // get_tenant:存活 → Some;不存在 → None
+    assert_eq!(repo.get_tenant(t_new).await.unwrap().unwrap().id, t_new);
+    assert_eq!(repo.get_tenant(Uuid::now_v7()).await.unwrap(), None);
+
+    // list_tenants:含 t_new(存活),不含未建的
+    let all = repo.list_tenants().await.unwrap();
+    assert!(all.iter().any(|t| t.id == t_new), "list 必须含新建租户");
+
+    // update_tenant 全量替换 display + status;不存在 → NotFound
+    let updated = repo
+        .update_tenant(
+            t_new,
+            "P6 Renamed",
+            TenantStatus::Suspended,
+            Some("sa".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.display_name, "P6 Renamed");
+    assert_eq!(updated.status, TenantStatus::Suspended);
+    assert_eq!(updated.name, new_name, "name(slug)不可改");
+    assert!(
+        matches!(
+            repo.update_tenant(Uuid::now_v7(), "x", TenantStatus::Active, None)
+                .await,
+            Err(AppError::NotFound)
+        ),
+        "update 不存在的租户 → NotFound"
+    );
+
+    // members_of + remove_member(用 t_alive:user_id 在它里面是 Admin,FK 才成立)
+    let members = repo.members_of(t_alive).await.unwrap();
+    assert_eq!(members.len(), 1, "t_alive 恰有 user_id 一名成员");
+    assert_eq!(members[0].user_id, user_id);
+    // 契约前面已把 user_id 在 t_alive 的角色改成 Member(第 124 行 upsert)——
+    // members_of 必须反映最新角色,不是最初的 Admin。
+    assert_eq!(members[0].role, TenantRole::Member);
+
+    repo.remove_member(user_id, t_alive).await.unwrap();
+    assert!(
+        repo.members_of(t_alive).await.unwrap().is_empty(),
+        "移除后成员列表空"
+    );
+    assert_eq!(
+        repo.membership(user_id, t_alive).await.unwrap(),
+        None,
+        "移除后不再是成员(membership 也查不到)"
+    );
+    assert!(
+        matches!(
+            repo.remove_member(user_id, t_alive).await,
+            Err(AppError::NotFound)
+        ),
+        "移除非成员 → NotFound"
+    );
+
+    vec![t_alive, t_suspended, t_early, t_late, t_new]
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──

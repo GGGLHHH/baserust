@@ -10,7 +10,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::TenantRepo;
-use crate::features::tenants::types::{Membership, TenantRole, TenantStatus};
+use crate::features::tenants::types::{
+    Membership, Tenant, TenantMemberFact, TenantRole, TenantStatus,
+};
 use crate::infra::error::AppError;
 
 /// 只存**本实现的语义需要**的字段。
@@ -27,6 +29,10 @@ struct TenantRow {
     status: TenantStatus,
     created_by: Option<String>,
     deleted_at: Option<OffsetDateTime>,
+    /// P6 的 `Tenant` DTO 要回 created_at/updated_at。PG 侧用 `now()`/触发器,内存用
+    /// `now_utc()` —— conformance 只断言相对关系(updated_at >= created_at),不断绝对值。
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 struct MemberRow {
@@ -105,6 +111,22 @@ impl MemStore {
             is_active: self.active.get(&user_id) == Some(&tenant_id),
         })
     }
+
+    /// 存活租户 → `Tenant` DTO(不含 deleted_at)。软删的返回 None。
+    fn alive_tenant(&self, id: Uuid) -> Option<Tenant> {
+        let t = self.tenants.get(&id)?;
+        if t.deleted_at.is_some() {
+            return None;
+        }
+        Some(Tenant {
+            id,
+            name: t.name.clone(),
+            display_name: t.display_name.clone(),
+            status: t.status,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+        })
+    }
 }
 
 #[async_trait]
@@ -160,6 +182,7 @@ impl TenantRepo for InMemoryTenantRepo {
             Some(t) => t.created_by.clone(),
             None => by,
         };
+        let created_at = existing.map_or_else(OffsetDateTime::now_utc, |t| t.created_at);
         store.tenants.insert(
             id,
             TenantRow {
@@ -168,6 +191,8 @@ impl TenantRepo for InMemoryTenantRepo {
                 status,
                 created_by,
                 deleted_at,
+                created_at,
+                updated_at: OffsetDateTime::now_utc(),
             },
         );
         Ok(())
@@ -197,6 +222,113 @@ impl TenantRepo for InMemoryTenantRepo {
                 granted_at,
             },
         );
+        Ok(())
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<Tenant>, AppError> {
+        let store = self.store.lock().expect("锁未中毒");
+        let mut rows: Vec<(OffsetDateTime, Tenant)> = store
+            .tenants
+            .keys()
+            .filter_map(|id| store.alive_tenant(*id))
+            .map(|t| (t.created_at, t))
+            .collect();
+        // created_at desc(镜像 PG 的 order by created_at desc)。now_utc() 同毫秒可能打平,
+        // 用 id 兜底定序(HashMap 迭代无序,否则同刻建的两个租户列表顺序会飘)。
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+        Ok(rows.into_iter().map(|(_, t)| t).collect())
+    }
+
+    async fn get_tenant(&self, id: Uuid) -> Result<Option<Tenant>, AppError> {
+        Ok(self.store.lock().expect("锁未中毒").alive_tenant(id))
+    }
+
+    async fn create_tenant(
+        &self,
+        id: Uuid,
+        name: &str,
+        display_name: &str,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError> {
+        let mut store = self.store.lock().expect("锁未中毒");
+        // 存活行内 name 唯一(镜像 PG 的 tenants_name_alive_uidx)→ 重名 Conflict(409)。
+        // 这是端口契约的一部分(create 与 upsert 的区别就在这),故内存也必须查 —— 不是
+        // trait 头「已知分歧」里那种「只 PG 强制」的约束。
+        if store
+            .tenants
+            .values()
+            .any(|t| t.deleted_at.is_none() && t.name == name)
+        {
+            return Err(AppError::Conflict("tenant name already exists".to_owned()));
+        }
+        let now = OffsetDateTime::now_utc();
+        store.tenants.insert(
+            id,
+            TenantRow {
+                name: name.to_string(),
+                display_name: display_name.to_string(),
+                status: TenantStatus::Active, // 建时恒 active(镜像 PG)
+                created_by: by,
+                deleted_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        Ok(store.alive_tenant(id).expect("刚插入的存活租户"))
+    }
+
+    async fn update_tenant(
+        &self,
+        id: Uuid,
+        display_name: &str,
+        status: TenantStatus,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError> {
+        let mut store = self.store.lock().expect("锁未中毒");
+        // 只动存活行(镜像 PG 的 where deleted_at is null);不存在/已软删 → NotFound。
+        match store.tenants.get_mut(&id) {
+            Some(t) if t.deleted_at.is_none() => {
+                t.display_name = display_name.to_string();
+                t.status = status;
+                let _ = by; // updated_by 内存不存,理由见 TenantRow 的 doc(PG 侧照写)
+                t.updated_at = OffsetDateTime::now_utc();
+            }
+            _ => return Err(AppError::NotFound),
+        }
+        Ok(store.alive_tenant(id).expect("刚更新的存活租户"))
+    }
+
+    async fn members_of(&self, tenant_id: Uuid) -> Result<Vec<TenantMemberFact>, AppError> {
+        let store = self.store.lock().expect("锁未中毒");
+        let mut rows: Vec<(Uuid, TenantMemberFact)> = store
+            .members
+            .iter()
+            .filter(|((_, t), _)| *t == tenant_id)
+            .map(|((u, _), m)| {
+                (
+                    m.seq,
+                    TenantMemberFact {
+                        user_id: *u,
+                        role: m.role,
+                        granted_at: m.granted_at,
+                    },
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0)); // seq 升序(镜像 PG 的 order by seq)
+        Ok(rows.into_iter().map(|(_, m)| m).collect())
+    }
+
+    async fn remove_member(&self, user_id: Uuid, tenant_id: Uuid) -> Result<(), AppError> {
+        let removed = self
+            .store
+            .lock()
+            .expect("锁未中毒")
+            .members
+            .remove(&(user_id, tenant_id));
+        if removed.is_none() {
+            return Err(AppError::NotFound); // 不是成员 → NotFound(镜像 PG 的 rows_affected == 0)
+        }
         Ok(())
     }
 }

@@ -5,17 +5,16 @@
 //! `auth_audit/types.rs` 的既有范式)—— sqlx 直接 Encode/Decode,`.bind(role)` 即可,
 //! 不用手写 as_db/parse_db,坏值自动经 sqlx 的 decode 错误 fail-closed。
 
+use garde::Validate;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// 租户状态。DB 侧有 `tenants_status_ck` check 约束双保险。
 ///
-/// **只 `Deserialize`,没有 `Serialize`/`ToSchema`**:spec §4.9 的 `GET /auth/tenants`
-/// 返回 `{id, name, display_name, role, is_active}`,不带 status,`Membership` 也不带它 ——
-/// 那两个派生目前没有消费方。`Deserialize` 是挣来的:spec §9 的 `seed.toml` 要解析
-/// `status = "active"`。等真有端点要序列化它再挣回来。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, sqlx::Type)]
+/// P6 的租户管理端点(`GET /admin/auth/tenants` 列表、`PUT` 改状态)要序列化/接收它,
+/// 故挣回了 `Serialize`/`ToSchema`(闭集枚举 → 前端生成 union,不漂成 string)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text")]
 pub enum TenantStatus {
@@ -62,6 +61,84 @@ pub struct Membership {
     pub is_active: bool,
 }
 
-// 刻意**没有** `Tenant` 实体 struct:P1 没有任何方法返回一整个租户
-// (`upsert_tenant` 收散参,`memberships` 返回 `Membership`)。
-// 等 P2 的 `GET /auth/tenants` 或租户管理端点真要它时再加。
+/// 一整个租户(P6 的平台管理端点 `GET/POST/PUT /admin/auth/tenants` 用)。
+///
+/// **不含 `deleted_at`**:DTO 从不暴露软删标记(同 widget 的 `Widget`)。列表只回存活行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema, sqlx::FromRow)]
+pub struct Tenant {
+    pub id: Uuid,
+    /// 机器码 slug(`acme`)。**唯一**(存活行内),代码/引用用。
+    pub name: String,
+    /// 展示名(`Acme 公司`)。UI 用,可改。
+    pub display_name: String,
+    pub status: TenantStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+}
+
+/// 成员资格**原始事实**(repo 层返回)。**没有 username** —— 那是 `users` 表的字段,
+/// 而 `users` 归 idm,内存 repo 根本没有它。username 由 `TenantAdminService` 富化上去
+/// (照 widget 富化 created_by 的 `cross-module-enrichment` 范式:repo 出事实,组合侧补展示)。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct TenantMemberFact {
+    pub user_id: Uuid,
+    pub role: TenantRole,
+    #[allow(dead_code)] // 富化时透传给 TenantMember;直接字段读发生在 service
+    pub granted_at: time::OffsetDateTime,
+}
+
+/// 一个租户的一名成员(P6 的成员管理端点 `GET /.../members` 的一行)。
+///
+/// 与 `Membership` 相反的视角:`Membership` 是「某用户在**哪些**租户」(用户视角),
+/// 这个是「某租户里有**哪些**成员」(租户视角)。`username` 由 service 从 idm 富化。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct TenantMember {
+    pub user_id: Uuid,
+    pub username: String,
+    pub role: TenantRole,
+    #[serde(with = "time::serde::rfc3339")]
+    pub granted_at: time::OffsetDateTime,
+}
+
+// ── 请求 DTO(入参:Deserialize + ToSchema + Validate)──
+
+/// 平台开通一个租户(`POST /admin/auth/tenants`)。可选带一个初始管理员。
+///
+/// **PUT/POST 全量**:name 是机器码 slug(建后不改,像 username);display_name 可后续 PUT 改。
+/// `admin_identifier` 给了就把该已有用户设为这个租户的第一个 `tn:admin` —— 平台开通即交钥匙,
+/// 之后由租户管理员自助邀请其余人(spec §7:平台开通 + 租户内部邀请)。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct CreateTenantRequest {
+    #[garde(length(min = 2, max = 64))]
+    pub name: String,
+    #[garde(length(min = 1, max = 128))]
+    pub display_name: String,
+    /// 初始管理员的 username 或 email(必须是已有账号)。不给 = 建空租户。
+    #[garde(inner(length(min = 1, max = 320)))]
+    pub admin_identifier: Option<String>,
+}
+
+/// 全量更新一个租户(`PUT /admin/auth/tenants/{id}`)。**PUT 全量替换,不是 PATCH**:
+/// display_name 与 status 都必传(status 用它来停用/恢复)。name(slug)刻意不可改。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct UpdateTenantRequest {
+    #[garde(length(min = 1, max = 128))]
+    pub display_name: String,
+    #[garde(skip)]
+    pub status: TenantStatus,
+}
+
+/// 邀请一名成员进租户(`POST /admin/auth/tenants/{id}/members` 或自助
+/// `POST /frontend/auth/tenants/members`)。`identifier` = 已有账号的 username/email。
+///
+/// **被邀请者必须先有账号**:0 租户是常规状态(register 的常规出口,spec §1.1)——
+/// 人先注册、再被邀请进公司。查无此人 → 404。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct AddMemberRequest {
+    #[garde(length(min = 1, max = 320))]
+    pub identifier: String,
+    #[garde(skip)]
+    pub role: TenantRole,
+}

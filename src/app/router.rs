@@ -27,7 +27,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{auth, auth_audit, content, profile, users, widget};
+use crate::features::{auth, auth_audit, content, profile, tenants, users, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::error::{ErrorBody, ErrorCode};
@@ -74,12 +74,16 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     if needs_idm {
         public = public.merge(auth::public_router());
         frontend = frontend.merge(auth::me_router());
+        // 租户内成员管理(自助,/frontend/auth/tenants/members)。租户数据在 idm schema,
+        // 故与 auth 一样只在 needs_idm 挂、路径带 /auth/ 前缀(nginx 分流到 idm 进程)。
+        frontend = frontend.merge(tenants::frontend_router());
         // 后台资料/头像端点写 app schema(profiles/contents):只在同进程也连了 app 侧
         // (Mount::Both)时挂 —— 纯 idm 进程的 profiles/contents 是内存占位 repo,挂上去
         // 写操作会 200 却静默丢失、重启蒸发(fail-closed:不挂 → 404,镜像 auth_audit 未接线范式)。
         // ponytail: 分进程拓扑要启用它,需给 idm 进程连 app 库,或把路径挪出 /admin/auth 前缀归 app 进程。
         let mut auth_admin = OpenApiRouter::new()
             .merge(users::admin_router())
+            .merge(tenants::admin_router())
             .merge(auth_audit::admin_router());
         if needs_app {
             auth_admin = auth_admin.merge(profile::admin_router());
@@ -221,7 +225,8 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                         .merge(content::router())
                         .merge(profile::router())
                         .merge(crate::infra::authz::router())
-                        .merge(auth::me_router()),
+                        .merge(auth::me_router())
+                        .merge(tenants::frontend_router()),
                 )
                 .nest(
                     "/admin",
@@ -232,6 +237,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                             "/auth",
                             OpenApiRouter::new()
                                 .merge(users::admin_router())
+                                .merge(tenants::admin_router())
                                 .merge(profile::admin_router())
                                 .merge(auth_audit::admin_router()),
                         )

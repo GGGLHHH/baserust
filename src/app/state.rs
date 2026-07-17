@@ -85,6 +85,9 @@ pub struct AppState {
     /// `Mount::App` 没有 idm_pool、auth 路由也不挂,本就够不着。
     /// 给它一个**空的**实现比 None 更坏:误挂到 app 组的租户端点会静默「查无此租户」而不是炸。
     pub tenants: Option<Arc<dyn TenantDirectory>>,
+    /// 租户管理服务(P6:平台开通 + 租户内成员管理)。**仅 needs_idm 进程 Some** ——
+    /// 同 `tenants`:租户/成员/用户数据全在 idm schema。持 TenantRepo + idm UserRepo。
+    pub tenant_admin: Option<crate::features::tenants::TenantAdminService>,
     /// idm.outbox 写句柄(仅 needs_idm 进程 Some):auth handler 发审计事件用(fire-and-forget)。
     pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
     /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
@@ -263,6 +266,11 @@ impl AppState {
         let tenants: Option<Arc<dyn TenantDirectory>> = tenant_repo
             .clone()
             .map(|r| Arc::new(InProcessTenantDirectory::new(r)) as Arc<dyn TenantDirectory>);
+        // 租户管理服务(P6):持 TenantRepo + idm UserRepo(解析邀请、富化 username)。
+        // 只在 needs_idm(tenant_repo Some)时装 —— 与切换端点同口径。
+        let tenant_admin = tenant_repo
+            .clone()
+            .map(|r| crate::features::tenants::TenantAdminService::new(r, idm_users.clone()));
 
         // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
@@ -444,6 +452,7 @@ impl AppState {
                 token_verifier,
                 token_signer,
                 tenants,
+                tenant_admin,
                 idm_outbox,
                 auth_audit,
                 auth_events_bus,

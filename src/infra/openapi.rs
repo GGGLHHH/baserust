@@ -37,7 +37,8 @@ use crate::infra::op_perms::{op_authz, PermReq};
         (name = "auth", description = "认证:注册/登录/刷新/登出"),
         (name = "me", description = "当前用户:资料/改密/注销"),
         (name = "admin", description = "后台:管理端登录/当前管理员"),
-        (name = "users", description = "后台用户管理:CRUD/角色/密码/资料/认证审计")
+        (name = "users", description = "后台用户管理:CRUD/角色/密码/资料/认证审计"),
+        (name = "tenants", description = "租户开通/管理 + 租户内成员管理")
     )
 )]
 pub struct ApiDoc;

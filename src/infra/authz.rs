@@ -54,6 +54,11 @@ pub enum Perm {
     ContentDelete,
     #[serde(rename = "users:admin")]
     UsersAdmin,
+    /// 租户开通/管理(建租户、列全部、停用)。**superadmin 专属**:同 `users:admin` 只进
+    /// `Perm::ALL`、不进 admin 的显式列表 —— 平台开通租户是超管运营动作(spec §7.1)。
+    /// 与 `users:admin` 拆开:管租户 ≠ 管用户,一个 admin 可以只管其一。
+    #[serde(rename = "tenants:admin")]
+    TenantsAdmin,
     /// 后台准入(backend gate)。`/api/v1/admin` 组闸 + admin_login 自查用它。
     /// 与 `users:admin` **拆开**:admin+superadmin 皆持(能进后台);`users:admin` 仍 superadmin 专属
     /// (用户管理 + 跨用户列全 widget 等真·超管操作)。故名为 admin 的账号能登后台,但仍够不到 superadmin 专属端点。
@@ -80,7 +85,7 @@ impl Perm {
     /// seed 权限词表都从它派生 —— 漏一个变体 = superadmin 静默缺权 + 该 scope 不进文档 + 不入库,
     /// 且两个看似能拦住的测试都拦不住(它们两边都从 `ALL` 派生,自洽通过)。
     /// 要根治:用声明宏单源展开 enum + `ALL` + 各投影,让"漏项"不可表达。
-    pub const ALL: [Perm; 15] = [
+    pub const ALL: [Perm; 16] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
@@ -92,6 +97,7 @@ impl Perm {
         Perm::ContentWriteAll,
         Perm::ContentDelete,
         Perm::UsersAdmin,
+        Perm::TenantsAdmin,
         Perm::AdminLogin,
         Perm::ProfileRead,
         Perm::ProfileWrite,
@@ -113,6 +119,7 @@ impl Perm {
             | Perm::ContentWriteAll
             | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
+            Perm::TenantsAdmin => "tenants",
             Perm::AdminLogin => "admin",
             Perm::ProfileRead | Perm::ProfileWrite | Perm::ProfileWriteAll => "profiles",
         }
@@ -127,7 +134,7 @@ impl Perm {
             Perm::ContentRead | Perm::ContentReadAll => "read",
             Perm::ContentWrite | Perm::ContentWriteAll => "write",
             Perm::ContentDelete => "delete",
-            Perm::UsersAdmin => "admin",
+            Perm::UsersAdmin | Perm::TenantsAdmin => "admin",
             Perm::AdminLogin => "login",
             Perm::ProfileRead => "read",
             Perm::ProfileWrite | Perm::ProfileWriteAll => "write",
@@ -187,6 +194,7 @@ impl Perm {
             Perm::ContentWriteAll => "修改 / 删除任何人的内容(而非仅自己)",
             Perm::ContentDelete => "删除内容",
             Perm::UsersAdmin => "用户管理(superadmin 专属)",
+            Perm::TenantsAdmin => "租户开通/管理(superadmin 专属)",
             Perm::AdminLogin => {
                 "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)"
             }

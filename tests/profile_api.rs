@@ -121,6 +121,7 @@ fn test_app() -> (
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
         tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,

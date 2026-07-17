@@ -251,6 +251,35 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "stats_auth_events",
         perm: PermReq::All(&[Perm::UsersAdmin]),
     },
+    // ── 租户管理(P6)──
+    // 平台开通(admin/auth/tenants):superadmin 专属 tenants:admin。
+    OpAuthz {
+        operation_id: "create_tenant",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    OpAuthz {
+        operation_id: "list_tenants",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    OpAuthz {
+        operation_id: "update_tenant",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    // 自助成员管理(frontend/auth/tenants/members):**仅登录**,授权靠 handler 里的活 tn:admin
+    // 检查(tenant_members.role 数据事实,同切换端点 —— 不给 perm 免得造「有 perm 但不是本租户
+    // admin」的荒谬状态)。非本租户 admin → 403。
+    OpAuthz {
+        operation_id: "list_members",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "add_member",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "remove_member",
+        perm: PermReq::LoginOnly,
+    },
     OpAuthz {
         operation_id: "stream_auth_events",
         perm: PermReq::All(&[Perm::UsersAdmin]),

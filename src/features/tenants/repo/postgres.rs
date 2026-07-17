@@ -10,8 +10,21 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::TenantRepo;
-use crate::features::tenants::types::{Membership, TenantRole, TenantStatus};
+use crate::features::tenants::types::{
+    Membership, Tenant, TenantMemberFact, TenantRole, TenantStatus,
+};
 use crate::infra::error::AppError;
+
+/// 唯一约束违例(23505)→ `Conflict`(409),其余 → `Internal`(500)。
+/// 镜像 `widget/repo/postgres.rs::map_db_err` —— 建租户重名不该漏成 500。
+fn map_db_err(e: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db) = &e {
+        if db.code().as_deref() == Some("23505") {
+            return AppError::Conflict("tenant name already exists".to_owned());
+        }
+    }
+    AppError::Internal(e.into())
+}
 
 pub struct PgTenantRepo {
     pool: PgPool,
@@ -84,6 +97,33 @@ const UPSERT_MEMBER_SQL: &str = "insert into tenant_members \
      on conflict (user_id, tenant_id) do update set \
        role = excluded.role";
 
+// ── P6 平台管理 ──
+
+/// 存活行,最近建的在前。列不含 deleted_at(`Tenant` DTO 不暴露)。
+const LIST_TENANTS_SQL: &str = "select id, name, display_name, status, created_at, updated_at \
+     from tenants where deleted_at is null order by created_at desc";
+
+const GET_TENANT_SQL: &str = "select id, name, display_name, status, created_at, updated_at \
+     from tenants where id = $1 and deleted_at is null";
+
+/// **INSERT**(非 upsert):重名 → 23505 → `map_db_err` → Conflict(409)。status 建时恒 active。
+const CREATE_TENANT_SQL: &str = "insert into tenants \
+     (id, name, display_name, status, created_by, updated_by) \
+     values ($1, $2, $3, 'active', $4, $4) \
+     returning id, name, display_name, status, created_at, updated_at";
+
+/// 全量替换 display_name + status(name 不改);只动存活行。updated_at 归触发器。
+const UPDATE_TENANT_SQL: &str =
+    "update tenants set display_name = $2, status = $3, updated_by = $4 \
+     where id = $1 and deleted_at is null \
+     returning id, name, display_name, status, created_at, updated_at";
+
+/// 某租户成员的原始事实(无 username —— 那由 service 富化)。按加入顺序。
+const MEMBERS_OF_SQL: &str = "select user_id, role, granted_at \
+     from tenant_members where tenant_id = $1 order by seq";
+
+const REMOVE_MEMBER_SQL: &str = "delete from tenant_members where user_id = $1 and tenant_id = $2";
+
 #[async_trait]
 impl TenantRepo for PgTenantRepo {
     async fn memberships(&self, user_id: Uuid) -> Result<Vec<Membership>, AppError> {
@@ -154,6 +194,77 @@ impl TenantRepo for PgTenantRepo {
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<Tenant>, AppError> {
+        sqlx::query_as::<_, Tenant>(LIST_TENANTS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn get_tenant(&self, id: Uuid) -> Result<Option<Tenant>, AppError> {
+        sqlx::query_as::<_, Tenant>(GET_TENANT_SQL)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn create_tenant(
+        &self,
+        id: Uuid,
+        name: &str,
+        display_name: &str,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError> {
+        sqlx::query_as::<_, Tenant>(CREATE_TENANT_SQL)
+            .bind(id)
+            .bind(name)
+            .bind(display_name)
+            .bind(by)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_db_err) // 重名 → 23505 → Conflict(409)
+    }
+
+    async fn update_tenant(
+        &self,
+        id: Uuid,
+        display_name: &str,
+        status: TenantStatus,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError> {
+        sqlx::query_as::<_, Tenant>(UPDATE_TENANT_SQL)
+            .bind(id)
+            .bind(display_name)
+            .bind(status)
+            .bind(by)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?
+            .ok_or(AppError::NotFound)
+    }
+
+    async fn members_of(&self, tenant_id: Uuid) -> Result<Vec<TenantMemberFact>, AppError> {
+        sqlx::query_as::<_, TenantMemberFact>(MEMBERS_OF_SQL)
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn remove_member(&self, user_id: Uuid, tenant_id: Uuid) -> Result<(), AppError> {
+        let res = sqlx::query(REMOVE_MEMBER_SQL)
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
         Ok(())
     }
 }

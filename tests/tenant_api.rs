@@ -97,7 +97,7 @@ async fn test_app() -> (Router, Arc<InMemoryTenantRepo>, Uuid, Uuid, Uuid) {
         ),
         auth,
         user_admin: baserust::features::users::UserAdminService::new(
-            users,
+            users.clone(),
             Arc::new(InMemoryRoleRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
@@ -111,6 +111,10 @@ async fn test_app() -> (Router, Arc<InMemoryTenantRepo>, Uuid, Uuid, Uuid) {
         token_verifier: verifier,
         tenants: Some(Arc::new(InProcessTenantDirectory::new(tenant_repo.clone()))
             as Arc<dyn TenantDirectory>),
+        tenant_admin: Some(baserust::features::tenants::TenantAdminService::new(
+            tenant_repo.clone(),
+            users.clone(),
+        )),
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,

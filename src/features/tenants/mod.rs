@@ -7,7 +7,11 @@
 //! (nginx 只把 `/{public,frontend,admin}/auth/` 分流进 idm 进程)。
 
 pub mod repo;
+pub mod routes;
+pub mod service;
 pub mod types;
 
 pub use repo::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
-pub use types::{Membership, TenantRole, TenantStatus};
+pub use routes::{admin_router, frontend_router};
+pub use service::TenantAdminService;
+pub use types::{Membership, Tenant, TenantMember, TenantRole, TenantStatus};

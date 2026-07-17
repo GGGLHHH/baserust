@@ -9,7 +9,7 @@ mod postgres;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::types::{Membership, TenantRole, TenantStatus};
+use super::types::{Membership, Tenant, TenantMemberFact, TenantRole, TenantStatus};
 use crate::infra::error::AppError;
 
 pub use memory::InMemoryTenantRepo;
@@ -17,10 +17,12 @@ pub use postgres::PgTenantRepo;
 
 /// 仓储端口。
 ///
-/// **消费方只有三个**,别加第四个的方法(YAGNI):
-/// 1. `TenantRoleRepo`(P2,组合根) —— 铸币时读 `memberships`(含 is_active)
+/// **消费方**:
+/// 1. `TenantClaimsExtender`(P2,组合根) —— 铸币时读 `memberships`(含 is_active)
 /// 2. 切换端点(P2)—— `membership` 校验 + `set_active`
 /// 3. `seed::apply`(P2)—— `upsert_tenant` / `upsert_member`
+/// 4. `TenantAdminService`(P6) —— 平台开通(`create_tenant`/`list_tenants`/`update_tenant`)
+///    与租户内成员管理(`members_of`/`upsert_member`/`remove_member`)。
 ///
 /// # `by` 的语义
 ///
@@ -119,4 +121,46 @@ pub trait TenantRepo: Send + Sync {
         role: TenantRole,
         by: Option<String>,
     ) -> Result<(), AppError>;
+
+    // ── P6 平台管理(第四个消费方)──
+
+    /// 全部**存活**租户,最近建的在前。平台管理端点 `GET /admin/auth/tenants` 用。
+    /// 不分页:租户数量有界(几十家量级),同 `list_roles` 的取舍。
+    async fn list_tenants(&self) -> Result<Vec<Tenant>, AppError>;
+
+    /// 按 id 取一个存活租户;不存在/已软删 → `Ok(None)`。
+    async fn get_tenant(&self, id: Uuid) -> Result<Option<Tenant>, AppError>;
+
+    /// **建**一个租户(平台开通,`POST`)。id 由调用方生成(`Uuid::now_v7()`)。
+    /// 与 `upsert_tenant` 的区别:这是 INSERT 不是 upsert —— **重名 → `Conflict`(409)**
+    /// (存活行内 name 唯一),而不是静默改掉一个已有租户。返回建好的整行。
+    async fn create_tenant(
+        &self,
+        id: Uuid,
+        name: &str,
+        display_name: &str,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError>;
+
+    /// **全量更新**一个租户(`PUT`):替 display_name + status。name(slug)不可改。
+    /// 不存在/已软删 → `NotFound`。停用 = 把 status 置 `Suspended`(memberships 契约随即
+    /// 把它过滤掉,成员 ≤ TTL 内自动掉出,见 spec §4.4)。返回更新后的整行。
+    async fn update_tenant(
+        &self,
+        id: Uuid,
+        display_name: &str,
+        status: TenantStatus,
+        by: Option<String>,
+    ) -> Result<Tenant, AppError>;
+
+    // ── P6 成员管理 ──
+
+    /// 一个租户全部成员的**原始事实**(user_id/role/granted_at,无 username),按加入顺序
+    /// (`seq` 升序)。username 由 `TenantAdminService` 富化(见 `TenantMemberFact` 的 doc)。
+    /// 租户不存在 → 空列表(与「无成员」无法区分,无妨)。
+    async fn members_of(&self, tenant_id: Uuid) -> Result<Vec<TenantMemberFact>, AppError>;
+
+    /// 移除一名成员(`DELETE`)。不是成员 → `NotFound`。
+    /// (加成员用 `upsert_member`;它对已存在的成员是改角色,故没有单独的 add。)
+    async fn remove_member(&self, user_id: Uuid, tenant_id: Uuid) -> Result<(), AppError>;
 }
