@@ -11,6 +11,15 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, sqlx::FromRow)]
 pub struct Widget {
     pub id: Uuid,
+    /// 所属租户。**只出不进**:没有任何 handler 收 `Json<Widget>`(入参是 `CreateWidget` /
+    /// `UpdateWidget`),所以它不是伪造面 —— 同 `ContentResponse.tenant_id`。
+    ///
+    /// **不能 `#[serde(skip)]`**:本类型是 `WidgetEvent::{Created,Updated}` 的载荷,
+    /// 跳过序列化 = 租户过不了事件总线 = SSE 订阅端没东西可逐帧过滤(spec §6.4b)。
+    ///
+    /// (spec §5.2 写的是「DTO 不暴露」—— 它假设 `Widget` 不是 DTO。事实是
+    /// create/get/update 三个端点**直接返回它**,只有 list 走 `WidgetView`。按事实走。)
+    pub tenant_id: Uuid,
     pub name: String,
     pub created_by: Option<String>,
     #[serde(with = "time::serde::rfc3339")]

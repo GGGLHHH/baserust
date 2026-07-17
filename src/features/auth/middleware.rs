@@ -13,7 +13,7 @@ use axum::response::Response;
 use axum_extra::extract::CookieJar;
 
 use crate::app::state::AppState;
-use crate::infra::authz::TokenScope;
+use crate::infra::authz::{Tenant, TenantId, TokenExp, TokenScope};
 
 /// 鉴权:**httponly cookie 优先,`Authorization: Bearer` 兜底**。
 pub async fn authenticate(
@@ -27,10 +27,18 @@ pub async fn authenticate(
         .map(|c| c.value().to_owned())
         .or_else(|| bearer_token(&req).map(str::to_owned));
     if let Some(token) = token {
-        // 单次验签同时出身份 + scope(热路径;语义 == idm::authenticate_token + scope_of)。
-        if let Ok((user, scope)) = state.token_verifier.verify_with_scope(&token) {
-            req.extensions_mut().insert(user);
-            req.extensions_mut().insert(TokenScope(scope));
+        // 单次验签同时出身份 + scope + 租户 + exp(热路径;语义 == idm::authenticate_token + scope_of)。
+        if let Ok(v) = state.token_verifier.verify_with_scope(&token) {
+            req.extensions_mut().insert(v.user);
+            req.extensions_mut().insert(TokenScope(v.scope));
+            // 长连接(SSE)要按它截流 —— 否则流能活过 token(见 widget_events)。
+            req.extensions_mut().insert(TokenExp(v.exp));
+            // **这是 TenantId 在生产路径上的唯一构造点** —— 且只从已验签的 claim 造。
+            // 0 租户(register 的常规出口)→ 不塞 ⇒ `Tenant` extractor 401(绝不 nil 兜底)。
+            if let Some(id) = v.tenant {
+                req.extensions_mut()
+                    .insert(Tenant(TenantId::from_claim(id)));
+            }
         }
     }
     next.run(req).await

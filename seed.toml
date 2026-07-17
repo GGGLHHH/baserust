@@ -25,3 +25,30 @@ display_name = "Admin"
 username = "user"
 password = "pwd"
 roles = ["user"]
+
+# ── 租户(**dev 样例数据**)。prod 用 SEED_FILE 覆盖成不含本节的文件 ──
+#
+# 真实租户由平台后台开通(spec §1:平台开通 + 租户内部邀请),不走 seed。这里的两家公司是
+# 给开发/冒烟用的:`user` 同时是 Acme 的 admin 和 Globex 的 member —— 正是 1:N 跨公司切换
+# 那个场景(顾问/代理商同时服务多家客户),起服务即可 `GET /auth/tenants` 看到两条。
+#
+# `name` 是机器码 slug,**租户 id 由它确定性派生**(uuid v5)—— 每次重启、每台机器都一样。
+# `members[].username` 引用上面 [[accounts]] 里的账号(标识引用,非 FK)。
+
+# `user` 同时是 Acme 的 admin 和 Globex 的 member —— 1:N 跨公司切换那个场景(顾问/代理商)。
+# admin/superadmin 也放进 Acme:**纯粹为了 dev 可用**。没有租户的账号在所有租户轴上的端点
+# (widget/content)都会 401 —— 那是设计的正确后果(平台员工不是客户公司的人,看不到客户
+# 业务数据,见 spec §7.1),但会让开发时一脸懵。prod 的 SEED_FILE 里没有本节。
+[[tenants]]
+name = "acme"
+display_name = "Acme 公司"
+members = [
+    { username = "user", role = "admin" },
+    { username = "admin", role = "member" },
+    { username = "superadmin", role = "member" },
+]
+
+[[tenants]]
+name = "globex"
+display_name = "Globex 公司"
+members = [{ username = "user", role = "member" }]

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::features::auth::port::TenantBrief;
 use crate::infra::authz::RoleName;
 
 /// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。
@@ -68,6 +69,47 @@ pub struct UserResponse {
     pub email_verified: bool,
     /// 角色名(闭集,生成前端 union)。
     pub roles: Vec<RoleName>,
+}
+
+/// 我的一个租户(`GET /auth/tenants` 的一行)。
+///
+/// `name` 是机器码 slug(与 `idm.tenants.name` 同名,**不叫 slug**)。
+///
+/// **没有 `role`**:见 `port::TenantBrief` 的 doc —— 切换器要的是「有哪几家、我现在在哪」。
+///
+/// **不实现 `From<TenantBrief>`**:`is_active` 只有 claim 知道(见 `list_my_tenants`),
+/// `From` 填不出来。给它一个「默认 false」的 From 就是给下一个人埋雷 —— 他会写出
+/// `brief.into()` 然后得到一个所有项都没选中的列表,而且没有任何东西会报错。
+/// 构造它必须同时给出 active,所以只有 `with_active` 这一条路。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MyTenantResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: String,
+    /// 是不是**本会话当前生效**的那个。
+    pub is_active: bool,
+}
+
+impl MyTenantResponse {
+    /// `active` = 本会话实际生效的租户(来自已验签的 claim),**不是**
+    /// `user_active_tenant` 里显式设过的那个 —— 后者对从没切过的用户(即每个人的
+    /// 初始状态)是空的,拿它当依据会让整个列表一个都不选中。
+    pub fn with_active(t: TenantBrief, active: Option<Uuid>) -> Self {
+        Self {
+            is_active: Some(t.id) == active,
+            id: t.id,
+            name: t.name,
+            display_name: t.display_name,
+        }
+    }
+}
+
+/// 切换激活租户(`PUT /auth/active-tenant`)。**PUT 全量替换**,不是 PATCH。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct SetActiveTenantRequest {
+    /// 目标租户。**非本人成员 → 404**(不是 403 —— 不泄露该租户是否存在)。
+    #[garde(skip)]
+    pub tenant_id: Uuid,
 }
 
 // ── 边界转换:app DTO ↔ idm 领域类型 ──

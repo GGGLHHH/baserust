@@ -34,9 +34,20 @@ fn test_app() -> (
 ) {
     let signer = Arc::new(AppTokenSigner::dev());
     let verifier = Arc::new(AppTokenVerifier::dev());
+    // 测试 token 带一个租户:这些用例用**通用 content 端点**(/contents/upload-url)seed 头像
+    // 素材,那个端点上了租户轴、要 Tenant extractor。**这不代表 profile 上了轴** ——
+    // 真实头像上传走 profile 自己的 set_user_avatar,那里落 NO_TENANT(头像 = 全局身份)。
+    // 这里只是让测试的 content-seed 步骤能过 content 的租户门。
     let mint = |id: Uuid, name: &str, role: &str| {
         signer
-            .mint_scoped(id, name, vec![role.to_owned()], vec![], 900)
+            .mint_scoped(
+                id,
+                name,
+                vec![role.to_owned()],
+                Some(Uuid::from_u128(0x7E57)),
+                vec![],
+                900,
+            )
             .unwrap()
     };
     let admin = mint(ADMIN_ID, "admin", "admin");
@@ -109,6 +120,8 @@ fn test_app() -> (
         ])),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,

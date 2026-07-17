@@ -99,6 +99,8 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         policy: Arc::new(policy),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: Some(AuthAuditService::new(
             auth_events.clone() as Arc<dyn AuthEventRepo>
@@ -116,6 +118,7 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -125,6 +128,7 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
             Uuid::now_v7(),
             "admin",
             vec!["admin".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -405,6 +409,8 @@ async fn no_auth_events_backend_is_404_not_panic() {
         policy: Arc::new(policy),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
@@ -419,6 +425,7 @@ async fn no_auth_events_backend_is_404_not_panic() {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            None,
             vec![],
             900,
         )

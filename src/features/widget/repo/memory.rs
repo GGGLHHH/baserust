@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::WidgetRepo;
 use crate::features::widget::types::{Widget, WidgetSortField};
+use crate::infra::authz::TenantId;
 use crate::infra::error::AppError;
 use crate::infra::pagination::{encode_cursor, Page, PageParams};
 use crate::infra::sort::SortOrder;
@@ -18,6 +19,7 @@ use crate::infra::sort::SortOrder;
 #[derive(Clone)]
 struct Row {
     id: Uuid,
+    tenant_id: Uuid,
     name: String,
     created_by: Option<String>,
     created_at: OffsetDateTime,
@@ -30,6 +32,7 @@ impl Row {
     fn to_widget(&self) -> Widget {
         Widget {
             id: self.id,
+            tenant_id: self.tenant_id,
             name: self.name.clone(),
             created_by: self.created_by.clone(),
             created_at: self.created_at,
@@ -75,6 +78,7 @@ impl Default for InMemoryWidgetRepo {
 impl WidgetRepo for InMemoryWidgetRepo {
     async fn list(
         &self,
+        tenant: TenantId,
         page: &PageParams,
         owner: Option<&str>,
         sort_by: WidgetSortField,
@@ -84,6 +88,9 @@ impl WidgetRepo for InMemoryWidgetRepo {
         let mut alive: Vec<Row> = store
             .widgets
             .values()
+            // **租户闸**:与软删过滤同级、同在这里 —— parity 于 PG 的 base_select。
+            // 必须在切页之前:事后筛会让 total 与分页都错(同 owner 过滤的理由)。
+            .filter(|r| r.tenant_id == tenant.get())
             .filter(|r| r.deleted_at.is_none())
             // ownership 过滤:owner=Some 只留自己创建的(created_by == owner);None 不过滤。
             .filter(|r| owner.is_none_or(|o| r.created_by.as_deref() == Some(o)))
@@ -146,29 +153,39 @@ impl WidgetRepo for InMemoryWidgetRepo {
         }
     }
 
-    async fn get(&self, id: Uuid) -> Result<Widget, AppError> {
+    async fn get(&self, tenant: TenantId, id: Uuid) -> Result<Widget, AppError> {
         let store = self.store.lock().expect("锁未中毒");
         store
             .widgets
             .get(&id)
+            // **复合键 (tenant, id)**:别租户的 id → NotFound,与「不存在」无法区分。
+            .filter(|r| r.tenant_id == tenant.get())
             .filter(|r| r.deleted_at.is_none())
             .map(Row::to_widget)
             .ok_or(AppError::NotFound)
     }
 
-    async fn create(&self, name: String, by: Option<String>) -> Result<Widget, AppError> {
+    async fn create(
+        &self,
+        tenant: TenantId,
+        name: String,
+        by: Option<String>,
+    ) -> Result<Widget, AppError> {
         let mut store = self.store.lock().expect("锁未中毒");
-        // name 在存活行内唯一(parity 于 PG 的部分唯一索引)→ 重名 Conflict(409)
+        // name 在**本租户的**存活行内唯一(parity 于 PG 的 widgets_tenant_name_unique_alive)。
+        // **租户维度不能漏**:漏了就是「别家用了这个名字,你就建不了」——
+        // 既是功能 bug,也是个跨租户的存在性预言机(试名字看 201/409 即可枚举别家的 widget)。
         if store
             .widgets
             .values()
-            .any(|r| r.deleted_at.is_none() && r.name == name)
+            .any(|r| r.tenant_id == tenant.get() && r.deleted_at.is_none() && r.name == name)
         {
             return Err(AppError::Conflict("widget name already exists".to_owned()));
         }
         let now = OffsetDateTime::now_utc();
         let row = Row {
             id: Uuid::now_v7(),
+            tenant_id: tenant.get(),
             name,
             created_by: by.clone(),
             created_at: now,
@@ -181,22 +198,27 @@ impl WidgetRepo for InMemoryWidgetRepo {
         Ok(widget)
     }
 
-    async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError> {
+    async fn update(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        name: String,
+        by: Option<String>,
+    ) -> Result<Widget, AppError> {
         let mut store = self.store.lock().expect("锁未中毒");
-        // 目标须存活(parity 于 PG 的 WHERE id=? AND deleted_at IS NULL):缺 / 已删 → NotFound。
+        // 目标须**本租户的**存活行(parity 于 PG 的 WHERE tenant_id=? AND id=? AND deleted_at IS NULL):
+        // 缺 / 已删 / 别租户 → NotFound。
         if store
             .widgets
             .get(&id)
-            .is_none_or(|r| r.deleted_at.is_some())
+            .is_none_or(|r| r.tenant_id != tenant.get() || r.deleted_at.is_some())
         {
             return Err(AppError::NotFound);
         }
-        // 改名撞别的存活行 → Conflict(parity 于部分唯一索引;且 NotFound 先于 Conflict,同 PG 顺序)。
-        if store
-            .widgets
-            .values()
-            .any(|r| r.id != id && r.deleted_at.is_none() && r.name == name)
-        {
+        // 改名撞**本租户**别的存活行 → Conflict(parity 于复合唯一索引;NotFound 先于 Conflict,同 PG 顺序)。
+        if store.widgets.values().any(|r| {
+            r.tenant_id == tenant.get() && r.id != id && r.deleted_at.is_none() && r.name == name
+        }) {
             return Err(AppError::Conflict("widget name already exists".to_owned()));
         }
         let r = store.widgets.get_mut(&id).expect("上面已确认存活");
@@ -206,10 +228,15 @@ impl WidgetRepo for InMemoryWidgetRepo {
         Ok(r.to_widget())
     }
 
-    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError> {
+    async fn soft_delete(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        by: Option<String>,
+    ) -> Result<(), AppError> {
         let mut store = self.store.lock().expect("锁未中毒");
         match store.widgets.get_mut(&id) {
-            Some(r) if r.deleted_at.is_none() => {
+            Some(r) if r.tenant_id == tenant.get() && r.deleted_at.is_none() => {
                 let now = OffsetDateTime::now_utc();
                 r.deleted_at = Some(now);
                 r.updated_by = by;
@@ -223,6 +250,7 @@ impl WidgetRepo for InMemoryWidgetRepo {
     // ── 父子双表事务范式:一次 lock() 内"先全量校验、再整体落盘"= PG begin..commit 的内存等价。──
     async fn create_with_tags(
         &self,
+        tenant: TenantId,
         name: String,
         labels: Vec<String>,
         by: Option<String>,
@@ -230,11 +258,11 @@ impl WidgetRepo for InMemoryWidgetRepo {
         let mut store = self.store.lock().expect("锁未中毒");
 
         // ── 先校验(此刻一行未动 = 回滚前状态)。任一失败提前 return = ROLLBACK。──
-        // 父:widget 名存活唯一(parity 于部分唯一索引)。
+        // 父:widget 名在**本租户内**存活唯一(parity 于 widgets_tenant_name_unique_alive)。
         if store
             .widgets
             .values()
-            .any(|r| r.deleted_at.is_none() && r.name == name)
+            .any(|r| r.tenant_id == tenant.get() && r.deleted_at.is_none() && r.name == name)
         {
             return Err(AppError::Conflict("widget name already exists".to_owned()));
         }
@@ -252,6 +280,7 @@ impl WidgetRepo for InMemoryWidgetRepo {
         let widget_id = Uuid::now_v7();
         let row = Row {
             id: widget_id,
+            tenant_id: tenant.get(),
             name,
             created_by: by.clone(),
             created_at: now,
@@ -267,8 +296,19 @@ impl WidgetRepo for InMemoryWidgetRepo {
         Ok(widget)
     }
 
-    async fn tags_of(&self, widget_id: Uuid) -> Result<Vec<String>, AppError> {
+    /// 子表无租户列 —— 经父表判定(parity 于 PG 的 join):
+    /// 知道别租户的 widget id 也读不到它的标签。
+    async fn tags_of(&self, tenant: TenantId, widget_id: Uuid) -> Result<Vec<String>, AppError> {
         let store = self.store.lock().expect("锁未中毒");
+        // 父行必须是本租户的存活行 —— 否则等价于「查无此 widget」,返回空
+        // (parity 于 PG:那边 inner join 直接筛掉,同样是空)。
+        let visible = store
+            .widgets
+            .get(&widget_id)
+            .is_some_and(|r| r.tenant_id == tenant.get() && r.deleted_at.is_none());
+        if !visible {
+            return Ok(Vec::new());
+        }
         let mut labels: Vec<String> = store
             .tags
             .iter()

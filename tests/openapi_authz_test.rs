@@ -48,6 +48,13 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
             b = b.header("content-type", "application/json");
             Body::from(r#"{"tags":[]}"#)
         }
+        // 租户写端点:含各 DTO 必填字段(name/display_name/status/identifier/role,serde 忽略多余键)。
+        "create_tenant" | "update_tenant" | "add_member" => {
+            b = b.header("content-type", "application/json");
+            Body::from(
+                r#"{"name":"probe-tenant","display_name":"Probe","status":"active","identifier":"probe","role":"member"}"#,
+            )
+        }
         // users 写端点:一份含各 DTO 必填字段的 body(serde 忽略多余键)→ 四端点共用,触达 gate。
         "create_user" | "update_user" | "set_user_roles" | "reset_user_password" => {
             b = b.header("content-type", "application/json");
@@ -84,12 +91,18 @@ async fn spec_security_matches_real_enforcement() {
         .unwrap();
     // state 的 verifier 用内嵌默认 dev 公钥,故本地 dev 私钥签的令牌它也认。
     let signer = AppTokenSigner::dev();
+    // ⚠️ **探针 token 必须带租户**:上租户轴后,widget/content 端点都有 Tenant extractor,
+    // 它在授权判定**之前**就会对无租户的 token 401 —— 那会把本测试要验的「授权闸」正向断言
+    // 全部污染成 401。给探针一个存在的租户(superadmin 在 seed 里是 Acme 成员),
+    // 让租户闸放行、authz 闸成为唯一变量。
+    let probe_tenant = Some(baserust::app::seed::tenant_id_for("acme"));
     let mint = |scope: Vec<Perm>| {
         signer
             .mint_scoped(
                 su.user.id,
                 &su.user.username,
                 su.user.roles.clone(),
+                probe_tenant,
                 scope,
                 900,
             )
@@ -123,11 +136,21 @@ async fn spec_security_matches_real_enforcement() {
                 .collect();
             checked += 1;
 
+            // **运行期数据授权的仅登录端点**:授权不来自 op_perms 的 perm,而来自一次数据事实
+            // 检查(成员管理:actor 是否是当前租户的 tn:admin)。对非管理员它**合法地 403** ——
+            // 与 ownership 端点合法地 404 同类,探针的「LoginOnly ⇒ 不 403」对它不成立。
+            // (这不是漏洞:403 说的是「你不是本租户管理员」,而你本就知道这个租户存在,无泄露。)
+            const RUNTIME_TENANT_ADMIN_GATED: &[&str] =
+                &["list_members", "add_member", "remove_member"];
+
             let union: Vec<Perm> = branches.iter().flatten().copied().collect();
             if union.is_empty() {
+                if RUNTIME_TENANT_ADMIN_GATED.contains(&op_id) {
+                    continue; // 授权是运行期租户 admin 事实,不在 perm 层 —— 探针跳过,由 tenants_api 黑盒钉
+                }
                 // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
                 let zero = signer
-                    .mint_scoped(su.user.id, "probe", vec![], vec![], 900)
+                    .mint_scoped(su.user.id, "probe", vec![], probe_tenant, vec![], 900)
                     .unwrap();
                 let s = hit(&app, method, &uri, op_id, &zero).await;
                 assert!(

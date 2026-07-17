@@ -26,9 +26,16 @@ use crate::infra::error::AppError;
 
 /// widget 变更事件。SSE 帧的 event name = serde tag(created/updated/deleted)。
 ///
-/// **每个变体都带得出 owner**([`WidgetEvent::owner`])—— SSE handler 要按 `Access` 逐帧过滤,
-/// 没 owner 的帧无法判定:放行=泄露、丢弃=owner 收不到自己的删除。`Deleted` 因此单带 `created_by`
-/// (删除后行已软删,订阅侧无从回查)。
+/// **每个变体都带得出 tenant 与 owner**([`WidgetEvent::tenant`] / [`WidgetEvent::owner`])——
+/// SSE handler 要按 `Access` **逐帧**过滤,缺任一维的帧都无法判定:放行=泄露、丢弃=本人收不到
+/// 自己的事件。
+///
+/// `Deleted` 因此单带 `created_by` **与 `tenant_id`** —— 两者理由**逐字同源**:删除后行已软删,
+/// 订阅侧无从回查。
+///
+/// ⚠️ **总线是全局广播**(NATS subject / PG NOTIFY 不分租户),过滤**纯在消费端**。
+/// 所以别租户的帧会进本进程内存 —— 但出不去。要连"进内存"都不许,那是按租户分 subject,
+/// 另一个威胁模型(spec §7)。
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WidgetEvent {
@@ -40,6 +47,8 @@ pub enum WidgetEvent {
     },
     Deleted {
         id: Uuid,
+        /// 见本枚举 doc:行已软删,订阅侧回查不到 —— 必须随帧带上。
+        tenant_id: Uuid,
         created_by: Option<String>,
     },
 }
@@ -63,6 +72,18 @@ impl WidgetEvent {
                 widget.created_by.as_deref()
             }
             WidgetEvent::Deleted { created_by, .. } => created_by.as_deref(),
+        }
+    }
+
+    /// 该事件所指 widget 的租户(**租户闸判定用**)。
+    ///
+    /// 喂 [`Access::allows_created_by`](crate::infra::authz::Access::allows_created_by) 的首参。
+    /// 没有它,SSE 订阅端**没有任何东西可以按租户过滤** —— 总线是全局广播,
+    /// 别租户的每一帧都会推给你的浏览器。
+    pub fn tenant(&self) -> Uuid {
+        match self {
+            WidgetEvent::Created { widget } | WidgetEvent::Updated { widget } => widget.tenant_id,
+            WidgetEvent::Deleted { tenant_id, .. } => *tenant_id,
         }
     }
 }

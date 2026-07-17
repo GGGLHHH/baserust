@@ -11,6 +11,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::features::profile::{ProfileFields, ProfileRepo};
+use crate::features::tenants::{TenantRepo, TenantRole, TenantStatus};
 use crate::infra::authz::{Perm, Policy, RoleName};
 use idm::{IdmError, PwHasher, RoleRepo, UserRepo};
 
@@ -25,6 +26,39 @@ const EMBEDDED_SEED: &str = include_str!("../../seed.toml");
 pub struct SeedData {
     #[serde(default)]
     accounts: Vec<AccountSeed>,
+    /// 租户 + 成员(**dev 样例数据**)。prod 用 `SEED_FILE` 覆盖成不含 `[[tenants]]` 的文件 ——
+    /// 真实租户由平台后台开通,不走 seed(spec §1:平台开通 + 租户内部邀请)。
+    ///
+    /// 它在这里的理由是**可验证性**:没有它,全仓没有任何代码能创建租户,整条铸币链
+    /// 在任何跑得起来的配置下都是死的 —— 开发者没法验证自己刚合的功能,冒烟只能靠手插 SQL
+    /// (P2 第一版就是这么"验"绿的)。
+    #[serde(default)]
+    tenants: Vec<TenantSeed>,
+}
+
+#[derive(Deserialize)]
+struct TenantSeed {
+    /// 机器码 slug(= `idm.tenants.name`)。**租户 id 由它派生**(见 `tenant_id_for`)。
+    name: String,
+    display_name: String,
+    #[serde(default)]
+    members: Vec<MemberSeed>,
+}
+
+#[derive(Deserialize)]
+struct MemberSeed {
+    /// 引用 `[[accounts]]` 里的 username(标识引用,非 FK —— 跨 schema 不用 FK)。
+    username: String,
+    role: TenantRole,
+}
+
+/// 租户 slug → 稳定 id。
+///
+/// **必须确定性**:`upsert_tenant` 按 id 冲突,而 seed 每次启动都重跑 —— 随机 id 会让每次
+/// 重启都新建一家同名公司(然后撞上 `tenants_name_alive_uidx` 报错)。v5 还顺带让 dev/CI/
+/// 每个同事的机器上租户 id 一致,写测试和排查时能直接照抄。
+pub fn tenant_id_for(name: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
 }
 
 #[derive(Deserialize)]
@@ -131,11 +165,16 @@ async fn ensure_roles_with_event(
 pub async fn apply(
     users: &dyn UserRepo,
     roles: &dyn RoleRepo,
+    tenants: &dyn TenantRepo,
     hasher: &dyn PwHasher,
     data: &SeedData,
     by: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. 角色(幂等 upsert),记 name -> id 供账号授予引用。角色集是代码闭集(`RoleName`)。
+    // `idm.roles` 是**可授予的平台角色目录**:进了这里的角色就能经 `GET /admin/auth/roles`
+    // 出现在后台候选集、经 `PUT /users/{id}/roles` 授给任意用户 —— 所以 `RoleName` 里只准
+    // 有平台角色(见它的 doc)。租户角色是 `TenantRole`,靠 `tenant_members` 的成员资格获得,
+    // 根本不经过这条路。
     let mut role_ids: HashMap<&'static str, uuid::Uuid> = HashMap::new();
     for r in RoleName::ALL {
         let id = roles
@@ -200,9 +239,45 @@ pub async fn apply(
         }
     }
 
+    // 3. 租户 + 成员(幂等)。**必须在账号之后** —— 成员靠 username 引用账号。
+    // 没有这一段,全仓就没有任何代码能创建租户:`memberships()` 对每个人恒返回 `[]`,
+    // 每枚 token 都不带租户 claim,`GET /auth/tenants` 恒空,切换端点恒 404 ——
+    // 整条链在任何跑得起来的配置下都是死的。
+    let mut members = 0usize;
+    for t in &data.tenants {
+        let id = tenant_id_for(&t.name);
+        tenants
+            .upsert_tenant(
+                id,
+                &t.name,
+                &t.display_name,
+                TenantStatus::Active,
+                by.clone(),
+            )
+            .await
+            .with_context(|| format!("seed tenant {} 失败", t.name))?;
+        for m in &t.members {
+            let username = m.username.trim().to_lowercase();
+            // 标识引用(username → user_id),不是 FK —— 跨 schema 不用 FK(CLAUDE.md)。
+            // 查不到就报错而非跳过:seed.toml 写错人名该在启动时炸,不该静默少一个成员。
+            let user = users
+                .find_by_identifier(&username)
+                .await?
+                .with_context(|| format!("租户 {} 的成员 {username} 不存在于 accounts", t.name))?
+                .user;
+            tenants
+                .upsert_member(user.id, id, m.role, by.clone())
+                .await
+                .with_context(|| format!("seed member {username}@{} 失败", t.name))?;
+            members += 1;
+        }
+    }
+
     tracing::info!(
         roles = RoleName::ALL.len(),
         accounts = data.accounts.len(),
+        tenants = data.tenants.len(),
+        members,
         "idm seed 已应用(幂等)"
     );
     Ok(())
@@ -265,10 +340,10 @@ mod tests {
 
     use super::*;
 
-    /// 嵌入的 seed.toml 能解析,且账号引用的角色都是已知 `RoleName`(拼错 → 这里挂)。
+    /// 嵌入的 seed.toml 能解析,且账号引用的角色都是已知角色(拼错 → 这里挂)。
     /// 角色集/权限集已是代码闭集,其自身正确性由 `authz::role_name_wire_matches` 等守;这里只守账号引用。
     #[test]
-    fn embedded_seed_accounts_reference_known_roles() {
+    fn embedded_seed_accounts_reference_known_platform_roles() {
         let data = SeedData::load(None).unwrap();
         let known: HashSet<&str> = RoleName::ALL.iter().map(|r| r.as_str()).collect();
         for role in data.granted_roles() {
@@ -276,10 +351,98 @@ mod tests {
         }
     }
 
+    /// 嵌入 seed 里的租户成员引用的 username 必须真的存在于 `[[accounts]]` ——
+    /// 拼错 → `apply` 会在启动时 bail。这条让它在**测试期**就报。
+    #[test]
+    fn embedded_seed_tenant_members_reference_known_accounts() {
+        let data = SeedData::load(None).unwrap();
+        let accounts: HashSet<String> = data
+            .accounts
+            .iter()
+            .map(|a| a.username.trim().to_lowercase())
+            .collect();
+        for t in &data.tenants {
+            for m in &t.members {
+                assert!(
+                    accounts.contains(&m.username.trim().to_lowercase()),
+                    "租户 {} 的成员 `{}` 不在 accounts 里",
+                    t.name,
+                    m.username
+                );
+            }
+        }
+    }
+
+    /// 租户 id 由 slug **确定性**派生 —— seed 每次启动都重跑,随机 id 会让每次重启都新建
+    /// 一家同名公司(然后撞 `tenants_name_alive_uidx`)。
+    #[test]
+    fn tenant_id_is_stable_across_runs() {
+        assert_eq!(tenant_id_for("acme"), tenant_id_for("acme"));
+        assert_ne!(tenant_id_for("acme"), tenant_id_for("globex"));
+    }
+
+    /// **端到端**:跑一遍 seed,`user` 就真的有两家公司了。
+    ///
+    /// 这条钉的是「链是活的」—— P2 第一版整条铸币链在任何跑得起来的配置下都是死的
+    /// (没有任何代码创建租户),而冒烟"验"绿是因为数据是手工 SQL 插的。
+    /// 这条测试会在那种情况下报红。
+    #[tokio::test]
+    async fn seeded_tenants_give_the_user_real_memberships() {
+        let users = idm::InMemoryUserRepo::new();
+        let roles = idm::InMemoryRoleRepo::sharing_with(&users);
+        let tenants = crate::features::tenants::InMemoryTenantRepo::new();
+        let data = SeedData::load(None).unwrap(); // 嵌入的真 seed.toml
+        apply(
+            &users,
+            &roles,
+            &tenants,
+            &idm::FakeHasher,
+            &data,
+            Some("system".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        let uid = users
+            .find_by_identifier("user")
+            .await
+            .unwrap()
+            .expect("seed 应建出 user")
+            .user
+            .id;
+        let ms = tenants.memberships(uid).await.unwrap();
+        assert_eq!(
+            ms.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["acme", "globex"],
+            "seed 后 user 该同时属于两家公司(按 seq 升序)—— 这是 1:N 切换的样例数据"
+        );
+        assert_eq!(ms[0].role, TenantRole::Admin, "user 是 Acme 的 admin");
+        assert_eq!(ms[1].role, TenantRole::Member, "user 是 Globex 的 member");
+
+        // 幂等:重跑不重复、不换 id
+        apply(
+            &users,
+            &roles,
+            &tenants,
+            &idm::FakeHasher,
+            &data,
+            Some("system".to_owned()),
+        )
+        .await
+        .unwrap();
+        let again = tenants.memberships(uid).await.unwrap();
+        assert_eq!(again.len(), 2, "重跑 seed 不该重复建成员");
+        assert_eq!(again[0].tenant_id, ms[0].tenant_id, "重跑不该换租户 id");
+    }
+
     /// role→权限默认映射能建成 `Policy`,且 superadmin 持全权闭集(bootstrap 正确性)。
     #[test]
     fn default_policy_superadmin_has_all_perms() {
-        let policy = SeedData { accounts: vec![] }.policy();
+        let policy = SeedData {
+            accounts: vec![],
+            tenants: vec![],
+        }
+        .policy();
         let perms = policy.perms_for(&["superadmin".to_owned()]);
         for p in Perm::ALL {
             assert!(perms.contains(&p), "{p:?} superadmin 应持有");
@@ -312,11 +475,19 @@ mod tests {
                 display_name: Some("Alice".to_owned()),
                 ..account("alice", &["user"])
             }],
+            tenants: vec![],
         };
 
-        apply(&users, &roles, &hasher, &data, by.clone())
-            .await
-            .unwrap();
+        apply(
+            &users,
+            &roles,
+            &crate::features::tenants::InMemoryTenantRepo::new(),
+            &hasher,
+            &data,
+            by.clone(),
+        )
+        .await
+        .unwrap();
         apply_profiles(&profiles, &users, &data, by.clone())
             .await
             .unwrap();
@@ -383,8 +554,10 @@ mod tests {
         // 首建:只声明 user
         let data = SeedData {
             accounts: vec![account("alice", &["user"])],
+            tenants: vec![],
         };
-        apply(&users, &roles, &hasher, &data, by.clone())
+        let tenants = crate::features::tenants::InMemoryTenantRepo::new();
+        apply(&users, &roles, &tenants, &hasher, &data, by.clone())
             .await
             .unwrap();
         let uid = users
@@ -410,8 +583,9 @@ mod tests {
         // 重跑 seed,声明里多加一个 admin:应补上 admin,且**不动**运行期的 superadmin
         let data = SeedData {
             accounts: vec![account("alice", &["user", "admin"])],
+            tenants: vec![],
         };
-        apply(&users, &roles, &hasher, &data, by.clone())
+        apply(&users, &roles, &tenants, &hasher, &data, by.clone())
             .await
             .unwrap();
         // 事件是重点:没有它,idm 里角色对了但投影永远停在旧值(只能手工 rebuild_search 自愈)。
@@ -443,7 +617,9 @@ mod tests {
         );
 
         // 再重跑(声明集已全在身)→ 收敛:不写、**不再发事件**(否则每次重启都刷一条噪声)
-        apply(&users, &roles, &hasher, &data, by).await.unwrap();
+        apply(&users, &roles, &tenants, &hasher, &data, by)
+            .await
+            .unwrap();
         assert_eq!(
             role_names(&roles, uid).await,
             vec![

@@ -50,9 +50,27 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "delete_widget",
         perm: PermReq::All(&[Perm::WidgetDelete]),
     },
-    // 仅登录(无特定 perm);widget_stats 是 public → 不在表
+    // 仅登录(无特定 perm)
     OpAuthz {
         operation_id: "my_widget_count",
+        perm: PermReq::LoginOnly,
+    },
+    // widget_stats 曾是 public(不在本表)。上租户轴后挪进 frontend 组 —— public 端点没有
+    // token 就造不出 TenantId(spec §6.1)。仅登录:计数不需要特定 perm,租户闸已在 handler。
+    OpAuthz {
+        operation_id: "widget_stats",
+        perm: PermReq::LoginOnly,
+    },
+    // 租户切换(spec §4.9):**仅登录,不设专门的 perm** —— 授权靠成员资格本身,
+    // 不是靠角色:能不能列出/切进某租户,取决于你是不是它的成员(`TenantRepo::membership`),
+    // 而那是数据事实、不是 RBAC 判定。给它发一个 `tenants:switch` 之类的 perm 反而会造出
+    // 「有 perm 但不是成员」的荒谬状态。非成员 → 404(不是 403,不泄露该租户存在)。
+    OpAuthz {
+        operation_id: "list_my_tenants",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "put_active_tenant",
         perm: PermReq::LoginOnly,
     },
     // superadmin-only:gate 一个只 superadmin 持有的 perm(users:admin)
@@ -232,6 +250,35 @@ pub const OP_PERMS: &[OpAuthz] = &[
     OpAuthz {
         operation_id: "stats_auth_events",
         perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    // ── 租户管理(P6)──
+    // 平台开通(admin/auth/tenants):superadmin 专属 tenants:admin。
+    OpAuthz {
+        operation_id: "create_tenant",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    OpAuthz {
+        operation_id: "list_tenants",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    OpAuthz {
+        operation_id: "update_tenant",
+        perm: PermReq::All(&[Perm::TenantsAdmin]),
+    },
+    // 自助成员管理(frontend/auth/tenants/members):**仅登录**,授权靠 handler 里的活 tn:admin
+    // 检查(tenant_members.role 数据事实,同切换端点 —— 不给 perm 免得造「有 perm 但不是本租户
+    // admin」的荒谬状态)。非本租户 admin → 403。
+    OpAuthz {
+        operation_id: "list_members",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "add_member",
+        perm: PermReq::LoginOnly,
+    },
+    OpAuthz {
+        operation_id: "remove_member",
+        perm: PermReq::LoginOnly,
     },
     OpAuthz {
         operation_id: "stream_auth_events",

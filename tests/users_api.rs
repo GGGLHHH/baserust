@@ -88,6 +88,8 @@ async fn test_app() -> (Router, String, String) {
         policy: Arc::new(policy),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
@@ -103,6 +105,7 @@ async fn test_app() -> (Router, String, String) {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -112,6 +115,7 @@ async fn test_app() -> (Router, String, String) {
             Uuid::now_v7(),
             "admin",
             vec!["admin".to_owned()],
+            None,
             vec![],
             900,
         )
@@ -738,6 +742,7 @@ fn useradmin_token() -> String {
             Uuid::now_v7(),
             "useradmin",
             vec!["useradmin".to_owned()],
+            None,
             vec![],
             900,
         )

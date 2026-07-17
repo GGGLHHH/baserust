@@ -18,6 +18,10 @@ use baserust::features::widget::{InMemoryWidgetRepo, WidgetService};
 use baserust::infra::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
+/// 本文件测试共处的租户。repo 空、不跑 mock,取什么值不重要 —— 建/查同一个即可。
+/// 端点上了租户轴要 Tenant extractor,给 token 一个租户让它过门(隔离另有专测)。
+const WIDGET_TEST_TENANT: Uuid = Uuid::from_u128(0x1D6E7);
+
 /// 内存仓储的测试 app(无 DB)+ **admin 令牌**(widget 端点现需登录 + RBAC + ownership)。
 /// admin 有 read:all → 看全部,故沿用原有"建后即见"断言;struct 直建不跑 mock seed,repo 空、不受干扰。
 fn test_app() -> (Router, String) {
@@ -25,7 +29,14 @@ fn test_app() -> (Router, String) {
     let verifier = Arc::new(AppTokenVerifier::dev());
     // admin 满权令牌(roles=[admin],scope 空):mint 即可,不必走真实登录。
     let admin = signer
-        .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
+        .mint_scoped(
+            Uuid::nil(),
+            "admin",
+            vec!["admin".to_owned()],
+            Some(WIDGET_TEST_TENANT),
+            vec![],
+            900,
+        )
         .unwrap();
     let bus: Arc<dyn baserust::features::widget::EventBus> =
         Arc::new(baserust::features::widget::MemoryEventBus::new());
@@ -55,6 +66,8 @@ fn test_app() -> (Router, String) {
         policy: Arc::new(test_policy()),
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
+        tenants: None,
+        tenant_admin: None,
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
@@ -106,7 +119,14 @@ fn test_policy() -> Policy {
 fn user_token() -> (String, Uuid) {
     let uid = Uuid::now_v7();
     let t = AppTokenSigner::dev()
-        .mint_scoped(uid, "user", vec!["user".to_owned()], vec![], 900)
+        .mint_scoped(
+            uid,
+            "user",
+            vec!["user".to_owned()],
+            Some(WIDGET_TEST_TENANT),
+            vec![],
+            900,
+        )
         .unwrap();
     (t, uid)
 }
@@ -613,6 +633,7 @@ async fn sse_requires_read_scope() {
             Uuid::nil(),
             "admin",
             vec!["admin".to_owned()],
+            Some(WIDGET_TEST_TENANT),
             vec![Perm::WidgetWrite],
             900,
         )
@@ -637,7 +658,14 @@ async fn multi_perm_and_or_endpoints() {
     let signer = AppTokenSigner::dev(); // 与 fixture 同 dev 密钥,可自铸降权令牌
     let narrowed = |scope: Vec<Perm>| {
         signer
-            .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], scope, 900)
+            .mint_scoped(
+                Uuid::nil(),
+                "admin",
+                vec!["admin".to_owned()],
+                Some(WIDGET_TEST_TENANT),
+                scope,
+                900,
+            )
             .unwrap()
     };
 

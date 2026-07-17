@@ -38,11 +38,11 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(routes::purge_preview))
         .routes(routes!(routes::widget_overview))
         .routes(routes!(routes::widget_events))
-}
-
-/// public 组(无闸):公开样板。
-pub fn public_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(routes::widget_stats))
+        // widget_stats 曾在 public 组。上租户轴后挪进来 —— public 端点没有 token 就造不出
+        // TenantId,而「把所有客户公司的数据加总告诉匿名访问者」不是一个能加闸的端点,
+        // 是一个不该存在的端点(spec §6.1)。widget 因此不再演示 public 形态,这是对的:
+        // 多租户下「public + 租户数据」本身就是反模式,留着当样板是在教人写洞。
+        .routes(routes!(routes::widget_stats))
 }
 
 /// admin 组(组闸「users:admin」由 composition root 上)。

@@ -6,5 +6,6 @@ pub mod auth_audit;
 pub mod content;
 pub mod profile;
 pub mod search;
+pub mod tenants;
 pub mod users;
 pub mod widget;

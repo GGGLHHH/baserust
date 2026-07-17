@@ -5,11 +5,11 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 use super::adapters::{
-    ContentAvatarProbe, IdmOutboxSource, InProcessProfileDirectory, InProcessUserDirectory,
-    SearchIndexAdapter,
+    ContentAvatarProbe, IdmOutboxSource, InProcessProfileDirectory, InProcessTenantDirectory,
+    InProcessUserDirectory, SearchIndexAdapter, TenantClaimsExtender,
 };
 use super::router::Mount;
-use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
+use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner, TenantDirectory};
 use crate::features::auth_audit::{
     projector::AuthEventProjector, AuthAuditService, AuthEventBus, AuthEventRepo, AuthRetentionJob,
     PgAuthEventRepo,
@@ -18,6 +18,7 @@ use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
 };
 use crate::features::search::{projector::Projector, PgSearchIndexRepo, SearchIndexRepo};
+use crate::features::tenants::{InMemoryTenantRepo, PgTenantRepo, TenantRepo};
 use crate::features::users::{self, UserAdminService, UserSearchIndex};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
@@ -79,6 +80,14 @@ pub struct AppState {
     pub token_verifier: Arc<AppTokenVerifier>,
     /// JWT 签发半边(私钥)。**仅 needs_idm 进程 Some**;`Mount::App` = None(app 被攻破铸不出 token)。
     pub token_signer: Option<Arc<AppTokenSigner>>,
+    /// 租户目录(auth 切租户用的**消费方端口**,实现见 `app/adapters`)。
+    /// **仅 needs_idm 进程 Some** —— 与 `token_signer` 同口径:租户是铸币侧的事,
+    /// `Mount::App` 没有 idm_pool、auth 路由也不挂,本就够不着。
+    /// 给它一个**空的**实现比 None 更坏:误挂到 app 组的租户端点会静默「查无此租户」而不是炸。
+    pub tenants: Option<Arc<dyn TenantDirectory>>,
+    /// 租户管理服务(P6:平台开通 + 租户内成员管理)。**仅 needs_idm 进程 Some** ——
+    /// 同 `tenants`:租户/成员/用户数据全在 idm schema。持 TenantRepo + idm UserRepo。
+    pub tenant_admin: Option<crate::features::tenants::TenantAdminService>,
     /// idm.outbox 写句柄(仅 needs_idm 进程 Some):auth handler 发审计事件用(fire-and-forget)。
     pub idm_outbox: Option<Arc<dyn idm::OutboxRepo>>,
     /// auth_event 读句柄(admin 查询端点用)。仅 needs_idm + 配了 search pool 时 Some。
@@ -240,6 +249,29 @@ impl AppState {
                 )
             }
         };
+        // 租户仓储:三张表同在 **idm schema**(铸 token 的进程只有 idm_pool,见 spec §2.1),
+        // 故跟着 idm_pool 二选一 —— 不是跟 app_pool。
+        //
+        // ⚠️ **`Mount::App` 必须是 `None`,不能 fallback 到内存** —— 与 `token_signer` 同口径。
+        // 租户是铸币侧的事:app 进程没有 idm_pool、auth 路由也不挂,本就够不着。若给它一个
+        // **空的**内存租户库,任何将来误挂到 app 组的租户端点都会静默返回「查无此租户」
+        // 而不是炸 —— 那是最坏的失败模式(看起来在工作,其实永远查不到)。
+        // 内层的 Some/None 才是「PG 还是内存」:needs_idm 但没配 IDM_DB_HOST = dev 内存模式,合法。
+        let tenant_repo: Option<Arc<dyn TenantRepo>> = needs_idm.then(|| match &idm_pool {
+            Some(pool) => Arc::new(PgTenantRepo::new(pool.clone())) as Arc<dyn TenantRepo>,
+            None => Arc::new(InMemoryTenantRepo::new()) as Arc<dyn TenantRepo>,
+        });
+        // 仓储只留在组合根内(seed / ClaimsExtender 用);**AppState 上放的是 auth 的消费方端口** ——
+        // handler 只该看见「我要什么」,不该看见 tenants 的领域实体(CLAUDE.md:业务模块彼此零 import)。
+        let tenants: Option<Arc<dyn TenantDirectory>> = tenant_repo
+            .clone()
+            .map(|r| Arc::new(InProcessTenantDirectory::new(r)) as Arc<dyn TenantDirectory>);
+        // 租户管理服务(P6):持 TenantRepo + idm UserRepo(解析邀请、富化 username)。
+        // 只在 needs_idm(tenant_repo Some)时装 —— 与切换端点同口径。
+        let tenant_admin = tenant_repo
+            .clone()
+            .map(|r| crate::features::tenants::TenantAdminService::new(r, idm_users.clone()));
+
         // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
 
@@ -270,6 +302,11 @@ impl AppState {
             super::seed::apply(
                 idm_users.as_ref(),
                 idm_roles.as_ref(),
+                // needs_idm ⇒ tenants 必 Some(见 `AppState::tenants` 的 doc);
+                // 真 None 就是 wiring bug,该在启动时炸而不是静默 seed 不出租户。
+                tenant_repo
+                    .as_deref()
+                    .context("needs_idm 进程必须有 tenants 仓储 —— wiring bug")?,
                 &Argon2Hasher,
                 &seed,
                 Some("system".to_owned()),
@@ -348,13 +385,22 @@ impl AppState {
             user_search,
         );
 
-        let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
+        // 租户经 `ClaimsExtender` 端口进 claim(idm v0.6.0):**只在铸币路径上跑**
+        // (`issue_session` ← register/login/refresh),`me()`/`update_me()` 不碰它。
+        // `idm_roles` 三个消费方(seed / user_admin / AuthService)现在拿的是**同一个**
+        // 未加料的仓储 —— 角色就是角色,不再兼职运租户,也就没有「包错了就崩」这回事。
+        //
+        // `Mount::App`(tenants=None)不装:那个进程铸不了币(NoopSigner)、auth 路由也不挂。
+        let mut auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
             .hasher(Arc::new(Argon2Hasher))
             .signer(signer_port)
             .verifier(token_verifier.clone())
             .access_ttl_secs(config.idm_access_ttl_secs)
-            .refresh_ttl_secs(config.idm_refresh_ttl_secs)
-            .build();
+            .refresh_ttl_secs(config.idm_refresh_ttl_secs);
+        if let Some(t) = &tenant_repo {
+            auth = auth.claims_extender(Arc::new(TenantClaimsExtender::new(t.clone())));
+        }
+        let auth = auth.build();
 
         let outbox_relays = build_outbox_relays(
             config,
@@ -405,6 +451,8 @@ impl AppState {
                 policy,
                 token_verifier,
                 token_signer,
+                tenants,
+                tenant_admin,
                 idm_outbox,
                 auth_audit,
                 auth_events_bus,

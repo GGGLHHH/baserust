@@ -285,6 +285,10 @@ impl UserAdminService {
     }
 
     /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
+    ///
+    /// 这里只可能出平台角色,**由构造保证**:`idm.roles` 的行只来自 `seed::apply` 的
+    /// `for r in RoleName::ALL`,而 `RoleName` 只装平台角色(见它的 doc)。租户角色是
+    /// 另一个类型、另一张表,根本到不了这条路上。
     pub async fn list_roles(&self) -> Result<Page<RoleView>, AppError> {
         // 不在闭集的角色行(存量脏数据)跳出目录 + warn,不打挂端点。
         let items: Vec<RoleView> = self
@@ -353,10 +357,11 @@ impl UserAdminService {
             .collect();
         ids.iter()
             .map(|id| {
-                by_id
+                let name = by_id
                     .get(id)
                     .cloned()
-                    .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))
+                    .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))?;
+                Ok(name)
             })
             .collect()
     }
