@@ -10,8 +10,11 @@ mod routes;
 mod token;
 mod types;
 
+pub mod port;
+
 pub use middleware::authenticate;
-pub use token::{AppTokenSigner, AppTokenVerifier, NoopSigner};
+pub use port::{StaticTenantDirectory, TenantBrief, TenantDirectory};
+pub use token::{AppTokenSigner, AppTokenVerifier, ExtraClaims, NoopSigner};
 pub use types::UserResponse;
 
 use utoipa_axum::router::OpenApiRouter;

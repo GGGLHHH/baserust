@@ -8,7 +8,8 @@ mod idm_outbox_source;
 mod idm_user_directory;
 mod in_process_profile_directory;
 mod profile_display_names;
-mod tenant_role_repo;
+mod tenant_claims;
+mod tenant_directory;
 mod user_search_index;
 
 pub use content_avatar_probe::ContentAvatarProbe;
@@ -16,5 +17,6 @@ pub use idm_outbox_source::IdmOutboxSource;
 pub use idm_user_directory::InProcessUserDirectory;
 pub use in_process_profile_directory::InProcessProfileDirectory;
 pub use profile_display_names::ProfileDisplayNames;
-pub use tenant_role_repo::TenantRoleRepo;
+pub use tenant_claims::TenantClaimsExtender;
+pub use tenant_directory::InProcessTenantDirectory;
 pub use user_search_index::SearchIndexAdapter;

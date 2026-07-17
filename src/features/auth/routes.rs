@@ -12,13 +12,13 @@ use garde::Validate;
 use uuid::Uuid;
 
 use super::emit::{emit_auth_event, failure_data, success_data};
+use super::port::TenantDirectory;
 use super::types::{
     ChangePasswordRequest, DeleteMeRequest, LoginRequest, MyTenantResponse, RegisterRequest,
     SetActiveTenantRequest, UpdateMeRequest, UserResponse,
 };
 use crate::app::state::AppState;
 use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
-use crate::features::tenants::TenantRepo;
 use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, Tenant};
 use crate::infra::client_context::ClientContext;
@@ -460,9 +460,9 @@ pub async fn admin_get_me(
 // 则一签名就 panic(`NoopSigner`)。它们写在本文件而非新模块,是因为 `set_auth_cookies`
 // 是模块私有 fn;而且切租户本就是认证域的动作(它改的是铸币的输入)。
 
-/// 取本进程的租户仓储。`Mount::App` 恒 `None`(见 `AppState::tenants` 的 doc)——
+/// 取本进程的租户目录。`Mount::App` 恒 `None`(见 `AppState::tenants` 的 doc)——
 /// 但这两个端点只挂 needs_idm 组,走到这就是 wiring bug,故 500 而非静默空列表。
-fn tenants_of(state: &AppState) -> Result<&std::sync::Arc<dyn TenantRepo>, AppError> {
+fn tenants_of(state: &AppState) -> Result<&std::sync::Arc<dyn TenantDirectory>, AppError> {
     state.tenants.as_ref().ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
             "租户端点挂到了没有 idm_pool 的进程上 —— 它们必须只挂 needs_idm 组(spec §2.3)"
@@ -484,28 +484,18 @@ pub async fn list_my_tenants(
     // (register 的常规出口,spec §1.1 —— 前端据此渲染「你还没有租户」)。
     tenant: Option<Tenant>,
 ) -> Result<Json<Vec<MyTenantResponse>>, AppError> {
-    // memberships 已过滤停用/软删租户(TenantRepo 契约,spec §4.4)、按 seq 升序(最早加入在前)。
-    let items = tenants_of(&state)?.memberships(user.0.id).await?;
+    // 端口契约:已过滤停用/软删租户、按加入顺序。
+    let items = tenants_of(&state)?.memberships_of(user.0.id).await?;
 
-    // ⚠️ **`is_active` 以 claim 为准,不用 `Membership::is_active`** —— 两者不是一回事:
-    // - `Membership::is_active` = `user_active_tenant` 里**显式设过**的那个;
-    // - claim 的 tenant = 本会话**实际生效**的那个,可能来自回退(`.or(ms.first())`,spec §4.1)。
-    //
-    // 从没切过的用户(**每个人的初始状态**)`user_active_tenant` 是空的 ⇒ 直接用
-    // `Membership::is_active` 会让整个列表全是 false,而他的 token 明明落在某个租户里 ——
-    // 前端渲染成「一个都没选中」。前端要的是「我现在在哪」,那只有 claim 知道。
+    // `is_active` **以 claim 为准** —— 只有它知道本会话实际落在哪个租户
+    // (可能来自「没显式选过 → 取第一个」的回退)。见 `MyTenantResponse::with_active`。
     let active = tenant.map(|t| t.0.get());
-    let items = items
-        .into_iter()
-        .map(|m| {
-            let is_active = Some(m.tenant_id) == active;
-            MyTenantResponse {
-                is_active,
-                ..m.into()
-            }
-        })
-        .collect();
-    Ok(Json(items))
+    Ok(Json(
+        items
+            .into_iter()
+            .map(|t| MyTenantResponse::with_active(t, active))
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -537,27 +527,42 @@ pub async fn put_active_tenant(
         .map(|c| c.value().to_owned())
         .ok_or(AppError::Unauthorized)?;
 
-    // ── 2. 安全支点:membership 校验。 ──
+    // ── 2. **两枚凭证必须是同一个人**。 ──
+    // 本 handler 是全仓唯一同时吃 access token(`CurrentUser`)与 refresh cookie 的地方,
+    // 而这两者**不保证同源**:`authenticate` 接受 cookie **或** `Authorization: Bearer`
+    // (middleware.rs),而 `refresh()` 只按 refresh 的哈希认人 —— 它根本看不到 `user.0.id`。
+    // 不核对的话,`Bearer <A 的 access>` + `Cookie: refresh_token=<B 的>` 会:按 A 校验成员
+    // 资格、**改 A 的 active_tenant**、按 B 铸新会话、把这笔账记在 B 头上而 from_tenant 取自
+    // A 的 claim。四件事,四个主体错位。
+    //
+    // 必须用 `session_owner`(只读)而不是「先 refresh 再比对」—— 后者要先把 A 的
+    // active_tenant 改掉才发现不对,检查来得太晚。
+    if state.auth.session_owner(&refresh).await? != Some(user.0.id) {
+        return Err(AppError::Unauthorized);
+    }
+
+    // ── 3. 安全支点:成员资格校验。 ──
     // **客户端说的 tenant 只是一个「请求」,不是断言** —— 它只到达签发方(本进程)且必须
     // 过这一关;资源 API 永远只读已签名的 claim,绝不从 header/query/body 读 active tenant。
     // 非成员 → 404(不是 403):403 等于承认「这个租户存在,只是你不在里面」。
-    // membership 同样过滤停用/软删租户,所以「租户被停用」与「你不是成员」对外同样是 404。
-    if tenants
-        .membership(user.0.id, req.tenant_id)
+    // `memberships_of` 同样过滤停用/软删租户,所以「租户被停用」与「你不是成员」对外同为 404。
+    if !tenants
+        .memberships_of(user.0.id)
         .await?
-        .is_none()
+        .iter()
+        .any(|t| t.id == req.tenant_id)
     {
         return Err(AppError::NotFound);
     }
 
-    // ── 3. 改状态。 ──
+    // ── 4. 改状态。 ──
     // 租户选择必须状态化:idm 的 `roles_for_user` 只收 user_id,收不到「哪个租户」,
     // per-request 的选择不可能在 idm 内部发生(spec §4.1)。
     tenants.set_active(user.0.id, req.tenant_id).await?;
 
-    // ── 4. 重新铸币 —— 这是 idm 唯一公开的「重新发 token」API(issue_session 是私有的)。 ──
-    // refresh() 会:撤旧 session → 建新 session(**新 jti**)→ 重跑 TenantRoleRepo::roles_for_user
-    // (此时读到的 active 已是新租户)→ 拿新租户的角色 → 重签 access(带新 tenant claim)+ 新 refresh。
+    // ── 5. 重新铸币 —— 这是 idm 唯一公开的「重新发 token」API(issue_session 是私有的)。 ──
+    // refresh() 会:撤旧 session → 建新 session(**新 jti**)→ 重问一遍 TenantClaimsExtender
+    // (此时读到的 active 已是新租户)→ 重签 access(带新 tenant claim)+ 新 refresh。
     // 失败(refresh 过期)→ 401 → 前端重新登录;但 active 已改,重登即落新租户(状态化的意外好处)。
     let outcome = state.auth.refresh(&refresh).await?;
 
@@ -603,7 +608,7 @@ pub async fn put_active_tenant(
     )
     .await;
 
-    // ── 5. **refresh cookie 必须整条轮换** ——旧 refresh 一次性、已被 idm 撤销,
+    // ── 6. **refresh cookie 必须整条轮换** ——旧 refresh 一次性、已被 idm 撤销,
     //    前端留着下次必 401。 ──
     let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
     Ok((jar, Json(outcome.user.into())))

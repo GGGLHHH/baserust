@@ -45,7 +45,7 @@
 
 **R4 是产品意图,不是当前代码的事实。** `POST /api/v1/public/auth/register` 仍在 `public_router()` 里、仍是公开自助注册,本设计**不删它也不闸它**(邀请流在 §7 被推迟)。
 
-⇒ 新注册用户 0 membership ⇒ `TenantRoleRepo` 不 push 哨兵 ⇒ **铸出的 token 没有 tenant claim**。
+⇒ 新注册用户 0 membership ⇒ `TenantClaimsExtender` 返回 `tenant: None` ⇒ **铸出的 token 没有 tenant claim**。
 
 **这是互联网上每一次 register 的必经路径,不是边角。** 因此:
 
@@ -88,7 +88,8 @@
 | idm schema / idm 进程 | 部署单元 + PG schema | **baserust 自己** | 知道 |
 | app schema / app 进程 | 业务数据与逻辑 | baserust 自己 | 知道 |
 
-**"表住 idm schema" ≠ "租户归 rust-idm 拥有"。** `migrations/idm/0004_*`、`TenantRepo`、`TenantRoleRepo` 全是 baserust 的代码。
+**"表住 idm schema" ≠ "租户归 rust-idm 拥有"。** `migrations/idm/0004_*`、`TenantRepo`、`TenantClaimsExtender` 全是 baserust 的代码。
+(v0.6.0 给 idm 加的只有 `extra` 字段 + `ClaimsExtender`/`session_owner` 两个通用原语 —— 它们不认识「租户」。)
 
 ### 2.3 职责归属判据
 
@@ -100,24 +101,47 @@
 | **平台**角色(`superadmin` / `admin` / `user`) | `idm.user_roles`(现状不动) |
 | **租户**角色(`tn:admin` / `tn:member`) | `idm.tenant_members.role` |
 | tenant → claim 的翻译 | `src/features/auth/token.rs`(claim 形状的实际所在) |
-| `TenantRoleRepo` 装饰器 | `src/app/adapters/`(同时耦合 idm 库与 TenantRepo → 只能在组合根) |
+| `TenantClaimsExtender` / `InProcessTenantDirectory` | `src/app/adapters/`(同时耦合 idm 库与 TenantRepo → 只能在组合根) |
 | 数据带 `tenant_id` + 查询层过滤 | app,各 feature 的 repo |
 | `Access` 的租户轴 | `src/infra/authz.rs` |
 | 租户计费 / 配额 / 设置(未来) | app schema,普通业务模块,照 `adding-a-feature` |
 
 **推论(反直觉,忘了会在生产 500)**:切换租户 / 邀请成员的端点**必须挂 `/auth/` 前缀** —— `deploy/nginx.conf` 里 `^/api/v1/(public|frontend|admin)/auth/` 是唯一把请求分流进 idm 进程的规则,只有那里读得到 `tenant_members`;路由到 app 进程则一签名就 panic(`NoopSigner`,`src/features/auth/token.rs:172-178`)。
 
-### 2.4 `TenantRoleRepo` 的包装点唯一 ⚠️
+### 2.4 租户进 claim 的通道:`idm::ClaimsExtender` ⚠️
 
-`idm_roles: Arc<dyn RoleRepo>` 在组合根被**三个消费方**共用。包错就崩:
+**rust-idm 是本项目自己的仓库**(`github.com/GGGLHHH/rust-idm`,本地 `../rust-idm`)。
+它的 `src/token.rs` 模块头**自己写着**「app 可注入自定义 claims(tenant_id/权限位…)」——
+意图一直在,只是承载它的字段从没建。v0.6.0 补上:
 
-| 消费方 | 收哪个 | 理由 |
-|---|---|---|
-| `AuthService::builder`(`state.rs:351`) | **包装后的 `TenantRoleRepo`** | 只有铸币路径需要哨兵 |
-| `seed::apply`(`state.rs:272`) | **未包装的 `idm_roles`** | 它拿 `roles_for_user` 的 `current` 与 `roles.list()` 的 `by_name` 比对;哨兵不在目录里 → 命中 `seed.rs:122` 的 `anyhow::bail!("角色 {name} 在 user_roles 里但不在角色目录中")` → **dev 每次启动直接崩** |
-| `UserAdminService::new`(`state.rs:344`) | **未包装的 `idm_roles`** | 那是平台角色的 CRUD 与目录,租户角色不是它的语料;包了会把 `t:{uuid}` 哨兵显示给后台 |
+| 新增 | 是什么 |
+|---|---|
+| `TokenClaims::extra: serde_json::Value` | app 的自定义 claim 载荷。idm **不解释内容**,只负责运到 signer |
+| `trait ClaimsExtender` | 可选端口,`issue_session` 里问一次「这人还有什么该进 claim」。**位置与 `roles_for_user` 对称** |
+| `AuthServiceBuilder::claims_extender` | 装它。不装 = `extra` 恒 `Null`,行为同 v0.5.0 |
 
-`TenantRoleRepo` 的 doc 必须写:**本装饰器的产物只允许流向 signer**。
+**为什么非得动 idm**:`TokenSigner::sign` 是**同步**的,只拿得到 `&TokenClaims`,不能 await
+一次查库 —— 「签发时去查这人的租户」在 signer 里做不到。值必须由 idm 在 `issue_session` 里
+先查好递进来。
+
+baserust 侧:`app/adapters/tenant_claims.rs` 的 `TenantClaimsExtender` 实现它,
+`auth/token.rs` 的 `sign()` 从 `extra` 读出 → `AppClaims.tenant`。
+
+> ### 曾经的错法(别走回去)
+>
+> v0.5.0 没有 `extra`,于是 P2 第一版把 tenant 编码成 `t:{uuid}` **塞进 `roles: Vec<String>`**
+> 走私,再在 sign 里摘出;租户角色则做成 `RoleName::TenantAdmin`(`tn:admin`)混在同一个数组里。
+> 那个设计的连锁代价:
+>
+> - 租户 id 变成了「角色」⇒ 污染角色闭集,所有按角色判定的授权闸对它**结构性失明**
+>   (它们查 `RoleName::is_tenant_scoped()`,而 `t:` 按构造就解析不成 `RoleName`);
+> - `tn:admin` 成了 `RoleName` 变体 ⇒ 被 `Policy` 映射成**平台范围**的 `:all` 权限,而
+>   `Policy` 没有租户维度 ⇒ **一家 5 人公司的管理员成了全平台 widget/content 的事实管理员**;
+> - 泄漏路径要靠三处手写 `starts_with("t:")` 各自记得堵,`/auth/me` 每次多一次三表 join;
+> - 为了看住上面这些,又长出三层防护闸 + 三个只为看守它们而存在的测试。
+>
+> 补上 `extra` 之后,以上**全部删除**(净 −174 行)。教训不是「哨兵写错了」,而是:
+> **绕过自己能改的库,代价会连锁**。
 
 ---
 
@@ -250,7 +274,7 @@ update app.widgets set tenant_id = '<seed.toml 里 [[tenants]] 声明的那个 i
 | 阶段 | 内容 | 出口 | 约 |
 |---|---|---|---|
 | **P1 存储** | `migrations/idm/0004` + `src/features/tenants/`(types / repo trait / memory / postgres)+ repo conformance 测试。**app 侧零改动** | `just test` 绿;新表存在但无人读 | 400 行 |
-| **P2 铸币与切换** | `TenantRoleRepo`(+ §2.4 的包装点)、`split_tenant`、`AppClaims.tenant: Option<Uuid>`、`mint_scoped` 加 tenant 入参、`UserResponse` 与 `/permissions/me` 双收口、`GET /auth/tenants`、`PUT /auth/active-tenant`、审计事件 | 绿,**可部署**。tenant 进了 claim,但没人拿它过滤 —— 行为与今天完全一致 | 500 行 |
+| **P2 铸币与切换** | idm v0.6.0(`extra` + `ClaimsExtender` + `session_owner`)、`TenantClaimsExtender`、`AppClaims.tenant: Option<Uuid>`、`auth/port.rs` 的 `TenantDirectory` + 组合根适配器、seed 灌 dev 租户、`GET /auth/tenants`、`PUT /auth/active-tenant`、审计事件、`tests/tenant_api.rs` | 绿,**可部署**。tenant 进了 claim,但没人拿它过滤 —— 行为与今天完全一致 | 400 行 |
 | **P3 数据落列** | `migrations/app/0005`(可空)→ 手工 backfill → `0006`(not null + 索引)。widget 写侧开始填 `tenant_id`,**读侧不过滤** | 绿。数据带上了标签,闸还没开 | 200 行 |
 | **P4 开闸** ⚠️ | `Access` 重塑 + `data_access` / `row_access` + `WidgetRepo` 复合键 + 10 个 handler + SSE + `WidgetEvent` 带 tenant + content 收编 + profile `row_access` | 绿。**隔离生效** | **~800 行** |
 | **P5 验收** | `tests/tenant_isolation_api.rs` + 各测试探针带 tenant + §10 逐条过 | 绿 | 300 行 |
@@ -263,67 +287,57 @@ update app.widgets set tenant_id = '<seed.toml 里 [[tenants]] 声明的那个 i
 
 ## 4. Token 与切换
 
-### 4.1 偷渡通道(唯一的脏东西,关在一个文件里)
+### 4.1 租户怎么进 claim
 
-`TokenClaims` 没给你留字段,`roles: Vec<String>` 是唯一的可变长字符串通道。
+`TenantClaimsExtender`(组合根)在铸币时被问一次,返回 `{"tenant": "<uuid>"}`:
 
 ```rust
-// src/app/adapters/tenant_role_repo.rs
-//
-// 唯一能让租户信息穿过 rust-idm 到达 signer 的路径。
-// roles_for_user 只收 user_id(rust-idm/src/repo/mod.rs:287),收不到"哪个租户"
-// → 租户选择必须状态化(user_active_tenant 表)。
-// register/login/refresh 三个入口全部汇流到 issue_session,它每次都重查 roles
-// (rust-idm/src/service.rs:257)→「改表 + refresh()」就是切租户,零上游改动。
-//
-// **本装饰器的产物只允许流向 signer。** 任何把它当通用 RoleRepo 用的地方都会踩
-// seed.rs:122 的 bail! 或把哨兵显示给后台 —— 见 §2.4。
-impl idm::RoleRepo for TenantRoleRepo {
-    async fn roles_for_user(&self, user_id: Uuid) -> Result<Vec<String>, IdmError> {
-        let mut roles = self.inner.roles_for_user(user_id).await?;   // 平台角色
-        // 一次读拿全:有效成员资格 + 哪条是激活的(is_active)。**不是两次独立查** ——
-        // 那样每次铸币多一次往返,且两次读非同一快照(并发 set_active 会读到不一致的组合)。
-        let ms = self.tenants.memberships(user_id).await?;           // 已过滤停用/软删租户,见 §4.4
-        // 「active 未设」与「active 指向已失效租户」坍缩成同一结果(没有任何 is_active),
-        // 两者的处理本就相同:回退到最早加入的那个(ms 按 seq 升序)。
-        // 成员被踢 / 租户被停用,下次 refresh 自动掉出。
-        // 0 租户(register 的常规出口,见 §1.1)→ 不 push 任何东西 → claim 无 tenant。
-        if let Some(m) = ms.iter().find(|m| m.is_active).or(ms.first()) {
-            roles.push(format!("t:{}", m.tenant_id));       // 哨兵,由 split_tenant 解回
-            roles.push(m.role.claim().to_string());         // "tn:admin" / "tn:member",见 §4.2
-        }
-        Ok(roles)
+// src/app/adapters/tenant_claims.rs
+#[async_trait]
+impl ClaimsExtender for TenantClaimsExtender {
+    async fn extra_for(&self, user_id: Uuid) -> Result<serde_json::Value, IdmError> {
+        // memberships 已过滤停用/软删租户(§4.4)、按 seq 升序。
+        // 失败不吞:租户读不到就该让登录炸,而不是静默降级成 0 租户。
+        let ms = self.tenants.memberships(user_id).await.map_err(..)?;
+        // 「active 未设」与「active 指向已失效租户」被 memberships 坍缩成同一结果
+        // (没有任何 is_active)⇒ 两者都回退到最早加入的那个。
+        // 0 租户(register 的常规出口,§1.1)→ None → claim 无 tenant。
+        let tenant = ms.iter().find(|m| m.is_active).or(ms.first()).map(|m| m.tenant_id);
+        serde_json::to_value(ExtraClaims { tenant })
     }
 }
 ```
 
-### 4.2 `split_tenant`:全设计唯一的信任转换点 ⚠️
+**为什么租户选择必须状态化**:`extra_for` 只收 `user_id`,收不到「哪个租户」—— per-request
+的选择不可能在铸币时凭空发生,只能落 `user_active_tenant` 表。register / login / refresh
+三个入口全部汇流到 `issue_session`,它每次都重问一遍 extender ⇒「改 active 表 + 调 `refresh()`」
+就是切租户。
 
-**必须写死,不能留给实施者发挥:**
+**它只在铸币路径上跑**:`me()` / `update_me()` 不碰 `ClaimsExtender`。这是重点不是巧合 ——
+`/auth/me` 是全站最热的认证端点,不该为一个它根本不用的租户 id 去 join 三张表。
+(旧的 `RoleRepo` 装饰器方案做不到:`roles_for_user` 被这三条路径共用。)
+
+### 4.2 `sign()` 读 `extra` ⚠️
 
 ```rust
 // src/features/auth/token.rs
-/// 把 TenantRoleRepo 偷渡的 `t:{uuid}` 哨兵从 roles 里摘出来,还原成真正的 tenant claim。
-/// 这是整个设计唯一的信任转换点。
-fn split_tenant(roles: Vec<String>) -> Result<(Option<Uuid>, Vec<String>), AppError> {
-    let (sentinels, rest): (Vec<_>, Vec<_>) =
-        roles.into_iter().partition(|r| r.starts_with("t:"));
-    match sentinels.len() {
-        0 => Ok((None, rest)),                       // 0 租户,合法(§1.1)
-        1 => {
-            // strip_prefix,不是 split(':') —— uuid 里没有冒号,但别赌
-            let id = sentinels[0].strip_prefix("t:").unwrap()
-                .parse::<Uuid>().map_err(|_| AppError::Internal)?;
-            Ok((Some(id), rest))
-        }
-        // ≥2 只可能是平台角色表被污染(有人建了个叫 t:xxx 的平台角色)。
-        // **拒签并报 Internal,绝不"挑一个"** —— 挑哪个都是在替攻击者做选择。
-        _ => Err(AppError::Internal),
+fn extra_claims(extra: &serde_json::Value) -> Result<ExtraClaims, IdmError> {
+    if extra.is_null() {
+        return Ok(ExtraClaims::default());   // 没装 extender —— 合法,行为同 v0.5.0
     }
+    // **非 Null 但形状不对 = wiring bug ⇒ 拒签,绝不 unwrap_or_default()**。
+    // 静默签出一枚少了 tenant 的 token = 静默降权/越权:没有异常、没有日志,
+    // 只有用户看见了不该看见的数据。宁可让登录炸。
+    serde_json::from_value(extra.clone()).map_err(..)
 }
 ```
 
-**今天伪造不了**(`idm.roles` 的行只来自 `seed.rs:140` 的 `for r in RoleName::PLATFORM`,全仓无建角色端点,`PUT /users/{id}/roles` 收的是角色 **id** 不是 name),**但这个防御必须在**,因为它挡的是未来某天有人加了个建角色端点。
+`ExtraClaims` 是**强类型**的(生产方与消费方都在本仓,idm 只负责运输)。
+加新的自定义 claim = 在 `ExtraClaims` 加字段 + 在对应 extender 里填。
+
+**roles 不再兼职**:它只装平台角色闭集。`token.rs` 有一条回归测试钉死
+`a_role_named_like_the_old_sentinel_is_just_a_role` —— 叫 `t:{uuid}` 的角色现在只是个
+名字古怪的普通角色,不是租户。
 
 ### 4.3 第二条铸币路径:`mint_scoped` ⚠️
 
@@ -337,7 +351,7 @@ pub fn mint_scoped(user_id: Uuid, username: &str, roles: Vec<String>,
                    scope: Vec<Perm>, ttl: Duration) -> Result<String, AppError>
 ```
 
-**`split_tenant` 只准在 `impl TokenSigner for AppTokenSigner::sign` 里调,一处。** 让 `mint_scoped` 也去解析 roles = 把偷渡通道从"idm 的无奈"变成"我们的 API 约定",那才是真的把 hack 扩散了。
+`mint_scoped` **不经 idm 的 `issue_session`,故也不经 `ClaimsExtender`** —— tenant 由调用方作为独立入参直接给。
 
 ### 4.4 `TenantRepo::memberships` 的契约 ⚠️
 
@@ -363,62 +377,37 @@ async fn memberships(&self, user_id: Uuid) -> Result<Vec<Membership>, AppError>;
 
 §8 加用例:停用租户后 refresh → 该 tenant 不再进 claim(若是唯一租户则进 §1.1 的 0 租户态)。
 
-### 4.5 两级角色:命名空间隔离 + `RoleName::ALL` 一拆为二 ⚠️
+### 4.5 两级角色是**两个类型**,不是一个枚举的两组变体 ⚠️
 
-**这是本设计最容易做错、后果最严重的一处。**
-
-若 `TenantRoleRepo` push 裸 `admin`,则 A 公司 admin 拿到的 `widget:read:all` 与 `superadmin` 的**完全一样**。
-
-| 角色 | 作用域 | 存哪 | claim 里长什么样 |
-|---|---|---|---|
-| `superadmin` / `admin` / `user` | **平台级**,骑在租户边界之上 | `idm.user_roles` | `superadmin` … |
-| `tn:admin` | **租户级**,关在租户边界之内 | `idm.tenant_members.role` | `tn:admin` |
-| `tn:member` | 租户级 | `idm.tenant_members.role` | `tn:member` |
-
-> 注:现存的 `RoleName::Admin` 是**平台**角色(`default_permissions()` 给它 `Perm::AdminLogin`),与租户的 `tn:admin` 是两回事。别把它当租户 admin。
-
-#### `RoleName::ALL` 有一个未写明的双重身份 —— 这是提权路径的根
-
-`RoleName::ALL` 同时干两件事,只看见一件就会造出提权路径:
-
-| 身份 | 消费者 | `tn:*` 该不该在 |
+| | 平台角色 | 租户角色 |
 |---|---|---|
-| (a) role→权限映射的源 | `seed.rs:59` `policy()`、`:80` `role_permission_mappings()`、`permission_catalog`、round-trip 测试 | **必须在**(否则 claim 里的 `tn:admin` 解析出零权限) |
-| (b) **`idm.roles` 平台角色目录的 upsert 源** | `seed.rs:140` `for r in RoleName::ALL { roles.upsert(...) }` | **绝不能在** |
+| 类型 | `infra::authz::RoleName` | `features::tenants::TenantRole` |
+| 值 | `superadmin` / `admin` / `user` | `admin` / `member`(DB 裸值) |
+| 存哪 | `idm.user_roles` | `idm.tenant_members.role` |
+| 怎么获得 | 后台 `PUT /users/{id}/roles` | 成员资格 |
+| 进 claim 吗 | 进 `roles` | **P2 不进** —— 见下 |
+| 映射成 `Perm` 吗 | 是(`Policy`) | **否** |
 
-若 `tn:admin` 进了 (b):`GET /admin/auth/roles`(`users/routes.rs:300` `list_roles`)把它当候选发给后台 UI → `PUT /users/{id}/roles`(`users/routes.rs:256` `set_user_roles`)能把它授进 `idm.user_roles` → `TenantRoleRepo` 第一行 `self.inner.roles_for_user()` 原样返回 → 签进 claim。
+**`TenantRole` 绝不能是 `RoleName` 的变体。** 试过一次,后果是本设计最严重的一个洞:
+`Policy` 是平台级的、没有租户维度,于是 `tn:admin` 被映射成**平台范围**的
+`WidgetReadAll` / `ContentWriteAll` / `ContentDelete`…—— 而 P4 的 repo 租户过滤还没落地,
+那些 `:all` 就是字面意思。**当上一家 5 人小公司的管理员 = 成为全平台 widget/content
+的事实管理员**,正好与「A 公司不能看 B 公司数据」相反。
 
-**结果:一个从没被邀请进任何租户的人,在 `ms.first()` 回退挑中的那个租户里就是 admin。**
+当时代码里写了句注释「P4 之前不要给任何人授租户角色」—— 没有任何东西执行它:
+`TenantRoleRepo` 见到一行 `tenant_members` 就自动把 `tn:admin` 签进 claim。而三层防护闸
+(seed 只灌 PLATFORM / list_roles 过滤 / role_names_by_ids 拒绝)守的**全是授予路径**,
+claim 是从 `tenant_members` 来的,根本不过那三道闸。
 
-`assert_no_escalation`(`users/routes.rs:38-50`)挡不住 —— 它只要求授予方持有被授角色的全部 perm,而"`tn:admin` 的权限 ⊆ superadmin 的 `Perm::ALL`"恰恰**保证**闸必过。
+两个类型让这件事**编译不过**。随之删除:`RoleName::{TenantAdmin,TenantMember}`、
+`PLATFORM`/`ALL` 分裂、`is_tenant_scoped()`、`TenantRole::claim()`、`tn:` 线上串、
+三层防护闸、以及三个只为看守它们而存在的测试。
 
-**决定:一拆为二。**
+`RoleName::ALL` 恢复成**一个**常量、三个变体。它的双重身份(可授予目录 **且** 权限映射源)
+是对的 —— **前提是它只装平台角色**:能被授予的 ⟺ 能映射到平台权限的。
 
-```rust
-// src/infra/authz.rs
-/// 平台角色目录。**只有这三个能进 idm.roles、能被 set_user_roles 授予。**
-pub const PLATFORM: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
-/// 全部角色(含租户级)。只喂 role_permission_mappings / permission_catalog / Policy。
-pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, RoleName::TenantMember];
-```
-
-加变体的四个连带,一个都不能漏:
-
-1. `ALL` 是**定长数组** `[RoleName; 3]`(注释自己写着"漏了没有任何东西会发现")→ 改 `[RoleName; 5]`
-2. `as_str()` 必须返回 `"tn:admin"` / `"tn:member"` —— 与 §4.1 的 `m.role.claim()` **同源,这是等式不是巧合**
-   (P1 里那个方法**刻意不叫 `wire()`**:本仓 `Perm::wire()` 的既有语义是「与 serde 输出逐字相等」
-   且有测试钉住,而 `TenantRole` 的 claim 串恰恰**不**等于它的 serde 输出(`admin`),同名会误导)
-3. `seed.rs:140` 的循环改 `for r in RoleName::PLATFORM`
-4. `users` 模块的 `list_roles` / `set_user_roles` 入参校验同样只认 `PLATFORM`
-
-`default_permissions()` 给 `tn:*` 的权限里**绝不含任何平台级 perm**(尤其 `users:admin` / `admin:login`)。
-
-**测试断言(P2 必须有,两条)**:
-
-1. `list_roles()` 的返回集 ∩ `{TenantAdmin, TenantMember}` = ∅ —— 提权闸。
-2. `TenantRole::Admin.claim() == RoleName::TenantAdmin.as_str()`(Member 同)—— **P1 钉不住这条**:
-   等式的另一端此刻还不存在,`claim()` 也零调用方,所以 `"tn:admin"` 里一个拼写错误会一路静默到
-   P2 接线才炸。P1 只能把它记在这里(实施者会逐条过的清单),rustdoc 里的 TODO 没人跑。
+**P2 的 claim 里没有租户角色**:今天没有任何消费方。「我在这家公司能干什么」是权限问题,
+P4/P5 让 `/permissions/me` 按租户回答才是对的形状,不是往 claim 里塞一个角色串。
 
 ### 4.6 角色定义保持全局(Clerk 模型)
 
@@ -436,16 +425,15 @@ pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, Ro
 
 把全 membership 塞 token、让后端按请求选 = **把签发方的 membership 校验下放到每个端点,漏一次即越权**。
 
-### 4.8 roles 泄漏到 API 的收口点(**两个**,不是一个)
+### 4.8 没有「泄漏收口点」了
 
-`t:{uuid}` 哨兵绝不能出现在任何 API 响应里:
+旧设计需要在两处显式剥离哨兵(`sign()` 一处、`me()` → `UserResponse` 一处),因为
+`AuthService` 用同一个 `RoleRepo` 服务两条路径,而只有一条经过 `sign()`。
 
-1. `src/features/auth/types.rs` 的 `From<UserView> for UserResponse`
-2. **`src/infra/authz.rs:555` 的 `get_my_permissions`** —— 它同样对 claim roles 跑 `RoleName::parse_lossy` 并把 roles 放进 `MyPermissionsResponse`,前端的按钮显隐正吃这个端点
+**现在不需要**:租户走 `extra` → `AppClaims.tenant`,`roles` 从头到尾只装平台角色。
+没有东西可泄漏,`strip_tenant_sentinel` 及其测试已删除。
 
-**且 `/me` 的 `tenant` 字段必须从 claim 取,不准从 `UserView`(库)取** —— 库不知道租户。handler 已有 `CurrentUser`,让 middleware 注入的 `Tenant` 一起进 handler。
-
-> `parse_lossy`(`authz.rs:273-284`)遇到 `t:9f2a...` 会跳过并 warn(每名一次)。收口点剥掉哨兵后就不会触发,但若实施顺序有误会看到 warn —— 那是信号,不是噪音。
+这是「正确的位置」自带的好处 —— 不是修出来的。
 
 ### 4.9 切换流程
 
@@ -465,7 +453,7 @@ pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, Ro
 3. `tenants.membership(user.id, tenant_id)` 查 idm schema —— **非成员 → 404**(不是 403,不泄露该租户存在)
    > **这是整个方案的安全支点**:客户端说的 tenant 只是一个**请求**,不是断言;它只到达签发方(idm 进程)且经 membership 校验;资源 API 永远只读已签名的 claim,**绝不从 header / query / body 读 active tenant**。
 4. `tenants.set_active(user.id, tenant_id)` upsert `user_active_tenant`
-5. `state.auth.refresh(&refresh)`:idm 撤旧 session → 建新 session(**新 jti**)→ 重跑 `TenantRoleRepo::roles_for_user` → 拿新租户角色 → 重签 access(带新 tenant claim)+ **新 refresh**
+5. `state.auth.refresh(&refresh)`:idm 撤旧 session → 建新 session(**新 jti**)→ 重问一遍 `TenantClaimsExtender`(此时读到的 active 已是新租户)→ 重签 access(带新 tenant claim)+ **新 refresh**
 6. `set_auth_cookies(jar, &outcome, state.cookie_secure)` —— **refresh cookie 必须整条轮换**,旧 refresh 一次性、已被 revoke
 7. `emit(&state.idm_outbox, AuthEventType::TenantSwitched, ...)` —— **必须用 `success_data(..)` 组 payload 再合并租户字段,别手搓 `json!`**:投影器的 `AuthEventData` 要求 `occurred_at`/`channel`/`outcome`,缺一个整条被当**毒消息 ack 丢弃**(事件进得了 outbox 却永不进 `auth_events` 读模型,且**没有任何测试会红** —— P2 实施时真踩到了,是冒烟的日志抓的)。
    >
@@ -478,7 +466,7 @@ pub const ALL: [RoleName; 5] = [/* PLATFORM 三个 */, RoleName::TenantAdmin, Ro
 
 **失败分支**:refresh 已过期 → 401 → 前端重新登录;但 `user_active_tenant` 已改,重登即落新租户(状态化的意外好处)。
 
-**登录路径零改动** —— `TenantRoleRepo` 已在 `issue_session` 里跑。
+**登录路径零改动** —— `TenantClaimsExtender` 已在 `issue_session` 里跑。
 
 ---
 
@@ -748,13 +736,19 @@ cargo test --test tenant_isolation_api
 # 4. 拓扑:/frontend/auth/tenants 在 Idm 下 200、App 下 404
 cargo test --test tenant_isolation_api topology
 
-# 5. 提权闸:tn:* 不得出现在平台角色目录
-cargo test --test rbac_scope_test tenant_roles_not_grantable
+# 5. 提权闸:租户角色不是 RoleName 的变体 —— **由类型保证,无需测试**
+#    (TenantRole 与 RoleName 是两个类型;想把前者塞进后者的 ALL 会编译失败)
 
 # 6. 构造点唯一
-grep -rn "TenantId::from_claim" src/         # 只准命中 src/features/auth/token.rs
-grep -rn "TenantRoleRepo" src/app/state.rs   # 只准命中 AuthService::builder 那一处(§2.4)
-grep -rn "split_tenant" src/                 # 只准命中 token.rs 的定义 + sign() 一处调用
+grep -rn "TenantId::from_claim" src/         # 只准命中 src/features/auth/middleware.rs
+
+# 7. **回归**:roles 不再兼职运租户(旧走私通道已删,别回去)
+grep -rn '"t:"\|tn:admin\|split_tenant\|TenantRoleRepo' src/   # 只准命中解释历史的注释
+cargo test --lib a_role_named_like_the_old_sentinel_is_just_a_role
+
+# 8. **链是活的**(P2 第一版就死在这:没有任何代码能创建租户,冒烟靠手插 SQL 才"绿")
+cargo test --lib seeded_tenants_give_the_user_real_memberships
+cargo test --test tenant_api
 ```
 
 **人工确认项**(测试盖不住的):

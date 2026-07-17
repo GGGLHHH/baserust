@@ -9,7 +9,7 @@ default-run = "baserust"
 [dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
-idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.5.0" }
+idm = { path = "../rust-idm" }  # TODO: 回 tag(v0.6.0 发布后)
 
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`
@@ -62,7 +62,7 @@ sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-
 async-trait = "0.1"
 
 # 工具
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 # 时间:timestamptz <-> OffsetDateTime(审计字段);serde-well-known 提供 RFC3339
 time = { version = "0.3", features = ["serde-well-known"] }
 # cursor 游标编解码(opaque base64url token)

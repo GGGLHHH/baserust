@@ -286,10 +286,9 @@ impl UserAdminService {
 
     /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
     ///
-    /// **只出平台角色**:租户角色(`tn:*`)只能靠 `tenant_members` 的成员资格获得,
-    /// 出现在后台候选集就是一条跨租户提权路径(见 `RoleName::PLATFORM` 的 doc)。
-    /// 第一层是 `seed::apply` 只把 `PLATFORM` upsert 进 `idm.roles`;**这里是第二层** ——
-    /// 万一有行以别的方式进了表(手工 SQL / 未来的代码),目录也不发它。
+    /// 这里只可能出平台角色,**由构造保证**:`idm.roles` 的行只来自 `seed::apply` 的
+    /// `for r in RoleName::ALL`,而 `RoleName` 只装平台角色(见它的 doc)。租户角色是
+    /// 另一个类型、另一张表,根本到不了这条路上。
     pub async fn list_roles(&self) -> Result<Page<RoleView>, AppError> {
         // 不在闭集的角色行(存量脏数据)跳出目录 + warn,不打挂端点。
         let items: Vec<RoleView> = self
@@ -303,17 +302,6 @@ impl UserAdminService {
                     RoleName::warn_unknown(&name); // 与 parse_lossy 同口径(每进程每名一次)
                     None
                 }
-            })
-            .filter(|v| {
-                if v.name.is_tenant_scoped() {
-                    tracing::error!(
-                        role = v.name.as_str(),
-                        "租户角色出现在 idm.roles 目录里 —— 它本不该被 seed 进去(见 \
-                         RoleName::PLATFORM);已从候选集剔除,请查这行是怎么来的"
-                    );
-                    return false;
-                }
-                true
             })
             .collect();
         let limit = items.len().max(1) as u64;
@@ -373,17 +361,6 @@ impl UserAdminService {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))?;
-                // **租户角色不可经平台授予路径**(见 `RoleName::PLATFORM` 的 doc):
-                // 它只能靠 `tenant_members` 的成员资格获得。授进 `idm.user_roles` 会让
-                // `TenantRoleRepo` 原样把它签进 claim —— 一个从没被邀请进任何租户的人,
-                // 就在回退挑中的那个租户里成了 admin。
-                // 这是第三层(前两层:seed 只灌 PLATFORM、list_roles 不发候选)——
-                // 挡的是「有人拿到了 tn:* 的 id 并直接 PUT」。
-                if name.parse::<RoleName>().is_ok_and(|r| r.is_tenant_scoped()) {
-                    return Err(AppError::Validation(format!(
-                        "租户角色 `{name}` 不可经平台角色授予 —— 它只能靠租户成员资格获得"
-                    )));
-                }
                 Ok(name)
             })
             .collect()

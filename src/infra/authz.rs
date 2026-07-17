@@ -201,13 +201,17 @@ impl Perm {
 /// 见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT
 /// claim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。
 ///
-/// # 两级角色 —— 加变体前先看清它属于哪一级(spec §4.5)
+/// # 这里**只装平台角色**
 ///
-/// - **平台角色**(`Superadmin`/`Admin`/`User`):骑在租户边界**之上**,存 `idm.user_roles`,
-///   可经后台 `PUT /users/{id}/roles` 授予 ⇒ 必须进 [`RoleName::PLATFORM`]。
-/// - **租户角色**(`TenantAdmin`/`TenantMember`):关在租户边界**之内**,存
-///   `idm.tenant_members.role`,只能靠成员资格获得 ⇒ **绝不可进 `PLATFORM`**,否则就是一条
-///   提权路径(见 `PLATFORM` 的 doc)。
+/// 平台角色骑在租户边界**之上**,存 `idm.user_roles`,可经后台 `PUT /users/{id}/roles` 授予,
+/// 由 [`Policy`] 映射成 [`Perm`]。
+///
+/// **租户角色(某人在某家公司里是 admin 还是 member)不是它的变体** —— 那是
+/// [`TenantRole`](crate::features::tenants::TenantRole),存 `idm.tenant_members.role`,靠成员
+/// 资格获得。别把它们塞进来:`Policy` 没有租户维度,`tn:admin` 一旦成为 `RoleName` 变体就会
+/// 被 `Policy` 映射成**平台范围**的权限 —— 一个 5 人小公司的管理员就此成为全平台
+/// widget/content 的事实管理员。那是 P2 真实犯过的错,靠三层防护也没堵住(三层守的全是
+/// **授予**路径,而 claim 是从 `tenant_members` 来的,根本不过那三道闸)。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum RoleName {
     #[serde(rename = "superadmin")]
@@ -216,62 +220,26 @@ pub enum RoleName {
     Admin,
     #[serde(rename = "user")]
     User,
-    /// **租户级** admin(`tn:admin`)。与平台 `Admin` 是两回事 —— 见本枚举的 doc。
-    #[serde(rename = "tn:admin")]
-    TenantAdmin,
-    /// **租户级** 普通成员(`tn:member`)。
-    #[serde(rename = "tn:member")]
-    TenantMember,
 }
 
 impl RoleName {
-    /// **可授予的平台角色目录** —— `ALL` 一拆为二的那一半。
-    ///
-    /// ⚠️ **租户角色绝不可进这里**,否则是一条完整的跨租户提权路径:
-    /// `seed::apply` 拿它 upsert 进 `idm.roles` → `GET /admin/auth/roles`(`list_roles`)把它当
-    /// 候选发给后台 UI → `PUT /users/{id}/roles`(`set_user_roles`)能把 `tn:admin` 授进
-    /// `idm.user_roles` → `TenantRoleRepo` 第一行 `inner.roles_for_user()` 原样返回它 → 签进 claim。
-    /// **结果:一个从没被邀请进任何租户的人,在回退挑中的那个租户里就是 admin。**
-    ///
-    /// `assert_no_escalation` 挡不住 —— 它只要求授予方持有被授角色的全部 perm,而
-    /// 「`tn:admin` 的权限 ⊆ superadmin 的 `Perm::ALL`」恰恰**保证**闸必过。
-    ///
-    /// 消费方:`seed::apply` 的 `idm.roles` upsert、seed.toml 账号引用校验、
-    /// `users` 模块的 `list_roles`/`set_user_roles` 入参校验。
-    pub const PLATFORM: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
-
-    /// 全部变体(**含租户角色**)。加变体必补这里 —— 同 `Perm::ALL`,**漏了没有任何东西会发现**
+    /// 全部变体。加变体必补这里 —— 同 `Perm::ALL`,**漏了没有任何东西会发现**
     /// (数组字面量,不编译失败;round-trip 测试遍历的就是它)。`as_str()` 的穷尽 match 会逼你
     /// 回到本 impl,但补 `ALL` 靠自觉。
     ///
-    /// 消费方(**只准是这三类**,别拿它去 seed `idm.roles`):`from_str`(claim 里的 `tn:*`
-    /// 必须解析得出)、`Policy::from_roles` 的权限映射、`role_permissions` 表的 bootstrap。
-    pub const ALL: [RoleName; 5] = [
-        RoleName::Superadmin,
-        RoleName::Admin,
-        RoleName::User,
-        RoleName::TenantAdmin,
-        RoleName::TenantMember,
-    ];
+    /// 它同时是**可授予的角色目录**(`seed::apply` 拿它 upsert 进 `idm.roles`、`list_roles`
+    /// 拿它发候选)与**权限映射源**(`Policy::from_roles`、`role_permissions` bootstrap)——
+    /// 两个身份合一是对的,**前提是这里只有平台角色**:能被授予的 ⟺ 能映射到平台权限的。
+    /// 往里加一个不该被授予的东西,这个等式就破了(见本枚举 doc)。
+    pub const ALL: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
 
     /// wire 串(== serde `rename`;单一来源,`role_name_wire_matches` 测试钉死不漂移)。
-    ///
-    /// `tn:admin`/`tn:member` **必须与 `TenantRole::claim()` 逐字相等** —— 这是等式不是巧合
-    /// (spec §4.5):`TenantRoleRepo` push 它,`Policy` 按它查权限。
-    /// `tenant_role_claim_matches_role_name` 测试钉住。
     pub fn as_str(&self) -> &'static str {
         match self {
             RoleName::Superadmin => "superadmin",
             RoleName::Admin => "admin",
             RoleName::User => "user",
-            RoleName::TenantAdmin => "tn:admin",
-            RoleName::TenantMember => "tn:member",
         }
-    }
-
-    /// 是不是**租户级**角色(`tn:` 前缀)。平台角色目录/授予路径靠它过滤。
-    pub fn is_tenant_scoped(&self) -> bool {
-        matches!(self, RoleName::TenantAdmin | RoleName::TenantMember)
     }
 
     /// 人读显示名(seed idm.roles.display_name)。
@@ -280,8 +248,6 @@ impl RoleName {
             RoleName::Superadmin => "超级管理员",
             RoleName::Admin => "管理员",
             RoleName::User => "普通用户",
-            RoleName::TenantAdmin => "租户管理员",
-            RoleName::TenantMember => "租户成员",
         }
     }
 
@@ -308,34 +274,6 @@ impl RoleName {
             ],
             RoleName::User => vec![
                 Perm::WidgetRead,
-                Perm::ContentRead,
-                Perm::ContentWrite,
-                Perm::ProfileRead,
-                Perm::ProfileWrite,
-            ],
-            // ── 租户级:**绝不含任何平台级 perm**(`UsersAdmin` / `AdminLogin`)。 ──
-            // 那两个是「骑在租户边界之上」的能力:UsersAdmin 能管所有租户的用户、AdminLogin
-            // 是后台入口。租户 admin 只在自己那家公司里是 admin —— 它的 `:all` 限定符
-            // (WidgetReadAll 等)在 P4 开闸后语义会**收窄**成「本租户内全部」,因为
-            // repo 已先按 tenant 过滤过(spec §5.1)。在那之前它就是普通的 read:all,
-            // 所以 P4 之前**不要**给任何人授租户角色。
-            RoleName::TenantAdmin => vec![
-                Perm::WidgetRead,
-                Perm::WidgetReadAll,
-                Perm::WidgetWrite,
-                Perm::WidgetWriteAll,
-                Perm::WidgetDelete,
-                Perm::ContentRead,
-                Perm::ContentReadAll,
-                Perm::ContentWrite,
-                Perm::ContentWriteAll,
-                Perm::ContentDelete,
-                Perm::ProfileRead,
-                Perm::ProfileWrite,
-            ],
-            RoleName::TenantMember => vec![
-                Perm::WidgetRead,
-                Perm::WidgetWrite,
                 Perm::ContentRead,
                 Perm::ContentWrite,
                 Perm::ProfileRead,
@@ -713,60 +651,6 @@ mod tests {
             assert_eq!(seg.next(), p.qualifier(), "{wire}: qualifier");
             assert_eq!(seg.next(), None, "{wire}: 多余段");
         }
-    }
-
-    // ── 两级角色的提权闸(spec §4.5 / §10 验收 5)──
-
-    /// **`PLATFORM` ∩ 租户角色 = ∅** —— 这是整条提权链的根闸。
-    /// 若哪天有人图省事把 `TenantAdmin` 塞进 `PLATFORM`,`seed::apply` 就会把它 upsert 进
-    /// `idm.roles`,它随即成为后台可授予的**平台**角色 —— 一个从没被邀请进任何租户的人
-    /// 就能拿到 `tn:admin`,在回退挑中的租户里当 admin。
-    #[test]
-    fn platform_catalog_excludes_tenant_roles() {
-        for r in RoleName::PLATFORM {
-            assert!(
-                !r.is_tenant_scoped(),
-                "{} 是租户角色,绝不可进 PLATFORM —— 见 RoleName::PLATFORM 的 doc",
-                r.as_str()
-            );
-        }
-        // 反向:ALL 里除去 PLATFORM 的,必须全是租户角色(防「加了平台角色只补 ALL 忘补 PLATFORM」)
-        for r in RoleName::ALL {
-            if !RoleName::PLATFORM.contains(&r) {
-                assert!(
-                    r.is_tenant_scoped(),
-                    "{} 既不在 PLATFORM 又不是租户角色 —— 加平台角色要同时补 PLATFORM",
-                    r.as_str()
-                );
-            }
-        }
-    }
-
-    /// 租户角色**绝不含平台级 perm**。`UsersAdmin`(管所有租户的用户)与 `AdminLogin`
-    /// (后台入口)都是骑在租户边界之上的能力 —— 租户 admin 只在自己那家公司里是 admin。
-    #[test]
-    fn tenant_roles_hold_no_platform_perms() {
-        for r in RoleName::ALL.iter().filter(|r| r.is_tenant_scoped()) {
-            let perms = r.default_permissions();
-            for forbidden in [Perm::UsersAdmin, Perm::AdminLogin] {
-                assert!(
-                    !perms.contains(&forbidden),
-                    "{} 不该持有平台级权限 {:?}",
-                    r.as_str(),
-                    forbidden
-                );
-            }
-        }
-    }
-
-    /// `RoleName::TenantAdmin.as_str()` 必须与 `TenantRole::claim()` **逐字相等** ——
-    /// 这是等式不是巧合(spec §4.5):`TenantRoleRepo` push `claim()`,`Policy` 按
-    /// `as_str()` 查权限。两边任一改了名字,claim 里的角色就查不到权限、静默变成零权限。
-    #[test]
-    fn tenant_role_claim_matches_role_name() {
-        use crate::features::tenants::TenantRole;
-        assert_eq!(TenantRole::Admin.claim(), RoleName::TenantAdmin.as_str());
-        assert_eq!(TenantRole::Member.claim(), RoleName::TenantMember.as_str());
     }
 
     /// RoleName: `as_str()` == serde rename(不漂移);superadmin 默认持全权闭集。

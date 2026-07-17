@@ -11,6 +11,7 @@ use anyhow::Context;
 use baserust::app::policy_repo;
 use baserust::app::seed::{apply, apply_profiles, SeedData};
 use baserust::features::profile::PgProfileRepo;
+use baserust::features::tenants::PgTenantRepo;
 use baserust::infra::config::Config;
 use idm::{Argon2Hasher, PgRoleRepo, PgUserRepo};
 use sqlx::postgres::PgPoolOptions;
@@ -37,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     apply(
         &PgUserRepo::new(idm_pool.clone()),
         &PgRoleRepo::new(idm_pool.clone()),
+        &PgTenantRepo::new(idm_pool.clone()),
         &Argon2Hasher,
         &data,
         Some("system".to_owned()),

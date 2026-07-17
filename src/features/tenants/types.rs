@@ -25,13 +25,15 @@ pub enum TenantStatus {
     Suspended,
 }
 
-/// **租户级**角色。与平台级的 `infra::authz::RoleName` 是两回事 ——
-/// 平台角色骑在租户边界之上,租户角色关在租户边界之内。见 spec §4.5。
+/// **租户级**角色:某人在**某一家**公司里是 admin 还是 member。
 ///
-/// serde/sqlx 的串都是 DB 裸值(`admin`/`member`),与 `tenant_members_role_ck` 一致;
-/// JWT claim 里那个带前缀的串走 [`TenantRole::claim`],**刻意不叫 `wire()`** ——
-/// 本仓 `Perm::wire()` 的既有语义是「与 serde 输出逐字相等」(还有测试钉住),
-/// 而这里的 claim 串(`tn:admin`)恰恰**不**等于 serde 输出,同名会误导读者。
+/// 与平台级的 [`RoleName`](crate::infra::authz::RoleName) 是两个类型,**这是刻意的** ——
+/// 平台角色骑在租户边界之上、由 `Policy` 映射成平台范围的 `Perm`;租户角色关在租户边界
+/// 之内、存 `tenant_members.role`。把它做成 `RoleName` 的变体试过一次:`Policy` 没有租户
+/// 维度,于是 `tn:admin` 被映射成**平台范围**的 `:all` 权限,一家 5 人公司的管理员就成了
+/// 全平台的事实管理员。两个类型让那件事编译不过。
+///
+/// serde/sqlx 的串都是 DB 裸值(`admin`/`member`),与 `tenant_members_role_ck` 一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text")]
@@ -40,22 +42,6 @@ pub enum TenantRole {
     Admin,
     #[sqlx(rename = "member")]
     Member,
-}
-
-impl TenantRole {
-    /// JWT claim 里的串。**必须与 `RoleName::TenantAdmin.as_str()` 逐字相等** ——
-    /// 这是等式不是巧合(spec §4.5):TenantRoleRepo push 它,Policy 按它查权限。
-    ///
-    /// ⚠️ **P1 里这条等式钉不住**:等式的另一端 `RoleName::TenantAdmin` 此刻还不存在
-    /// (P2 才加),本方法也零调用方 —— 一个拼写错误会静默到 P2 接线才炸。留着它是因为
-    /// P2 一定要用、且它是 spec §4.5 的一部分;**但别指望这行 rustdoc 提醒谁** ——
-    /// 该等式的强制在 spec §4.5 的 checklist 里(那是 P2 实施者会逐条过的清单)。
-    pub fn claim(self) -> &'static str {
-        match self {
-            Self::Admin => "tn:admin",
-            Self::Member => "tn:member",
-        }
-    }
 }
 
 /// 一条**有效**成员资格(已过滤停用/软删租户,见 `TenantRepo::memberships` 契约)。
