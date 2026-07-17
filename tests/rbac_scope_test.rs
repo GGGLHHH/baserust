@@ -216,11 +216,18 @@ async fn body_of(app: &Router, method: &str, uri: &str, bearer: Option<&str>) ->
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-/// 经 service 直查某 mock widget 的 id(owner=None 看全部;id 运行期生成,按 name 找)。
+/// mock 数据落在哪个租户 —— 与 mock.toml 的 `tenant = "acme"` 同源。
+/// 用 `seed::tenant_id_for` 而不是硬编码 uuid:租户 id 是从 slug 确定性派生的(v5),
+/// 硬编码会在有人改 slug 时静默失配。
+fn test_tenant() -> baserust::infra::authz::TenantId {
+    baserust::infra::authz::TenantId::from_claim(baserust::app::seed::tenant_id_for("acme"))
+}
+
+/// 经 service 直查某 mock widget 的 id(owner=None 看**本租户内**全部;id 运行期生成,按 name 找)。
 async fn widget_id(state: &AppState, name: &str) -> Uuid {
     state
         .widgets
-        .list(page_query(), None)
+        .list(test_tenant(), page_query(), None)
         .await
         .unwrap()
         .items
@@ -307,17 +314,25 @@ async fn enrichment_fills_created_by_user() {
 
 /// public:`/widgets/stats` 无 token 也 200,且统计到 mock seed 的 3 个 widget。
 #[tokio::test]
-async fn public_stats_needs_no_auth() {
+async fn stats_needs_login_and_counts_own_tenant() {
+    // widget_stats 曾是 public。上租户轴后必须登录(spec §6.1):public 端点没有 token
+    // 就造不出 TenantId,而「把所有租户的数据加总告诉匿名者」不是一个能加闸的端点。
     let (state, _) = setup().await;
     let app = real_app(&state);
+
+    // 未登录 → 401(不再是 public)。路径也从 /public 挪到了 /frontend。
     assert_eq!(
-        status(&app, "GET", "/api/v1/public/widgets/stats", None).await,
-        StatusCode::OK
+        status(&app, "GET", "/api/v1/frontend/widgets/stats", None).await,
+        StatusCode::UNAUTHORIZED
     );
-    let body = body_of(&app, "GET", "/api/v1/public/widgets/stats", None).await;
+
+    // 登录后 → 本租户计数。`user` 落在 Acme(seed 里是 Acme admin);
+    // mock 在 Acme 建了 3 个(admin-w1/w2 + user-w1),Globex 只有 1 个 → 这里必须是 3,不是 4。
+    let user = login(&state, "user").await.access_token;
+    let body = body_of(&app, "GET", "/api/v1/frontend/widgets/stats", Some(&user)).await;
     assert!(
         body.contains("\"total\":3"),
-        "应统计 mock 的 3 个 widget: {body}"
+        "stats 必须只算本租户(Acme 3 个),绝不把 Globex 的算进来: {body}"
     );
 }
 
@@ -386,13 +401,15 @@ async fn scope_without_read_all_narrows_admin_to_own() {
     .await;
     assert!(full.contains("user-w1"), "满权应见全部: {full}");
 
-    // admin 降权令牌:scope=[widgets:read],**不含 read:all** → 跌回 Own → 只见自己的
+    // admin 降权令牌:scope=[widgets:read],**不含 read:all** → 跌回 Own → 只见自己的。
+    // **第 4 参 tenant 必须给**:mint_scoped 是第二条铸币路径(PAT/第三方),不经 ClaimsExtender ——
+    // 传 None 会让 Tenant extractor 401(spec §4.3)。admin 在 seed 里是 Acme 的成员。
     let scoped = AppTokenSigner::dev()
         .mint_scoped(
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
-            None,
+            Some(test_tenant().get()),
             vec![Perm::WidgetRead],
             900,
         )

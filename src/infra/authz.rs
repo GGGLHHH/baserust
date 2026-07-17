@@ -412,14 +412,40 @@ impl Policy {
         }
     }
 
-    /// **数据可见域(ownership mode)**:边缘的 RBAC∩scope 推出"能不能看全部"——有 `all_perm`(经
-    /// `require_scoped`,故 role 与 scope 都参与)→ [`Access::All`],否则只看自己 → [`Access::Own`]。
-    /// 这是三轴的扣点:类型级判定(RBAC∩scope)**参数化**行级 ownership;真正的过滤在查询里(见 `Access`)。
-    pub fn data_access(&self, user: &AuthUser, scope: &[Perm], all_perm: Perm) -> Access {
+    /// **行级可见域(ownership mode)**:边缘的 RBAC∩scope 推出"能不能看全部"——有 `all_perm`(经
+    /// `require_scoped`,故 role 与 scope 都参与)→ [`Rows::All`],否则只看自己 → [`Rows::Own`]。
+    /// 这是三轴的扣点:类型级判定(RBAC∩scope)**参数化**行级 ownership;真正的过滤在查询里。
+    ///
+    /// **给不上租户轴的模块用**(profile —— 它是全局身份,与密码同级、跟人走,见 spec §6.6)。
+    /// 上了轴的模块用 [`Policy::data_access`]。
+    ///
+    /// 让它单独存在,而不是让 profile 传一个「自比自」的恒真租户 —— 后者是在教人写洞,
+    /// 也会让「`Access` 恒带租户闸」这句话变成谎话。
+    pub fn row_access(&self, user: &AuthUser, scope: &[Perm], all_perm: Perm) -> Rows {
         if self.require_scoped(user, scope, all_perm).is_ok() {
-            Access::All
+            Rows::All
         } else {
-            Access::Own(user.id)
+            Rows::Own(user.id)
+        }
+    }
+
+    /// **数据可见域 = 租户闸 × 行级 ownership**。见 [`Access`]。
+    ///
+    /// `tenant` 是**实参不是字段**:`Arc<Policy>` 在 `router.rs` 被烘焙进 `from_fn_with_state`,
+    /// per-request 换 policy 不可能 —— 租户只能这么进来。
+    ///
+    /// 注意 `Rows::All` 在这里的语义是「**本租户内**全部」,不是「表内全部」:
+    /// superadmin 也被关在租户闸里(它只影响读**业务数据**,不影响它管租户 —— 见 spec §7.1)。
+    pub fn data_access(
+        &self,
+        user: &AuthUser,
+        scope: &[Perm],
+        all_perm: Perm,
+        tenant: TenantId,
+    ) -> Access {
+        Access {
+            tenant,
+            rows: self.row_access(user, scope, all_perm),
         }
     }
 
@@ -439,43 +465,115 @@ impl Policy {
     }
 }
 
-/// **数据可见域(行级 ownership)**。RBAC∩scope 在边缘算出它(见 [`Policy::data_access`]),
-/// 真正的过滤**在查询/service 里**执行——这是 ownership 与 RBAC/scope 的本质差异:它需要"那行的 owner"。
-/// `All` = 看全部(不加 owner 过滤);`Own(id)` = 只看 `created_by == id` 的行。
-#[derive(Clone, Copy, Debug)]
-pub enum Access {
+/// **行级可见域**(ownership 一维,**不含租户**)。给**不上租户轴**的模块用(profile)。
+///
+/// `All` = 该维度不过滤;`Own(id)` = 只看 `created_by == id` 的行。
+///
+/// 上了租户轴的模块别直接用它 —— 用 [`Access`](Access)(= 租户闸 × 本类型)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// **注意语义**:在 [`Access`] 里它是「**本租户内**全部」,不是「表内全部」——
+    /// 租户闸在外层,它管不着。
     All,
     Own(Uuid),
 }
 
-impl Access {
-    /// 某行(owner = `created_by`)在本可见域内是否可见。list 用它过滤;**读路径**单条不可见 → 调用方通常返 404
-    /// (不泄露存在);**写权型 ownership**(资源本就任意可读,如 profile PUT)可返 403,见 profile routes。
-    pub fn allows(&self, owner: Uuid) -> bool {
+impl Rows {
+    /// 某行(owner)在本维度内是否可见。
+    pub fn allows(self, owner: Uuid) -> bool {
         match self {
-            Access::All => true,
-            Access::Own(me) => *me == owner,
+            Rows::All => true,
+            Rows::Own(me) => me == owner,
         }
     }
 
-    /// 同 [`Access::allows`],但吃实体的 `created_by: Option<String>`(用户 id 字符串)。
-    /// 非 UUID('system'/NULL/历史脏值)→ `Own` 下一律不可见(只有 `All` 放行)。
-    pub fn allows_created_by(&self, created_by: Option<&str>) -> bool {
+    /// 同 [`Rows::allows`],但吃实体的 `created_by: Option<String>`(用户 id 字符串)。
+    /// 非 UUID(`'system'` / NULL / 历史脏值)→ `Own` 下一律不可见(只有 `All` 放行)。
+    pub fn allows_created_by(self, created_by: Option<&str>) -> bool {
         match self {
-            Access::All => true,
-            Access::Own(_) => created_by
+            Rows::All => true,
+            Rows::Own(_) => created_by
                 .and_then(|s| Uuid::parse_str(s).ok())
                 .is_some_and(|o| self.allows(o)),
         }
     }
 
-    /// **list 用的 owner 过滤**:`All` → `None`(不过滤,看全部);`Own(id)` → `Some(id)`(查询里 `created_by = id`)。
+    /// **list 用的 owner 过滤**:`All` → `None`(不过滤);`Own(id)` → `Some(id)`(查询里 `created_by = id`)。
     /// ownership 过滤落在**查询层**(repo)才对分页正确 —— 边缘只产出这个过滤,不在内存里事后筛。
-    pub fn owner_filter(&self) -> Option<Uuid> {
+    pub fn owner_filter(self) -> Option<Uuid> {
         match self {
-            Access::All => None,
-            Access::Own(id) => Some(*id),
+            Rows::All => None,
+            Rows::Own(id) => Some(id),
         }
+    }
+}
+
+/// **数据可见域 = 租户闸(硬,不可为空)× 行级 ownership(软)**。
+///
+/// RBAC∩scope 在边缘算出它(见 [`Policy::data_access`]),真正的过滤**在查询/service 里**执行 ——
+/// 这是 ownership 与 RBAC/scope 的本质差异:它需要"那行的 owner"。租户同理,而且更硬。
+///
+/// # 字段私有、无公开构造函数
+///
+/// 构造点唯一:`Policy::data_access`。想凭空造一个「放行一切」的 Access,得改本文件 ——
+/// review 一眼看见。
+///
+/// 保持 `Copy`:SSE 的 `stream::unfold((sub, access), ..)` 要把它 move 进流状态。
+#[derive(Clone, Copy, Debug)]
+pub struct Access {
+    tenant: TenantId,
+    rows: Rows,
+}
+
+impl Access {
+    /// repo 过滤用:**租户永远参与查询,永远不是 Option**。
+    pub fn tenant(self) -> TenantId {
+        self.tenant
+    }
+
+    /// 某行是否可见 = **租户对得上**且 ownership 允许。
+    ///
+    /// `row_tenant` 是**必填实参**:老签名 `allows(owner)` 编译不过 —— 这是有意的,
+    /// 让「忘了判租户」变成编译错误而不是静默放行。
+    pub fn allows(self, row_tenant: Uuid, owner: Uuid) -> bool {
+        self.tenant.get() == row_tenant && self.rows.allows(owner)
+    }
+
+    /// 同 [`Access::allows`],但吃 `created_by: Option<&str>`。
+    ///
+    /// ⚠️ **widget 的三个实际调用点走的是这个,不是 `allows`**(`get_widget` / `ensure_may_write` / SSE)。
+    /// 只给 `allows` 加 `row_tenant` 而漏掉它,widget 主路径照样编译通过、租户闸静默失效 ——
+    /// 那正是本设计要避免的 fail-open。
+    pub fn allows_created_by(self, row_tenant: Uuid, created_by: Option<&str>) -> bool {
+        self.tenant.get() == row_tenant && self.rows.allows_created_by(created_by)
+    }
+
+    /// **list 用的 owner 过滤**。租户不在这里 —— 它经 [`Access::tenant`] 单独进查询,
+    /// 且**不可为 None**(owner 可以「不过滤」,租户不行)。
+    pub fn owner_filter(self) -> Option<Uuid> {
+        self.rows.owner_filter()
+    }
+}
+
+/// 当前令牌的过期时刻(claim 的 `exp`,unix 秒)。中间件在验签时塞进 extensions。
+///
+/// **只有长连接用得上它。** 普通请求的鉴权是「每次请求验一次签」,过期天然会 401;
+/// 但 SSE 是**开流时验一次、然后推到天荒地老** —— `keep_alive` 还主动帮它续命。
+/// 没有它,一条流能活过 token:用户切了租户、被踢出公司、或租户被停用,那条流照推不误。
+///
+/// extractor:只读 extension,无则 `None`(未认证由 `CurrentUser` 先 401 挡掉)。
+#[derive(Clone, Copy, Debug)]
+pub struct TokenExp(pub i64);
+
+impl<S: Send + Sync> FromRequestParts<S> for TokenExp {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<TokenExp>()
+            .copied()
+            .ok_or(AppError::Unauthorized)
     }
 }
 
@@ -694,14 +792,96 @@ mod tests {
             policy.require(&u, Perm::WidgetRead).is_ok(),
             "顶层 read 闸不应 403"
         );
-        assert!(matches!(
-            policy.data_access(&u, &[], Perm::WidgetReadAll),
-            Access::All
-        ));
+        assert_eq!(policy.row_access(&u, &[], Perm::WidgetReadAll), Rows::All);
         // scope 侧:降权令牌 scope=[read:all] 也视为含 read
         assert!(policy
             .require_scoped(&u, &[Perm::WidgetReadAll], Perm::WidgetRead)
             .is_ok());
+    }
+
+    // ── 租户闸(spec §5.1)──
+
+    /// **`Rows::All` 在 `Access` 里是「本租户内全部」,不是「表内全部」。**
+    ///
+    /// 这是整个多租户设计的中心断言:`read:all` 是 mode 不是闸,它压不过租户。
+    /// 连 superadmin 也关在这道闸里(它只影响读**业务数据**,不影响它管租户 —— spec §7.1)。
+    #[test]
+    fn tenant_gate_beats_rows_all() {
+        let policy =
+            Policy::from_roles([("sa".to_owned(), vec![Perm::WidgetRead, Perm::WidgetReadAll])]);
+        let u = user(&["sa"]);
+        let mine = Uuid::now_v7();
+        let theirs = Uuid::now_v7();
+        let access = policy.data_access(&u, &[], Perm::WidgetReadAll, TenantId::from_claim(mine));
+
+        let somebody = Uuid::now_v7();
+        assert!(
+            access.allows(mine, somebody),
+            "本租户内、read:all ⇒ 谁的行都看得见"
+        );
+        assert!(
+            !access.allows(theirs, somebody),
+            "**别租户的行,read:all 也看不见** —— 租户闸压过 Rows::All"
+        );
+        assert!(
+            !access.allows(theirs, u.id),
+            "别租户里连自己的行都不该看见(租户闸在 ownership 之前)"
+        );
+    }
+
+    /// ⚠️ `allows_created_by` 必须和 `allows` **一样**被租户闸挡住。
+    ///
+    /// widget 的三个真实调用点(get_widget / ensure_may_write / SSE)走的是**这个**,
+    /// 不是 `allows`。只给 `allows` 加租户参数、漏掉它 —— widget 主路径照样编译通过、
+    /// 租户闸静默失效。那正是本设计要避免的 fail-open,这条钉死它。
+    #[test]
+    fn allows_created_by_is_gated_too() {
+        let policy =
+            Policy::from_roles([("sa".to_owned(), vec![Perm::WidgetRead, Perm::WidgetReadAll])]);
+        let u = user(&["sa"]);
+        let mine = Uuid::now_v7();
+        let theirs = Uuid::now_v7();
+        let access = policy.data_access(&u, &[], Perm::WidgetReadAll, TenantId::from_claim(mine));
+        let owner = Uuid::now_v7().to_string();
+
+        assert!(access.allows_created_by(mine, Some(&owner)));
+        assert!(
+            !access.allows_created_by(theirs, Some(&owner)),
+            "**别租户的行,allows_created_by 也必须拒**"
+        );
+        // 保住原语义:非 UUID 脏值在 Own 下不可见(这里 All 放行,但租户仍挡)
+        let own = policy.data_access(
+            &user(&["u"]),
+            &[],
+            Perm::WidgetReadAll,
+            TenantId::from_claim(mine),
+        );
+        assert!(
+            !own.allows_created_by(mine, Some("system")),
+            "非 UUID 脏值在 Own 下不可见"
+        );
+    }
+
+    /// `owner_filter` 只出 ownership 那一维 —— 租户**不走它**,而是经 `Access::tenant()`
+    /// 单独进查询。理由:owner 可以「不过滤」(`All` → None),租户**不行**。
+    #[test]
+    fn owner_filter_carries_no_tenant() {
+        let policy =
+            Policy::from_roles([("sa".to_owned(), vec![Perm::WidgetRead, Perm::WidgetReadAll])]);
+        let t = Uuid::now_v7();
+        let all = policy.data_access(
+            &user(&["sa"]),
+            &[],
+            Perm::WidgetReadAll,
+            TenantId::from_claim(t),
+        );
+        assert_eq!(all.owner_filter(), None, "read:all ⇒ 租户内不按 owner 过滤");
+        assert_eq!(all.tenant().get(), t, "但租户永远在,且不是 Option");
+
+        let u = user(&["plain"]);
+        let own = policy.data_access(&u, &[], Perm::WidgetReadAll, TenantId::from_claim(t));
+        assert_eq!(own.owner_filter(), Some(u.id));
+        assert_eq!(own.tenant().get(), t);
     }
 
     /// 多权限组合子:AND 缺一即拒、OR 任一即过;scope 收窄与 implies 语义同 require_scoped。

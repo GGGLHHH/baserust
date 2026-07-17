@@ -57,7 +57,7 @@ struct MemberSeed {
 /// **必须确定性**:`upsert_tenant` 按 id 冲突,而 seed 每次启动都重跑 —— 随机 id 会让每次
 /// 重启都新建一家同名公司(然后撞上 `tenants_name_alive_uidx` 报错)。v5 还顺带让 dev/CI/
 /// 每个同事的机器上租户 id 一致,写测试和排查时能直接照抄。
-fn tenant_id_for(name: &str) -> uuid::Uuid {
+pub fn tenant_id_for(name: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
 }
 

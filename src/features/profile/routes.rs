@@ -1,7 +1,15 @@
 //! profile HTTP 边界(薄)。三轴:CurrentUser(401)→ require_scoped(403)→ ownership。
-//! GET 无 ownership(任意登录可读);PUT 的 ownership 用 `data_access(ProfileWriteAll)`:
+//! GET 无 ownership(任意登录可读);PUT 的 ownership 用 `row_access(ProfileWriteAll)`:
 //! 越权失败给 **403 而非 404** —— profile 本就任意可读,存在性不敏感,藏 404 无意义
 //! (对比 widget GET 的 404:那里 ownership 是可见性,这里只是写权)。
+//!
+//! # profile **不上租户轴**(spec §6.6)
+//!
+//! 它是**全局身份**:与密码同级、跟人走,不属于任何一家公司。所以这里用 `row_access`
+//! (只判 ownership)而不是 `data_access`(租户闸 × ownership)。
+//!
+//! 让它单独有个 `row_access`,而不是传一个「自比自」的恒真租户 —— 后者是在教人写洞,
+//! 也会让「`Access` 恒带租户闸」这句话变成谎话。
 
 use axum::body::Body;
 use axum::extract::State;
@@ -16,6 +24,23 @@ use crate::infra::audit::{AuditContext, CurrentUser};
 use crate::infra::authz::{Perm, TokenScope};
 use crate::infra::error::{AppError, ErrorBody};
 use crate::infra::extract::{Json, Multipart, Path};
+
+/// 头像 content 的租户占位:**头像不属于任何租户**。
+///
+/// 头像是全局身份的一部分 —— 与 `display_name` 同级、跟人走(spec §6.6):你换公司,脸不换。
+/// 但 `content.tenant_id` 是 not null,总得给个值。
+///
+/// **为什么不用 claim 里的租户**:那会让同一个人在 Acme 传的头像,切到 Globex 之后变成
+/// 「别租户的数据」—— 而它明明还是同一张脸。头像会随着人在公司间移动而时隐时现。
+///
+/// **为什么不用 spec §6.6 说的「demo 租户 id」**:那个租户是 dev seed 造的,prod 的
+/// `SEED_FILE` 里没有 `[[tenants]]` —— 它在生产环境根本不存在。把全平台的头像挂到一个
+/// 不存在的租户上,是在制造悬空引用。这里与 spec 有意分歧,已回写 spec。
+///
+/// **不会与真租户碰撞**:真租户 id 全部来自 `seed::tenant_id_for`(uuid v5),v5 永不为 nil。
+/// 也读不出来:`/contents/{id}` 的租户闸会把它 404 掉 —— 头像只经
+/// `GET /profiles/{id}/avatar` 出,那是租户闸的**显式例外**(头像 = 全局身份的可视化)。
+const NO_TENANT: Uuid = Uuid::nil();
 
 /// 读任意用户的资料(需 `profiles:read`;所有登录角色都有)。
 /// 注意:响应含 phone 等 PII,"任意登录可读"是脚手架的刻意选择——收紧时给 GET 加 ownership 或拆敏感字段视图。
@@ -95,7 +120,7 @@ pub async fn put_profile(
     // ownership:path 即资源 owner(user_id 主键),无需查行 —— 越权直接 403。
     if !state
         .policy
-        .data_access(&user.0, &scope.0, Perm::ProfileWriteAll)
+        .row_access(&user.0, &scope.0, Perm::ProfileWriteAll)
         .allows(user_id)
     {
         return Err(AppError::Forbidden);
@@ -281,9 +306,9 @@ pub async fn set_user_avatar(
         ));
     }
 
-    // content 归目标用户(是他的头像);单租户 tenant=nil。
+    // content 归目标用户(是他的头像),租户 = NO_TENANT(见常量 doc)。
     let input = UploadContentInput {
-        tenant_id: Uuid::nil(),
+        tenant_id: NO_TENANT,
         owner_id: id,
         owner_type: None,
         name: None,

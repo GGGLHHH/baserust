@@ -18,6 +18,10 @@ use baserust::features::widget::{InMemoryWidgetRepo, WidgetService};
 use baserust::infra::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
+/// 本文件测试共处的租户。repo 空、不跑 mock,取什么值不重要 —— 建/查同一个即可。
+/// 端点上了租户轴要 Tenant extractor,给 token 一个租户让它过门(隔离另有专测)。
+const WIDGET_TEST_TENANT: Uuid = Uuid::from_u128(0x1D6E7);
+
 /// 内存仓储的测试 app(无 DB)+ **admin 令牌**(widget 端点现需登录 + RBAC + ownership)。
 /// admin 有 read:all → 看全部,故沿用原有"建后即见"断言;struct 直建不跑 mock seed,repo 空、不受干扰。
 fn test_app() -> (Router, String) {
@@ -29,7 +33,7 @@ fn test_app() -> (Router, String) {
             Uuid::nil(),
             "admin",
             vec!["admin".to_owned()],
-            None,
+            Some(WIDGET_TEST_TENANT),
             vec![],
             900,
         )
@@ -114,7 +118,14 @@ fn test_policy() -> Policy {
 fn user_token() -> (String, Uuid) {
     let uid = Uuid::now_v7();
     let t = AppTokenSigner::dev()
-        .mint_scoped(uid, "user", vec!["user".to_owned()], None, vec![], 900)
+        .mint_scoped(
+            uid,
+            "user",
+            vec!["user".to_owned()],
+            Some(WIDGET_TEST_TENANT),
+            vec![],
+            900,
+        )
         .unwrap();
     (t, uid)
 }
@@ -621,7 +632,7 @@ async fn sse_requires_read_scope() {
             Uuid::nil(),
             "admin",
             vec!["admin".to_owned()],
-            None,
+            Some(WIDGET_TEST_TENANT),
             vec![Perm::WidgetWrite],
             900,
         )
@@ -650,7 +661,7 @@ async fn multi_perm_and_or_endpoints() {
                 Uuid::nil(),
                 "admin",
                 vec!["admin".to_owned()],
-                None,
+                Some(WIDGET_TEST_TENANT),
                 scope,
                 900,
             )

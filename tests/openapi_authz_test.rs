@@ -84,13 +84,18 @@ async fn spec_security_matches_real_enforcement() {
         .unwrap();
     // state 的 verifier 用内嵌默认 dev 公钥,故本地 dev 私钥签的令牌它也认。
     let signer = AppTokenSigner::dev();
+    // ⚠️ **探针 token 必须带租户**:上租户轴后,widget/content 端点都有 Tenant extractor,
+    // 它在授权判定**之前**就会对无租户的 token 401 —— 那会把本测试要验的「授权闸」正向断言
+    // 全部污染成 401。给探针一个存在的租户(superadmin 在 seed 里是 Acme 成员),
+    // 让租户闸放行、authz 闸成为唯一变量。
+    let probe_tenant = Some(baserust::app::seed::tenant_id_for("acme"));
     let mint = |scope: Vec<Perm>| {
         signer
             .mint_scoped(
                 su.user.id,
                 &su.user.username,
                 su.user.roles.clone(),
-                None,
+                probe_tenant,
                 scope,
                 900,
             )
@@ -128,7 +133,7 @@ async fn spec_security_matches_real_enforcement() {
             if union.is_empty() {
                 // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
                 let zero = signer
-                    .mint_scoped(su.user.id, "probe", vec![], None, vec![], 900)
+                    .mint_scoped(su.user.id, "probe", vec![], probe_tenant, vec![], 900)
                     .unwrap();
                 let s = hit(&app, method, &uri, op_id, &zero).await;
                 assert!(

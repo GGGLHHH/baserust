@@ -22,6 +22,11 @@ use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemo
 /// 内存 app + 两枚令牌:`admin`(read+write+delete)与 `viewer`(只 read),store 可注入
 /// (presign 用例喂覆写 URL 方法的假 store)。admin/viewer 各有独立 owner uuid(content list 按
 /// owner 过滤,故 admin 上传 admin 才看得到)。
+/// 本文件所有测试身份(admin/viewer/auditor)共处的**同一个**租户 —— content 测的是
+/// ownership + content 逻辑,不是租户隔离(那在 widget_repo_conformance 的 isolation 契约)。
+/// 三个身份都在这一个租户里,才能测「跨 user 但同租户」的 read:all/write:all。
+const CONTENT_TEST_TENANT: Uuid = Uuid::from_u128(0xC0FFEE);
+
 fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String, String) {
     let signer = Arc::new(AppTokenSigner::dev());
     let verifier = Arc::new(AppTokenVerifier::dev());
@@ -30,7 +35,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             Uuid::from_u128(1),
             "admin",
             vec!["admin".to_owned()],
-            None,
+            Some(CONTENT_TEST_TENANT),
             vec![],
             900,
         )
@@ -40,7 +45,7 @@ fn test_app_with_store(store: Arc<dyn content::ObjectStore>) -> (Router, String,
             Uuid::from_u128(2),
             "viewer",
             vec!["viewer".to_owned()],
-            None,
+            Some(CONTENT_TEST_TENANT),
             vec![],
             900,
         )
@@ -698,7 +703,7 @@ async fn cross_user_content_is_404_unless_all_mode() {
             Uuid::from_u128(3),
             "auditor",
             vec!["auditor".to_owned()],
-            None,
+            Some(CONTENT_TEST_TENANT),
             vec![],
             900,
         )
@@ -728,6 +733,55 @@ async fn cross_user_content_is_404_unless_all_mode() {
     );
 
     // owner 本人始终可读自己的(已被删 → 404 属正常;此处验证的是删除前 admin 可读,上面用例已覆盖)
+}
+
+/// **跨租户隔离**:哪怕持 `contents:read:all` / `write:all`,也读不到**别租户**的 content。
+///
+/// 这与上面的 `cross_user_...` 正交:那个测「同租户内、非 owner、无 :all → 404」;
+/// 这个测「别租户、有 :all → 依然 404」。租户闸压过 ownership mode —— :all 是「本租户内全部」,
+/// 不是「全表全部」(spec §5.1)。
+#[tokio::test]
+async fn cross_tenant_content_is_404_even_with_read_all() {
+    let (app, admin, _viewer) = test_app(); // admin 在 CONTENT_TEST_TENANT
+    let resp = app
+        .clone()
+        .oneshot(upload_req(
+            &admin,
+            "acme-secret.txt",
+            "text/plain",
+            b"acme only",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = uploaded_content_id(resp).await;
+
+    // 另一租户的 auditor:read:all + write:all 全给,但**租户不同**。
+    let outsider = AppTokenSigner::dev()
+        .mint_scoped(
+            Uuid::from_u128(999),
+            "outsider",
+            vec!["auditor".to_owned()],
+            Some(Uuid::from_u128(0xB0B)), // ≠ CONTENT_TEST_TENANT
+            vec![],
+            900,
+        )
+        .unwrap();
+
+    // 每个单条读端点:别租户 + read:all → 依然 404,与「不存在」无法区分。
+    for uri in [
+        format!("/api/v1/frontend/contents/{id}"),
+        format!("/api/v1/frontend/contents/{id}/download"),
+        format!("/api/v1/frontend/contents/{id}/objects"),
+        format!("/api/v1/frontend/contents/{id}/metadata"),
+    ] {
+        let resp = app.clone().oneshot(get(&uri, &outsider)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}:别租户即便有 read:all 也必须 404(租户闸压过 mode)"
+        );
+    }
 }
 
 /// **mime 是服务端所有物**:上传后 `PUT /metadata` 改不动它。

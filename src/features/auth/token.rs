@@ -160,6 +160,22 @@ fn encode_eddsa(claims: &AppClaims, key: &jsonwebtoken::EncodingKey) -> Result<S
     .map_err(|e| IdmError::Internal(anyhow::anyhow!("JWT 签发失败: {e}")))
 }
 
+/// 一次验签产出的**全部**已验证事实。
+///
+/// 用结构体而不是元组:字段从 3 个涨到 4 个之后,`(_, _, _, exp)` 这种解构没人读得懂,
+/// 而且加字段要改每个调用点的位置。这里字段有名字,加字段只动用得上的那几处。
+pub struct VerifiedClaims {
+    pub user: idm::AuthUser,
+    /// per-token 权限子集;空 = 无限制(第一方满权令牌)。
+    pub scope: Vec<Perm>,
+    /// 当前激活租户。`None` 有两种合法来源:0 租户用户(register 的常规出口,spec §1.1)、
+    /// 或存量的无该字段的 token。中间件把两者都译成「无 `Tenant` extension」⇒ 下游 401。
+    pub tenant: Option<Uuid>,
+    /// claim 的 `exp`(unix 秒)。**长连接要它** —— SSE 得在 token 过期时截流,
+    /// 否则流能活过 token(见 `widget_events`)。
+    pub exp: i64,
+}
+
 /// 验证半边(公钥)。所有进程装配;只验不签。
 pub struct AppTokenVerifier {
     decoding: jsonwebtoken::DecodingKey,
@@ -180,7 +196,7 @@ impl AppTokenVerifier {
     /// 读出令牌 scope claim(测试/工具用)。**验签**通过才信;失败 → 空(身份闸随后 401)。
     pub fn scope_of(&self, token: &str) -> Vec<Perm> {
         self.verify_with_scope(token)
-            .map(|(_, scope, _)| scope)
+            .map(|v| v.scope)
             .unwrap_or_default()
     }
 
@@ -189,10 +205,7 @@ impl AppTokenVerifier {
     ///
     /// `tenant` 为 `None` 有两种合法来源:0 租户用户(register 的常规出口,spec §1.1)、
     /// 或存量的无该字段的 token。两者中间件都译成「无 `Tenant` extension」⇒ 下游 401。
-    pub fn verify_with_scope(
-        &self,
-        token: &str,
-    ) -> Result<(idm::AuthUser, Vec<Perm>, Option<Uuid>), IdmError> {
+    pub fn verify_with_scope(&self, token: &str) -> Result<VerifiedClaims, IdmError> {
         let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
         let claims = jsonwebtoken::decode::<AppClaims>(token, &self.decoding, &validation)
             .map(|d| d.claims)
@@ -201,15 +214,16 @@ impl AppTokenVerifier {
             .sub
             .parse::<Uuid>()
             .map_err(|_| IdmError::Unauthorized)?;
-        Ok((
-            idm::AuthUser {
+        Ok(VerifiedClaims {
+            user: idm::AuthUser {
                 id: user_id,
                 username: claims.username,
                 roles: claims.roles,
             },
-            claims.scope,
-            claims.tenant,
-        ))
+            scope: claims.scope,
+            tenant: claims.tenant,
+            exp: claims.exp,
+        })
     }
 }
 
@@ -217,11 +231,11 @@ impl TokenVerifier for AppTokenVerifier {
     fn verify(&self, token: &str) -> Result<VerifiedToken, IdmError> {
         // 复用 verify_with_scope 的单次 decode,丢弃 scope/tenant(镜像 scope_of 的委托姿势)——
         // 这是 idm 端口的形状,它不认识租户。租户走 app 自己的 `Tenant` extractor。
-        let (user, _scope, _tenant) = self.verify_with_scope(token)?;
+        let v = self.verify_with_scope(token)?;
         Ok(VerifiedToken {
-            user_id: user.id,
-            username: user.username,
-            roles: user.roles,
+            user_id: v.user.id,
+            username: v.user.username,
+            roles: v.user.roles,
         })
     }
 }
@@ -397,7 +411,8 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 serde_json::json!({ "tenant": t }),
             ))
             .unwrap();
-        let (user, _scope, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let v = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let (user, tenant) = (v.user, v.tenant);
         assert_eq!(tenant, Some(t));
         assert_eq!(
             user.roles,
@@ -416,7 +431,8 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 serde_json::Value::Null,
             ))
             .unwrap();
-        let (user, _scope, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let v = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let (user, tenant) = (v.user, v.tenant);
         assert_eq!(tenant, None, "0 租户是常规状态,不该报错");
         assert_eq!(user.roles, vec!["superadmin".to_owned(), "user".to_owned()]);
     }
@@ -450,7 +466,8 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 serde_json::Value::Null, // 没有 extra ⇒ 无租户
             ))
             .unwrap();
-        let (user, _scope, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let v = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let (user, tenant) = (v.user, v.tenant);
         assert_eq!(
             tenant, None,
             "**roles 里的 t:{{uuid}} 绝不能再被当成租户** —— 那是已删除的走私通道"
@@ -477,7 +494,10 @@ MCowBQYDK2VwAyEAumo0Rm5V+h4e0LXhVM+Wrm/iQ8rwzhHes8dztR2HWXE=
                 900,
             )
             .unwrap();
-        let (_user, _s, tenant) = AppTokenVerifier::dev().verify_with_scope(&token).unwrap();
+        let tenant = AppTokenVerifier::dev()
+            .verify_with_scope(&token)
+            .unwrap()
+            .tenant;
         assert_eq!(tenant, Some(t));
     }
 }

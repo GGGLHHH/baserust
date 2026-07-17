@@ -50,9 +50,15 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "delete_widget",
         perm: PermReq::All(&[Perm::WidgetDelete]),
     },
-    // 仅登录(无特定 perm);widget_stats 是 public → 不在表
+    // 仅登录(无特定 perm)
     OpAuthz {
         operation_id: "my_widget_count",
+        perm: PermReq::LoginOnly,
+    },
+    // widget_stats 曾是 public(不在本表)。上租户轴后挪进 frontend 组 —— public 端点没有
+    // token 就造不出 TenantId(spec §6.1)。仅登录:计数不需要特定 perm,租户闸已在 handler。
+    OpAuthz {
+        operation_id: "widget_stats",
         perm: PermReq::LoginOnly,
     },
     // 租户切换(spec §4.9):**仅登录,不设专门的 perm** —— 授权靠成员资格本身,

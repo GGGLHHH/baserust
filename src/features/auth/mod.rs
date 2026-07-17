@@ -14,7 +14,7 @@ pub mod port;
 
 pub use middleware::authenticate;
 pub use port::{StaticTenantDirectory, TenantBrief, TenantDirectory};
-pub use token::{AppTokenSigner, AppTokenVerifier, ExtraClaims, NoopSigner};
+pub use token::{AppTokenSigner, AppTokenVerifier, ExtraClaims, NoopSigner, VerifiedClaims};
 pub use types::UserResponse;
 
 use utoipa_axum::router::OpenApiRouter;

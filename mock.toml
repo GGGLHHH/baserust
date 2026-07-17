@@ -1,19 +1,33 @@
 # mock 样本数据(**dev/demo 专用**,非 prod 种子)。幂等写入 app 的 widget / profile 仓储。
-# owner 用 username 引用 seed.toml 里的账号(apply 时经 idm 解析成用户 id;标识引用、非 FK)。
-# 改样本数据编辑这里,不动代码。设 MOCK_FILE 可指向外部文件覆盖。
-# 经典 ownership 矩阵:admin 拥 2 个 widget、user 拥 1 个 —— 演示 own-vs-all。
+# owner 用 username 引用 seed.toml 的账号、tenant 用 slug 引用 seed.toml 的 [[tenants]]
+# (都是标识引用、非 FK;apply 时解析)。改样本数据编辑这里,不动代码。MOCK_FILE 可覆盖。
+#
+# 两个维度各演示一次:
+# - **ownership**(own vs all):Acme 里 admin 拥 2 个、user 拥 1 个;
+# - **租户隔离**:`user` 在 Acme 看得见 user-w1、切到 Globex 只看得见 user-g1。
+#   起服务登录 user、`PUT /auth/active-tenant` 切一下,列表当场变 —— 那就是隔离在工作。
 
 [[widgets]]
 name = "admin-w1"
 owner = "admin"
+tenant = "acme"
 
 [[widgets]]
 name = "admin-w2"
 owner = "admin"
+tenant = "acme"
 
 [[widgets]]
 name = "user-w1"
 owner = "user"
+tenant = "acme"
+
+# 同名!**故意的** —— 它与 Acme 那个 user-w1 重名,证明唯一约束是 (tenant_id, name) 复合的。
+# 若哪天有人把它改回全局唯一,这行 mock 会让服务启动失败(409),当场报警。
+[[widgets]]
+name = "user-w1"
+owner = "user"
+tenant = "globex"
 
 # 样本 profile(1:1 user)。跟在 seed 的初始 profile 之后跑、直接 upsert 覆盖它 —— demo 数据
 # (带 phone、像样的名字)优先于 seed 的 display_name。**不撞 404 不再靠这里**:`/profiles/me`

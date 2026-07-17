@@ -221,8 +221,7 @@ mod tests {
             "livez",
             "health",
             "readyz",
-            "widget_stats", // 公开计数:无 CurrentUser/require_scoped
-            "admin_login",  // 验密后 handler 自查 admin:login,非表驱动
+            "admin_login", // 验密后 handler 自查 admin:login,非表驱动
         ];
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
         for (_path, item) in v["paths"].as_object().expect("paths").iter() {

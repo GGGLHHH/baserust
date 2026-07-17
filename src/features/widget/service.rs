@@ -10,6 +10,7 @@ use super::repo::WidgetRepo;
 use super::types::{CreateWidget, UpdateWidget, Widget, WidgetSortField};
 use super::view::WidgetView;
 use crate::infra::audit::AuditContext;
+use crate::infra::authz::TenantId;
 use crate::infra::error::AppError;
 use crate::infra::pagination::{Page, PageInfo, PageParams, PageQuery};
 use crate::infra::sort::SortOrder;
@@ -44,6 +45,7 @@ impl WidgetService {
     /// `owner = Some(id)` → 只列该用户创建的(数据所有权:user 只看自己的);`None` → 全部(有 read:all 的角色)。
     pub async fn list(
         &self,
+        tenant: TenantId,
         query: PageQuery,
         owner: Option<Uuid>,
     ) -> Result<Page<Widget>, AppError> {
@@ -52,6 +54,7 @@ impl WidgetService {
         // 无排序诉求的内部路径(count/测试)→ 默认序(created_at desc)。
         self.repo
             .list(
+                tenant,
                 &params,
                 owner.as_deref(),
                 WidgetSortField::default(),
@@ -67,6 +70,7 @@ impl WidgetService {
     /// `params` 由 handler `resolve()`(cursor+非默认 sort 的 422 校验在 handler);`sort_by`/`order` 下传 repo。
     pub async fn list_enriched(
         &self,
+        tenant: TenantId,
         params: PageParams,
         owner: Option<Uuid>,
         sort_by: WidgetSortField,
@@ -75,7 +79,7 @@ impl WidgetService {
         let owner = owner.map(|id| id.to_string());
         let page = self
             .repo
-            .list(&params, owner.as_deref(), sort_by, order)
+            .list(tenant, &params, owner.as_deref(), sort_by, order)
             .await?;
         // 收集 distinct + parse 过滤:'system'/NULL/历史脏值 parse 失败的不当 user 查。
         let ids: Vec<Uuid> = page
@@ -92,30 +96,31 @@ impl WidgetService {
 
     /// 计数。复用 `list` 的 offset+total(size=1 少拉行)。`owner=Some` 只数自己创建的。
     // ponytail: demo 复用 list 取 total;真高频再加 `repo.count()`。
-    pub async fn count(&self, owner: Option<Uuid>) -> Result<u64, AppError> {
+    pub async fn count(&self, tenant: TenantId, owner: Option<Uuid>) -> Result<u64, AppError> {
         let q = PageQuery {
             page: Some(1),
             size: Some(1),
             cursor: None,
             with_total: Some(true),
         };
-        match self.list(q, owner).await?.page_info {
+        match self.list(tenant, q, owner).await?.page_info {
             PageInfo::Offset { total, .. } => Ok(total.unwrap_or(0)),
             PageInfo::Cursor { .. } => Ok(0), // 不会发生:上面固定 offset 模式
         }
     }
 
-    pub async fn get(&self, id: Uuid) -> Result<Widget, AppError> {
-        self.repo.get(id).await
+    pub async fn get(&self, tenant: TenantId, id: Uuid) -> Result<Widget, AppError> {
+        self.repo.get(tenant, id).await
     }
 
     pub async fn create(
         &self,
+        tenant: TenantId,
         input: CreateWidget,
         ctx: &AuditContext,
     ) -> Result<Widget, AppError> {
         input.validate()?;
-        let w = self.repo.create(input.name, ctx.audit_id()).await?;
+        let w = self.repo.create(tenant, input.name, ctx.audit_id()).await?;
         self.events
             .publish(WidgetEvent::Created { widget: w.clone() })
             .await;
@@ -124,12 +129,16 @@ impl WidgetService {
 
     pub async fn update(
         &self,
+        tenant: TenantId,
         id: Uuid,
         input: UpdateWidget,
         ctx: &AuditContext,
     ) -> Result<Widget, AppError> {
         input.validate()?;
-        let w = self.repo.update(id, input.name, ctx.audit_id()).await?;
+        let w = self
+            .repo
+            .update(tenant, id, input.name, ctx.audit_id())
+            .await?;
         self.events
             .publish(WidgetEvent::Updated { widget: w.clone() })
             .await;
@@ -137,14 +146,24 @@ impl WidgetService {
     }
 
     /// 软删除(非物理 DELETE)。
-    /// 删前先 `get`:软删后行不可读,**只有这里能拿到 `created_by`** —— 事件带上它,订阅侧才能按
-    /// ownership 逐帧过滤(见 `WidgetEvent::owner`)。多一次读换事件可过滤;`get` 的 NotFound 与
-    /// `soft_delete` 的幂等 NotFound 同语义,不改对外契约。
-    pub async fn delete(&self, id: Uuid, ctx: &AuditContext) -> Result<(), AppError> {
-        let created_by = self.repo.get(id).await?.created_by;
-        self.repo.soft_delete(id, ctx.audit_id()).await?;
+    /// 删前先 `get`:软删后行不可读,**只有这里能拿到 `created_by` 与 `tenant_id`** —— 事件带上
+    /// 它们,订阅侧才能按租户 + ownership 逐帧过滤(见 `WidgetEvent::{tenant,owner}`)。
+    /// 多一次读换事件可过滤;`get` 的 NotFound 与 `soft_delete` 的幂等 NotFound 同语义,
+    /// 不改对外契约(别租户的 id 同样在这一步就 NotFound)。
+    pub async fn delete(
+        &self,
+        tenant: TenantId,
+        id: Uuid,
+        ctx: &AuditContext,
+    ) -> Result<(), AppError> {
+        let w = self.repo.get(tenant, id).await?;
+        self.repo.soft_delete(tenant, id, ctx.audit_id()).await?;
         self.events
-            .publish(WidgetEvent::Deleted { id, created_by })
+            .publish(WidgetEvent::Deleted {
+                id,
+                tenant_id: w.tenant_id,
+                created_by: w.created_by,
+            })
             .await;
         Ok(())
     }
@@ -157,9 +176,15 @@ mod tests {
     use super::*;
     use crate::features::widget::repo::InMemoryWidgetRepo;
     use crate::features::widget::{MemoryEventBus, StaticUserDirectory, UserBrief};
+    use uuid::Uuid;
 
     fn ctx() -> AuditContext {
         AuditContext::anonymous()
+    }
+    /// 测试用固定租户。这些用例测的是 ownership / 分页 / 事件,不是租户隔离
+    /// (那在 `tests/tenant_isolation_api.rs`)—— 全用同一个租户即可。
+    fn t() -> TenantId {
+        TenantId::from_claim(Uuid::from_u128(0xACE))
     }
     fn first_page() -> PageQuery {
         PageQuery {
@@ -183,6 +208,7 @@ mod tests {
         let svc = new_svc();
         let err = svc
             .create(
+                t(),
                 CreateWidget {
                     name: String::new(),
                 },
@@ -197,6 +223,7 @@ mod tests {
     async fn create_then_list_roundtrips() {
         let svc = new_svc();
         svc.create(
+            t(),
             CreateWidget {
                 name: "alpha".into(),
             },
@@ -204,7 +231,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let page = svc.list(first_page(), None).await.unwrap();
+        let page = svc.list(t(), first_page(), None).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].name, "alpha");
     }
@@ -212,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_not_found() {
         let svc = new_svc();
-        let err = svc.get(Uuid::now_v7()).await.unwrap_err();
+        let err = svc.get(t(), Uuid::now_v7()).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound));
     }
 
@@ -220,15 +247,18 @@ mod tests {
     async fn soft_delete_hides_from_list_and_get() {
         let svc = new_svc();
         let w = svc
-            .create(CreateWidget { name: "x".into() }, &ctx())
+            .create(t(), CreateWidget { name: "x".into() }, &ctx())
             .await
             .unwrap();
-        svc.delete(w.id, &ctx()).await.unwrap();
+        svc.delete(t(), w.id, &ctx()).await.unwrap();
         // 软删后 get 404、list 不含、再删幂等 NotFound
-        assert!(matches!(svc.get(w.id).await, Err(AppError::NotFound)));
-        assert_eq!(svc.list(first_page(), None).await.unwrap().items.len(), 0);
+        assert!(matches!(svc.get(t(), w.id).await, Err(AppError::NotFound)));
+        assert_eq!(
+            svc.list(t(), first_page(), None).await.unwrap().items.len(),
+            0
+        );
         assert!(matches!(
-            svc.delete(w.id, &ctx()).await,
+            svc.delete(t(), w.id, &ctx()).await,
             Err(AppError::NotFound)
         ));
     }
@@ -239,10 +269,10 @@ mod tests {
         let repo = Arc::new(InMemoryWidgetRepo::new());
         let uid = Uuid::now_v7();
         // 直接 repo.create 精确控 created_by(service.create 的 by 来自 ctx,这里要指定具体值)
-        repo.create("known".into(), Some(uid.to_string()))
+        repo.create(t(), "known".into(), Some(uid.to_string()))
             .await
             .unwrap();
-        repo.create("orphan".into(), Some("system".into()))
+        repo.create(t(), "orphan".into(), Some("system".into()))
             .await
             .unwrap();
         let dir = Arc::new(StaticUserDirectory(HashMap::from([(
@@ -256,6 +286,7 @@ mod tests {
         let svc = WidgetService::new(repo, dir, Arc::new(MemoryEventBus::new()));
         let page = svc
             .list_enriched(
+                t(),
                 first_page().resolve().unwrap(),
                 None,
                 WidgetSortField::default(),
@@ -283,7 +314,7 @@ mod tests {
         );
         let mut sub = bus.subscribe().await.unwrap();
         let w = svc
-            .create(CreateWidget { name: "evt".into() }, &ctx())
+            .create(t(), CreateWidget { name: "evt".into() }, &ctx())
             .await
             .unwrap();
         let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())

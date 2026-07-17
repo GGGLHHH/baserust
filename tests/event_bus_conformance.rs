@@ -31,6 +31,7 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let id1 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         id: id1,
+        tenant_id: uuid::Uuid::from_u128(0xACE),
         created_by: None,
     })
     .await;
@@ -42,6 +43,7 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let id2 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         id: id2,
+        tenant_id: uuid::Uuid::from_u128(0xACE),
         created_by: None,
     })
     .await;
@@ -53,6 +55,7 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let id3 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         id: id3,
+        tenant_id: uuid::Uuid::from_u128(0xACE),
         created_by: None,
     })
     .await;
@@ -74,12 +77,14 @@ async fn memory_lagged_subscriber_skips_and_continues() {
     for _ in 0..199 {
         bus.publish(WidgetEvent::Deleted {
             id: Uuid::now_v7(),
+            tenant_id: uuid::Uuid::from_u128(0xACE),
             created_by: None,
         })
         .await;
     }
     bus.publish(WidgetEvent::Deleted {
         id: last,
+        tenant_id: uuid::Uuid::from_u128(0xACE),
         created_by: None,
     })
     .await;

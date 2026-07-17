@@ -62,11 +62,12 @@ async fn post_login(app: &Router, uri: &str, identifier: &str) -> axum::response
 /// public 组:免登录可达(无组闸)。
 #[tokio::test]
 async fn public_group_reachable_without_token() {
+    // public 组无需 token 可达 —— 这个架构断言仍然成立,只是不再用 widget_stats 证明:
+    // 它上租户轴后挪进了 frontend 组(spec §6.1,「public + 租户数据」是反模式)。
+    // 改用 login:它是真正无租户语义的 public 端点(注册/登录本就发生在有租户之前)。
     let (app, _state) = setup().await;
-    let (s, _) = get(&app, "/api/v1/public/widgets/stats", None).await;
-    assert_eq!(s, StatusCode::OK);
     let resp = post_login(&app, "/api/v1/public/auth/login", "user").await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK, "public 组应无需 token 可达");
 }
 
 /// frontend 组:无 token → 401 统一 ErrorBody;登录即过组闸。
