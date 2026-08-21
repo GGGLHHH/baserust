@@ -20,13 +20,13 @@ use crate::infra::op_perms::{op_authz, PermReq};
 #[openapi(
     info(title = "baserust API", version = "0.1.0", description = "Rust 脚手架"),
     // query 参数枚举:utoipa 只自动收集 responses/request_body 可达的 schema,
-    // IntoParams 字段用的 ToSchema 枚举不会被收集 —— 必须在此显式声明,否则 spec 出悬空 $ref。
+    // IntoParams 字段用的 ToSchema 枚举不会被收集(utoipa#1388)—— 必须在此显式声明,否则 spec 出悬空 $ref。
+    // 下面三个**只**出现在 query 参数里,无响应体承载;有响应体承载的(如 RoleName ← AdminUserView.roles)
+    // 会被传递收集,登记反而冗余。加错/漏加由 `no_dangling_schema_refs` 兜。
     components(schemas(
         crate::infra::sort::SortOrder,
         crate::features::widget::WidgetSortField,
         crate::features::users::UserSortField,
-        // 仅出现在 list_users 的 role/role_not query 数组里($ref),无响应体承载它 → 显式登记,否则 ref 悬空。
-        crate::infra::authz::RoleName,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -207,6 +207,51 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// **fail-closed**:spec 里每个 `$ref` 必须在 `components.schemas` 有条目。
+    /// utoipa 不做任何校验,而 `IntoParams` 字段上的 `ToSchema` 枚举**不被**自动收集(utoipa#1388)——
+    /// 漏在 `components(schemas(..))` 登记就静默出悬空 ref:Scalar 渲染成空 schema、前端 codegen 出断类型。
+    /// 反向也兜:登记了已被传递收集的类型只是冗余,不会在此红,靠 review 删。
+    #[test]
+    fn no_dangling_schema_refs() {
+        fn collect(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if let Some(r) = m.get("$ref").and_then(|r| r.as_str()) {
+                        out.insert(r.to_owned());
+                    }
+                    for x in m.values() {
+                        collect(x, out);
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for x in a {
+                        collect(x, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        let mut refs = BTreeSet::new();
+        collect(&v, &mut refs);
+        assert!(!refs.is_empty(), "spec 一个 $ref 都没有?schema 收集坏了");
+
+        let schemas = v["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas 应存在");
+        for r in &refs {
+            let name = r
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("非 components.schemas 的 $ref:`{r}`"));
+            assert!(
+                schemas.contains_key(name),
+                "悬空 $ref:`{r}` 不在 components.schemas —— \
+                 若该类型只出现在 IntoParams 字段上,去 ApiDoc 的 components(schemas(..)) 显式登记"
+            );
         }
     }
 
