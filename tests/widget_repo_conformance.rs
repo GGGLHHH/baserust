@@ -304,6 +304,136 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         bi < ai,
         "name 排序必须字节序('B'=66 < 'a'=97 → Banana 在 apple 前),实际: {names:?}"
     );
+
+    // ── cursor keyset 按 **name**(非 id 键的样例):(name, id) 复合 keyset ──
+    // 此刻 name 字节序与创建序(id 序)完全不同 —— 实现若偷偷按 id 翻,下面的拼接必然对不上。
+    // 期望序取自 offset 同 sort(它的 collation 口径刚在上面钉过)。
+    let expected: Vec<String> = repo
+        .list(
+            &PageParams::Offset {
+                page: 1,
+                size: 100,
+                with_total: false,
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|w| w.name)
+        .collect();
+    assert!(expected.len() >= 5, "样本太少,测不出 keyset 翻页");
+
+    // 逐页拼接必须**逐位**等于 offset 全量。上限保护:漏掉严格不等会翻不完(否则死循环挂 CI)。
+    let mut got: Vec<String> = Vec::new();
+    let mut after: Option<Uuid> = None;
+    let mut done = false;
+    for _ in 0..expected.len() + 2 {
+        let page = repo
+            .list(
+                &PageParams::Cursor { after, limit: 2 },
+                None,
+                WidgetSortField::Name,
+                SortOrder::Asc,
+            )
+            .await
+            .unwrap();
+        got.extend(page.items.iter().map(|w| w.name.clone()));
+        match page.page_info {
+            PageInfo::Cursor {
+                next_cursor: Some(c),
+                ..
+            } => after = Some(decode_cursor(&c).unwrap()),
+            PageInfo::Cursor { .. } => {
+                done = true;
+                break;
+            }
+            _ => panic!("应是 cursor 模式"),
+        }
+    }
+    assert!(
+        done,
+        "cursor 翻页未在有限页内结束(keyset 谓词可能漏了严格不等)"
+    );
+    assert_eq!(
+        got, expected,
+        "cursor 按 name 翻页拼接须等于 offset 全量同序"
+    );
+
+    // 方向跟随 `order`(不是恒 desc):desc 首条 = name 最大者。
+    let desc1 = repo
+        .list(
+            &PageParams::Cursor {
+                after: None,
+                limit: 1,
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Desc,
+        )
+        .await
+        .unwrap();
+    assert_eq!(desc1.items[0].name, *expected.last().unwrap());
+
+    // 锚点行不存在(伪造 / 别的表的 cursor)→ BadRequest,与 decode 失败同口径。
+    // **仅非 id 键如此**:`CreatedAt` 复用 v7 id 直接比较,不读锚点,伪造 cursor 只会翻到空页。
+    assert!(
+        matches!(
+            repo.list(
+                &PageParams::Cursor {
+                    after: Some(Uuid::now_v7()),
+                    limit: 2
+                },
+                None,
+                WidgetSortField::Name,
+                SortOrder::Asc,
+            )
+            .await,
+            Err(AppError::BadRequest(_))
+        ),
+        "锚点不存在的 cursor 应 400"
+    );
+
+    // 锚点行在翻页途中被**软删**:后续页仍要翻得下去(锚点查询不过滤软删,软删行还在表里)。
+    let first = repo
+        .list(
+            &PageParams::Cursor {
+                after: None,
+                limit: 1,
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await
+        .unwrap();
+    let anchor_cursor = match first.page_info {
+        PageInfo::Cursor {
+            next_cursor: Some(c),
+            ..
+        } => c,
+        _ => panic!("首页之后应还有下一页"),
+    };
+    repo.soft_delete(first.items[0].id, None).await.unwrap();
+    let next = repo
+        .list(
+            &PageParams::Cursor {
+                after: Some(decode_cursor(&anchor_cursor).unwrap()),
+                limit: 1,
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next.items[0].name, expected[1],
+        "锚点被软删后仍应从它之后继续翻"
+    );
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──

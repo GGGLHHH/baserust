@@ -680,9 +680,10 @@ async fn multi_perm_and_or_endpoints() {
 }
 
 /// list 排序(offset):`sort_by=name&order=asc` → 首个 "a";`order=desc` → 首个 "b"。
-/// cursor + 非默认 `sort_by` → 422(keyset 恒按 id,排序仅 offset 支持)。
+/// cursor + `sort_by=name` → 200,按 `(name, id)` keyset 翻页(创建序是 b<a,name 序是 a<b ——
+/// 两个序相反,所以这个用例能区分"真按 name 翻"和"偷偷按 id 翻")。
 #[tokio::test]
-async fn list_sort_by_name_offset_and_cursor_rejects() {
+async fn list_sort_by_name_offset_and_cursor() {
     let (app, tok) = test_app();
     // 建 b、再建 a(创建序 b<a);按 name 排序应与创建序解耦。
     for name in ["b", "a"] {
@@ -727,10 +728,30 @@ async fn list_sort_by_name_offset_and_cursor_rejects() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(first_name(&body_string(resp).await), "b");
 
-    // cursor 模式(空 cursor = 首页)+ 非默认 sort_by → 422
+    // cursor 模式(空 cursor = 首页)+ sort_by=name → 200,首条按 name 序是 "a"(id 序会是 "b")
     let resp = app
-        .oneshot(get("/api/v1/frontend/widgets?cursor=&sort_by=name", &tok))
+        .clone()
+        .oneshot(get(
+            "/api/v1/frontend/widgets?cursor=&sort_by=name&order=asc&size=1",
+            &tok,
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert_eq!(first_name(&body), "a");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["page_info"]["mode"], "cursor");
+    let next = v["page_info"]["next_cursor"].as_str().unwrap().to_owned();
+
+    // 拿 next_cursor 翻第二页 → "b";锚点的 name 值由服务端从锚点行读,cursor 仍只是 16 字节 id。
+    let resp = app
+        .oneshot(get(
+            &format!("/api/v1/frontend/widgets?cursor={next}&sort_by=name&order=asc&size=1"),
+            &tok,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(first_name(&body_string(resp).await), "b");
 }

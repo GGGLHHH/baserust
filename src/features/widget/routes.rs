@@ -28,11 +28,10 @@ pub struct WidgetSort {
     pub order: SortOrder,
 }
 
-/// cursor keyset 恒按 id;非默认 sort 只能配 offset。cursor + 非默认 sort → 422(而非静默忽略)。
+/// cursor keyset 只支持 [`WidgetSortField::keyset_capable`] 的键(准入条件见那里);
+/// 不支持的键 + cursor → 422,**而非静默按别的键排**。两个方向(`order`)都支持。
 fn ensure_sort_pagination(params: &PageParams, sort: &WidgetSort) -> Result<(), AppError> {
-    let is_default_sort =
-        matches!(sort.sort_by, WidgetSortField::CreatedAt) && matches!(sort.order, SortOrder::Desc);
-    if matches!(params, PageParams::Cursor { .. }) && !is_default_sort {
+    if matches!(params, PageParams::Cursor { .. }) && !sort.sort_by.keyset_capable() {
         return Err(AppError::Validation(
             "sort_by requires offset/page pagination".into(),
         ));

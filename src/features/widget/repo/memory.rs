@@ -123,13 +123,45 @@ impl WidgetRepo for InMemoryWidgetRepo {
                 Ok(Page::offset(items, *page, *size, total))
             }
             PageParams::Cursor { after, limit } => {
-                // cursor keyset 恒按 id DESC(v7 id 即创建序倒序);sort_by 不参与(parity 于 PG)。
-                alive.sort_by(|a, b| b.id.cmp(&a.id));
+                // 锚点行:**不过滤软删**(翻页途中锚点被软删,后续页仍要翻得下去);
+                // 查不到 → 400,parity 于 PG 的 `anchor()`。
+                let anchor = match after {
+                    Some(a) => Some(
+                        store
+                            .widgets
+                            .get(a)
+                            .ok_or_else(|| AppError::BadRequest("Invalid cursor".to_owned()))?
+                            .to_widget(),
+                    ),
+                    None => None,
+                };
+                // 排序与谓词同键(parity 于 PG):created_at 序用 v7 id 单列,其余 (key, id) 复合。
+                // `String::cmp` 是字节序 —— 对齐 PG 侧 `sort_expr` 的 `COLLATE "C"`,不对齐就漏行。
+                let key_cmp = |a: &Row, b: &Row| match sort_by {
+                    WidgetSortField::CreatedAt => a.id.cmp(&b.id),
+                    WidgetSortField::Name => a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)),
+                };
+                alive.sort_by(|a, b| match order {
+                    SortOrder::Asc => key_cmp(a, b),
+                    SortOrder::Desc => key_cmp(a, b).reverse(),
+                });
                 let mut items: Vec<Widget> = alive
                     .iter()
-                    .filter(|r| match after {
-                        Some(after) => r.id < *after, // id < cursor 配 ORDER BY id DESC
+                    .filter(|r| match &anchor {
                         None => true,
+                        // 严格不等:排除锚点行自身。
+                        Some(a) => {
+                            let ord = match sort_by {
+                                WidgetSortField::CreatedAt => r.id.cmp(&a.id),
+                                WidgetSortField::Name => {
+                                    r.name.cmp(&a.name).then_with(|| r.id.cmp(&a.id))
+                                }
+                            };
+                            match order {
+                                SortOrder::Asc => ord.is_gt(),
+                                SortOrder::Desc => ord.is_lt(),
+                            }
+                        }
                     })
                     .take((*limit + 1) as usize)
                     .map(Row::to_widget)

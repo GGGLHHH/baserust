@@ -45,11 +45,28 @@ pub enum WidgetSortField {
 }
 
 impl WidgetSortField {
-    /// 映射到 sea-query 列标识符(cursor 分支不用它 —— keyset 恒按 id)。
+    /// 映射到 sea-query 列标识符。
     pub(crate) fn column(&self) -> super::repo::Widgets {
         match self {
             Self::CreatedAt => super::repo::Widgets::CreatedAt,
             Self::Name => super::repo::Widgets::Name,
+        }
+    }
+
+    /// 能否作 cursor keyset 键。**准入三条,缺一不可**:
+    /// 1. 列 `NOT NULL` —— 可空键的 keyset 谓词要跨 NULL 边界(三分支),内存实现极易与 PG 漂移;
+    /// 2. 有 `(key, id)` 复合索引 —— 否则 keyset 深翻退化成全表排序,白付复杂度;
+    /// 3. 文本键的 PG collation 与内存 `str Ord` 一致(见 `postgres::sort_expr` 的 `COLLATE "C"`)
+    ///    —— offset 下不一致只是顺序难看,keyset 下**直接漏行**。
+    ///
+    /// **放开一个键 = 改这里 + 加索引 + 加一条 conformance 用例。**
+    /// 不满足就留 `false`:该键只走 offset,handler 返回 422 而非静默按别的键排。
+    pub(crate) fn keyset_capable(&self) -> bool {
+        match self {
+            // v7 id 代理创建序,复用主键索引,无需额外索引也无需读锚点行。
+            Self::CreatedAt => true,
+            // name not null + widgets_alive_name_id_idx + COLLATE "C"。
+            Self::Name => true,
         }
     }
 }

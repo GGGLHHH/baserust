@@ -54,7 +54,9 @@ pub trait WidgetRepo: Send + Sync {
     /// 列表分页(offset 跳页 / cursor keyset 双模式,由 `PageParams` 选)。只返回存活行。
     /// `owner = Some(id)` → 只列 `created_by = id` 的行(数据所有权:user 只看自己的);`None` → 全部。
     /// **ownership 过滤在查询层**(非内存事后筛)—— 分页/total 才正确。
-    /// `sort_by`/`order` **只在 offset 分支生效**;cursor 分支恒按 id keyset(换排序键会破翻页正确性)。
+    /// `sort_by`/`order` **两个分支都生效**。cursor 分支的 keyset 键随 `sort_by` 走:
+    /// `created_at` 用 v7 id 单列代理,其余用 `(key, id)` 复合(键值从锚点行读,cursor payload 不变)。
+    /// 哪些键能配 cursor 由 `WidgetSortField::keyset_capable` 圈定,handler 层挡不合格的组合。
     async fn list(
         &self,
         page: &PageParams,

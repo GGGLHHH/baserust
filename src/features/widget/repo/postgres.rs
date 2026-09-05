@@ -1,7 +1,9 @@
 //! widget 仓储的 Postgres 实现 —— sea-query 构建 + sqlx 执行。设了 APP_DB_HOST 才注入(app role 连接)。
 
 use async_trait::async_trait;
-use sea_query::{Expr, ExprTrait, Func, Order, PostgresQueryBuilder, Query, SelectStatement};
+use sea_query::{
+    Condition, Expr, ExprTrait, Func, Order, PostgresQueryBuilder, Query, SelectStatement,
+};
 use sea_query_sqlx::SqlxBinder;
 use sqlx::{AssertSqlSafe, PgPool};
 use time::OffsetDateTime;
@@ -24,6 +26,39 @@ fn sort_expr(sort: WidgetSortField) -> Expr {
     }
 }
 
+/// 方向敏感的 keyset 比较:asc 取 `>`、desc 取 `<`。**严格**不等 —— 排除锚点行自身。
+fn cmp_dir(e: Expr, order: SortOrder, v: impl Into<Expr>) -> Expr {
+    match order {
+        SortOrder::Asc => e.gt(v),
+        SortOrder::Desc => e.lt(v),
+    }
+}
+
+/// `(key, id)` 字典序 keyset 谓词,展开成 `key <> a.key OR (key = a.key AND id <> a.id)`
+/// (`<>` 随 order 取 `<`/`>`)。不用行值比较 `(a,b) < (c,d)`:左侧文本键是带 `COLLATE` 的自定义
+/// 表达式,展开形式在任何后端都稳,PG 照样能用 `(name COLLATE "C", id)` 复合索引。
+///
+/// **比较必须复用 `sort_expr`** —— 与 ORDER BY 同一个 collation。两者分叉不会报错,会**漏行**。
+fn keyset_after(key: WidgetSortField, order: SortOrder, anchor: &Widget) -> Condition {
+    let (primary, eq) = match key {
+        WidgetSortField::Name => (
+            cmp_dir(sort_expr(key), order, anchor.name.clone()),
+            sort_expr(key).eq(anchor.name.clone()),
+        ),
+        WidgetSortField::CreatedAt => (
+            cmp_dir(sort_expr(key), order, anchor.created_at),
+            sort_expr(key).eq(anchor.created_at),
+        ),
+    };
+    Condition::any()
+        .add(primary)
+        .add(
+            Condition::all()
+                .add(eq)
+                .add(cmp_dir(Expr::col(Widgets::Id), order, anchor.id)),
+        )
+}
+
 pub struct PgWidgetRepo {
     pool: PgPool,
 }
@@ -40,6 +75,22 @@ impl PgWidgetRepo {
         q.from(Widgets::Table)
             .and_where(Expr::col(Widgets::DeletedAt).is_null());
         q
+    }
+
+    /// 取 cursor 锚点行,只为读它的排序键值。**不走 `base_select`** —— 不过滤软删:
+    /// 翻页途中锚点行被软删,后续页仍要翻得下去(软删行还在表里)。
+    /// 查不到 = cursor 不是本表发出的 → 400,与 `decode_cursor` 解码失败同口径。
+    async fn anchor(&self, id: Uuid) -> Result<Widget, AppError> {
+        let mut q = Query::select();
+        q.columns(COLS)
+            .from(Widgets::Table)
+            .and_where(Expr::col(Widgets::Id).eq(id));
+        let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
+        sqlx::query_as_with::<sqlx::Postgres, Widget, _>(AssertSqlSafe(sql), values)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?
+            .ok_or_else(|| AppError::BadRequest("Invalid cursor".to_owned()))
     }
 }
 
@@ -99,17 +150,37 @@ impl WidgetRepo for PgWidgetRepo {
                 Ok(Page::offset(rows, *page, *size, total))
             }
             PageParams::Cursor { after, limit } => {
-                // keyset on id(v7 单列严格全序):取 limit+1 判 has_more
+                // ── keyset:**ORDER BY 与谓词必须同一把键**,否则翻页跳行 ──
+                // (反面教材见 `search/rebuild.rs` 的注释:ORDER BY created_at 配 id 谓词会漏人。)
+                // `created_at` 序复用 v7 id 单列(零额外查询);其余键用 `(key, id)` 复合,
+                // 键值从锚点行读 —— 所以 **cursor payload 仍只是 16 字节 id,换排序键不动它的格式**。
+                // 取 limit+1 判 has_more。
                 let mut q = Self::base_select();
                 q.columns(COLS);
                 if let Some(o) = owner {
                     q.and_where(Expr::col(Widgets::CreatedBy).eq(o)); // ownership 过滤
                 }
                 if let Some(after) = after {
-                    // v7 id 单列严格全序:id < cursor 配 ORDER BY id DESC 即正确翻页
-                    q.and_where(Expr::col(Widgets::Id).lt(*after));
+                    match sort_by {
+                        // v7 id 单列严格全序:直接和 cursor 比,不必读锚点行。
+                        WidgetSortField::CreatedAt => {
+                            q.and_where(cmp_dir(Expr::col(Widgets::Id), order, *after));
+                        }
+                        key => {
+                            q.cond_where(keyset_after(key, order, &self.anchor(*after).await?));
+                        }
+                    }
                 }
-                q.order_by(Widgets::Id, Order::Desc).limit(*limit + 1);
+                match sort_by {
+                    WidgetSortField::CreatedAt => {
+                        q.order_by(Widgets::Id, order.into());
+                    }
+                    key => {
+                        q.order_by_expr(sort_expr(key), order.into())
+                            .order_by(Widgets::Id, order.into());
+                    }
+                }
+                q.limit(*limit + 1);
                 let (sql, values) = q.build_sqlx(PostgresQueryBuilder);
                 let mut rows =
                     sqlx::query_as_with::<sqlx::Postgres, Widget, _>(AssertSqlSafe(sql), values)
@@ -272,5 +343,48 @@ fn map_db_err(e: sqlx::Error) -> AppError {
         AppError::Conflict("resource already exists".to_owned())
     } else {
         AppError::Internal(e.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// keyset 谓词与 ORDER BY **必须用同一个 collation**:分叉不会报错,只会静默漏行。
+    /// 行为对拍归 PG conformance(要 DB);这条无 DB 也能钉住 SQL 形状,守住那个静默失败。
+    #[test]
+    fn name_keyset_predicate_and_order_share_collation() {
+        let now = OffsetDateTime::now_utc();
+        let anchor = Widget {
+            id: Uuid::now_v7(),
+            name: "m".to_owned(),
+            created_by: None,
+            created_at: now,
+            updated_by: None,
+            updated_at: now,
+        };
+        let mut q = Query::select();
+        q.column(Widgets::Id)
+            .from(Widgets::Table)
+            .cond_where(keyset_after(
+                WidgetSortField::Name,
+                SortOrder::Desc,
+                &anchor,
+            ))
+            .order_by_expr(sort_expr(WidgetSortField::Name), Order::Desc)
+            .order_by(Widgets::Id, Order::Desc);
+        let sql = q.to_string(PostgresQueryBuilder);
+
+        // 谓词两处(`name <> a.name`、`name = a.name`)+ ORDER BY 一处,一个都不能少。
+        assert_eq!(
+            sql.matches(r#"COLLATE "C""#).count(),
+            3,
+            "谓词与 ORDER BY 的 collation 必须一致: {sql}"
+        );
+        // tiebreaker 方向随主键(desc → `<`),否则同名行会翻重或翻漏。
+        assert!(
+            sql.contains(r#""id" < "#),
+            "tiebreaker 方向应随 order: {sql}"
+        );
     }
 }
