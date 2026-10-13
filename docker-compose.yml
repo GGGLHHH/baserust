@@ -238,8 +238,9 @@ services:
 
   # S3 兼容对象存储:content 模块的字节落这(元数据进 PG,字节进 minio)。
   # 不设 app 的 S3_ENDPOINT 则 content 走内存 backend、本服务可不起(对齐"零外部依赖也能跑")。
+  # 官方 minio/minio、minio/mc 已停更并从 Docker Hub 下架,改用社区维护的 pgsty 构建(命令/参数兼容)。
   minio:
-    image: minio/minio
+    image: pgsty/minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_USER:-minio}
@@ -256,10 +257,10 @@ services:
     volumes:
       - miniodata:/data
 
-  # 一次性:等 minio 起来 + 幂等建桶(minio/minio 镜像无 curl,健康检查交给这个 mc one-shot)。
+  # 一次性:等 minio 起来 + 幂等建桶(minio 镜像无 curl,健康检查交给这个 mc one-shot)。
   # app 用 depends_on service_completed_successfully 等它跑完 → 桶一定先于 app 就绪。
   minio-init:
-    image: minio/mc
+    image: pgsty/mc
     depends_on:
       - minio
     entrypoint: >

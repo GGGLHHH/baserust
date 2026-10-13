@@ -123,8 +123,9 @@ services:
       timeout: 3s
       retries: 10
 
+  # 官方 minio/minio、minio/mc 已停更并从 Docker Hub 下架,改用社区维护的 pgsty 构建(命令/参数兼容)。
   minio:
-    image: minio/minio
+    image: pgsty/minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -136,7 +137,7 @@ services:
     # 对外只开 nginx:80。
 
   minio-init:
-    image: minio/mc
+    image: pgsty/mc
     depends_on: [minio]
     env_file: [.env]
     entrypoint: >
