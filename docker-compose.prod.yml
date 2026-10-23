@@ -38,8 +38,14 @@ services:
       APP_DB_PORT: "5432"
       CONTENT_DB_HOST: pg
       CONTENT_DB_PORT: "5432"
-      IDM_DB_HOST: pg              # 跨模块预留(needs_idm=false 不实连,见架构文档)
-      IDM_DB_PORT: "5432"
+      # **app = Mount::App(needs_idm=false),永不连 idm schema**:idm_pool 只在 needs_idm 时才建
+      # (state.rs),`connect_for_schema(Idm)` 在 app 进程里根本不调用。原先这里留 IDM_DB_HOST/PORT
+      # 「跨模块预留」,叠上 env_file(.env)注入的 IDM_DB_USER/PASSWORD —— 对 app 是纯多余的攻击面:
+      # 被攻破的 app 拿到 idm role 密码即可直连 idm schema、**绕过物理隔离**读写身份数据。
+      # environment 覆盖 env_file,**显式清空凭证** = 最小权限;idm 的库凭证只该活在 idm 容器里。
+      # (真要做 app→idm 跨模块只读富化时,再按需授一个 idm schema 的**只读** role,别复用签发方凭证。)
+      IDM_DB_USER: ""
+      IDM_DB_PASSWORD: ""
       NATS_URL: nats://nats:4222
       # presign 相对 URL 拓扑(只开 80):app 用内网 host 签、返回相对 URL,浏览器经 nginx→minio。
       # S3_ENDPOINT 指内网 minio(app 内部 HEAD/PUT 直连它 + presign 用它的 host 签);
