@@ -1,25 +1,50 @@
-//! **六边形架构的依赖规则,扫源码钉死**(端口与适配器):核心不依赖框架、数据库、HTTP;依赖只向内指。
+//! **六边形架构的依赖规则**(端口与适配器):核心不依赖框架、数据库、HTTP;依赖只向内指。
 //!
-//! "核心" = `src/kernel/**`(共享内核)+ 每个业务模块 `src/features/<m>/` 下**除 `adapters/` 以外**的文件
-//! (领域模型、端口、用例)。这些文件里不许出现:
-//! - 框架 / 数据库 / HTTP / 消息 / 对象存储 / JWT 的 crate(见 [`FORBIDDEN_CRATES`]);
-//! - 向外的依赖:`crate::infra`(适配器侧横切件)、`crate::app`(组合根);
-//! - 别的业务模块(`crate::features::<其他>`)—— 模块间协作走端口,实现在组合根 `app/adapters/`。
+//! 核心是独立 crate `baserust-core`(`crates/core`):共享内核 + 各业务模块的领域模型 / 端口 / 用例 +
+//! 纯 Rust 的内存适配器。**主要防线是编译器** —— 核心的 `Cargo.toml` 里没有 axum / sqlx / … ,
+//! 核心代码想用也 import 不到。本测试守编译器管不到的三条:
+//! 1. 核心的依赖清单不许加回框架 / 数据库 / HTTP / 消息 / 对象存储 / JWT 依赖([`FORBIDDEN_PACKAGES`]);
+//! 2. 核心里的业务模块之间不许直接 import(`crate::features::<别的模块>`)—— 协作走端口,
+//!    实现在主 crate 的组合根 `app/adapters/`;
+//! 3. 主 crate 的 `src/features/<m>/` 下除 `adapters/` 外只许有 `mod.rs`(重新导出核心),
+//!    不许把模型 / 端口 / 用例写回主 crate;也不许再出现 `src/kernel/`。
 //!
-//! 允许:`crate::kernel`、本模块、领域库(idm / content,零 HTTP)、serde / garde / uuid / time /
-//! thiserror / anyhow / async-trait / tokio / tracing 这类不属于框架、数据库、HTTP 的基础库。
-//! 适配器(`adapters/`)、`infra`、`app` 不受限 —— 它们就是用这些依赖去实现端口、驱动核心的那一层。
+//! 另外保留源码扫描([`FORBIDDEN_CRATES`]):`[dev-dependencies]` 或传递依赖不该被核心源码直接点名。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// 核心里禁止出现的 crate(按路径前缀匹配,如 `axum::`、`use axum`)。
+/// 核心 crate 的 Cargo.toml 里禁止出现的包(按 Cargo 包名)。
+const FORBIDDEN_PACKAGES: &[&str] = &[
+    "axum",
+    "axum-extra",
+    "tower",
+    "tower-http",
+    "http",
+    "hyper",
+    "actix-web",
+    "utoipa",
+    "utoipa-axum",
+    "utoipa-scalar",
+    "sqlx",
+    "sea-query",
+    "sea-query-sqlx",
+    "async-nats",
+    "aws-sdk-s3",
+    "aws-config",
+    "reqwest",
+    "jsonwebtoken",
+];
+
+/// 核心源码里禁止出现的路径前缀(按 Rust crate 名,如 `axum::`、`use sqlx`)。
 const FORBIDDEN_CRATES: &[&str] = &[
     "axum",
     "axum_extra",
     "tower",
     "tower_http",
     "http",
+    "hyper",
+    "actix_web",
     "utoipa",
     "utoipa_axum",
     "utoipa_scalar",
@@ -32,6 +57,10 @@ const FORBIDDEN_CRATES: &[&str] = &[
     "reqwest",
     "jsonwebtoken",
 ];
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("读目录 {}: {e}", dir.display())) {
@@ -73,7 +102,7 @@ fn mentions_crate(text: &str, krate: &str) -> bool {
     false
 }
 
-/// 一个核心文件的违规清单(`文件:行: 原因`)。`module` = 所属业务模块名(kernel 为 None)。
+/// 一个核心源文件的违规清单(`文件:行: 原因`)。`module` = 所属业务模块名(kernel 为 None)。
 fn violations(path: &Path, module: Option<&str>) -> Vec<String> {
     let src = fs::read_to_string(path).unwrap();
     let mut out = Vec::new();
@@ -117,47 +146,109 @@ fn violations(path: &Path, module: Option<&str>) -> Vec<String> {
     out
 }
 
-#[test]
-fn core_depends_on_no_framework_database_or_http() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut checked = 0;
-    let mut problems = Vec::new();
-
-    // 共享内核:整个目录都是核心。
-    let mut kernel = Vec::new();
-    rs_files(&root.join("kernel"), &mut kernel);
-    for f in &kernel {
-        problems.extend(violations(f, None));
-        checked += 1;
+/// 某个 TOML 段(如 `[dependencies]`)里声明的包名。够用的极简解析:段内每行 `name = …` / `name.workspace = true`。
+fn packages_in_section(toml: &str, section: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == section;
+            continue;
+        }
+        if !inside || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, _)) = line.split_once('=') {
+            let name = name
+                .trim()
+                .split('.')
+                .next()
+                .unwrap()
+                .trim()
+                .trim_matches('"');
+            out.push(name.to_owned());
+        }
     }
+    out
+}
 
-    // 业务模块:adapters/ 以外的文件是核心。
-    for entry in fs::read_dir(root.join("features")).unwrap() {
+#[test]
+fn core_crate_manifest_has_no_framework_dependencies() {
+    let toml = fs::read_to_string(manifest_dir().join("crates/core/Cargo.toml")).unwrap();
+    let deps = packages_in_section(&toml, "[dependencies]");
+    assert!(
+        deps.contains(&"serde".to_owned()),
+        "依赖段解析坏了?读到:{deps:?}"
+    );
+    let bad: Vec<_> = deps
+        .iter()
+        .filter(|d| FORBIDDEN_PACKAGES.contains(&d.as_str()))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "核心 crate 依赖了框架 / 数据库 / HTTP 类包 {bad:?} —— 这类代码属于主 crate 的适配器"
+    );
+}
+
+#[test]
+fn core_sources_respect_dependency_rules() {
+    let core_src = manifest_dir().join("crates/core/src");
+    let mut files = Vec::new();
+    rs_files(&core_src, &mut files);
+    let mut problems = Vec::new();
+    for f in &files {
+        // crates/core/src/features/<m>/… → 所属模块 m;kernel / lib.rs → None
+        let rel = f.strip_prefix(&core_src).unwrap();
+        let mut parts = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let module = match (parts.next().as_deref(), parts.next()) {
+            (Some("features"), Some(m)) if !m.ends_with(".rs") => Some(m),
+            _ => None,
+        };
+        problems.extend(violations(f, module.as_deref()));
+    }
+    assert!(
+        files.len() >= 30,
+        "只扫到 {} 个核心文件 —— 目录结构变了?",
+        files.len()
+    );
+    assert!(
+        problems.is_empty(),
+        "核心违反依赖规则 {} 处:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn main_crate_holds_no_core_code() {
+    let src = manifest_dir().join("src");
+    assert!(
+        !src.join("kernel").exists(),
+        "src/kernel/ 又出现了 —— 共享内核在 crates/core/src/kernel"
+    );
+    let mut misplaced = Vec::new();
+    for entry in fs::read_dir(src.join("features")).unwrap() {
         let dir = entry.unwrap().path();
         if !dir.is_dir() {
             continue;
         }
-        let module = dir.file_name().unwrap().to_string_lossy().into_owned();
         let mut files = Vec::new();
         rs_files(&dir, &mut files);
         for f in files {
-            if f.strip_prefix(&dir).unwrap().starts_with("adapters") {
+            let rel = f.strip_prefix(&dir).unwrap();
+            if rel.starts_with("adapters") || rel == Path::new("mod.rs") {
                 continue;
             }
-            problems.extend(violations(&f, Some(&module)));
-            checked += 1;
+            misplaced.push(f.display().to_string());
         }
     }
-
     assert!(
-        checked >= 30,
-        "只扫到 {checked} 个核心文件 —— 目录结构变了?检查本测试的路径约定"
-    );
-    assert!(
-        problems.is_empty(),
-        "核心(kernel + features/*/ 除 adapters/)违反依赖规则 {} 处:\n{}",
-        problems.len(),
-        problems.join("\n")
+        misplaced.is_empty(),
+        "主 crate 的业务模块里只该有 mod.rs + adapters/;模型 / 端口 / 用例放 crates/core:\n{}",
+        misplaced.join("\n")
     );
 }
 
@@ -167,7 +258,7 @@ fn scanner_detects_crate_paths_but_not_lookalikes() {
     assert!(mentions_crate("use axum::Json;", "axum"));
     assert!(mentions_crate("#[derive(sqlx::FromRow)]", "sqlx"));
     assert!(mentions_crate("use utoipa;", "utoipa"));
-    assert!(!mentions_crate("use axum_extra::extract::Query;", "axum")); // 交给 axum_extra 自己那条
+    assert!(!mentions_crate("use axum_extra::extract::Query;", "axum"));
     assert!(mentions_crate(
         "use axum_extra::extract::Query;",
         "axum_extra"
@@ -175,4 +266,9 @@ fn scanner_detects_crate_paths_but_not_lookalikes() {
     assert!(!mentions_crate("let http_status = 1;", "http"));
     assert!(!mentions_crate("fn my_sqlx_helper() {}", "sqlx"));
     assert_eq!(code_of("let a = 1; // axum::Json 只是注释"), "let a = 1; ");
+    let toml = "[package]\nname = \"x\"\n[dependencies]\nserde = \"1\"\nidm.workspace = true\n[dev-dependencies]\ntokio = \"1\"\n";
+    assert_eq!(
+        packages_in_section(toml, "[dependencies]"),
+        vec!["serde", "idm"]
+    );
 }

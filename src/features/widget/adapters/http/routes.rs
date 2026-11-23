@@ -16,12 +16,11 @@ use super::dto::{
 use crate::app::state::AppState;
 use crate::features::widget::model;
 use crate::infra::authz::TokenScope;
-use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
 use crate::infra::http::sort::SortOrder;
-use crate::kernel::audit::AuditContext;
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 use crate::kernel::pagination::PageParams;
@@ -70,7 +69,7 @@ pub async fn list_widgets(
     scope: TokenScope,
     Query(query): Query<PageQuery>,
     Query(sort): Query<WidgetSort>,
-) -> Result<Json<Page<WidgetView>>, AppError> {
+) -> Result<Json<Page<WidgetView>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
@@ -105,9 +104,9 @@ pub async fn create_widget(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Json(input): Json<CreateWidget>,
-) -> Result<(StatusCode, Json<Widget>), AppError> {
+) -> Result<(StatusCode, Json<Widget>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
@@ -132,7 +131,7 @@ pub async fn get_widget(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<Widget>, AppError> {
+) -> Result<Json<Widget>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
@@ -143,7 +142,7 @@ pub async fn get_widget(
     if access.allows_created_by(widget.created_by.as_deref()) {
         Ok(Json(widget.into()))
     } else {
-        Err(AppError::NotFound) // 不是你的 → 404(不泄露存在,区别于 403)
+        Err(AppError::NotFound.into()) // 不是你的 → 404(不泄露存在,区别于 403)
     }
 }
 
@@ -166,10 +165,10 @@ pub async fn update_widget(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateWidget>,
-) -> Result<Json<Widget>, AppError> {
+) -> Result<Json<Widget>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
@@ -221,9 +220,9 @@ pub async fn delete_widget(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetDelete)?;
@@ -242,7 +241,7 @@ pub async fn delete_widget(
     tag = "widgets",
     responses((status = 200, description = "全站 widget 计数(公开)", body = WidgetStats))
 )]
-pub async fn widget_stats(State(state): State<AppState>) -> Result<Json<WidgetStats>, AppError> {
+pub async fn widget_stats(State(state): State<AppState>) -> Result<Json<WidgetStats>, ApiError> {
     Ok(Json(WidgetStats {
         total: state.widgets.count(None).await?,
     }))
@@ -262,7 +261,7 @@ pub async fn widget_stats(State(state): State<AppState>) -> Result<Json<WidgetSt
 pub async fn my_widget_count(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> Result<Json<WidgetStats>, AppError> {
+) -> Result<Json<WidgetStats>, ApiError> {
     Ok(Json(WidgetStats {
         total: state.widgets.count(Some(user.0.id)).await?,
     }))
@@ -284,7 +283,7 @@ pub async fn purge_preview(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<Json<WidgetStats>, AppError> {
+) -> Result<Json<WidgetStats>, ApiError> {
     state
         .policy
         .require_all(&user.0, &scope.0, &[Perm::WidgetRead, Perm::WidgetDelete])?;
@@ -309,7 +308,7 @@ pub async fn widget_overview(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<Json<WidgetStats>, AppError> {
+) -> Result<Json<WidgetStats>, ApiError> {
     state
         .policy
         .require_any(&user.0, &scope.0, &[Perm::WidgetRead, Perm::UsersAdmin])?;
@@ -338,7 +337,7 @@ pub async fn admin_list_widgets(
     scope: TokenScope,
     Query(query): Query<PageQuery>,
     Query(sort): Query<WidgetSort>,
-) -> Result<Json<Page<WidgetView>>, AppError> {
+) -> Result<Json<Page<WidgetView>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -376,7 +375,7 @@ pub async fn widget_events(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;

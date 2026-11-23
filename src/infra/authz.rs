@@ -2,6 +2,7 @@
 //! `GET /permissions/me` 端点,以及 `Perm` / `RoleName` 的 OpenAPI schema。
 //! 词表与判定(`Perm` / `RoleName` / `Policy` / `Access`)是核心,在 `kernel::authz`。
 
+use crate::infra::http::error::ApiError;
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, Request, State};
@@ -15,12 +16,12 @@ use crate::kernel::error::AppError;
 use idm::AuthUser;
 
 crate::closed_enum_to_schema!(
-    Perm,
+    PermSchema => Perm,
     Perm::ALL,
     "权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。\nwire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。\n加权限 = 加一个变体 + `rename`,别处不动。"
 );
 crate::closed_enum_to_schema!(
-    RoleName,
+    RoleNameSchema => RoleName,
     RoleName::ALL,
     "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。"
 );
@@ -49,7 +50,7 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenScope {
 /// 本闸只是防御纵深第一层。注:axum `.layer()` 只包已注册路由,组内未知路径仍走 fallback 404、不过闸。
 pub async fn require_login(req: Request, next: Next) -> Response {
     if req.extensions().get::<AuthUser>().is_none() {
-        return AppError::Unauthorized.into_response();
+        return ApiError::from(AppError::Unauthorized).into_response();
     }
     next.run(req).await
 }
@@ -64,7 +65,7 @@ pub async fn require_admin_login(
     next: Next,
 ) -> Response {
     let Some(user) = req.extensions().get::<AuthUser>().cloned() else {
-        return AppError::Unauthorized.into_response();
+        return ApiError::from(AppError::Unauthorized).into_response();
     };
     let scope = req
         .extensions()
@@ -72,7 +73,7 @@ pub async fn require_admin_login(
         .cloned()
         .unwrap_or_default();
     if let Err(e) = policy.require_scoped(&user, &scope.0, Perm::AdminLogin) {
-        return e.into_response();
+        return ApiError::from(e).into_response();
     }
     next.run(req).await
 }
@@ -86,8 +87,10 @@ pub async fn require_admin_login(
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MyPermissionsResponse {
     /// token claim 里的角色名(闭集,生成前端 union)。
+    #[schema(value_type = Vec<RoleNameSchema>)]
     pub roles: Vec<RoleName>,
     /// 有效权限(闭集,wire 串序输出)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。
+    #[schema(value_type = Vec<PermSchema>)]
     pub permissions: Vec<Perm>,
 }
 
@@ -218,11 +221,11 @@ mod tests {
     #[test]
     fn closed_enum_schemas_list_wire_values() {
         use utoipa::PartialSchema;
-        let json = serde_json::to_value(Perm::schema()).unwrap();
+        let json = serde_json::to_value(PermSchema::schema()).unwrap();
         let values = json["enum"].as_array().unwrap();
         assert_eq!(values.len(), Perm::ALL.len());
         assert_eq!(values[0], serde_json::to_value(Perm::ALL[0]).unwrap());
-        let json = serde_json::to_value(RoleName::schema()).unwrap();
+        let json = serde_json::to_value(RoleNameSchema::schema()).unwrap();
         assert_eq!(json["enum"].as_array().unwrap().len(), RoleName::ALL.len());
     }
 }

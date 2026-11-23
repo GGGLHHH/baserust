@@ -5,22 +5,26 @@
 FROM rust:1.94-bookworm AS builder
 WORKDIR /app
 
-# 先用 manifest + 占位 main 缓存依赖层:Cargo.toml/lock 不变时,改源码不重编依赖。
+# 先用 manifest + 占位源码缓存依赖层:Cargo.toml/lock 不变时,改源码不重编依赖。
+# 工作区两个 crate(主 crate + crates/core 核心)的 manifest 都要先到位,占位 main / lib 各一个。
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
+COPY crates/core/Cargo.toml ./crates/core/Cargo.toml
+RUN mkdir -p src crates/core/src \
  && echo 'fn main() {}' > src/main.rs \
+ && touch crates/core/src/lib.rs \
  && cargo build --release \
- && rm -rf src
+ && rm -rf src crates/core/src
 
 # 再拷真实源码编译(sqlx 用运行时 query_as,build 不需要 DATABASE_URL / 在线 DB)。
 # seed.toml / mock.toml:进程内 seed/mock 用 include_str! 编译期嵌入,故 build 上下文需有它们(否则编译失败)。
+COPY crates/core/src ./crates/core/src
 COPY src ./src
 COPY seed.toml ./seed.toml
 COPY mock.toml ./mock.toml
 # keys/:config.rs 用 include_str! 编译期嵌入 dev 密钥对(零配置启动的默认 JWT 钥),故 build 上下文需有它们。
 # 只嵌入 dev 对(prod 钥永不入库、运行期经 JWT_*_KEY_FILE 挂卷);.dockerignore 别把 keys/ 整个排掉。
 COPY keys ./keys
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs crates/core/src/lib.rs && cargo build --release
 
 # ---- sqlx:仅用来产出 sqlx-cli 二进制(构建期 stage,不进任何运行镜像)----
 FROM rust:1.94-bookworm AS sqlx

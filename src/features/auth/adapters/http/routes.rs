@@ -19,10 +19,9 @@ use crate::app::state::AppState;
 use crate::features::auth::adapters::emit::{emit_auth_event, failure_data, success_data};
 use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
 use crate::infra::client_context::ClientContext;
-use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
-use crate::kernel::audit::AuditContext;
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 
@@ -89,9 +88,9 @@ pub async fn register(
     State(state): State<AppState>,
     jar: CookieJar,
     ctx: ClientContext,
-    audit: AuditContext,
+    Audit(audit): Audit,
     Json(req): Json<RegisterRequest>,
-) -> Result<(StatusCode, CookieJar, Json<UserResponse>), AppError> {
+) -> Result<(StatusCode, CookieJar, Json<UserResponse>), ApiError> {
     req.validate()?;
     let outcome = state.auth.register(req.into(), audit.audit_id()).await?;
     emit_auth_event(
@@ -125,7 +124,7 @@ pub async fn login(
     ctx: ClientContext,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
-) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
     req.validate()?;
     let identifier = req.identifier.clone();
     match state.auth.login(req.into()).await {
@@ -176,7 +175,7 @@ pub async fn refresh(
     State(state): State<AppState>,
     ctx: ClientContext,
     jar: CookieJar,
-) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
     let refresh = jar
         .get(REFRESH_COOKIE)
         .map(|c| c.value().to_owned())
@@ -207,7 +206,7 @@ pub async fn logout(
     State(state): State<AppState>,
     ctx: ClientContext,
     jar: CookieJar,
-) -> Result<(StatusCode, CookieJar), AppError> {
+) -> Result<(StatusCode, CookieJar), ApiError> {
     // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等 —— 没找到活跃会话不发事件。
     if let Some(c) = jar.get(REFRESH_COOKIE) {
         if let Some(session) = state.auth.logout(c.value()).await? {
@@ -237,7 +236,7 @@ pub async fn logout_all(
     ctx: ClientContext,
     jar: CookieJar,
     user: CurrentUser,
-) -> Result<(StatusCode, CookieJar), AppError> {
+) -> Result<(StatusCode, CookieJar), ApiError> {
     state.auth.logout_all(user.0.id).await?;
     emit_auth_event(
         &state.idm_outbox,
@@ -261,7 +260,7 @@ pub async fn logout_all(
 pub async fn get_me(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> Result<Json<UserResponse>, AppError> {
+) -> Result<Json<UserResponse>, ApiError> {
     let view = state.auth.me(user.0.id).await?;
     Ok(Json(view.into()))
 }
@@ -277,10 +276,10 @@ pub async fn get_me(
 )]
 pub async fn update_me(
     State(state): State<AppState>,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     user: CurrentUser,
     Json(req): Json<UpdateMeRequest>,
-) -> Result<Json<UserResponse>, AppError> {
+) -> Result<Json<UserResponse>, ApiError> {
     req.validate()?;
     let view = state
         .auth
@@ -300,11 +299,11 @@ pub async fn update_me(
 pub async fn delete_me(
     State(state): State<AppState>,
     ctx: ClientContext,
-    audit: AuditContext,
+    Audit(audit): Audit,
     user: CurrentUser,
     jar: CookieJar,
     Json(req): Json<DeleteMeRequest>,
-) -> Result<(StatusCode, CookieJar), AppError> {
+) -> Result<(StatusCode, CookieJar), ApiError> {
     req.validate()?;
     state
         .auth
@@ -340,7 +339,7 @@ pub async fn change_password(
     user: CurrentUser,
     jar: CookieJar,
     Json(req): Json<ChangePasswordRequest>,
-) -> Result<(StatusCode, CookieJar), AppError> {
+) -> Result<(StatusCode, CookieJar), ApiError> {
     req.validate()?;
     state.auth.change_password(user.0.id, req.into()).await?;
     emit_auth_event(
@@ -376,7 +375,7 @@ pub async fn admin_login(
     ctx: ClientContext,
     jar: CookieJar,
     Json(req): Json<LoginRequest>,
-) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
     req.validate()?;
     let identifier = req.identifier.clone();
     let outcome = match state.auth.login(req.into()).await {
@@ -418,7 +417,7 @@ pub async fn admin_login(
             ),
         )
         .await;
-        return Err(AppError::Forbidden);
+        return Err(AppError::Forbidden.into());
     }
     emit_auth_event(
         &state.idm_outbox,
@@ -448,7 +447,7 @@ pub async fn admin_login(
 pub async fn admin_get_me(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> Result<Json<UserResponse>, AppError> {
+) -> Result<Json<UserResponse>, ApiError> {
     let view = state.auth.me(user.0.id).await?;
     Ok(Json(view.into()))
 }

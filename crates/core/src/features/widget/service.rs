@@ -151,7 +151,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::features::widget::adapters::memory::{
+    use crate::features::widget::memory::{
         InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory,
     };
     use crate::features::widget::ports::UserBrief;
@@ -271,8 +271,8 @@ mod tests {
     /// create 成功后发布 Created 事件;订阅方收到的 widget 与返回值一致。
     #[tokio::test]
     async fn create_publishes_created_event() {
-        use crate::features::widget::adapters::memory::MemoryEventBus;
         use crate::features::widget::events::WidgetEvent;
+        use crate::features::widget::memory::MemoryEventBus;
         use crate::features::widget::ports::EventBus;
         let bus = Arc::new(MemoryEventBus::new());
         let svc = WidgetService::new(

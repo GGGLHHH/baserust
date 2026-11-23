@@ -741,6 +741,7 @@ dependencies = [
  "axum-extra",
  "axum-prometheus",
  "base64 0.22.1",
+ "baserust-core",
  "bytes",
  "content",
  "dotenvy",
@@ -770,6 +771,24 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "utoipa-scalar",
+ "uuid",
+]
+
+[[package]]
+name = "baserust-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "content",
+ "garde",
+ "idm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

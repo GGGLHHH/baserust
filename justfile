@@ -24,11 +24,11 @@ watch:
 
 # 快速编译检查
 check:
-    cargo check --all-targets
+    cargo check --workspace --all-targets
 
 # 测试(默认:零 DB,含内存侧仓储一致性 conformance)
 test:
-    cargo test
+    cargo test --workspace
 
 # ───── 仓储一致性测试(同一契约对内存/PG 各跑一遍,防 drift)─────
 # 一次性:给测试集群 app role 授权(只动本地 dev pg,不碰 prod):
@@ -141,7 +141,7 @@ gen-keys out="./keys/prod-ed25519":
 # lint:格式检查 + clippy(警告即失败)
 lint:
     cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # 自动格式化
 fmt:
@@ -150,7 +150,7 @@ fmt:
 # 自动修复(类似 eslint --fix):clippy 机器可应用的建议自动改 + 格式化。一键修掉能自动修的。
 # --allow-dirty/--allow-staged:clippy --fix 默认要求 git 干净,开发时工作区常有改动,放开。
 fix:
-    cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features
+    cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features
     cargo fmt --all
 
 # 清理热更新累积的编译缓存(自己的 codegen 产物 + 增量),保留依赖缓存 → 下次只重编自己、秒级

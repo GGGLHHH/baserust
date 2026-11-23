@@ -4,16 +4,14 @@
 //! `ports`(仓储、头像探针)、`service`(用例)。
 //! **适配器**(`adapters/`):`http`、`memory` / `postgres`(仓储)、`outbox`(app schema 发件箱)。
 //! 头像探针的真实现(经 content 领域库)在组合根 `app/adapters/`。
+//!
+//! **核心**(模型 / 端口 / 用例 / 内存适配器)在 `baserust-core`(`crates/core`),这里整体重新导出,
+//! 原有路径(`features::profile::model` 等)不变;本 crate 只放适配器。
+
+pub use baserust_core::features::profile::*;
 
 pub mod adapters;
-pub mod model;
-pub mod ports;
-mod service;
 
 pub use adapters::http::{admin_router, router};
-pub use adapters::memory::{InMemoryProfileRepo, StaticAvatarProbe};
-pub use adapters::outbox::{AppOutboxRecord, InMemoryAppOutbox, PgAppOutbox};
+pub use adapters::outbox::PgAppOutbox;
 pub use adapters::postgres::PgProfileRepo;
-pub use model::{Profile, ProfileFields, ProfileView, PutProfile};
-pub use ports::{AvatarInfo, AvatarProbe, ProfileRepo};
-pub use service::ProfileService;

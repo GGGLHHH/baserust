@@ -15,7 +15,7 @@ use super::dto::{AuthEventFilter, AuthEventRow, AuthStats, StatsQuery};
 use crate::app::state::AppState;
 use crate::infra::authz::TokenScope;
 use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
 use crate::kernel::authz::Perm;
@@ -42,7 +42,7 @@ pub async fn list_user_auth_events(
     Path(id): Path<Uuid>,
     Query(page): Query<PageQuery>,
     Query(filter): Query<AuthEventFilter>,
-) -> Result<Json<Page<AuthEventRow>>, AppError> {
+) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -73,7 +73,7 @@ pub async fn list_auth_events(
     scope: TokenScope,
     Query(page): Query<PageQuery>,
     Query(filter): Query<AuthEventFilter>,
-) -> Result<Json<Page<AuthEventRow>>, AppError> {
+) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -100,7 +100,7 @@ pub async fn stats_auth_events(
     user: CurrentUser,
     scope: TokenScope,
     Query(q): Query<StatsQuery>,
-) -> Result<Json<AuthStats>, AppError> {
+) -> Result<Json<AuthStats>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -126,7 +126,7 @@ pub async fn stream_auth_events(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;

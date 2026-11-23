@@ -14,10 +14,9 @@ use super::dto::{AvatarForm, ProfileResponse, PutProfileRequest};
 use crate::app::state::AppState;
 use crate::features::profile::model::{self, is_allowed_avatar_mime};
 use crate::infra::authz::TokenScope;
-use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Multipart, Path};
-use crate::kernel::audit::AuditContext;
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 
@@ -40,7 +39,7 @@ pub async fn get_profile(
     user: CurrentUser,
     scope: TokenScope,
     Path(user_id): Path<Uuid>,
-) -> Result<Json<ProfileResponse>, AppError> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ProfileRead)?;
@@ -65,7 +64,7 @@ pub async fn get_profile(
 pub async fn get_my_profile(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> Result<Json<ProfileResponse>, AppError> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     Ok(Json(state.profiles.get_or_empty(user.0.id).await?.into()))
 }
 
@@ -89,10 +88,10 @@ pub async fn put_profile(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(user_id): Path<Uuid>,
     Json(input): Json<PutProfileRequest>,
-) -> Result<(StatusCode, Json<ProfileResponse>), AppError> {
+) -> Result<(StatusCode, Json<ProfileResponse>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ProfileWrite)?;
@@ -102,7 +101,7 @@ pub async fn put_profile(
         .data_access(&user.0, &scope.0, Perm::ProfileWriteAll)
         .allows(user_id)
     {
-        return Err(AppError::Forbidden);
+        return Err(AppError::Forbidden.into());
     }
     let (created, view) = state.profiles.put(user_id, input.into(), &ctx).await?;
     let status = if created {
@@ -134,7 +133,7 @@ pub async fn get_user_avatar(
     State(state): State<AppState>,
     _user: CurrentUser,
     Path(user_id): Path<Uuid>,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     let cid = state
         .profiles
         .avatar_content_id(user_id)
@@ -153,7 +152,7 @@ pub async fn get_user_avatar(
         .as_deref()
         .is_some_and(is_allowed_avatar_mime)
     {
-        return Err(AppError::NotFound);
+        return Err(AppError::NotFound.into());
     }
     // 出字节:presign 后端 → 307 到签名 URL;内存 backend → 代理 inline。刻意重复
     // content::preview_content 的服务段(去掉 owner 闸 —— 本端点契约就是"这个用户的公开头像"),
@@ -179,7 +178,7 @@ pub async fn get_user_avatar(
         // 分支直连存储、加不了 CSP —— 故防线必须在上传白名单,不能靠出字节时补)。
         .header("content-security-policy", "sandbox")
         .body(Body::from(p.data))
-        .map_err(|e| AppError::Internal(e.into()))
+        .map_err(|e| AppError::Internal(e.into()).into())
 }
 
 // ── 后台资料管理(admin 组,路径仍在 /users/{id} 下、归 users:admin 授权面;
@@ -205,7 +204,7 @@ pub async fn get_user_profile(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<ProfileResponse>, AppError> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -230,10 +229,10 @@ pub async fn set_user_profile(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Json(input): Json<PutProfileRequest>,
-) -> Result<Json<ProfileResponse>, AppError> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -261,10 +260,10 @@ pub async fn set_user_avatar(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Multipart(mut multipart): Multipart,
-) -> Result<Json<ProfileResponse>, AppError> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -282,7 +281,8 @@ pub async fn set_user_avatar(
     {
         return Err(AppError::Validation(
             "avatar must be a raster image (png/jpeg/gif/webp)".into(),
-        ));
+        )
+        .into());
     }
 
     // content 归目标用户(是他的头像);单租户 tenant=nil。
@@ -337,7 +337,7 @@ pub async fn set_user_avatar(
             {
                 tracing::warn!(error = %cleanup, %content_id, "头像绑定失败后清理孤儿 content 失败(软删)");
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
     Ok(Json(view.into()))

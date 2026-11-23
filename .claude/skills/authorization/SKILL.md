@@ -34,7 +34,7 @@ oauth2 scopes = "which perm gates this op". Ownership is runtime/data-dependent 
 
 | truth | file |
 |---|---|
-| which perms exist | `Perm` enum — `kernel/authz.rs`(schema 在 `infra/authz.rs` 的 `closed_enum_to_schema!`) |
+| which perms exist | `Perm` enum — `crates/core/src/kernel/authz.rs`(OpenAPI schema 标记类型 `PermSchema` 在 `src/infra/authz.rs`) |
 | endpoint → perm (**docs**) | `infra/op_perms.rs` — add one row |
 | endpoint → perm (**enforce**) | the handler's `require_scoped` |
 | role → perms | `seed.toml` |

@@ -1,3 +1,4 @@
+use crate::infra::http::error::ApiError;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -164,9 +165,10 @@ pub fn doc_routes(api: utoipa::openapi::OpenApi) -> Router<AppState> {
 fn yaml_response(api: &utoipa::openapi::OpenApi) -> Response {
     match api.to_yaml() {
         Ok(body) => ([(header::CONTENT_TYPE, "application/yaml")], body).into_response(),
-        Err(e) => {
-            AppError::Internal(anyhow::anyhow!("生成 OpenAPI YAML 失败: {e}")).into_response()
-        }
+        Err(e) => ApiError::from(AppError::Internal(anyhow::anyhow!(
+            "生成 OpenAPI YAML 失败: {e}"
+        )))
+        .into_response(),
     }
 }
 

@@ -20,8 +20,8 @@ use baserust::features::auth::{authenticate, AppTokenSigner};
 use baserust::infra::authz::TokenScope;
 use baserust::infra::config::Config;
 use baserust::infra::http::audit::CurrentUser;
+use baserust::infra::http::error::ApiError;
 use baserust::kernel::authz::Perm;
-use baserust::kernel::error::AppError;
 use baserust::kernel::pagination::PageParams;
 use idm::{AuthOutcome, LoginInput};
 
@@ -31,7 +31,7 @@ async fn demo_read(
     axum::extract::State(s): axum::extract::State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     s.policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
     Ok(StatusCode::OK)
@@ -41,7 +41,7 @@ async fn demo_write(
     axum::extract::State(s): axum::extract::State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     s.policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
     Ok(StatusCode::OK)
@@ -51,7 +51,7 @@ async fn demo_admin(
     axum::extract::State(s): axum::extract::State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     s.policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     Ok(StatusCode::NO_CONTENT)

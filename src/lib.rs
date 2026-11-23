@@ -11,4 +11,5 @@ pub mod app;
 pub mod features;
 pub mod health;
 pub mod infra;
-pub mod kernel;
+/// 共享内核在核心 crate(`baserust-core`),重新导出保持 `crate::kernel::…` 路径不变。
+pub use baserust_core::kernel;

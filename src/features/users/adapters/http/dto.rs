@@ -8,6 +8,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::features::users::model;
+use crate::infra::authz::RoleNameSchema;
 use crate::infra::http::sort::SortOrder;
 use crate::kernel::authz::RoleName;
 
@@ -21,6 +22,7 @@ pub struct AdminUserView {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// idm 角色名(全量;闭集,生成前端 union)。
+    #[schema(value_type = Vec<RoleNameSchema>)]
     pub roles: Vec<RoleName>,
     /// 富化:app.profiles 的显示名(悬空/分进程 → null)。
     pub display_name: Option<String>,
@@ -49,6 +51,7 @@ impl From<model::AdminUserView> for AdminUserView {
 pub struct RoleView {
     pub id: Uuid,
     /// 机器码(闭集,生成前端 union)。
+    #[schema(value_type = RoleNameSchema)]
     pub name: RoleName,
     pub display_name: String,
 }
@@ -162,10 +165,10 @@ pub struct ListUsersFilter {
     /// 用户名 + 显示名模糊搜索(仅投影/search 后端支持;无后端 → 422)。
     pub q: Option<String>,
     /// 正选:含任一角色(重复 key,如 `?role=admin&role=user`)。
-    #[param(style = Form, explode)]
+    #[param(style = Form, explode, value_type = Vec<RoleNameSchema>)]
     pub role: Vec<RoleName>,
     /// 反选:不含任一角色。
-    #[param(style = Form, explode)]
+    #[param(style = Form, explode, value_type = Vec<RoleNameSchema>)]
     pub role_not: Vec<RoleName>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub created_from: Option<OffsetDateTime>,

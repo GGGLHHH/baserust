@@ -14,8 +14,17 @@ use utoipa::ToSchema;
 
 use crate::kernel::error::AppError;
 
-impl AppError {
-    pub(crate) fn status_code(&self) -> StatusCode {
+/// 核心错误的 **HTTP 映射**(状态码 / 机器码 / 安全消息 / 落日志)。`AppError` 在核心 crate,孤儿规则
+/// 不许在这里给它写固有方法 —— 用扩展 trait 承载。
+pub trait HttpErrorExt {
+    fn status_code(&self) -> StatusCode;
+    fn code(&self) -> ErrorCode;
+    fn client_message(&self) -> String;
+    fn log_detail(&self) -> Option<String>;
+}
+
+impl HttpErrorExt for AppError {
+    fn status_code(&self) -> StatusCode {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -147,22 +156,53 @@ pub struct ErrorBody {
     pub error: String,
 }
 
-impl IntoResponse for AppError {
+/// HTTP 层的错误类型:包一层核心 [`AppError`],实现 axum 的 `IntoResponse`(孤儿规则不许直接给外部类型
+/// `AppError` 实现外部 trait)。handler 返回 `Result<_, ApiError>`;service 返回的 `AppError` 经 `?` 自动转换。
+#[derive(Debug)]
+pub struct ApiError(pub AppError);
+
+impl From<AppError> for ApiError {
+    fn from(e: AppError) -> Self {
+        Self(e)
+    }
+}
+
+// 常见上游错误直接 `?`(经 AppError 的同名 From 转换)。不写泛型 From —— 与标准库的自反 From 冲突。
+impl From<garde::Report> for ApiError {
+    fn from(e: garde::Report) -> Self {
+        Self(e.into())
+    }
+}
+
+impl From<idm::IdmError> for ApiError {
+    fn from(e: idm::IdmError) -> Self {
+        Self(e.into())
+    }
+}
+
+impl From<content::ContentError> for ApiError {
+    fn from(e: content::ContentError) -> Self {
+        Self(e.into())
+    }
+}
+
+impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.status_code();
+        let ApiError(e) = self;
+        let status = e.status_code();
         // 统一:任何带原始细节的错误都把原始内容写进日志(见 `log_detail`)。响应体里给什么由
         // `client_message` 单独决定 —— 多数变体只给通用措辞,Validation 例外(细节两边都给)。
         // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
-        if let Some(detail) = self.log_detail() {
+        if let Some(detail) = e.log_detail() {
             if status.is_server_error() {
-                tracing::error!(code = self.code().as_str(), detail, "request failed");
+                tracing::error!(code = e.code().as_str(), detail, "request failed");
             } else {
-                tracing::warn!(code = self.code().as_str(), detail, "request rejected");
+                tracing::warn!(code = e.code().as_str(), detail, "request rejected");
             }
         }
         let body = ErrorBody {
-            code: self.code(),
-            error: self.client_message(),
+            code: e.code(),
+            error: e.client_message(),
         };
         (status, Json(body)).into_response()
     }

@@ -25,7 +25,7 @@ description: Use when one module's list or response must display a field owned b
 | ❌ 消费方定义端口,提供方实现它 | provider → consumer | provider 依赖每个消费者的端口,多消费者依赖膨胀 |
 | ✅ 消费方定义端口,**组合根**写适配器 | 两 feature 互不 import | provider/consumer 彼此零认知,耦合集中在组合根一处 |
 
-**铁律:端口归消费方(它最小地声明"我要什么")、适配器归组合根(唯一同时认识两边的地方)、provider 与 consumer 彼此 import 一次都不出现。** `widget/ports.rs` + `app/adapters/` 连起来读就是 ports-and-adapters 本身。
+**铁律:端口归消费方(它最小地声明"我要什么")、适配器归组合根(唯一同时认识两边的地方)、provider 与 consumer 彼此 import 一次都不出现。** `crates/core/src/features/widget/ports.rs` + `src/app/adapters/` 连起来读就是 ports-and-adapters 本身。
 
 ## Recipe
 
@@ -45,4 +45,4 @@ description: Use when one module's list or response must display a field owned b
 
 ## baserust 锚点
 
-provider 原语 `UserRepo::find_by_ids`;consumer 窄端口 `src/features/widget/ports.rs` 的 `UserDirectory` + `UserBrief`;组合根适配器 `src/app/adapters/` 的 `InProcessUserDirectory`;富化 `WidgetService::list_enriched`;投影 `Page::map_items`(`Page<Widget>→Page<WidgetView>`);跨 schema 连接走 `connect_for_schema`(同 memory `cross-schema-access` 原则:禁 join、走对方 repo、标识引用非 FK)。装配按 `Mount` 在 `AppState::new` 注入,与按 `*_DB_HOST` 选 Pg/Memory repo 是同一个 seam。
+provider 原语 `UserRepo::find_by_ids`;consumer 窄端口 `crates/core/src/features/widget/ports.rs` 的 `UserDirectory` + `UserBrief`;组合根适配器 `src/app/adapters/` 的 `InProcessUserDirectory`;富化 `WidgetService::list_enriched`;投影 `Page::map_items`(`Page<Widget>→Page<WidgetView>`);跨 schema 连接走 `connect_for_schema`(同 memory `cross-schema-access` 原则:禁 join、走对方 repo、标识引用非 FK)。装配按 `Mount` 在 `AppState::new` 注入,与按 `*_DB_HOST` 选 Pg/Memory repo 是同一个 seam。

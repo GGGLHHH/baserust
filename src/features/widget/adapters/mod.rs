@@ -3,5 +3,6 @@
 
 pub mod bus;
 pub mod http;
-pub mod memory;
+/// 内存适配器是纯 Rust,住在核心 crate(核心单测要用它当假适配器);这里重新导出,路径不变。
+pub use baserust_core::features::widget::memory;
 pub mod postgres;

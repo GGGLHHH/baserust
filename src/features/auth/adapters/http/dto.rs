@@ -67,6 +67,7 @@ pub struct UserResponse {
     pub email: Option<String>,
     pub email_verified: bool,
     /// 角色名(闭集,生成前端 union)。
+    #[schema(value_type = Vec<crate::infra::authz::RoleNameSchema>)]
     pub roles: Vec<RoleName>,
 }
 

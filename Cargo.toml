@@ -6,15 +6,33 @@ rust-version = "1.88"
 # 有 seed bin 后,cargo run 默认跑主服务(seed 用 `just seed` / `cargo run --bin seed`)
 default-run = "baserust"
 
-[dependencies]
+# 工作区:主 crate(适配器 + 组合根)+ 核心 crate(crates/core,不依赖任何 web / 数据库 / 消息框架)。
+[workspace]
+members = ["crates/core"]
+
+# 两个 crate 共用的领域库版本只写一处(idm / content 的类型在核心与适配器之间流动,版本必须一致)。
+[workspace.dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
 idm = { git = "https://github.com/GGGLHHH/rust-idm", tag = "v0.5.0" }
-
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`
 # (注意 path 依赖期间 docker compose build 不可用 —— 路径在构建上下文外);稳定走 tag。
 content = { git = "https://github.com/GGGLHHH/rust-content", tag = "v0.3.0" }
+
+# lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明,两个 crate 共用
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[dependencies]
+# 核心:领域模型 / 端口 / 用例 / 内存适配器(本 crate 只放适配器与组合根)
+baserust-core = { path = "crates/core" }
+idm = { workspace = true }
+
+content = { workspace = true }
 
 # 异步运行时 —— 一切的地基
 # sync:widget 事件总线用 broadcast(勿靠 aws-sdk 的传递特性碰巧解锁)
@@ -115,9 +133,5 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # 快照测试:OpenAPI 规范(= 前端生成类型的契约)存成快照,接口一变即红;改动经 `cargo insta review` 审过再接受。
 insta = { version = "1", features = ["json"] }
 
-# lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "warn"
+[lints]
+workspace = true

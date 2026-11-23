@@ -76,13 +76,16 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 
 ## 加一个业务模块
 
-有项目级 skill **`adding-a-feature`**(加业务时会自动 invoke)。手动概要:在 `src/features/<name>/` 照抄 `widget/` 的结构
+有项目级 skill **`adding-a-feature`**(加业务时会自动 invoke)。手动概要:核心放 `crates/core/src/features/<name>/`、适配器放 `src/features/<name>/adapters/`,照抄 `widget` 的结构
 
 ```
-features/<name>/
-  model.rs · ports.rs · service.rs        核心:领域模型 / 端口 trait / 用例(不碰框架、数据库、HTTP)
-  adapters/http/{dto,routes,mod}.rs      HTTP 适配器:线格式 DTO ↔ 领域模型、handler、router
-  adapters/{memory,postgres}.rs          仓储实现(PG 行结构只在这)
+crates/core/src/features/<name>/          核心(独立 crate,依赖里没有任何 web / 数据库 / 消息框架)
+  model.rs · ports.rs · service.rs        领域模型 / 端口 trait / 用例
+  memory.rs                               内存适配器(默认实现 + 核心单测的假适配器)
+src/features/<name>/
+  mod.rs                                  重新导出核心
+  adapters/http/{dto,routes,mod}.rs       HTTP 适配器:线格式 DTO ↔ 领域模型、handler、router
+  adapters/postgres.rs                    仓储实现(PG 行结构只在这)
 ```
 
 然后 **4 处装配**:`features/mod.rs`(`pub mod`)、`app/state.rs`(AppState 加字段 + 装配)、`app/router.rs`(路由 merge 进 `/api/v1`)、`infra/openapi.rs`(tags)。基础设施(分页 / 审计 / 软删除 / 错误契约 / 提取器)全部复用,只写业务特有部分。
@@ -93,15 +96,15 @@ features/<name>/
 src/
   main.rs · lib.rs        入口(瘦) / 库根(解锁 tests/)
   app/                    装配层:state(AppState) · router(build_router)
-  kernel/                 共享内核(纯):error · pagination · sort · audit · authz
   infra/                  适配器侧横切:config · http(错误→HTTP / 提取器 / 分页查询)· openapi · pg · outbox …
   health.rs               探针
-  features/widget/        业务模块(核心 model/ports/service + adapters/,六边形样板)
+  features/widget/        业务模块的适配器(adapters/);核心在 crates/core
+crates/core/              核心 crate baserust-core:kernel(error · pagination · sort · audit · authz)+ 各模块 model/ports/service/memory
 ```
 
 范式要点:
 
-- **六边形(端口与适配器)**:核心(kernel + 各模块 model/ports/service)不依赖框架/数据库/HTTP,适配器在 `adapters/` 与 `infra/`;`tests/architecture.rs` 扫源码钉死依赖方向
+- **六边形(端口与适配器)**:核心是独立 crate `crates/core`,依赖里没有任何 web / 数据库 / 消息框架,由编译器保证依赖只向内;适配器在主 crate 的 `adapters/` 与 `infra/`;`tests/architecture.rs` 守核心依赖清单与模块边界
 - **可拔插实现**:`Arc<dyn Repo>` 端口,启动按 `APP_DB_HOST` 注入内存或 Postgres 实现
 - **统一不泄露错误契约**:核心 `AppError` → HTTP 适配器 `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
@@ -113,7 +116,8 @@ src/
 ## 测试
 
 ```bash
-just test          # 默认:零 DB,单测 + API 集成 + 内存侧仓储 conformance
+just test          # 默认:零 DB,单测 + API 集成 + 黑盒 HTTP 验收 + OpenAPI 快照 + 内存侧仓储 conformance
+just test-http     # 只跑黑盒 HTTP 验收(tests/http_*.rs:真实端口 + reqwest,换 web 框架时原样当验收标准)
 just pg-test-grant # 一次性:给 app role 授 CREATEDB + CREATE ON DATABASE
 just test-pg       # repo conformance 打真 PG(sqlx::test 临时库,与内存同一份契约防漂移)
 just test-all      # 内存 + PG

@@ -23,10 +23,9 @@ use super::dto::{
 };
 use crate::app::state::AppState;
 use crate::infra::authz::TokenScope;
-use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Multipart, Path};
-use crate::kernel::audit::AuditContext;
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 use content::{CreateContentInput, UploadContentInput};
@@ -103,9 +102,9 @@ pub async fn create_content(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Json(input): Json<CreateContentRequest>,
-) -> Result<(StatusCode, Json<ContentResponse>), AppError> {
+) -> Result<(StatusCode, Json<ContentResponse>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
@@ -145,9 +144,9 @@ pub async fn upload_content(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Multipart(mut multipart): Multipart,
-) -> Result<(StatusCode, Json<UploadResponse>), AppError> {
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
@@ -257,7 +256,7 @@ pub async fn list_contents(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-) -> Result<Json<Vec<ContentResponse>>, AppError> {
+) -> Result<Json<Vec<ContentResponse>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -283,7 +282,7 @@ pub async fn get_content(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<ContentResponse>, AppError> {
+) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -310,10 +309,10 @@ pub async fn update_content(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateContentRequest>,
-) -> Result<Json<ContentResponse>, AppError> {
+) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
@@ -343,9 +342,9 @@ pub async fn delete_content(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentDelete)?;
@@ -375,7 +374,7 @@ pub async fn download_content(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -407,7 +406,7 @@ pub async fn download_content(
         .header(CONTENT_TYPE, mime)
         .header(CONTENT_DISPOSITION, disposition)
         .body(Body::from(bytes))
-        .map_err(|e| AppError::Internal(e.into()))
+        .map_err(|e| AppError::Internal(e.into()).into())
 }
 
 /// 预览内容(inline 展示,`<img src>` 即用)。需 `contents:read`。
@@ -432,7 +431,7 @@ pub async fn preview_content(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Response, AppError> {
+) -> Result<Response, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -481,7 +480,7 @@ pub async fn preview_content(
         .header(CONTENT_DISPOSITION, disposition)
         .header("content-security-policy", "sandbox")
         .body(Body::from(p.data))
-        .map_err(|e| AppError::Internal(e.into()))
+        .map_err(|e| AppError::Internal(e.into()).into())
 }
 
 /// 列某内容的对象。需 `contents:read`。
@@ -502,7 +501,7 @@ pub async fn list_content_objects(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<ObjectResponse>>, AppError> {
+) -> Result<Json<Vec<ObjectResponse>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -531,7 +530,7 @@ pub async fn get_content_metadata(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<ContentMetadataResponse>, AppError> {
+) -> Result<Json<ContentMetadataResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
@@ -560,7 +559,7 @@ pub async fn set_content_metadata(
     scope: TokenScope,
     Path(id): Path<Uuid>,
     Json(input): Json<SetContentMetadataRequest>,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
@@ -633,9 +632,9 @@ pub async fn prepare_upload(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Json(input): Json<PrepareUploadRequest>,
-) -> Result<(StatusCode, Json<PrepareUploadResponse>), AppError> {
+) -> Result<(StatusCode, Json<PrepareUploadResponse>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
@@ -673,9 +672,9 @@ pub async fn confirm_upload(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-) -> Result<Json<ContentResponse>, AppError> {
+) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;

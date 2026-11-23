@@ -15,11 +15,10 @@ use super::dto::{
 use crate::app::state::AppState;
 use crate::features::users::model;
 use crate::infra::authz::TokenScope;
-use crate::infra::http::audit::CurrentUser;
-use crate::infra::http::error::ErrorBody;
+use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::kernel::audit::AuditContext;
 use crate::kernel::authz::{Perm, Policy};
 use crate::kernel::error::AppError;
 use crate::kernel::pagination::PageParams;
@@ -90,16 +89,14 @@ pub async fn list_users(
     scope: TokenScope,
     Query(page): Query<PageQuery>,
     Query(filter): Query<ListUsersFilter>,
-) -> Result<Json<Page<AdminUserView>>, AppError> {
+) -> Result<Json<Page<AdminUserView>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     let params = page.resolve()?;
     let filter = model::ListUsers::from(filter);
     if matches!(params, PageParams::Cursor { .. }) && !filter.is_default_sort() {
-        return Err(AppError::Validation(
-            "sort_by requires offset/page pagination".into(),
-        ));
+        return Err(AppError::Validation("sort_by requires offset/page pagination".into()).into());
     }
     let page = state.user_admin.list(&filter, params).await?;
     Ok(Json(Page::from_core(page, AdminUserView::from)))
@@ -123,9 +120,9 @@ pub async fn create_user(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Json(req): Json<CreateUserRequest>,
-) -> Result<(StatusCode, Json<AdminUserView>), AppError> {
+) -> Result<(StatusCode, Json<AdminUserView>), ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -155,7 +152,7 @@ pub async fn get_user(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-) -> Result<Json<AdminUserView>, AppError> {
+) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -182,10 +179,10 @@ pub async fn update_user(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateUserRequest>,
-) -> Result<Json<AdminUserView>, AppError> {
+) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -225,9 +222,9 @@ pub async fn delete_user(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -265,10 +262,10 @@ pub async fn set_user_roles(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    ctx: AuditContext,
+    Audit(ctx): Audit,
     Path(id): Path<Uuid>,
     Json(req): Json<SetRolesRequest>,
-) -> Result<Json<AdminUserView>, AppError> {
+) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -314,7 +311,7 @@ pub async fn list_roles(
     user: CurrentUser,
     scope: TokenScope,
     Query(_page): Query<PageQuery>,
-) -> Result<Json<Page<RoleView>>, AppError> {
+) -> Result<Json<Page<RoleView>>, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
@@ -343,7 +340,7 @@ pub async fn reset_user_password(
     scope: TokenScope,
     Path(id): Path<Uuid>,
     Json(req): Json<ResetPasswordRequest>,
-) -> Result<StatusCode, AppError> {
+) -> Result<StatusCode, ApiError> {
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;

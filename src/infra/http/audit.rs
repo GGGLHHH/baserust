@@ -10,13 +10,16 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
+use crate::infra::http::error::ApiError;
 use crate::kernel::audit::{Actor, AuditContext};
 use crate::kernel::error::AppError;
 use idm::AuthUser;
 
-/// extractor:鉴权中间件验过 JWT 会在 extensions 塞 `AuthUser`;有 → `User`,无 → `Anonymous`。
-/// 下游 handler 签名不变,审计列(created_by/updated_by)自动从这里灌入。
-impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
+/// 审计上下文提取器(handler 写 `Audit(ctx): Audit`):鉴权中间件验过 JWT 会在 extensions 塞 `AuthUser`;
+/// 有 → `User`,无 → `Anonymous`。`AuditContext` 在核心 crate,孤儿规则不许直接给它实现 axum 提取器 —— 包一层。
+pub struct Audit(pub AuditContext);
+
+impl<S: Send + Sync> FromRequestParts<S> for Audit {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
@@ -26,7 +29,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
             },
             None => Actor::Anonymous,
         };
-        Ok(Self { actor })
+        Ok(Self(AuditContext { actor }))
     }
 }
 
@@ -34,7 +37,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuditContext {
 pub struct CurrentUser(pub AuthUser);
 
 impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
-    type Rejection = AppError;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         parts
@@ -42,6 +45,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
             .get::<AuthUser>()
             .cloned()
             .map(CurrentUser)
-            .ok_or(AppError::Unauthorized)
+            .ok_or(ApiError(AppError::Unauthorized))
     }
 }

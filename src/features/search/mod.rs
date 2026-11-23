@@ -4,15 +4,13 @@
 //! **核心**(模块根目录;不依赖框架、数据库、HTTP):`model`(读模型行 / 查询条件)、`ports`(仓储)、
 //! `rebuild`(从源真相全量回填的用例)。
 //! **适配器**(`adapters/`):`projector`(JetStream 消费)、`memory` / `postgres`(仓储)。
+//!
+//! **核心**(模型 / 端口 / 用例 / 内存适配器)在 `baserust-core`(`crates/core`),这里整体重新导出,
+//! 原有路径(`features::search::model` 等)不变;本 crate 只放适配器。
+
+pub use baserust_core::features::search::*;
 
 pub mod adapters;
-pub mod model;
-pub mod ports;
-pub mod rebuild;
 
-pub use adapters::memory::InMemorySearchIndexRepo;
 pub use adapters::postgres::PgSearchIndexRepo;
 pub use adapters::projector;
-pub use model::{AdminUserIndexRow, IndexQuery, IndexQueryResult, IndexSort};
-pub use ports::SearchIndexRepo;
-pub use rebuild::{rebuild, DisplayNameSource};

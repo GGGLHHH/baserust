@@ -376,7 +376,7 @@ impl UserAdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::users::adapters::memory::StaticProfileDirectory;
+    use crate::features::users::memory::StaticProfileDirectory;
     use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
     /// 内存装配:user/role repo **共享** RoleStore(否则新号角色对 list/roles_for_user 不可见);

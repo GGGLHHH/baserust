@@ -5,7 +5,7 @@ description: Use when adding or changing an API-facing (ToSchema) field that onl
 
 # Closed enums (kill frontend type drift at the source)
 
-The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (`features/auth_audit/model.rs`, schemas in `adapters/http/dto.rs`, PG parsing in `adapters/postgres.rs`).
+The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (core `crates/core/src/features/auth_audit/model.rs`, schema markers in `src/features/auth_audit/adapters/http/dto.rs`, PG parsing in `.../adapters/postgres.rs`).
 
 ## bare `String` across the API boundary is not "flexible", it's a landmine
 
@@ -13,7 +13,7 @@ Rust `String` → OpenAPI `string` → TS `string`. The frontend gets zero compi
 
 ## the enum recipe (copy this shape verbatim)
 
-The enum is a **domain** type, so it lives in the core (`model.rs`) and derives **serde only** — no `ToSchema`, no `sqlx::Type` (the core must not depend on utoipa / sqlx; `tests/architecture.rs` enforces it):
+The enum is a **domain** type, so it lives in the core crate (`crates/core/.../model.rs`) and derives **serde only** — no `ToSchema`, no `sqlx::Type` (the core crate has no utoipa / sqlx dependency at all). Because the enum is now a *foreign* type to the main crate, the orphan rule forbids `impl ToSchema for AuthOutcome` there — the macro generates a local **schema marker type** instead, and DTO fields point at it with `value_type`:
 
 ```rust
 // model.rs (core)
@@ -28,8 +28,19 @@ impl AuthOutcome {
 }
 impl std::str::FromStr for AuthOutcome { /* look up in ALL by as_str */ }
 
-// adapters/http/dto.rs — the OpenAPI schema, enum values taken from serde (cannot drift)
-crate::closed_enum_to_schema!(AuthOutcome, AuthOutcome::ALL, "认证结果闭集");
+// adapters/http/dto.rs — marker type AuthOutcomeSchema, schema name "AuthOutcome", values from serde (cannot drift)
+crate::closed_enum_to_schema!(AuthOutcomeSchema => AuthOutcome, AuthOutcome::ALL, "认证结果闭集");
+
+#[derive(Serialize, ToSchema)]
+pub struct AuthEventRow {
+    #[schema(value_type = AuthOutcomeSchema)]          // response / request body field
+    pub outcome: AuthOutcome,
+}
+#[derive(Deserialize, IntoParams)]
+pub struct AuthEventFilter {
+    #[param(value_type = Option<AuthOutcomeSchema>)]   // query parameter
+    pub outcome: Option<AuthOutcome>,
+}
 
 // adapters/postgres.rs — the row reads the column as String, TryFrom parses it via FromStr
 outcome: r.outcome.parse().map_err(bad_closed_value)?,

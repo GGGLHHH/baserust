@@ -131,7 +131,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::features::profile::adapters::memory::{InMemoryProfileRepo, StaticAvatarProbe};
+    use crate::features::profile::memory::{InMemoryProfileRepo, StaticAvatarProbe};
     use crate::features::profile::ports::AvatarInfo;
     use crate::kernel::audit::AuditContext;
     use async_trait::async_trait;

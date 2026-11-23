@@ -3,6 +3,7 @@
 //!
 //! 加新提取需求时照此包一层:调 axum 原提取器,失败分支映射进 AppError。
 
+use crate::infra::http::error::ApiError;
 use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Request};
 // serde_html_form 基座:支持重复 key 解进 Vec(如 `?role=a&role=b`),serde_urlencoded 不能。
 // 标量解析与 serde_urlencoded 等价,现有 13 处 Query<...> 调用点无感。
@@ -23,12 +24,12 @@ where
     T: DeserializeOwned + Send,
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match AxumPath::<T>::from_request_parts(parts, state).await {
             Ok(AxumPath(value)) => Ok(Self(value)),
-            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
     }
 }
@@ -41,12 +42,12 @@ where
     T: DeserializeOwned,
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match AxumQuery::<T>::from_request_parts(parts, state).await {
             Ok(AxumQuery(value)) => Ok(Self(value)),
-            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
     }
 }
@@ -59,12 +60,12 @@ where
     T: DeserializeOwned,
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match AxumJson::<T>::from_request(req, state).await {
             Ok(AxumJson(value)) => Ok(Self(value)),
-            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
     }
 }
@@ -77,12 +78,12 @@ impl<S> FromRequest<S> for Multipart
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::extract::Multipart::from_request(req, state).await {
             Ok(mp) => Ok(Self(mp)),
-            Err(rejection) => Err(AppError::BadRequest(rejection.to_string())),
+            Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
     }
 }
@@ -99,7 +100,7 @@ pub struct FilePart {
 /// 单文件表单(如头像上传)直接用;多字段表单(如 contents/upload)仍手写循环。
 pub async fn file_part(
     multipart: &mut axum::extract::Multipart,
-) -> Result<Option<FilePart>, AppError> {
+) -> Result<Option<FilePart>, ApiError> {
     let mut out = None;
     while let Some(field) = multipart
         .next_field()
