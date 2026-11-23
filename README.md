@@ -80,8 +80,9 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 
 ```
 features/<name>/
-  types.rs · service.rs · routes.rs
-  repo/ → mod.rs(trait + Iden) · memory.rs · postgres.rs
+  model.rs · ports.rs · service.rs        核心:领域模型 / 端口 trait / 用例(不碰框架、数据库、HTTP)
+  adapters/http/{dto,routes,mod}.rs      HTTP 适配器:线格式 DTO ↔ 领域模型、handler、router
+  adapters/{memory,postgres}.rs          仓储实现(PG 行结构只在这)
 ```
 
 然后 **4 处装配**:`features/mod.rs`(`pub mod`)、`app/state.rs`(AppState 加字段 + 装配)、`app/router.rs`(路由 merge 进 `/api/v1`)、`infra/openapi.rs`(tags)。基础设施(分页 / 审计 / 软删除 / 错误契约 / 提取器)全部复用,只写业务特有部分。
@@ -92,16 +93,17 @@ features/<name>/
 src/
   main.rs · lib.rs        入口(瘦) / 库根(解锁 tests/)
   app/                    装配层:state(AppState) · router(build_router)
-  infra/                  框架管线 + 共享:config · error · extract · openapi · audit · pagination
+  kernel/                 共享内核(纯):error · pagination · sort · audit · authz
+  infra/                  适配器侧横切:config · http(错误→HTTP / 提取器 / 分页查询)· openapi · pg · outbox …
   health.rs               探针
-  features/widget/        业务模块层(vertical slice,薄分层 routes→service→repo→types)
+  features/widget/        业务模块(核心 model/ports/service + adapters/,六边形样板)
 ```
 
 范式要点:
 
-- **薄分层** routes → service → repo(trait)→ types
+- **六边形(端口与适配器)**:核心(kernel + 各模块 model/ports/service)不依赖框架/数据库/HTTP,适配器在 `adapters/` 与 `infra/`;`tests/architecture.rs` 扫源码钉死依赖方向
 - **可拔插实现**:`Arc<dyn Repo>` 端口,启动按 `APP_DB_HOST` 注入内存或 Postgres 实现
-- **统一不泄露错误契约**:`AppError` → `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
+- **统一不泄露错误契约**:核心 `AppError` → HTTP 适配器 `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
 - **基础实体**:审计字段(created_by/at · updated_by/at)+ 软删除(`deleted_at`,`base_select` 收口);`updated_at` 由 DB 触发器维护
 - **审计上下文**:`AuditContext`(未认证 → Anonymous → created_by NULL;已认证 → 取鉴权中间件 `auth::authenticate` 塞的 `idm::AuthUser` 作 created_by)

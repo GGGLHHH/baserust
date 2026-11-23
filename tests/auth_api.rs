@@ -51,7 +51,7 @@ fn test_app() -> Router {
         ),
         db_pool: None,
         cookie_secure: false,
-        policy: Arc::new(baserust::infra::authz::Policy::default()), // 这套契约不测授权
+        policy: Arc::new(baserust::kernel::authz::Policy::default()), // 这套契约不测授权
         token_signer: Some(signer.clone()),
         token_verifier: verifier,
         idm_outbox: None,

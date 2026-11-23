@@ -10,7 +10,7 @@ use anyhow::Context;
 use sqlx::PgPool;
 
 use super::seed::SeedData;
-use crate::infra::authz::{Perm, Policy};
+use crate::kernel::authz::{Perm, Policy};
 
 /// `Perm` → wire 串(经 serde rename;单一来源)。
 fn perm_wire(p: Perm) -> String {

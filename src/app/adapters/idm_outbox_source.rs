@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use idm::OutboxRepo;
 
-use crate::infra::error::AppError;
 use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxSource};
+use crate::kernel::error::AppError;
 
 pub struct IdmOutboxSource {
     repo: Arc<dyn OutboxRepo>,

@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::features::profile::{ProfileFields, ProfileRepo};
 use crate::features::widget::WidgetRepo;
-use crate::infra::pagination::PageParams;
+use crate::kernel::pagination::PageParams;
 use idm::UserRepo;
 
 /// 编译期嵌入的默认 mock(仓库根 `mock.toml`)。`MOCK_FILE` 设了则读外部文件覆盖。

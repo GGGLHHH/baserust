@@ -5,7 +5,7 @@ description: Use when adding or changing an API-facing (ToSchema) field that onl
 
 # Closed enums (kill frontend type drift at the source)
 
-The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (`features/auth_audit/types.rs`).
+The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (`features/auth_audit/model.rs`, schemas in `adapters/http/dto.rs`, PG parsing in `adapters/postgres.rs`).
 
 ## bare `String` across the API boundary is not "flexible", it's a landmine
 
@@ -13,16 +13,29 @@ Rust `String` → OpenAPI `string` → TS `string`. The frontend gets zero compi
 
 ## the enum recipe (copy this shape verbatim)
 
+The enum is a **domain** type, so it lives in the core (`model.rs`) and derives **serde only** — no `ToSchema`, no `sqlx::Type` (the core must not depend on utoipa / sqlx; `tests/architecture.rs` enforces it):
+
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
-#[sqlx(type_name = "text")]
+// model.rs (core)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AuthOutcome {
-    #[serde(rename = "success")] #[sqlx(rename = "success")] Success,
-    #[serde(rename = "failure")] #[sqlx(rename = "failure")] Failure,
+    #[serde(rename = "success")] Success,
+    #[serde(rename = "failure")] Failure,
 }
+impl AuthOutcome {
+    pub const ALL: [AuthOutcome; 2] = [AuthOutcome::Success, AuthOutcome::Failure]; // add new variants here
+    pub fn as_str(self) -> &'static str { /* … */ }
+}
+impl std::str::FromStr for AuthOutcome { /* look up in ALL by as_str */ }
+
+// adapters/http/dto.rs — the OpenAPI schema, enum values taken from serde (cannot drift)
+crate::closed_enum_to_schema!(AuthOutcome, AuthOutcome::ALL, "认证结果闭集");
+
+// adapters/postgres.rs — the row reads the column as String, TryFrom parses it via FromStr
+outcome: r.outcome.parse().map_err(bad_closed_value)?,
 ```
 
-Every variant renames to the **exact currently-stored string** — this is a strictness change, never a value/migration change. Add `FromStr` if the in-memory repo impl needs to parse a raw `String` back into the enum (mirrors `AuthEventType::FromStr`).
+Every variant renames to the **exact currently-stored string** — this is a strictness change, never a value/migration change. A wire round-trip test (serde ↔ `as_str` ↔ `FromStr` over `ALL`) keeps the three in sync.
 
 ## no `#[serde(other)]` catch-all — by default
 
@@ -30,7 +43,7 @@ Justified only when the column has **one writer** (our own emit code, same binar
 
 ## read model gets the enum; write model can stay `String`
 
-Precedent: `NewAuthEvent` (write side, fed from an internal NATS/JSON message already deserialized once) stays `String`; `AuthEventRow` / `AuthStats.*` (the `ToSchema` surface that actually becomes the generated frontend type) gets the enum. The strictness has to live at the boundary that generates the contract — don't bother enum-ifying a purely-internal intermediate that never reaches `ToSchema`.
+Precedent: `NewAuthEvent` (write side, fed from an internal NATS/JSON message already deserialized once) stays `String`; `AuthEventRow` / `AuthStats.*` (the surface whose HTTP DTO / schema actually becomes the generated frontend type) gets the enum. The strictness has to live at the boundary that generates the contract — don't bother enum-ifying a purely-internal intermediate that never reaches `ToSchema`.
 
 ## frontend: import, never redeclare
 

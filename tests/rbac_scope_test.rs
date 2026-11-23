@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{authenticate, AppTokenSigner};
-use baserust::infra::audit::CurrentUser;
-use baserust::infra::authz::{Perm, TokenScope};
+use baserust::infra::authz::TokenScope;
 use baserust::infra::config::Config;
-use baserust::infra::error::AppError;
-use baserust::infra::pagination::PageQuery;
+use baserust::infra::http::audit::CurrentUser;
+use baserust::kernel::authz::Perm;
+use baserust::kernel::error::AppError;
+use baserust::kernel::pagination::PageParams;
 use idm::{AuthOutcome, LoginInput};
 
 // ── mock 端点:每个 gate 在一个 Perm 上(范式:require_scoped 同时管 RBAC 与 scope)──
@@ -193,12 +194,11 @@ async fn scope_downscopes_below_role_grant() {
 // 三轴扣点:RBAC∩scope 在边缘判"能不能读"+ data_access 推"看全部 or 自己",
 // 过滤在查询层按 created_by 执行(repo)。superadmin/admin 有 read:all → 全见;user 无 → 只见自己的。
 
-fn page_query() -> PageQuery {
-    PageQuery {
-        page: None,
-        cursor: None,
-        size: Some(100),
-        with_total: None,
+fn page_query() -> PageParams {
+    PageParams::Offset {
+        page: 1,
+        size: 100,
+        with_total: true,
     }
 }
 

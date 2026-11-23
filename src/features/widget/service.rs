@@ -4,18 +4,16 @@ use std::sync::Arc;
 use garde::Validate;
 use uuid::Uuid;
 
-use super::events::{EventBus, WidgetEvent};
-use super::port::UserDirectory;
-use super::repo::WidgetRepo;
-use super::types::{CreateWidget, UpdateWidget, Widget, WidgetSortField};
-use super::view::WidgetView;
-use crate::infra::audit::AuditContext;
-use crate::infra::error::AppError;
-use crate::infra::pagination::{Page, PageInfo, PageParams, PageQuery};
-use crate::infra::sort::SortOrder;
+use super::events::WidgetEvent;
+use super::model::{CreateWidget, UpdateWidget, Widget, WidgetSortField, WidgetView};
+use super::ports::{EventBus, UserDirectory, WidgetRepo};
+use crate::kernel::audit::AuditContext;
+use crate::kernel::error::AppError;
+use crate::kernel::pagination::{Page, PageInfo, PageParams};
+use crate::kernel::sort::SortOrder;
 
-/// 业务逻辑层。范式:
-/// - 持 `Arc<dyn WidgetRepo>` 端口,不关心底层是内存还是 Postgres。
+/// 用例层(核心)。范式:
+/// - 只依赖端口(`Arc<dyn WidgetRepo>` 等),不关心底层是内存还是 Postgres、调用方是不是 HTTP。
 /// - 在此做输入校验、编排;写操作从 `AuditContext` 取审计主体下传给 repo。
 /// - `Clone` 廉价(只 clone Arc),可直接放进 `AppState`。
 #[derive(Clone)]
@@ -40,14 +38,13 @@ impl WidgetService {
         }
     }
 
-    /// 分页列表(纯,不富化)。`PageQuery::resolve` 兼做互斥校验/clamp/默认,失败映射 AppError。
+    /// 分页列表(纯,不富化)。分页参数由边界解析好(HTTP 侧是 `PageQuery::resolve`)。
     /// `owner = Some(id)` → 只列该用户创建的(数据所有权:user 只看自己的);`None` → 全部(有 read:all 的角色)。
     pub async fn list(
         &self,
-        query: PageQuery,
+        params: PageParams,
         owner: Option<Uuid>,
     ) -> Result<Page<Widget>, AppError> {
-        let params = query.resolve()?;
         let owner = owner.map(|id| id.to_string());
         // 无排序诉求的内部路径(count/测试)→ 默认序(created_at desc)。
         self.repo
@@ -64,7 +61,7 @@ impl WidgetService {
     /// 防 N+1 的纪律在此:一次 `batch_by_ids`、不是每行一次;脏值('system'/NULL/非 UUID)与
     /// 已删用户优雅降级成 `created_by_user: null`,绝不报错、绝不跨 schema join。
     /// `owner` 同 [`Self::list`]:行级所有权过滤(在查询层,分页正确)。
-    /// `params` 由 handler `resolve()`(cursor+非默认 sort 的 422 校验在 handler);`sort_by`/`order` 下传 repo。
+    /// `params` 由边界解析(HTTP 侧 `resolve()`,cursor + 非 keyset 键的 422 校验也在那);`sort_by`/`order` 下传 repo。
     pub async fn list_enriched(
         &self,
         params: PageParams,
@@ -93,13 +90,12 @@ impl WidgetService {
     /// 计数。复用 `list` 的 offset+total(size=1 少拉行)。`owner=Some` 只数自己创建的。
     // ponytail: demo 复用 list 取 total;真高频再加 `repo.count()`。
     pub async fn count(&self, owner: Option<Uuid>) -> Result<u64, AppError> {
-        let q = PageQuery {
-            page: Some(1),
-            size: Some(1),
-            cursor: None,
-            with_total: Some(true),
+        let params = PageParams::Offset {
+            page: 1,
+            size: 1,
+            with_total: true,
         };
-        match self.list(q, owner).await?.page_info {
+        match self.list(params, owner).await?.page_info {
             PageInfo::Offset { total, .. } => Ok(total.unwrap_or(0)),
             PageInfo::Cursor { .. } => Ok(0), // 不会发生:上面固定 offset 模式
         }
@@ -155,18 +151,19 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::features::widget::repo::InMemoryWidgetRepo;
-    use crate::features::widget::{MemoryEventBus, StaticUserDirectory, UserBrief};
+    use crate::features::widget::adapters::memory::{
+        InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory,
+    };
+    use crate::features::widget::ports::UserBrief;
 
     fn ctx() -> AuditContext {
         AuditContext::anonymous()
     }
-    fn first_page() -> PageQuery {
-        PageQuery {
-            page: None,
-            cursor: None,
-            size: None,
-            with_total: None,
+    fn first_page() -> PageParams {
+        PageParams::Offset {
+            page: 1,
+            size: 20,
+            with_total: true,
         }
     }
     /// 测试用 service:内存 repo + 空富化目录(不富化的用例够用)。
@@ -256,7 +253,7 @@ mod tests {
         let svc = WidgetService::new(repo, dir, Arc::new(MemoryEventBus::new()));
         let page = svc
             .list_enriched(
-                first_page().resolve().unwrap(),
+                first_page(),
                 None,
                 WidgetSortField::default(),
                 SortOrder::default(),
@@ -274,7 +271,9 @@ mod tests {
     /// create 成功后发布 Created 事件;订阅方收到的 widget 与返回值一致。
     #[tokio::test]
     async fn create_publishes_created_event() {
-        use crate::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
+        use crate::features::widget::adapters::memory::MemoryEventBus;
+        use crate::features::widget::events::WidgetEvent;
+        use crate::features::widget::ports::EventBus;
         let bus = Arc::new(MemoryEventBus::new());
         let svc = WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),

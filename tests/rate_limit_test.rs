@@ -11,8 +11,8 @@ use tower::ServiceExt; // oneshot
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
-use baserust::infra::authz::Policy;
 use baserust::infra::config::Config;
+use baserust::kernel::authz::Policy;
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
 /// 内存 app + **限流开启**,配额由参数给(`per_sec` = 每秒补的令牌数,`burst` = 桶容量)。

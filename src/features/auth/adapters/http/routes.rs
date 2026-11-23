@@ -1,0 +1,454 @@
+//! auth 端点(app 拥有的 HTTP 边界)。认证用 **httponly cookie**:login/register 把 access/refresh
+//! 写进 `Set-Cookie`,body 只返 `UserResponse`(token 不进响应体);鉴权由 `authenticate` 中间件读
+//! cookie(Bearer 兜底)。业务逻辑全在 idm 库的 `AuthService` —— 这里只做校验 + cookie + DTO 翻译。
+//!
+//! 端点分三组挂载(public:register/login/refresh/logout;frontend:me*/logout-all;
+//! admin:admin_login/admin_get_me),nginx 按 `/api/v1/{public,frontend,admin}/auth/` 三前缀分流。
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use garde::Validate;
+use uuid::Uuid;
+
+use super::dto::{
+    ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
+    UserResponse,
+};
+use crate::app::state::AppState;
+use crate::features::auth::adapters::emit::{emit_auth_event, failure_data, success_data};
+use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
+use crate::infra::client_context::ClientContext;
+use crate::infra::http::audit::CurrentUser;
+use crate::infra::http::error::ErrorBody;
+use crate::infra::http::extract::Json;
+use crate::kernel::audit::AuditContext;
+use crate::kernel::authz::Perm;
+use crate::kernel::error::AppError;
+
+const ACCESS_COOKIE: &str = "access_token";
+const REFRESH_COOKIE: &str = "refresh_token";
+
+/// 构造 httponly 认证 cookie:HttpOnly + SameSite=Lax + Secure(prod)+ Path=/ + Max-Age。
+fn auth_cookie(
+    name: &'static str,
+    value: String,
+    max_age_secs: i64,
+    secure: bool,
+) -> Cookie<'static> {
+    Cookie::build((name, value))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(secure)
+        .path("/")
+        .max_age(time::Duration::seconds(max_age_secs))
+        .build()
+}
+
+/// 把 access/refresh 写进 cookie(发会话)。
+fn set_auth_cookies(jar: CookieJar, outcome: &idm::AuthOutcome, secure: bool) -> CookieJar {
+    jar.add(auth_cookie(
+        ACCESS_COOKIE,
+        outcome.access_token.clone(),
+        outcome.access_max_age_secs,
+        secure,
+    ))
+    .add(auth_cookie(
+        REFRESH_COOKIE,
+        outcome.refresh_token.clone(),
+        outcome.refresh_max_age_secs,
+        secure,
+    ))
+}
+
+/// 清 access/refresh cookie(登出):显式发 `Max-Age=0` 的同名空 cookie 强制浏览器回收。
+/// (不用 `CookieJar::remove` —— 它只在请求**带了**原 cookie 时才发 removal,登出请求未必带。)
+fn clear_auth_cookies(jar: CookieJar) -> CookieJar {
+    jar.add(expired_cookie(ACCESS_COOKIE))
+        .add(expired_cookie(REFRESH_COOKIE))
+}
+
+fn expired_cookie(name: &'static str) -> Cookie<'static> {
+    Cookie::build((name, ""))
+        .http_only(true)
+        .path("/")
+        .max_age(time::Duration::ZERO)
+        .build()
+}
+
+#[utoipa::path(
+    post, path = "/auth/register", tag = "auth",
+    request_body = RegisterRequest,
+    responses(
+        (status = 201, description = "注册成功,token 写入 httponly cookie", body = UserResponse),
+        (status = 409, description = "用户名或邮箱已占用", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn register(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    ctx: ClientContext,
+    audit: AuditContext,
+    Json(req): Json<RegisterRequest>,
+) -> Result<(StatusCode, CookieJar, Json<UserResponse>), AppError> {
+    req.validate()?;
+    let outcome = state.auth.register(req.into(), audit.audit_id()).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::Registered,
+        outcome.user.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
+    )
+    .await;
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((StatusCode::CREATED, jar, Json(outcome.user.into())))
+}
+
+#[utoipa::path(
+    post, path = "/auth/login", tag = "auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "登录成功,token 写入 httponly cookie", body = UserResponse),
+        (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn login(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+    Json(req): Json<LoginRequest>,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    req.validate()?;
+    let identifier = req.identifier.clone();
+    match state.auth.login(req.into()).await {
+        Ok(outcome) => {
+            emit_auth_event(
+                &state.idm_outbox,
+                AuthEventType::LoginSucceeded,
+                outcome.user.id,
+                success_data(
+                    &ctx,
+                    AuthChannel::Public,
+                    outcome.user.id,
+                    Some(outcome.session_id),
+                    Some(&outcome.user.username),
+                ),
+            )
+            .await;
+            let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+            Ok((jar, Json(outcome.user.into())))
+        }
+        // 失败原因(仅供审计)必须在 `idm::IdmError` → `AppError` 的 `From` 转换**之前**读出
+        // (转换后统一收口 401,原因丢失);HTTP 仍统一 401,防枚举不变。
+        Err(idm_err) => {
+            let reason = match &idm_err {
+                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
+                _ => return Err(idm_err.into()),
+            };
+            emit_auth_event(
+                &state.idm_outbox,
+                AuthEventType::LoginFailed,
+                Uuid::nil(),
+                failure_data(&ctx, AuthChannel::Public, None, Some(&identifier), reason),
+            )
+            .await;
+            Err(idm_err.into())
+        }
+    }
+}
+
+#[utoipa::path(
+    post, path = "/auth/refresh", tag = "auth",
+    responses(
+        (status = 200, description = "刷新成功,新 token 写入 cookie", body = UserResponse),
+        (status = 401, description = "refresh cookie 无效/过期/已撤销", body = ErrorBody),
+    )
+)]
+pub async fn refresh(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    let refresh = jar
+        .get(REFRESH_COOKIE)
+        .map(|c| c.value().to_owned())
+        .ok_or(AppError::Unauthorized)?;
+    let outcome = state.auth.refresh(&refresh).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::Refreshed,
+        outcome.user.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
+    )
+    .await;
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user.into())))
+}
+
+#[utoipa::path(
+    post, path = "/auth/logout", tag = "auth",
+    responses((status = 204, description = "已登出,清除 cookie(幂等)"))
+)]
+pub async fn logout(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等 —— 没找到活跃会话不发事件。
+    if let Some(c) = jar.get(REFRESH_COOKIE) {
+        if let Some(session) = state.auth.logout(c.value()).await? {
+            emit_auth_event(
+                &state.idm_outbox,
+                AuthEventType::LoggedOut,
+                session.user_id,
+                success_data(
+                    &ctx,
+                    AuthChannel::Public,
+                    session.user_id,
+                    Some(session.id),
+                    None,
+                ),
+            )
+            .await;
+        }
+    }
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+#[utoipa::path(
+    post, path = "/auth/logout-all", tag = "auth",    responses((status = 204, description = "已撤销所有会话"), (status = 401, body = ErrorBody))
+)]
+pub async fn logout_all(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+    user: CurrentUser,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    state.auth.logout_all(user.0.id).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::LogoutAll,
+        user.0.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
+    )
+    .await;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+#[utoipa::path(
+    get, path = "/auth/me", tag = "me",    responses((status = 200, body = UserResponse), (status = 401, body = ErrorBody))
+)]
+pub async fn get_me(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<UserResponse>, AppError> {
+    let view = state.auth.me(user.0.id).await?;
+    Ok(Json(view.into()))
+}
+
+#[utoipa::path(
+    put, path = "/auth/me", tag = "me",    request_body = UpdateMeRequest,
+    responses(
+        (status = 200, body = UserResponse),
+        (status = 409, description = "新用户名/邮箱已占用", body = ErrorBody),
+        (status = 401, body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn update_me(
+    State(state): State<AppState>,
+    ctx: AuditContext,
+    user: CurrentUser,
+    Json(req): Json<UpdateMeRequest>,
+) -> Result<Json<UserResponse>, AppError> {
+    req.validate()?;
+    let view = state
+        .auth
+        .update_me(user.0.id, req.into(), ctx.audit_id())
+        .await?;
+    Ok(Json(view.into()))
+}
+
+#[utoipa::path(
+    delete, path = "/auth/me", tag = "me",    request_body = DeleteMeRequest,
+    responses(
+        (status = 204, description = "已注销"),
+        (status = 401, description = "密码错", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn delete_me(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    audit: AuditContext,
+    user: CurrentUser,
+    jar: CookieJar,
+    Json(req): Json<DeleteMeRequest>,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    req.validate()?;
+    state
+        .auth
+        .delete_me(user.0.id, req.password, audit.audit_id())
+        .await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::AccountDeleted,
+        user.0.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
+    )
+    .await;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+#[utoipa::path(
+    post, path = "/auth/me/password", tag = "me",    request_body = ChangePasswordRequest,
+    responses(
+        (status = 204, description = "已改密,撤销所有会话(需重新登录)"),
+        (status = 401, description = "旧密码错", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn change_password(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    user: CurrentUser,
+    jar: CookieJar,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<(StatusCode, CookieJar), AppError> {
+    req.validate()?;
+    state.auth.change_password(user.0.id, req.into()).await?;
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::PasswordChanged,
+        user.0.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            user.0.id,
+            None,
+            Some(&user.0.username),
+        ),
+    )
+    .await;
+    Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+// ── admin 组(后台)。login 在组闸外(public 语义,验密后自查);me 在闸内。 ──
+
+#[utoipa::path(
+    post, path = "/auth/login", tag = "admin",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "后台登录成功,token 写入 httponly cookie", body = UserResponse),
+        (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
+        (status = 403, description = "凭据正确但无后台准入(admin:login),不发 token 不设 cookie", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn admin_login(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+    Json(req): Json<LoginRequest>,
+) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    req.validate()?;
+    let identifier = req.identifier.clone();
+    let outcome = match state.auth.login(req.into()).await {
+        Ok(outcome) => outcome,
+        // 凭据本身错(同 public login 的原因匹配);HTTP 仍统一 401,防枚举不变。
+        Err(idm_err) => {
+            let reason = match &idm_err {
+                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
+                _ => return Err(idm_err.into()),
+            };
+            emit_auth_event(
+                &state.idm_outbox,
+                AuthEventType::LoginFailed,
+                Uuid::nil(),
+                failure_data(&ctx, AuthChannel::Admin, None, Some(&identifier), reason),
+            )
+            .await;
+            return Err(idm_err.into());
+        }
+    };
+    // 验密后闸:无 admin:login(后台准入)→ 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
+    // login 已铸的 refresh 会话立即撤销,不留"验过密但没资格"的孤儿会话。
+    if !state
+        .policy
+        .perms_for(&outcome.user.roles)
+        .contains(&Perm::AdminLogin)
+    {
+        state.auth.logout(&outcome.refresh_token).await?;
+        emit_auth_event(
+            &state.idm_outbox,
+            AuthEventType::AdminAccessDenied,
+            outcome.user.id,
+            failure_data(
+                &ctx,
+                AuthChannel::Admin,
+                Some(outcome.user.id),
+                Some(&identifier),
+                FailureReason::NoAdminPerm,
+            ),
+        )
+        .await;
+        return Err(AppError::Forbidden);
+    }
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::LoginSucceeded,
+        outcome.user.id,
+        success_data(
+            &ctx,
+            AuthChannel::Admin,
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+        ),
+    )
+    .await;
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user.into())))
+}
+
+#[utoipa::path(
+    get, path = "/auth/me", tag = "admin",
+    responses(
+        (status = 200, body = UserResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, description = "组闸:无 admin:login(后台准入)", body = ErrorBody),
+    )
+)]
+pub async fn admin_get_me(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<UserResponse>, AppError> {
+    let view = state.auth.me(user.0.id).await?;
+    Ok(Json(view.into()))
+}

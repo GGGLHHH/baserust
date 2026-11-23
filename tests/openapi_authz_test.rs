@@ -22,8 +22,8 @@ use uuid::Uuid;
 use baserust::app::router::api_spec;
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::AppTokenSigner;
-use baserust::infra::authz::Perm;
 use baserust::infra::config::Config;
+use baserust::kernel::authz::Perm;
 use idm::LoginInput;
 
 /// spec 里的 scope 串 → `Perm`(经 serde rename;非法即 panic,本就该是合法 Perm)。

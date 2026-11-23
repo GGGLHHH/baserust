@@ -11,7 +11,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::features::profile::{ProfileFields, ProfileRepo};
-use crate::infra::authz::{Perm, Policy, RoleName};
+use crate::kernel::authz::{Perm, Policy, RoleName};
 use idm::{IdmError, PwHasher, RoleRepo, UserRepo};
 
 /// 编译期嵌入的默认 seed(仓库根 `seed.toml`)。`SEED_FILE` 设了则读外部文件覆盖。

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::features::profile::ProfileRepo;
 use crate::features::users::{ProfileBrief, ProfileDirectory};
-use crate::infra::error::AppError;
+use crate::kernel::error::AppError;
 
 pub struct InProcessProfileDirectory {
     repo: Arc<dyn ProfileRepo>,

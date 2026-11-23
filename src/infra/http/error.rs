@@ -1,0 +1,268 @@
+//! 核心错误 [`AppError`] 的 **HTTP 适配**:变体 → 状态码 / 机器码 / 安全消息 / 落日志,
+//! 以及统一错误响应体 `ErrorBody`。核心(`kernel::error`)只表达业务语义,不知道 HTTP。
+//!
+//! **统一错误契约(关键)**:任何携带底层原始错误的变体,原始细节只进**日志**
+//! (`log_detail`),响应体只给刻意写的**安全消息**(`client_message`)。不管来源是
+//! uuid 解析、sqlx、还是 io,都绝不会把原始措辞漏给客户端 —— 加新错误来源时只要走
+//! 这套契约,就天然不泄露。加错误种类 = 在 `kernel::error` 加变体 + 在下面四个 match 各补一行。
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Serialize;
+use utoipa::ToSchema;
+
+use crate::kernel::error::AppError;
+
+impl AppError {
+    pub(crate) fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// 机器可读错误类别 —— 前端按它分支,而非脆弱地解析人读消息。
+    fn code(&self) -> ErrorCode {
+        match self {
+            AppError::NotFound => ErrorCode::NotFound,
+            AppError::Validation(_) => ErrorCode::Validation,
+            AppError::BadRequest(_) => ErrorCode::BadRequest,
+            AppError::Unauthorized => ErrorCode::Unauthorized,
+            AppError::Conflict(_) => ErrorCode::Conflict,
+            AppError::Forbidden => ErrorCode::Forbidden,
+            AppError::Internal(_) => ErrorCode::Internal,
+        }
+    }
+
+    /// 进响应 `error` 字段的消息 —— **永远安全、刻意写**,绝不含底层库的原始措辞。
+    /// Validation/Conflict 回传"具体内容"(本就写给用户);Unauthorized 刻意通用(防枚举)。
+    fn client_message(&self) -> String {
+        match self {
+            AppError::NotFound => "Resource not found".to_owned(),
+            AppError::Validation(msg) => format!("Invalid request: {msg}"),
+            AppError::BadRequest(_) => "Malformed request".to_owned(),
+            AppError::Unauthorized => "Authentication failed".to_owned(),
+            AppError::Conflict(msg) => msg.clone(),
+            AppError::Forbidden => "Forbidden".to_owned(),
+            AppError::Internal(_) => "Internal server error".to_owned(),
+        }
+    }
+
+    /// 排查需要的**原始细节** → 进日志。`None` = 无额外细节。
+    /// 这是"原始错误一律落日志"的统一入口:BadRequest 落 rejection、Internal 落
+    /// anyhow 的完整 source chain;将来 sqlx/io 错误经 `?` 进 Internal 也自动落这里。
+    ///
+    /// **落日志 ≠ 不进响应体**,两者由 [`Self::client_message`] 各自决定:BadRequest/Internal
+    /// 的细节**只**进日志(响应体给通用措辞);Validation 的细节**两边都去** —— 它本就写给调用方,
+    /// 同时运维也需要它。
+    ///
+    /// Validation 为什么必须落日志:`400`(serde 拒绝,缺字段)与 `422`(garde 拒绝,值不合法)
+    /// 本是同一类事 —— "调用方发来的东西不对",只是被不同的层拦下。以前只有前者落日志,
+    /// 于是**光看日志无法回溯任何 422**;而 `login` 这类公开端点的响应体在对方浏览器里,拿不到,
+    /// 日志是唯一的窗口(且 422 早于 `emit_auth_event`,`auth_events` 审计表也兜不住它)。
+    /// garde 的消息是规则级的(`identifier: length is lower than 1`),**只含字段名与规则、不含值**,
+    /// 故不引入 PII;`identifier` 等入参也都已封顶,灌不爆日志。
+    ///
+    /// Conflict 刻意仍不落:它的消息是我们自己写的业务语句(如 "cannot remove your own admin
+    /// access"),状态码 + 路径即可定位,落日志只是噪音。
+    fn log_detail(&self) -> Option<String> {
+        match self {
+            AppError::BadRequest(detail) => Some(detail.clone()),
+            AppError::Internal(err) => Some(format!("{err:?}")),
+            AppError::Validation(msg) => Some(msg.clone()),
+            AppError::NotFound
+            | AppError::Unauthorized
+            | AppError::Conflict(_)
+            | AppError::Forbidden => None,
+        }
+    }
+}
+
+/// 错误机器码闭集(前端按它分支;闭集生成前端 union,见 closed-enums skill)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    NotFound,
+    Validation,
+    BadRequest,
+    Unauthorized,
+    Conflict,
+    Forbidden,
+    Internal,
+    /// 仅 router 全局超时兜底路径产出(绕过 AppError)。
+    Timeout,
+    /// 仅 router 限流层产出(绕过 AppError)。
+    RateLimited,
+}
+
+impl ErrorCode {
+    /// 全部变体(wire round-trip 测试用)。镜像 `Perm::ALL`。
+    ///
+    /// **加变体必补这里,但漏了没人拦** —— `ALL` 是数组字面量,加变体不会让它编译失败;
+    /// round-trip 测试遍历的正是 `ALL`,漏掉的变体只是从不被测(那条测试就是为了钉住
+    /// `as_str()` 与 serde rename 不漂移,漏项恰好绕过它)。真正逼你回来的是 `as_str()`
+    /// 的穷尽 match(编译不过),但它只让你**手写**一个 wire 串,不校验它等于 serde 的 rename。
+    /// 后果:日志字段 `code`(as_str)与出参 `code`(serde)对新变体可能对不上。
+    /// 要根治:声明宏单源展开 enum + `ALL` + `as_str`,让漏项不可表达。
+    pub const ALL: [ErrorCode; 9] = [
+        ErrorCode::NotFound,
+        ErrorCode::Validation,
+        ErrorCode::BadRequest,
+        ErrorCode::Unauthorized,
+        ErrorCode::Conflict,
+        ErrorCode::Forbidden,
+        ErrorCode::Internal,
+        ErrorCode::Timeout,
+        ErrorCode::RateLimited,
+    ];
+
+    /// 日志字段用的 wire 串(== serde rename;`error_code_wire_matches` 测试钉死不漂移)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::NotFound => "not_found",
+            ErrorCode::Validation => "validation",
+            ErrorCode::BadRequest => "bad_request",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::Conflict => "conflict",
+            ErrorCode::Forbidden => "forbidden",
+            ErrorCode::Internal => "internal",
+            ErrorCode::Timeout => "timeout",
+            ErrorCode::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// 统一错误响应体。pub + ToSchema:让这个契约出现在 OpenAPI,前端 codegen 能看到错误形状。
+#[derive(Serialize, ToSchema)]
+pub struct ErrorBody {
+    /// 机器可读错误类别(闭集)
+    pub code: ErrorCode,
+    /// 给人看的安全消息 —— 不含 SQL/解析器/路径等任何内部原始措辞
+    pub error: String,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status_code();
+        // 统一:任何带原始细节的错误都把原始内容写进日志(见 `log_detail`)。响应体里给什么由
+        // `client_message` 单独决定 —— 多数变体只给通用措辞,Validation 例外(细节两边都给)。
+        // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
+        if let Some(detail) = self.log_detail() {
+            if status.is_server_error() {
+                tracing::error!(code = self.code().as_str(), detail, "request failed");
+            } else {
+                tracing::warn!(code = self.code().as_str(), detail, "request rejected");
+            }
+        }
+        let body = ErrorBody {
+            code: self.code(),
+            error: self.client_message(),
+        };
+        (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_detail_goes_to_log_never_to_response() {
+        // BadRequest:库原始措辞(uuid 解析失败)进日志,响应只给安全文案
+        let e = AppError::BadRequest("Cannot parse `id`: UUID parsing failed".to_owned());
+        assert_eq!(e.client_message(), "Malformed request");
+        assert!(!e.client_message().contains("UUID"));
+        assert!(e.log_detail().unwrap().contains("UUID"));
+
+        // Internal(将来 sqlx 错误同理):原始 SQL 进日志,响应只给通用文案
+        let e = AppError::Internal(anyhow::anyhow!("relation \"widgets\" does not exist"));
+        assert_eq!(e.client_message(), "Internal server error");
+        assert!(!e.client_message().contains("widgets"));
+        assert!(e.log_detail().unwrap().contains("widgets"));
+        assert_eq!(e.code().as_str(), "internal");
+    }
+
+    #[test]
+    fn client_facing_errors_keep_useful_message() {
+        // NotFound 写给客户端、无额外细节可落
+        assert_eq!(AppError::NotFound.client_message(), "Resource not found");
+        assert!(AppError::NotFound.log_detail().is_none());
+
+        let v = AppError::Validation("name: length is lower than 1".to_owned());
+        assert!(v.client_message().contains("name"));
+        assert_eq!(v.code().as_str(), "validation");
+    }
+
+    /// **422 的细节必须落日志**(而且照旧回传客户端 —— 两边都要)。
+    ///
+    /// 400(serde 拒绝,缺字段)与 422(garde 拒绝,值不合法)本是同一类事:"调用方发来的东西
+    /// 不对",只是被不同的层拦下。以前只有 400 落日志,于是**光看日志无法回溯任何 422** ——
+    /// 访问日志只有 `status=422`,原因全在响应体里;而 `login` 这类公开端点的响应体在对方浏览器
+    /// 里拿不到,且 422 早于 `emit_auth_event`、`auth_events` 审计表也兜不住 → 三条观测路径全漏。
+    #[test]
+    fn validation_detail_reaches_both_log_and_client() {
+        let v = AppError::Validation("identifier: length is lower than 1".to_owned());
+        assert_eq!(
+            v.log_detail().as_deref(),
+            Some("identifier: length is lower than 1"),
+            "422 的原因必须能从日志回溯(否则只剩一个光秃秃的 status=422)"
+        );
+        assert!(
+            v.client_message().contains("identifier"),
+            "同时照旧回传调用方 —— 这条细节本就是写给他的"
+        );
+
+        // 对照:400 一直落日志(同类事,口径必须一致)。
+        assert!(AppError::BadRequest("missing field `password`".to_owned())
+            .log_detail()
+            .is_some());
+
+        // 反面:Conflict 刻意不落 —— 消息是我们自己写的业务语句,状态码+路径即可定位。
+        assert!(AppError::Conflict("already registered".to_owned())
+            .log_detail()
+            .is_none());
+    }
+
+    #[test]
+    fn unauthorized_is_generic_to_prevent_enumeration() {
+        // 401 文案必须通用:不暴露"是用户不存在还是密码错" —— 防账号枚举
+        let e = AppError::Unauthorized;
+        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(e.code().as_str(), "unauthorized");
+        assert_eq!(e.client_message(), "Authentication failed");
+        assert!(e.log_detail().is_none());
+
+        // Conflict:409,消息写给用户、可回传
+        let c = AppError::Conflict("This email is already registered".to_owned());
+        assert_eq!(c.status_code(), StatusCode::CONFLICT);
+        assert_eq!(c.code().as_str(), "conflict");
+        assert_eq!(c.client_message(), "This email is already registered");
+    }
+
+    #[test]
+    fn invalid_credentials_maps_to_401() {
+        let e = AppError::from(idm::IdmError::InvalidCredentials(
+            idm::CredentialFailure::BadPassword,
+        ));
+        assert!(matches!(e, AppError::Unauthorized));
+        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn error_code_wire_matches() {
+        for c in ErrorCode::ALL {
+            let wire = serde_json::to_value(c).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(c.as_str()),
+                "{c:?}: as_str ↔ serde rename"
+            );
+        }
+    }
+}

@@ -30,7 +30,7 @@ use crate::app::AppState;
 use crate::features::{auth, auth_audit, content, profile, users, widget};
 use crate::health;
 use crate::infra::config::Config;
-use crate::infra::error::{ErrorBody, ErrorCode};
+use crate::infra::http::error::{ErrorBody, ErrorCode};
 use crate::infra::openapi;
 
 /// 请求处理超时上限,超过返回 408 + 统一错误契约。

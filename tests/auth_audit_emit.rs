@@ -19,7 +19,7 @@ use baserust::features::users::UserAdminService;
 use baserust::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory, WidgetService,
 };
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{
     AuthService, FakeHasher, InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo,
     InMemoryUserRepo, OutboxRecord, OutboxRepo, RoleRepo,

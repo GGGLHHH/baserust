@@ -9,7 +9,7 @@ mod support;
 
 use baserust::app::policy_repo;
 use baserust::app::seed::SeedData;
-use baserust::infra::authz::Perm;
+use baserust::kernel::authz::Perm;
 
 #[sqlx::test(migrations = false)]
 async fn seed_authz_then_load_policy_roundtrips(pool: sqlx::PgPool) -> sqlx::Result<()> {

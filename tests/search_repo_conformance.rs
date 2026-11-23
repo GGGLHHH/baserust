@@ -9,8 +9,8 @@
 //! `Uuid::now_v7()` 造用户,避免运行间撞行。
 
 use baserust::features::search::{AdminUserIndexRow, IndexQuery, IndexSort, SearchIndexRepo};
-use baserust::infra::pagination::PageParams;
-use baserust::infra::sort::SortOrder;
+use baserust::kernel::pagination::PageParams;
+use baserust::kernel::sort::SortOrder;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 

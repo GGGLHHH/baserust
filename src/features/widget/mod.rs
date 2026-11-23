@@ -1,51 +1,30 @@
-//! 示例业务模块 —— 标准分层范式的活样板。复制这套文件结构来加真实业务。
+//! 示例业务模块 —— **六边形分层(端口与适配器)的活样板**。复制这套文件结构来加真实业务。
 //!
-//! 分层:`routes`(handler,薄) → `service`(业务逻辑/校验) → `repo`(trait + 实现)。
-//! `types` 放 DTO。每个新业务域照抄此结构。
+//! **核心**(模块根目录;不依赖框架、数据库、HTTP —— `tests/architecture.rs` 扫源码钉死):
+//! - `model`   领域模型、命令(含校验规则)、读模型、可排序字段 —— 纯 Rust
+//! - `events`  领域事件
+//! - `ports`   端口:仓储、跨模块用户目录、事件总线(trait,归消费方)
+//! - `service` 用例:编排、校验、发事件;只依赖端口
+//!
+//! **适配器**(`adapters/`;实现端口或驱动核心,依赖只向内指):
+//! - `adapters::memory`   内存仓储 / 内存总线 / 静态用户目录(默认实现 + 核心单测的假适配器)
+//! - `adapters::postgres` 数据库行(`FromRow`)↔ 领域模型,sea-query + sqlx
+//! - `adapters::bus`      PG NOTIFY / NATS 总线
+//! - `adapters::http`     axum handler + 请求/响应 DTO(serde / utoipa)↔ 领域
+//!
+//! 装配(选哪个实现、注入)在组合根 `app/`;跨模块的端口实现在 `app/adapters/`。
 
-mod events;
-mod port;
-mod repo;
-mod routes;
+pub mod adapters;
+pub mod events;
+pub mod model;
+pub mod ports;
 mod service;
-mod types;
-mod view;
 
-pub use events::{
-    EventBus, EventSubscription, MemoryEventBus, NatsEventBus, PgEventBus, WidgetEvent,
-};
-pub use port::{StaticUserDirectory, UserBrief, UserDirectory};
-pub use repo::{InMemoryWidgetRepo, PgWidgetRepo, WidgetRepo};
+pub use adapters::bus::{NatsEventBus, PgEventBus};
+pub use adapters::http::{admin_router, public_router, router};
+pub use adapters::memory::{InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory};
+pub use adapters::postgres::PgWidgetRepo;
+pub use events::WidgetEvent;
+pub use model::{WidgetSortField, WidgetView};
+pub use ports::{EventBus, EventSubscription, UserBrief, UserDirectory, WidgetRepo};
 pub use service::WidgetService;
-pub use types::WidgetSortField;
-pub use view::WidgetView;
-
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
-
-use crate::app::state::AppState;
-
-/// frontend 组(组闸「需登录」由 composition root 上):CRUD / 仅登录样板 / SSE。
-pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(routes::list_widgets, routes::create_widget))
-        .routes(routes!(
-            routes::get_widget,
-            routes::update_widget,
-            routes::delete_widget
-        ))
-        .routes(routes!(routes::my_widget_count))
-        .routes(routes!(routes::purge_preview))
-        .routes(routes!(routes::widget_overview))
-        .routes(routes!(routes::widget_events))
-}
-
-/// public 组(无闸):公开样板。
-pub fn public_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(routes::widget_stats))
-}
-
-/// admin 组(组闸「users:admin」由 composition root 上)。
-pub fn admin_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(routes::admin_list_widgets))
-}

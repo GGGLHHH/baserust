@@ -22,13 +22,13 @@ use uuid::Uuid;
 use baserust::app::adapters::ProfileDisplayNames;
 use baserust::app::state::{connect_for_schema, Schema};
 use baserust::app::{AppState, Mount};
-use baserust::features::profile::{PgProfileRepo, PutProfileRequest};
+use baserust::features::profile::{PgProfileRepo, PutProfile};
 use baserust::features::search::projector::Projector;
 use baserust::features::search::{rebuild, AdminUserIndexRow, PgSearchIndexRepo, SearchIndexRepo};
-use baserust::features::users::{ListUsersFilter, UserSortField};
-use baserust::infra::audit::AuditContext;
+use baserust::features::users::{ListUsers, UserSortField};
 use baserust::infra::config::Config;
-use baserust::infra::pagination::PageParams;
+use baserust::kernel::audit::AuditContext;
+use baserust::kernel::pagination::PageParams;
 use idm::{PgUserRepo, RegisterInput};
 
 /// 轮询 `index_repo.get(user_id)` 直到 `pred(&row)` 为真或超时;超时 → `None`。
@@ -136,7 +136,7 @@ async fn user_write_converges_into_projection_row() -> anyhow::Result<()> {
         .profiles
         .put(
             user_id,
-            PutProfileRequest {
+            PutProfile {
                 display_name: Some(disp.clone()),
                 phone: None,
                 avatar_content_id: None,
@@ -177,7 +177,7 @@ async fn user_write_converges_into_projection_row() -> anyhow::Result<()> {
     // display_name 侧:取 disp 独有的前缀子串("Disp p3-" + 4 位 hex,uniq 里不含 "Disp"),
     // 只可能经投影的 display_name 列命中,证 P4 的"display_name 可搜"这一核心落点。
     let disp_substr = &disp[..12];
-    let filter_by_disp = ListUsersFilter {
+    let filter_by_disp = ListUsers {
         q: Some(disp_substr.to_string()),
         ..Default::default()
     };
@@ -189,7 +189,7 @@ async fn user_write_converges_into_projection_row() -> anyhow::Result<()> {
     );
 
     // username 侧:q=完整 uniq(username 本身)应命中。
-    let filter_by_uniq = ListUsersFilter {
+    let filter_by_uniq = ListUsers {
         q: Some(uniq.clone()),
         ..Default::default()
     };
@@ -201,7 +201,7 @@ async fn user_write_converges_into_projection_row() -> anyhow::Result<()> {
     );
 
     // 有 search 后端时 sort_by=display_name 不应 422(回退路才 422;此处走投影路)。
-    let filter_sort_display_name = ListUsersFilter {
+    let filter_sort_display_name = ListUsers {
         sort_by: UserSortField::DisplayName,
         ..Default::default()
     };

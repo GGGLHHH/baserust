@@ -1,0 +1,165 @@
+//! widget 事件总线端口的 **PG / NATS 适配器**(多实例扇出)。内存实现在 `adapters::memory`。
+//!
+//! **选择链(IoC,组合根 `AppState::new` 装配)**:`NATS_URL` 设了 → [`NatsEventBus`](多实例默认);
+//! 没设但有 app pool → [`PgEventBus`](已有 PG 不加组件的退路);都没有 → 内存总线(单实例兜底)。
+//! 契约见 `ports::EventBus`(fire-and-forget、best-effort 无回放、掉队跳过)。
+//!
+//! 负载格式 = HTTP 线格式 `adapters::http::dto::WidgetEvent`(SSE 帧与总线负载同一线格式):
+//! 发布时领域事件 → DTO → JSON,订阅时反向,出这个文件的一律是领域事件。
+
+use anyhow::Context;
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use sqlx::postgres::PgListener;
+
+use super::http::dto::WidgetEvent as Wire;
+use crate::features::widget::events::WidgetEvent;
+use crate::features::widget::ports::{EventBus, EventSubscription};
+use crate::kernel::error::AppError;
+
+// ── PG 实现:pg_notify / LISTEN(多实例扇出)──
+// 注意:publish 走**自己的 pool 连接、独立 autocommit**,不在任何调用方事务里 ——
+// 正确性来自 service 只在写成功后 publish。要"回滚不发幽灵事件"的事务性投递,
+// 必须在写操作**同一事务连接**上 NOTIFY,本实现不做(需要时把 publish 挪进 repo 事务)。
+
+/// 信任边界:NOTIFY 频道是**数据库级**(不受 schema/search_path 隔离),同库任何 role 都能
+/// NOTIFY 本频道,订阅侧只校验形状(serde)不校验来源 —— 能连本库执行 SQL 即视为可信。
+/// 事件仅 UI 提示、不回写状态,伪造后果止于展示;要跨信任域投递,换带鉴权的外部 broker。
+const CHANNEL: &str = "widget_events";
+
+pub struct PgEventBus {
+    pool: sqlx::PgPool,
+}
+
+impl PgEventBus {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl EventBus for PgEventBus {
+    async fn publish(&self, event: WidgetEvent) {
+        // ponytail: NOTIFY payload 上限 8000 字节(widget 事件几百字节,富余);超限升级路径 = 只发 id、订阅方回查。
+        let payload = match serde_json::to_string(&Wire::from(event)) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "widget 事件序列化失败,丢弃");
+                return;
+            }
+        };
+        if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(CHANNEL)
+            .bind(&payload)
+            .execute(&self.pool)
+            .await
+        {
+            // fire-and-forget 契约:失败只落日志,绝不上抛影响写操作。
+            tracing::warn!(error = %e, "widget 事件发布失败(NOTIFY)");
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Box<dyn EventSubscription>, AppError> {
+        // ponytail: 每条订阅从共享 pool 长期占走 1 连接(LISTEN 期间不归还)——
+        // SSE 客户端多时会挤兑业务查询;上量再给事件总线独立小 pool / 单连接多路复用。
+        let mut listener = PgListener::connect_with(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        listener
+            .listen(CHANNEL)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(Box::new(PgSubscription(listener)))
+    }
+}
+
+struct PgSubscription(PgListener);
+
+#[async_trait]
+impl EventSubscription for PgSubscription {
+    async fn recv(&mut self) -> Option<WidgetEvent> {
+        loop {
+            match self.0.recv().await {
+                // 坏 payload(未来版本混发/人为 NOTIFY):跳过,不断流。
+                Ok(n) => match serde_json::from_str::<Wire>(n.payload()) {
+                    Ok(e) => return Some(e.into()),
+                    Err(e) => tracing::warn!(error = %e, "widget 事件 payload 非法,跳过"),
+                },
+                // PgListener 自带断线重连;到这说明不可恢复 → 结束流(客户端 EventSource 自动重连)。
+                Err(e) => {
+                    tracing::warn!(error = %e, "PgListener 断开,事件流结束");
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+// ── NATS 实现:多实例扇出的**默认后端**(选择链最高优先;生产常态用外部 broker)──
+// core NATS(非 JetStream):语义与其余实现同契约 —— best-effort、无回放;
+// 要持久化/回放/消费组上 JetStream,是另一个范式(事件表+游标的 broker 版)。
+
+/// NATS subject(点分层级是 NATS 惯例;将来 `widget.*` 通配订阅留给消费方)。
+const SUBJECT: &str = "widget.events";
+
+/// ponytail: 脚手架连**无鉴权** NATS(compose 默认,内网/开发);网络可达即可发/订。
+/// 跨信任域部署给 NATS 配 token/nkey(`ConnectOptions`)+ TLS。
+pub struct NatsEventBus {
+    client: async_nats::Client,
+}
+
+impl NatsEventBus {
+    /// 启动期连接,fail-fast(NATS 挂着进程起不来 —— 同 DB pool 的哲学);之后 Client 自动重连。
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        let client = async_nats::connect(url)
+            .await
+            .with_context(|| format!("连接 NATS 失败: {url}"))?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl EventBus for NatsEventBus {
+    async fn publish(&self, event: WidgetEvent) {
+        let payload = match serde_json::to_vec(&Wire::from(event)) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "widget 事件序列化失败,丢弃");
+                return;
+            }
+        };
+        // fire-and-forget 契约:入客户端发送缓冲即返回(自动 flush);失败只落日志,绝不上抛。
+        if let Err(e) = self.client.publish(SUBJECT, payload.into()).await {
+            tracing::warn!(error = %e, "widget 事件发布失败(NATS)");
+        }
+    }
+
+    async fn subscribe(&self) -> Result<Box<dyn EventSubscription>, AppError> {
+        let sub = self
+            .client
+            .subscribe(SUBJECT)
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(Box::new(NatsSubscription(sub)))
+    }
+}
+
+struct NatsSubscription(async_nats::Subscriber);
+
+#[async_trait]
+impl EventSubscription for NatsSubscription {
+    async fn recv(&mut self) -> Option<WidgetEvent> {
+        loop {
+            match self.0.next().await {
+                // 坏 payload(版本混发/人为发布):跳过,不断流(同 PG 实现的契约)。
+                Some(msg) => match serde_json::from_slice::<Wire>(&msg.payload) {
+                    Ok(e) => return Some(e.into()),
+                    Err(e) => tracing::warn!(error = %e, "widget 事件 payload 非法,跳过"),
+                },
+                // 断线由 Client 自动重连、订阅存续(窗口内丢事件,best-effort);
+                // 到 None 说明客户端已关闭 → 结束流(客户端 EventSource 自动重连)。
+                None => return None,
+            }
+        }
+    }
+}

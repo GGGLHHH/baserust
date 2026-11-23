@@ -5,11 +5,11 @@ description: Use when a module needs to publish/subscribe domain events or push 
 
 # EventBus(领域事件 + SSE 实时推送,可拔插三后端)
 
-非显然的**判断**,先钉住;机制:**照抄 `widget/events.rs` + `widget_events` handler**(`features/widget/`)——活样板(端口 + memory/PG/NATS 三实现 + SSE 适配)。
+非显然的**判断**,先钉住;机制:**照抄 `widget/events.rs` + `ports.rs` 的 `EventBus` + `adapters/bus.rs` + `widget_events` handler**(`features/widget/`)——活样板(端口 + memory/PG/NATS 三实现 + SSE 适配)。
 
 ## 端口归消费方,typed 事件 —— 不做通用总线
 
-每个要事件的模块**自己声明** `XxxEvent` 枚举 + 自己的 `EventBus`/`EventSubscription` trait(`features/<mod>/events.rs`),三实现照抄改常量(channel `<mod>_events` / subject `<mod>.events`,**各模块必须不同**,撞名=串台)。
+每个要事件的模块**自己声明** `XxxEvent` 枚举 + 自己的 `EventBus`/`EventSubscription` trait(事件在 `features/<mod>/events.rs`、trait 在 `ports.rs`,都是核心;memory/PG/NATS 实现在 `adapters/`,线格式在 `adapters/http/dto.rs`),三实现照抄改常量(channel `<mod>_events` / subject `<mod>.events`,**各模块必须不同**,撞名=串台)。
 
 **禁止**:`EventBus<T>` 泛型进 `infra/`、跨模块 import 别人的 bus/事件。字面重复是**刻意的**——事件形状、降级策略、序列化演进以后必然分叉,横切抽象比重复贵。天花板:第 3 个模块也要事件时,再评估共享 NATS client(外面 connect 一次、各模块 `new(client.clone())`);在那之前每模块自连,2 条连接不值得抽。
 

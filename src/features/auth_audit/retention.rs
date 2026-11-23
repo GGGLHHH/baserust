@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 
-use super::repo::AuthEventRepo;
+use super::ports::AuthEventRepo;
 
 const RETENTION_DAYS: i64 = 90;
 

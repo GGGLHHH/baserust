@@ -7,20 +7,24 @@ description: Use when adding a new business feature module (a new resource like 
 
 ## Overview
 
-baserust is vertical-slice: each business domain is one `src/features/<name>/` dir, thin-layered `routes → service → repo(trait) → types`. **Copy the `widget` module** — it is the canonical sample. This skill is NOT a re-teaching of the layering (read `widget/` for that); it's the **wiring checklist + the non-obvious gotchas that copying widget won't make obvious**.
+baserust is vertical-slice: each business domain is one `src/features/<name>/` dir, hexagonal (ports & adapters): a pure core (`model` / `ports` / `service`) plus `adapters/` (HTTP, memory, Postgres). **Copy the `widget` module** — it is the canonical sample. This skill is NOT a re-teaching of the layering (read `widget/` for that); it's the **wiring checklist + the non-obvious gotchas that copying widget won't make obvious**.
 
 ## Files to create
 
 ```
 src/features/<name>/
-  mod.rs                 router() + `pub use` repo/service
-  types.rs               <Name> (FromRow+ToSchema) + Create<Name> (Deserialize+Validate)
-  service.rs             <Name>Service(Arc<dyn <Name>Repo>) + #[cfg(test)] tests
-  routes.rs              #[utoipa::path] handlers (thin)
-  repo/
-    mod.rs               <Name>Repo trait + #[derive(Iden)] enum + COLS const
-    memory.rs            In-memory impl (default, test-friendly)
-    postgres.rs          sea-query impl + base_select()
+  mod.rs                 `pub mod` + `pub use` of the public surface (router, service, repos, model)
+  ── core (no axum / utoipa / sqlx / sea-query; may use kernel, serde, garde, uuid, time, async-trait)
+  model.rs               <Name> domain struct + Create<Name>/Update<Name> (Deserialize + garde Validate) + sort field enum
+  ports.rs               <Name>Repo trait (+ any narrow ports to other modules, e.g. UserDirectory)
+  service.rs             <Name>Service(Arc<dyn <Name>Repo>): takes PageParams / domain inputs, returns kernel Page<T> + #[cfg(test)] tests on the memory repo
+  ── adapters (framework / DB code lives only here)
+  adapters/mod.rs        `pub mod http; pub mod memory; pub mod postgres;`
+  adapters/http/dto.rs   wire DTOs (Serialize/Deserialize + ToSchema, keep stable names) + From/Into domain
+  adapters/http/routes.rs #[utoipa::path] handlers (thin: extract → DTO.into() → service → Dto::from)
+  adapters/http/mod.rs   router()s (OpenApiRouter + routes!)
+  adapters/memory.rs     In-memory impl (default, test-friendly; also the core tests' fake)
+  adapters/postgres.rs   sea-query impl: #[derive(Iden)] enum + COLS + <Name>Row (FromRow) → <Name> + base_select() + map_db_err
 migrations/app/000N_create_<name>s.{up,down}.sql
 tests/<name>_api.rs      oneshot integration tests (optional but expected)
 ```
@@ -40,7 +44,7 @@ tests/<name>_api.rs      oneshot integration tests (optional but expected)
 | **Adding an AppState field breaks every test** | `AppState` is built by-struct in each `tests/*_api.rs` `test_app()`; add the new field there too, or the whole crate fails to compile |
 | **`just migrate-add` makes a timestamp prefix** | Hand-write `000N_create_<name>s.{up,down}.sql` to keep the sequential `000N` convention |
 | **`set_updated_at_utc()` is shared** | It's created by `0001`. New migration only `create trigger ... execute function set_updated_at_utc();`. down: drop the trigger, **never** drop the function |
-| **`COLS` order / no `deleted_at`** | Column order must match the `<Name>` FromRow field order; `COLS` excludes `deleted_at` (DTO never exposes it) |
+| **`COLS` order / no `deleted_at`** | Column order must match the `<Name>Row` FromRow field order (in `adapters/postgres.rs`); `COLS` excludes `deleted_at` (DTO never exposes it) |
 | **Route path** | Write `path = "/<name>s"` — the `/api/v1/<group>` prefix is added by `nest` (group = public/frontend/admin, see `router.rs`; default business CRUD belongs in `frontend`), don't repeat it |
 | **Reuse the pool** | In `AppState::new`'s `Some(url)` arm, `connect_pool` once and `pool.clone()` into each repo (PgPool is Arc-cheap) — don't connect per feature |
 
@@ -54,9 +58,10 @@ RESTful、资源导向,全项目统一,新端点照做、别逐 feature 重选:
 ## Decisions to make (don't default silently)
 
 - **Audit/soft-delete fields**: keep the 5 base fields (`created_by/created_at/updated_by/updated_at/deleted_at`) + `base_select()` filtering `deleted_at IS NULL`, to stay consistent with widget. Drop them only with a deliberate reason.
-- **Unique constraint → 409**: add the unique index in a **migration** (partial `WHERE deleted_at IS NULL` if you soft-delete, so deleted rows free the value — see `widgets_name_unique_alive` in `0001`). Then mirror `widget`'s `map_db_err` (`repo/postgres.rs`): **both `create` AND `update`** end with `.map_err(map_db_err)` so a `23505` unique violation becomes `AppError::Conflict`(409), not `Internal`(500). **Mirror the check in the in-memory repo too** (reject a duplicate live name on create/update with `Conflict`) — `widget_repo_conformance` pins memory↔PG parity and will go red if you skip it. Mark `(status = 409, body = ErrorBody)` on the create/update `#[utoipa::path]`. (Never edit an already-applied migration to add the index — append a new one, or `just migrate-app-revert` → edit → `migrate-app` locally.)
-- **Reuse infra**: pagination (`PageQuery::resolve` → `Page<T>`), `AuditContext` (`ctx.audit_id()` → created_by/updated_by), custom `extract::{Json,Path,Query}`, `AppError`. Never re-implement these per feature.
+- **Unique constraint → 409**: add the unique index in a **migration** (partial `WHERE deleted_at IS NULL` if you soft-delete, so deleted rows free the value — see `widgets_name_unique_alive` in `0001`). Then mirror `widget`'s `map_db_err` (`adapters/postgres.rs`): **both `create` AND `update`** end with `.map_err(map_db_err)` so a `23505` unique violation becomes `AppError::Conflict`(409), not `Internal`(500). **Mirror the check in the in-memory repo too** (reject a duplicate live name on create/update with `Conflict`) — `widget_repo_conformance` pins memory↔PG parity and will go red if you skip it. Mark `(status = 409, body = ErrorBody)` on the create/update `#[utoipa::path]`. (Never edit an already-applied migration to add the index — append a new one, or `just migrate-app-revert` → edit → `migrate-app` locally.)
+- **Reuse kernel / infra**: pagination (handler: `PageQuery::resolve()` → `kernel::pagination::PageParams` → service returns `kernel::pagination::Page<T>` → handler `infra::http::pagination::Page::from_core(page, Dto::from)`), `kernel::audit::AuditContext` (`ctx.audit_id()` → created_by/updated_by), `infra::http::extract::{Json,Path,Query}`, `kernel::error::AppError`. Never re-implement these per feature.
+- **Keep the core pure**: `tests/architecture.rs` fails if any file outside `adapters/` mentions axum / utoipa / sqlx / sea_query / `crate::infra` / `crate::app` / another feature. A closed enum the API exposes stays serde-only in `model.rs`; its `ToSchema` comes from `crate::closed_enum_to_schema!` in `adapters/http/dto.rs` (see `closed-enums` skill). Cross-module needs go through a port in `ports.rs`, adapted in `src/app/adapters/`.
 
 ## Verify
 
-`just check && just test && just lint` (clippy is `-D warnings` — zero warnings required). Integration test pattern: copy `tests/widget_api.rs` (`test_app()` builds an in-memory `AppState`, `oneshot` hits real endpoints, no DB).
+`just check && just test && just lint` (includes `tests/architecture.rs`) (clippy is `-D warnings` — zero warnings required). Integration test pattern: copy `tests/widget_api.rs` (`test_app()` builds an in-memory `AppState`, `oneshot` hits real endpoints, no DB).

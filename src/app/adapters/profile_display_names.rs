@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::features::profile::ProfileRepo;
 use crate::features::search::DisplayNameSource;
-use crate::infra::error::AppError;
+use crate::kernel::error::AppError;
 
 pub struct ProfileDisplayNames {
     repo: Arc<dyn ProfileRepo>,

@@ -23,7 +23,7 @@ use baserust::features::users::UserAdminService;
 use baserust::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory, WidgetService,
 };
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, RoleRepo};
 
 /// 内存 app + 两个令牌:`superadmin`(有 users:admin,满权)与 `admin`(只有 admin:login)。
@@ -60,7 +60,7 @@ async fn test_app() -> (Router, String, String) {
 
     // policy(归 app):superadmin 满权(含 users:admin + profiles:write:all);admin 仅后台准入。
     // `useradmin` = **中间管理员**:有 users:admin 但非满权 —— 提权闸真正要拦的那类主体
-    // (见 users/routes.rs 头注)。线上 seed 里没有这个角色,但 role→perms 是运行期可改的
+    // (见 users/adapters/http/routes.rs 头注)。线上 seed 里没有这个角色,但 role→perms 是运行期可改的
     // (`role_permissions` 表),superadmin 随时能造出这类主体,故闸必须对它成立。
     let policy = Policy::from_roles([
         ("superadmin".to_owned(), Perm::ALL.to_vec()),

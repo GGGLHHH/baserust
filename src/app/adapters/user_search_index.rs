@@ -10,9 +10,9 @@ use crate::features::search::{self, SearchIndexRepo};
 use crate::features::users::{
     UserSearchFilter, UserSearchIndex, UserSearchPage, UserSearchRow, UserSearchSort,
 };
-use crate::infra::error::AppError;
-use crate::infra::pagination::PageParams;
-use crate::infra::sort::SortOrder;
+use crate::kernel::error::AppError;
+use crate::kernel::pagination::PageParams;
+use crate::kernel::sort::SortOrder;
 
 pub struct SearchIndexAdapter {
     inner: Arc<dyn SearchIndexRepo>,

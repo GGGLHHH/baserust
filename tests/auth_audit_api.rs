@@ -25,7 +25,7 @@ use baserust::features::users::UserAdminService;
 use baserust::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory, WidgetService,
 };
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, RoleRepo};
 
 /// 内存 app + 两个令牌(镜像 `tests/users_api.rs::test_app`):`superadmin`(users:admin,满权)

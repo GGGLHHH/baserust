@@ -9,9 +9,9 @@ use utoipa::{Modify, OpenApi};
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::app::state::AppState;
-use crate::infra::authz::Perm;
-use crate::infra::error::AppError;
 use crate::infra::op_perms::{op_authz, PermReq};
+use crate::kernel::authz::Perm;
+use crate::kernel::error::AppError;
 
 /// OpenAPI 文档根。范式:
 /// - 顶层 info/tags 在此声明;path 与 schema 由各模块的 `#[utoipa::path]` + `routes!()` 贡献。
@@ -24,9 +24,9 @@ use crate::infra::op_perms::{op_authz, PermReq};
     // 下面三个**只**出现在 query 参数里,无响应体承载;有响应体承载的(如 RoleName ← AdminUserView.roles)
     // 会被传递收集,登记反而冗余。加错/漏加由 `no_dangling_schema_refs` 兜。
     components(schemas(
-        crate::infra::sort::SortOrder,
-        crate::features::widget::WidgetSortField,
-        crate::features::users::UserSortField,
+        crate::infra::http::sort::SortOrder,
+        crate::features::widget::adapters::http::dto::WidgetSortField,
+        crate::features::users::adapters::http::dto::UserSortField,
     )),
     modifiers(&SecurityAddon),
     tags(

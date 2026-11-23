@@ -16,7 +16,7 @@ use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::profile::{InMemoryProfileRepo, ProfileService};
 use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
 const ADMIN_ID: Uuid = Uuid::from_u128(1);

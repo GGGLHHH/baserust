@@ -7,18 +7,17 @@ use std::sync::Arc;
 use garde::Validate;
 use uuid::Uuid;
 
-use super::port::{ProfileDirectory, UserSearchFilter, UserSearchIndex};
-use super::types::{
-    AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, RoleView,
-    SetRolesRequest, UpdateUserRequest, UserSortField,
+use super::model::{
+    AdminUserView, CreateUser, ListUsers, ResetPassword, Role, SetRoles, UpdateUser, UserSortField,
 };
-use crate::infra::authz::RoleName;
-use crate::infra::error::AppError;
-use crate::infra::pagination::{encode_cursor, Page, PageParams};
-use crate::infra::sort::SortOrder;
+use super::ports::{ProfileDirectory, UserSearchFilter, UserSearchIndex};
+use crate::kernel::authz::RoleName;
+use crate::kernel::error::AppError;
+use crate::kernel::pagination::{Page, PageParams};
+use crate::kernel::sort::SortOrder;
 use idm::{PwHasher, RoleRepo, SessionRepo, UserRepo};
 
-/// `SortOrder`(app 共享)→ idm 侧排序方向。SortOrder 是本 crate 类型,orphan 规则允许。
+/// `SortOrder`(共享内核)→ idm 侧排序方向。SortOrder 是本 crate 类型,orphan 规则允许。
 impl From<SortOrder> for idm::SortDir {
     fn from(o: SortOrder) -> Self {
         match o {
@@ -60,10 +59,10 @@ impl UserAdminService {
 
     /// 列表:有 search 投影后端 → 走投影(支持 `q`/`display_name` 排序);无 → 回退 idm 直查
     /// (此时 `q`/`sort_by=display_name` → 422,因为回退路无法提供搜索能力)。
-    /// `page` 的 cursor + 非默认 sort 的 422 校验在 handler(此处只翻译参数)。
+    /// `page` 的 cursor + 非默认 sort 的 422 校验在边界(此处只翻译参数)。
     pub async fn list(
         &self,
-        filter: &ListUsersFilter,
+        filter: &ListUsers,
         page: PageParams,
     ) -> Result<Page<AdminUserView>, AppError> {
         match &self.search {
@@ -85,7 +84,7 @@ impl UserAdminService {
     async fn list_via_projection(
         &self,
         search: Arc<dyn UserSearchIndex>,
-        filter: &ListUsersFilter,
+        filter: &ListUsers,
         page: PageParams,
     ) -> Result<Page<AdminUserView>, AppError> {
         let sf = UserSearchFilter {
@@ -120,9 +119,7 @@ impl UserAdminService {
 
         Ok(match page {
             PageParams::Offset { page, size, .. } => Page::offset(items, page, size, result.total),
-            PageParams::Cursor { limit, .. } => {
-                Page::cursor(items, limit, result.next_after.map(encode_cursor))
-            }
+            PageParams::Cursor { limit, .. } => Page::cursor(items, limit, result.next_after),
         })
     }
 
@@ -130,7 +127,7 @@ impl UserAdminService {
     /// 现有(pre-search)逻辑原样保留,不支持 `q`/`display_name` 排序(由 `list()` 提前 422)。
     async fn list_via_idm(
         &self,
-        filter: &ListUsersFilter,
+        filter: &ListUsers,
         page: PageParams,
     ) -> Result<Page<AdminUserView>, AppError> {
         let idm_filter = idm::UserListFilter {
@@ -188,16 +185,14 @@ impl UserAdminService {
 
         Ok(match page {
             PageParams::Offset { page, size, .. } => Page::offset(items, page, size, result.total),
-            PageParams::Cursor { limit, .. } => {
-                Page::cursor(items, limit, result.next_after.map(encode_cursor))
-            }
+            PageParams::Cursor { limit, .. } => Page::cursor(items, limit, result.next_after),
         })
     }
 
     /// 建号(原子含角色)。名→id 解析(未知 → 422)→ hash → idm 事务建。
     pub async fn create(
         &self,
-        req: CreateUserRequest,
+        req: CreateUser,
         by: Option<String>,
     ) -> Result<AdminUserView, AppError> {
         req.validate()?;
@@ -232,7 +227,7 @@ impl UserAdminService {
     pub async fn update(
         &self,
         id: Uuid,
-        req: UpdateUserRequest,
+        req: UpdateUser,
         by: Option<String>,
     ) -> Result<AdminUserView, AppError> {
         req.validate()?;
@@ -257,7 +252,7 @@ impl UserAdminService {
     pub async fn set_roles(
         &self,
         id: Uuid,
-        req: SetRolesRequest,
+        req: SetRoles,
         by: Option<String>,
     ) -> Result<AdminUserView, AppError> {
         // 先确认用户存在(不存在/软删 → 404):否则空 roles 会对幽灵/软删用户做空替换 +
@@ -285,14 +280,14 @@ impl UserAdminService {
     }
 
     /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
-    pub async fn list_roles(&self) -> Result<Page<RoleView>, AppError> {
+    pub async fn list_roles(&self) -> Result<Page<Role>, AppError> {
         // 不在闭集的角色行(存量脏数据)跳出目录 + warn,不打挂端点。
-        let items: Vec<RoleView> = self
+        let items: Vec<Role> = self
             .roles
             .list()
             .await?
             .into_iter()
-            .filter_map(|r| match RoleView::try_from(r) {
+            .filter_map(|r| match Role::try_from(r) {
                 Ok(v) => Some(v),
                 Err(name) => {
                     RoleName::warn_unknown(&name); // 与 parse_lossy 同口径(每进程每名一次)
@@ -305,11 +300,7 @@ impl UserAdminService {
     }
 
     /// 管理员重置密码 + best-effort 撤会话(强制重新登录;撤失败仅 warn)。
-    pub async fn reset_password(
-        &self,
-        id: Uuid,
-        req: ResetPasswordRequest,
-    ) -> Result<(), AppError> {
+    pub async fn reset_password(&self, id: Uuid, req: ResetPassword) -> Result<(), AppError> {
         req.validate()?;
         // 存在性守卫(镜像 set_roles):缺失/软删用户 → 404,且不白算 hash / 撤会话。pinned idm 的 PG
         // update_password 不自校验存在(不查 rows_affected / deleted_at),不守则内存↔PG 分叉:PG 会对
@@ -385,7 +376,7 @@ impl UserAdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::users::port::StaticProfileDirectory;
+    use crate::features::users::adapters::memory::StaticProfileDirectory;
     use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
     /// 内存装配:user/role repo **共享** RoleStore(否则新号角色对 list/roles_for_user 不可见);
@@ -425,7 +416,7 @@ mod tests {
         };
         let created = svc
             .create(
-                CreateUserRequest {
+                CreateUser {
                     username: "alice".into(),
                     email: Some("a@x.io".into()),
                     password: "password123".into(),
@@ -440,7 +431,7 @@ mod tests {
         // 未知角色 → Validation(422)
         let e = svc
             .create(
-                CreateUserRequest {
+                CreateUser {
                     username: "z".into(),
                     email: None,
                     password: "password123".into(),
@@ -456,7 +447,7 @@ mod tests {
         let after = svc
             .set_roles(
                 created.id,
-                SetRolesRequest {
+                SetRoles {
                     roles: vec![rid("superadmin"), rid("user")],
                 },
                 None,
@@ -471,7 +462,7 @@ mod tests {
         let e = svc
             .set_roles(
                 created.id,
-                SetRolesRequest {
+                SetRoles {
                     roles: vec![rid("superadmin"), Uuid::now_v7()],
                 },
                 None,
@@ -483,7 +474,7 @@ mod tests {
         // list 命中(username 模糊 + offset)
         let page = svc
             .list(
-                &ListUsersFilter {
+                &ListUsers {
                     username: Some("ali".into()),
                     ..Default::default()
                 },
@@ -513,7 +504,7 @@ mod tests {
     async fn set_roles_on_missing_user_is_404_before_mutating() {
         let svc = test_service().await;
         let err = svc
-            .set_roles(Uuid::now_v7(), SetRolesRequest { roles: vec![] }, None)
+            .set_roles(Uuid::now_v7(), SetRoles { roles: vec![] }, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound));
@@ -532,7 +523,7 @@ mod tests {
             .id;
         let created = svc
             .create(
-                CreateUserRequest {
+                CreateUser {
                     username: "dup".into(),
                     email: None,
                     password: "password123".into(),
@@ -559,7 +550,7 @@ mod tests {
 
         let e = svc
             .list(
-                &ListUsersFilter {
+                &ListUsers {
                     q: Some("x".into()),
                     ..Default::default()
                 },
@@ -571,7 +562,7 @@ mod tests {
 
         let e = svc
             .list(
-                &ListUsersFilter {
+                &ListUsers {
                     sort_by: UserSortField::DisplayName,
                     ..Default::default()
                 },
@@ -586,7 +577,7 @@ mod tests {
     async fn list_without_search_backend_and_plain_filter_falls_back_to_idm() {
         let svc = test_service().await;
         svc.create(
-            CreateUserRequest {
+            CreateUser {
                 username: "bob".into(),
                 email: None,
                 password: "password123".into(),
@@ -598,7 +589,7 @@ mod tests {
         .unwrap();
 
         let page = svc
-            .list(&ListUsersFilter::default(), offset_page())
+            .list(&ListUsers::default(), offset_page())
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
@@ -611,7 +602,7 @@ mod tests {
     async fn list_without_search_backend_whitespace_q_falls_back_to_idm_not_422() {
         let svc = test_service().await;
         svc.create(
-            CreateUserRequest {
+            CreateUser {
                 username: "dora".into(),
                 email: None,
                 password: "password123".into(),
@@ -624,7 +615,7 @@ mod tests {
 
         let page = svc
             .list(
-                &ListUsersFilter {
+                &ListUsers {
                     q: Some("   ".into()),
                     ..Default::default()
                 },
@@ -638,7 +629,7 @@ mod tests {
 
     /// 假 search 后端:忽略入参,原样回放预置行(测投影分支的映射/富化,不测查询语义)。
     struct FakeSearchIndex {
-        rows: Vec<super::super::port::UserSearchRow>,
+        rows: Vec<super::super::ports::UserSearchRow>,
     }
 
     #[async_trait::async_trait]
@@ -646,11 +637,11 @@ mod tests {
         async fn query(
             &self,
             _filter: &UserSearchFilter,
-            _sort: super::super::port::UserSearchSort,
+            _sort: super::super::ports::UserSearchSort,
             _order: SortOrder,
             _page: &PageParams,
-        ) -> Result<super::super::port::UserSearchPage, AppError> {
-            Ok(super::super::port::UserSearchPage {
+        ) -> Result<super::super::ports::UserSearchPage, AppError> {
+            Ok(super::super::ports::UserSearchPage {
                 rows: self.rows.clone(),
                 total: Some(self.rows.len() as u64),
                 next_after: None,
@@ -660,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_with_search_backend_uses_projection_and_enriches_avatar() {
-        use super::super::port::{ProfileBrief, UserSearchRow};
+        use super::super::ports::{ProfileBrief, UserSearchRow};
 
         let id = Uuid::now_v7();
         let mut avatar_seed = HashMap::new();
@@ -696,7 +687,7 @@ mod tests {
 
         let page = svc
             .list(
-                &ListUsersFilter {
+                &ListUsers {
                     q: Some("carol".into()),
                     ..Default::default()
                 },
@@ -725,12 +716,12 @@ mod tests {
         async fn query(
             &self,
             filter: &UserSearchFilter,
-            _sort: super::super::port::UserSearchSort,
+            _sort: super::super::ports::UserSearchSort,
             _order: SortOrder,
             _page: &PageParams,
-        ) -> Result<super::super::port::UserSearchPage, AppError> {
+        ) -> Result<super::super::ports::UserSearchPage, AppError> {
             *self.received.lock().expect("锁未中毒") = Some(filter.clone());
-            Ok(super::super::port::UserSearchPage {
+            Ok(super::super::ports::UserSearchPage {
                 rows: vec![],
                 total: Some(0),
                 next_after: None,
@@ -755,7 +746,7 @@ mod tests {
         );
 
         svc.list(
-            &ListUsersFilter {
+            &ListUsers {
                 username: Some("alice".into()),
                 q: Some("wonder".into()),
                 ..Default::default()
@@ -804,7 +795,7 @@ mod tests {
         // 建号直接带存量角色(模拟旧部署遗留分配行)
         let u = svc
             .create(
-                CreateUserRequest {
+                CreateUser {
                     username: "legacy".into(),
                     email: None,
                     password: "password123".into(),
@@ -818,7 +809,7 @@ mod tests {
         let e = svc
             .set_roles(
                 u.id,
-                SetRolesRequest {
+                SetRoles {
                     roles: vec![ids["admin"]],
                 },
                 None,
@@ -829,7 +820,7 @@ mod tests {
         // 显式带上 editor → 放行
         svc.set_roles(
             u.id,
-            SetRolesRequest {
+            SetRoles {
                 roles: vec![ids["admin"], ids["editor"]],
             },
             None,

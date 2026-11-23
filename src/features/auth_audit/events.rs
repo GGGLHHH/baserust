@@ -1,5 +1,5 @@
 //! auth_event 实时推送总线(SSE 端点用)。projector 落库成功后 publish,`stream_auth_events`
-//! 订阅广播。
+//! 订阅广播。进程内实现,纯 Rust(tokio broadcast),载荷是领域读模型。
 //!
 //! ponytail: 进程内 `tokio::broadcast`,只覆盖单 idm 实例 —— 多实例部署下每个实例各见各的
 //! 投影结果,SSE 客户端连到哪个实例就只收哪个实例投的事件。要多实例扇出,SSE handler 应直接
@@ -7,7 +7,7 @@
 
 use tokio::sync::broadcast;
 
-use super::types::AuthEventRow;
+use super::model::AuthEventRow;
 
 #[derive(Clone)]
 pub struct AuthEventBus {

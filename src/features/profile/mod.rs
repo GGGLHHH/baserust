@@ -1,36 +1,19 @@
-//! 用户资料模块:显示名 / 电话 / 头像(头像经 content,富化为相对 preview 路径)。
-//! 分层照 widget;头像跨模块经 `AvatarProbe` 端口(适配在 app/adapters)。
+//! 用户资料模块:显示名 / 电话 / 头像(头像经 content,富化为相对头像端点路径)。
+//!
+//! **核心**(模块根目录;不依赖框架、数据库、HTTP):`model`(实体 / 命令 / 读模型 / 头像准入)、
+//! `ports`(仓储、头像探针)、`service`(用例)。
+//! **适配器**(`adapters/`):`http`、`memory` / `postgres`(仓储)、`outbox`(app schema 发件箱)。
+//! 头像探针的真实现(经 content 领域库)在组合根 `app/adapters/`。
 
-mod port;
-mod repo;
-mod routes;
+pub mod adapters;
+pub mod model;
+pub mod ports;
 mod service;
-mod types;
 
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
-
-use crate::app::state::AppState;
-
-pub use port::{AvatarInfo, AvatarProbe, StaticAvatarProbe};
-pub use repo::{
-    AppOutboxRecord, InMemoryAppOutbox, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo,
-    ProfileFields, ProfileRepo,
-};
+pub use adapters::http::{admin_router, router};
+pub use adapters::memory::{InMemoryProfileRepo, StaticAvatarProbe};
+pub use adapters::outbox::{AppOutboxRecord, InMemoryAppOutbox, PgAppOutbox};
+pub use adapters::postgres::PgProfileRepo;
+pub use model::{Profile, ProfileFields, ProfileView, PutProfile};
+pub use ports::{AvatarInfo, AvatarProbe, ProfileRepo};
 pub use service::ProfileService;
-pub use types::{AvatarForm, Profile, ProfileResponse, PutProfileRequest};
-
-/// 本模块路由 + OpenAPI,挂到主 router(/api/v1 由 nest 加)。
-pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(routes::get_my_profile))
-        .routes(routes!(routes::get_profile, routes::put_profile))
-        .routes(routes!(routes::get_user_avatar))
-}
-
-/// 后台资料管理(admin 组;路径在 /users/{id} 下,与 users::admin_router 并挂)。
-pub fn admin_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(routes::get_user_profile, routes::set_user_profile))
-        .routes(routes!(routes::set_user_avatar))
-}

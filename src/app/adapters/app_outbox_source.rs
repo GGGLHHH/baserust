@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 
 use crate::features::profile::{AppOutboxRecord, InMemoryAppOutbox, PgAppOutbox};
-use crate::infra::error::AppError;
 use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxSource};
+use crate::kernel::error::AppError;
 
 fn to_item(rec: AppOutboxRecord) -> OutboxItem {
     build_outbox_item(

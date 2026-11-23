@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::infra::error::AppError;
+use crate::kernel::error::AppError;
 
 /// relay 从某个发件箱源拉到的一条待发布事件 —— 已是发布就绪的形状
 /// (`subject` + `event_id` 作未来 JetStream `Nats-Msg-Id` 去重键 + 序列化好的 payload 字节)。

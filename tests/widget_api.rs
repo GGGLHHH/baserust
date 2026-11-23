@@ -15,7 +15,7 @@ use uuid::Uuid;
 use baserust::app::{build_router, AppState};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::widget::{InMemoryWidgetRepo, WidgetService};
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
 /// 内存仓储的测试 app(无 DB)+ **admin 令牌**(widget 端点现需登录 + RBAC + ownership)。

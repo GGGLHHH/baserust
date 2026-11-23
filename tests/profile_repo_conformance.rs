@@ -135,7 +135,7 @@ mod support;
 mod pg {
     use super::{profile_repo_contract, support};
     use baserust::features::profile::{PgAppOutbox, PgProfileRepo, ProfileFields, ProfileRepo};
-    use baserust::infra::error::AppError;
+    use baserust::kernel::error::AppError;
     use serde_json::Value;
     use uuid::Uuid;
 

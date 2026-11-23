@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::features::profile::{AvatarInfo, AvatarProbe};
-use crate::infra::error::AppError;
+use crate::kernel::error::AppError;
 use content::{ContentError, ContentService, ContentStatus};
 
 pub struct ContentAvatarProbe {

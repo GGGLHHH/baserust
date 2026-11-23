@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::features::widget::{UserBrief, UserDirectory};
-use crate::infra::error::AppError;
+use crate::kernel::error::AppError;
 use idm::UserRepo;
 
 pub struct InProcessUserDirectory {

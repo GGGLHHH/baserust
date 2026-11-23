@@ -11,8 +11,8 @@ use super::adapters::{
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
 use crate::features::auth_audit::{
-    projector::AuthEventProjector, AuthAuditService, AuthEventBus, AuthEventRepo, AuthRetentionJob,
-    PgAuthEventRepo,
+    adapters::projector::AuthEventProjector, AuthAuditService, AuthEventBus, AuthEventRepo,
+    AuthRetentionJob, PgAuthEventRepo,
 };
 use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
@@ -23,11 +23,11 @@ use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
     UserDirectory, WidgetRepo, WidgetService,
 };
-use crate::infra::authz::Policy;
 use crate::infra::config::Config;
 use crate::infra::jetstream::JetStreamPublisher;
 use crate::infra::objectstore::S3ObjectStore;
 use crate::infra::outbox::{EventPublisher, OutboxRelay, OutboxSource};
+use crate::kernel::authz::Policy;
 use content::{
     ContentRepo, ContentService, InMemoryContentRepo, InMemoryObjectRepo, InMemoryObjectStore,
     ObjectRepo, ObjectStore, PgContentRepo, PgObjectRepo,

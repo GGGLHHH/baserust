@@ -16,7 +16,7 @@ use uuid::Uuid;
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
-use baserust::infra::authz::{Perm, Policy};
+use baserust::kernel::authz::{Perm, Policy};
 use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
 /// 内存 app + 两枚令牌:`admin`(read+write+delete)与 `viewer`(只 read),store 可注入

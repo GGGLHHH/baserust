@@ -23,9 +23,9 @@ use uuid::Uuid;
 
 use baserust::app::state::{connect_for_schema, Schema};
 use baserust::app::{AppState, Mount};
-use baserust::features::profile::PutProfileRequest;
-use baserust::infra::audit::AuditContext;
+use baserust::features::profile::PutProfile;
 use baserust::infra::config::Config;
+use baserust::kernel::audit::AuditContext;
 use idm::RegisterInput;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -101,7 +101,7 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
         .profiles
         .put(
             user_id,
-            PutProfileRequest {
+            PutProfile {
                 display_name: Some(disp.clone()),
                 phone: None,
                 avatar_content_id: None,

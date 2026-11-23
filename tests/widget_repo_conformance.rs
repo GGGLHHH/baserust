@@ -6,9 +6,9 @@
 //! PG 入口:`cargo test --features pg-conformance`(需 DATABASE_URL 连 app role + 跑着的 pg),用 `just test-pg`。
 
 use baserust::features::widget::{WidgetRepo, WidgetSortField};
-use baserust::infra::error::AppError;
-use baserust::infra::pagination::{decode_cursor, PageInfo, PageParams};
-use baserust::infra::sort::SortOrder;
+use baserust::kernel::error::AppError;
+use baserust::kernel::pagination::{PageInfo, PageParams};
+use baserust::kernel::sort::SortOrder;
 use uuid::Uuid;
 
 /// 契约唯一真相源。内存与 PG 都调它 —— 加实现/加断言只改这一处。
@@ -74,7 +74,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         vec![a.id]
     );
 
-    // ── cursor keyset:首页 has_more,next_cursor 解码后续翻 ──
+    // ── cursor keyset:首页 has_more,next_after 作锚点续翻 ──
     let cur1 = repo
         .list(
             &PageParams::Cursor {
@@ -94,18 +94,18 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     let next = match cur1.page_info {
         PageInfo::Cursor {
             has_more,
-            next_cursor,
+            next_after,
             ..
         } => {
             assert!(has_more);
-            next_cursor.unwrap()
+            next_after.unwrap()
         }
         _ => panic!("应是 cursor 模式"),
     };
     let cur2 = repo
         .list(
             &PageParams::Cursor {
-                after: Some(decode_cursor(&next).unwrap()),
+                after: Some(next),
                 limit: 2,
             },
             None,
@@ -344,9 +344,9 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         got.extend(page.items.iter().map(|w| w.name.clone()));
         match page.page_info {
             PageInfo::Cursor {
-                next_cursor: Some(c),
+                next_after: Some(c),
                 ..
-            } => after = Some(decode_cursor(&c).unwrap()),
+            } => after = Some(c),
             PageInfo::Cursor { .. } => {
                 done = true;
                 break;
@@ -412,7 +412,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         .unwrap();
     let anchor_cursor = match first.page_info {
         PageInfo::Cursor {
-            next_cursor: Some(c),
+            next_after: Some(c),
             ..
         } => c,
         _ => panic!("首页之后应还有下一页"),
@@ -421,7 +421,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     let next = repo
         .list(
             &PageParams::Cursor {
-                after: Some(decode_cursor(&anchor_cursor).unwrap()),
+                after: Some(anchor_cursor),
                 limit: 1,
             },
             None,

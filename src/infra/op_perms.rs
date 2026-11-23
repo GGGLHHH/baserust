@@ -10,7 +10,7 @@
 //! 文档侧改 Perm 必过编译期表(by construction);spec 广告的 scope ⟷ handler 实际 `require_scoped` 由
 //! `tests/openapi_authz_test.rs` 行为钉死(by test)。**加端点 = 在此加一行**(漏了 → 覆盖测试 fail-closed 报红)。
 
-use crate::infra::authz::Perm;
+use crate::kernel::authz::Perm;
 
 /// 端点授权要求。单权限就是 `All` 的单元素特例,不设单独变体(少一形态少一漂移面)。
 #[derive(Clone, Copy, Debug)]

@@ -5,7 +5,7 @@ description: Use when adding a repo operation that writes more than once and mus
 
 # Transactions (atomic multi-write through the pluggable repo)
 
-The non-obvious **judgment** — stated so you get it right *even before* reading the sample. Mechanics: **copy `create_with_tags`** (`features/widget/repo/`) — the live template (PG `begin/commit`, memory lock).
+The non-obvious **judgment** — stated so you get it right *even before* reading the sample. Mechanics: **copy `create_with_tags`** (`features/widget/`:trait 在 `ports.rs`,实现在 `adapters/{postgres,memory}.rs`) — the live template (PG `begin/commit`, memory lock).
 
 ## the atomic unit is ONE trait method — never thread a transaction
 

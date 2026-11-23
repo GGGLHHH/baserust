@@ -1,26 +1,14 @@
-//! profile 业务逻辑:garde 校验 → 头像三查(经端口)→ upsert → 富化。
+//! profile 用例:garde 校验 → 头像四查(经端口)→ upsert → 富化成读模型 `ProfileView`。
 
 use std::sync::Arc;
 
 use garde::Validate;
 use uuid::Uuid;
 
-use super::port::AvatarProbe;
-use super::repo::{ProfileFields, ProfileRepo};
-use super::types::{Profile, ProfileResponse, PutProfileRequest};
-use crate::infra::audit::AuditContext;
-use crate::infra::error::AppError;
-
-/// 头像准入 MIME 白名单:只收**栅格图**。刻意**排除 `image/svg+xml`**(及其他非栅格 `image/*`)——
-/// SVG 是活动内容(可内联脚本);presign 后端把头像 307 直连存储出字节、**无 CSP sandbox**(只有代理
-/// 回退分支才加 sandbox),而头像端点任何登录用户跨用户可达 → 恶意 SVG 头像 = 存储型 XSS。收口在上传
-/// 边界(两处),从源头挡住,而非依赖出字节时的 `image/*` 前缀"双保险"(它并不排除 SVG)。
-pub(crate) fn is_allowed_avatar_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-    )
-}
+use super::model::{is_allowed_avatar_mime, Profile, ProfileFields, ProfileView, PutProfile};
+use super::ports::{AvatarProbe, ProfileRepo};
+use crate::kernel::audit::AuditContext;
+use crate::kernel::error::AppError;
 
 #[derive(Clone)]
 pub struct ProfileService {
@@ -34,7 +22,7 @@ impl ProfileService {
     }
 
     /// 读任意人的资料。未建 → 404(那里存在性是真问题:问的是"某个 id 有没有资料")。
-    pub async fn get(&self, user_id: Uuid) -> Result<ProfileResponse, AppError> {
+    pub async fn get(&self, user_id: Uuid) -> Result<ProfileView, AppError> {
         let p = self.repo.get(user_id).await?.ok_or(AppError::NotFound)?;
         Ok(self.enrich(p).await)
     }
@@ -46,10 +34,10 @@ impl ProfileService {
     /// (`/admin/profile`)的 loader 正是拿 me 的 404 抛错、根本渲染不出来。且没有任何路径
     /// 会预建 profile 行(注册/后台建号都在 idm 进程,写不了 app schema),所以**每个**新账号
     /// 都会撞上,不只 seed 出来的。
-    pub async fn get_or_empty(&self, user_id: Uuid) -> Result<ProfileResponse, AppError> {
+    pub async fn get_or_empty(&self, user_id: Uuid) -> Result<ProfileView, AppError> {
         match self.repo.get(user_id).await? {
             Some(p) => Ok(self.enrich(p).await),
-            None => Ok(ProfileResponse::empty(user_id)),
+            None => Ok(ProfileView::empty(user_id)),
         }
     }
 
@@ -68,9 +56,9 @@ impl ProfileService {
     pub async fn put(
         &self,
         user_id: Uuid,
-        input: PutProfileRequest,
+        input: PutProfile,
         ctx: &AuditContext,
-    ) -> Result<(bool, ProfileResponse), AppError> {
+    ) -> Result<(bool, ProfileView), AppError> {
         input.validate()?;
         if let Some(cid) = input.avatar_content_id {
             let info = self
@@ -113,7 +101,7 @@ impl ProfileService {
     /// **探测故障也 → null + warn**(读路径不因旁路故障炸——与写前校验的 500 刻意相反)。
     /// URL 指 `profiles/{user_id}/avatar`(头像专用端点,只服务本人 avatar);content 本体经
     /// `contents/{id}/preview` 严格按 owner 隔离,不再对他人放行任意 image(见 content::preview_content)。
-    async fn enrich(&self, p: Profile) -> ProfileResponse {
+    async fn enrich(&self, p: Profile) -> ProfileView {
         let user_id = p.user_id;
         let avatar_url = match p.avatar_content_id {
             None => None,
@@ -134,7 +122,7 @@ impl ProfileService {
                 }
             },
         };
-        ProfileResponse::from_profile(p, avatar_url)
+        ProfileView::from_profile(p, avatar_url)
     }
 }
 
@@ -143,9 +131,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::features::profile::port::{AvatarInfo, StaticAvatarProbe};
-    use crate::features::profile::repo::InMemoryProfileRepo;
-    use crate::infra::audit::AuditContext;
+    use crate::features::profile::adapters::memory::{InMemoryProfileRepo, StaticAvatarProbe};
+    use crate::features::profile::ports::AvatarInfo;
+    use crate::kernel::audit::AuditContext;
     use async_trait::async_trait;
 
     fn ctx() -> AuditContext {
@@ -156,8 +144,8 @@ mod tests {
         ProfileService::new(Arc::new(InMemoryProfileRepo::new()), Arc::new(probe))
     }
 
-    fn req(avatar: Option<Uuid>) -> PutProfileRequest {
-        PutProfileRequest {
+    fn req(avatar: Option<Uuid>) -> PutProfile {
+        PutProfile {
             display_name: Some("San Zhang".into()),
             phone: Some("13800000000".into()),
             avatar_content_id: avatar,
@@ -175,7 +163,7 @@ mod tests {
         let (created, r) = svc
             .put(
                 uid,
-                PutProfileRequest {
+                PutProfile {
                     display_name: None,
                     phone: Some("139".into()),
                     avatar_content_id: None,

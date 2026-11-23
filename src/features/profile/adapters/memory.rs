@@ -1,0 +1,127 @@
+//! profile 端口的**内存适配器**:仓储(脚手架默认,镜像 PG upsert 的"替换保留 created_*"语义,
+//! conformance 对拍钉住)+ 头像探针的静态替身。
+
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde_json::json;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use super::outbox::OutboxStore;
+use crate::features::profile::model::{Profile, ProfileFields};
+use crate::features::profile::ports::{AvatarInfo, AvatarProbe, ProfileRepo};
+use crate::kernel::error::AppError;
+
+pub struct InMemoryProfileRepo {
+    store: Mutex<HashMap<Uuid, Profile>>,
+    outbox: Arc<OutboxStore>,
+}
+
+impl InMemoryProfileRepo {
+    pub fn new() -> Self {
+        Self {
+            store: Mutex::new(HashMap::new()),
+            outbox: Arc::new(OutboxStore::default()),
+        }
+    }
+
+    /// 供 `InMemoryAppOutbox::sharing_with` 取共享存储(镜像 idm 的 `sharing_with` 手法)。
+    pub(crate) fn outbox_store(&self) -> &Arc<OutboxStore> {
+        &self.outbox
+    }
+}
+
+impl Default for InMemoryProfileRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ProfileRepo for InMemoryProfileRepo {
+    async fn get(&self, user_id: Uuid) -> Result<Option<Profile>, AppError> {
+        Ok(self.store.lock().expect("锁未中毒").get(&user_id).cloned())
+    }
+
+    async fn find_by_ids(&self, user_ids: &[Uuid]) -> Result<Vec<Profile>, AppError> {
+        let store = self.store.lock().expect("锁未中毒");
+        Ok(user_ids
+            .iter()
+            .filter_map(|id| store.get(id).cloned())
+            .collect())
+    }
+
+    async fn upsert(
+        &self,
+        user_id: Uuid,
+        f: ProfileFields,
+        by: Option<String>,
+    ) -> Result<(Profile, bool), AppError> {
+        let mut store = self.store.lock().expect("锁未中毒");
+        let now = OffsetDateTime::now_utc();
+        let (profile, created) = match store.entry(user_id) {
+            Entry::Occupied(mut e) => {
+                // 替换:业务字段全量覆盖 + updated_*;created_* 保留(镜像 PG 的 excluded 集)。
+                let p = e.get_mut();
+                p.display_name = f.display_name;
+                p.phone = f.phone;
+                p.avatar_content_id = f.avatar_content_id;
+                p.updated_by = by;
+                p.updated_at = now;
+                (p.clone(), false)
+            }
+            Entry::Vacant(v) => {
+                let p = Profile {
+                    user_id,
+                    display_name: f.display_name,
+                    phone: f.phone,
+                    avatar_content_id: f.avatar_content_id,
+                    created_by: by.clone(),
+                    created_at: now,
+                    updated_by: by,
+                    updated_at: now,
+                };
+                (v.insert(p).clone(), true)
+            }
+        };
+        // emit 必须留在 store 锁内:先放锁会让并发 upsert 的 profile 写序与 outbox 事件序
+        // 倒挂(旧快照拿到更大 seq),投影按 seq 水位会用旧值覆盖新值。锁序恒 store→outbox,
+        // InMemoryAppOutbox 只拿自己的锁,无死锁。(镜像 PG 侧"同事务落地"的语义)
+        // avatar_url:同 service::enrich 的头像端点口径(按 user_id,非 content id),但**不探测
+        // 就绪性**——那是读侧关注,这里只记录写入意图(悬空/未就绪由读侧消费者各自决定语义)。
+        let avatar_url = profile
+            .avatar_content_id
+            .map(|_cid| format!("/api/v1/frontend/profiles/{user_id}/avatar"));
+        self.outbox.emit(
+            "profile.updated",
+            user_id,
+            json!({
+                "user_id": user_id,
+                "display_name": profile.display_name,
+                "avatar_url": avatar_url,
+            }),
+        );
+        Ok((profile, created))
+    }
+}
+
+// ── 头像探针静态替身 ──
+
+/// 静态实现:预置 map 回答 —— 单测/无富化源占位用(镜像 widget 的 StaticUserDirectory)。
+pub struct StaticAvatarProbe(pub HashMap<Uuid, AvatarInfo>);
+
+impl StaticAvatarProbe {
+    pub fn empty() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+#[async_trait]
+impl AvatarProbe for StaticAvatarProbe {
+    async fn probe(&self, content_id: Uuid) -> Result<Option<AvatarInfo>, AppError> {
+        Ok(self.0.get(&content_id).cloned())
+    }
+}
