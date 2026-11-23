@@ -109,6 +109,11 @@ nats-conformance = []
 # 测试专用依赖(集成测试 tests/ 用 tower oneshot 打端点)
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# 黑盒 HTTP 测试(tests/http_*.rs):真实端口 + 浏览器式会话(cookie 存储),测试体不认识任何 web 框架
+# —— 换 web 底座时原样当验收标准。只打本机 http:不要 TLS / 系统代理。
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "cookies", "multipart"] }
+# 快照测试:OpenAPI 规范(= 前端生成类型的契约)存成快照,接口一变即红;改动经 `cargo insta review` 审过再接受。
+insta = { version = "1", features = ["json"] }
 
 # lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明
 [lints.rust]

@@ -1,0 +1,5916 @@
+---
+source: tests/openapi_snapshot.rs
+expression: spec
+---
+{
+  "components": {
+    "schemas": {
+      "AdminUserView": {
+        "description": "后台用户视图:身份(idm.users)+ 角色(idm)+ 富化的资料(app.profiles;缺/分进程降级 → null)。",
+        "properties": {
+          "avatar_url": {
+            "description": "富化:相对头像端点路径(悬空/分进程 → null)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "富化:app.profiles 的显示名(悬空/分进程 → null)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email_verified": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "roles": {
+            "description": "idm 角色名(全量;闭集,生成前端 union)。",
+            "items": {
+              "$ref": "#/components/schemas/RoleName"
+            },
+            "type": "array"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "email_verified",
+          "created_at",
+          "roles"
+        ],
+        "type": "object"
+      },
+      "AuthChannel": {
+        "description": "认证渠道闭集(`public` 前台 / `admin` 后台)。同 `AuthEventType` 头注:存储值不变,只加读侧\n强类型;无 `#[serde(other)]` 兜底,原因同上(唯一写者是本仓 emit)。",
+        "enum": [
+          "public",
+          "admin"
+        ],
+        "type": "string"
+      },
+      "AuthEventRow": {
+        "description": "读模型行(admin 端点返回 / SSE 帧 data)。",
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "browser": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "channel": {
+            "$ref": "#/components/schemas/AuthChannel"
+          },
+          "city": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_type": {
+            "$ref": "#/components/schemas/AuthEventType"
+          },
+          "failure_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FailureReason"
+              }
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "identifier_attempted": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "os": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/AuthOutcome"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "event_type",
+          "occurred_at",
+          "channel",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "AuthEventType": {
+        "description": "认证审计事件类型闭集。存储值不变(仍是 `emit` 写的 `\"auth.xxx\"` 字符串,免数据迁移),\n这里只是给它上一层强类型:emit 侧编译期防手滑字面量,读侧 utoipa 生成前端可辨识联合类型。\n故意不设 `#[serde(other)]` 兜底 —— 该列只由本仓 `auth::emit` 写入(闭集只增不改),\n出现未知值本身就是数据异常,该让它在解码处炸出来而不是悄悄吞掉。",
+        "enum": [
+          "auth.login_succeeded",
+          "auth.login_failed",
+          "auth.admin_access_denied",
+          "auth.refreshed",
+          "auth.logged_out",
+          "auth.logout_all",
+          "auth.password_changed",
+          "auth.registered",
+          "auth.account_deleted"
+        ],
+        "type": "string"
+      },
+      "AuthKpi": {
+        "properties": {
+          "failed_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "failed_delta": {
+            "format": "double",
+            "type": "number"
+          },
+          "success_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "total_delta": {
+            "description": "(当前 - 上个等长窗口) / 上个等长窗口;上个窗口为 0 时记 0.0(无基数,不作 +∞/NaN)。",
+            "format": "double",
+            "type": "number"
+          },
+          "total_events": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unique_ips": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_events",
+          "failed_count",
+          "unique_ips",
+          "success_rate",
+          "total_delta",
+          "failed_delta"
+        ],
+        "type": "object"
+      },
+      "AuthOutcome": {
+        "description": "认证结果闭集(`success` / `failure`)。同上头注。",
+        "enum": [
+          "success",
+          "failure"
+        ],
+        "type": "string"
+      },
+      "AuthStats": {
+        "properties": {
+          "activity": {
+            "items": {
+              "$ref": "#/components/schemas/StatBucket"
+            },
+            "type": "array"
+          },
+          "kpi": {
+            "$ref": "#/components/schemas/AuthKpi"
+          },
+          "reasons": {
+            "items": {
+              "$ref": "#/components/schemas/ReasonCount"
+            },
+            "type": "array"
+          },
+          "top_ips": {
+            "items": {
+              "$ref": "#/components/schemas/IpStat"
+            },
+            "type": "array"
+          },
+          "types": {
+            "items": {
+              "$ref": "#/components/schemas/TypeCount"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "activity",
+          "reasons",
+          "types",
+          "top_ips",
+          "kpi"
+        ],
+        "type": "object"
+      },
+      "ChangePasswordRequest": {
+        "description": "修改密码。",
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "type": "object"
+      },
+      "ContentMetadataResponse": {
+        "description": "内容元数据的对外响应(投影 `content::ContentMetadata`)。",
+        "properties": {
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "checksum_algorithm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "file_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_size": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "自由表单 JSONB。"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content_id",
+          "tags",
+          "metadata",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ContentResponse": {
+        "description": "内容主体的对外响应(投影 `content::Content`;`status` 投影成闭集视图)。",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "derivation_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "owner_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/ContentStatusView",
+            "description": "生命周期状态(闭集,生成前端 union)。"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "owner_id",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ContentStatusView": {
+        "description": "内容生命周期状态闭集(镜像 `content::ContentStatus` 的 wire 串;库零 HTTP 不 derive\nToSchema,视图枚举归消费方 —— 见 closed-enums skill)。`From` 穷尽匹配:库加变体这里编译错。",
+        "enum": [
+          "created",
+          "uploading",
+          "uploaded",
+          "processing",
+          "processed",
+          "failed",
+          "archived"
+        ],
+        "type": "string"
+      },
+      "CreateContentRequest": {
+        "description": "建内容的入参(仅建 content 行,不碰对象/字节)。owner_id 来自认证主体(不入参)。",
+        "properties": {
+          "derivation_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenant_id": {
+            "description": "单租户脚手架:省略 → `Uuid::nil()`(多租户隔离是 app authz 的职责,见 routes.rs)。",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CreateUserRequest": {
+        "description": "建号(原子含角色)。username 1..=100、email 合法、password ≥3(领域校验)。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "type": "string"
+          },
+          "roles": {
+            "description": "角色 id(空 = 不授角色);未知 id → 422。",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password",
+          "roles"
+        ],
+        "type": "object"
+      },
+      "CreateWidget": {
+        "description": "创建 widget 的入参(name 1..=100 字符,由领域校验)。审计字段不入参。",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "DeleteMeRequest": {
+        "description": "注销账户(需密码确认)。",
+        "properties": {
+          "password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "type": "object"
+      },
+      "ErrorBody": {
+        "description": "统一错误响应体。pub + ToSchema:让这个契约出现在 OpenAPI,前端 codegen 能看到错误形状。",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "机器可读错误类别(闭集)"
+          },
+          "error": {
+            "description": "给人看的安全消息 —— 不含 SQL/解析器/路径等任何内部原始措辞",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "error"
+        ],
+        "type": "object"
+      },
+      "ErrorCode": {
+        "description": "错误机器码闭集(前端按它分支;闭集生成前端 union,见 closed-enums skill)。",
+        "enum": [
+          "not_found",
+          "validation",
+          "bad_request",
+          "unauthorized",
+          "conflict",
+          "forbidden",
+          "internal",
+          "timeout",
+          "rate_limited"
+        ],
+        "type": "string"
+      },
+      "FailureReason": {
+        "description": "失败原因闭集。同上头注;`account_locked`/`rate_limited` 目前 emit 侧未产出(预留取值,\n闭集只增不改 —— 出现才炸,不提前拒绝合法但暂未使用的取值)。",
+        "enum": [
+          "unknown_user",
+          "bad_password",
+          "no_admin_perm",
+          "account_locked",
+          "rate_limited"
+        ],
+        "type": "string"
+      },
+      "IpStat": {
+        "properties": {
+          "failures": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ip",
+          "failures",
+          "total"
+        ],
+        "type": "object"
+      },
+      "LoginRequest": {
+        "description": "登录请求(公开)。`identifier` = username 或 email,由 idm 自动识别。",
+        "properties": {
+          "identifier": {
+            "description": "上限 320 = email 的最大合法长度(64 local + @ + 255 domain);username 上限 32 更窄,取宽的那个。\n**必须有上限**:登录失败时本字段被原样写进审计事件(`identifier_attempted`),经 outbox →\nNATS → 投影落 `auth_events`,而这条路是**未认证**可达的。没上限时唯一的界是 axum 的 2MB\nbody 上限(限流还是 opt-in),等于放任匿名者每次瞎登录就持久化 ~2MB 攻击者可控文本;\n这些行之后还会被后台 `q` 过滤 ILIKE 全表扫,成本反复付。",
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "identifier",
+          "password"
+        ],
+        "type": "object"
+      },
+      "MyPermissionsResponse": {
+        "description": "`GET /permissions/me` 响应。`roles` 来自 token claim;`permissions` 是**有效**集:\nrole 展开(含 implies)∩ scope 收窄,wire 串排序输出。",
+        "properties": {
+          "permissions": {
+            "description": "有效权限(闭集,wire 串序输出)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。",
+            "items": {
+              "$ref": "#/components/schemas/Perm"
+            },
+            "type": "array"
+          },
+          "roles": {
+            "description": "token claim 里的角色名(闭集,生成前端 union)。",
+            "items": {
+              "$ref": "#/components/schemas/RoleName"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "roles",
+          "permissions"
+        ],
+        "type": "object"
+      },
+      "ObjectResponse": {
+        "description": "存储对象的对外响应(投影 `content::Object`)。",
+        "properties": {
+          "content_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "file_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "object_key": {
+            "type": "string"
+          },
+          "object_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/ObjectStatusView",
+            "description": "对象状态(闭集,生成前端 union)。"
+          },
+          "storage_backend_name": {
+            "type": "string"
+          },
+          "storage_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "content_id",
+          "storage_backend_name",
+          "object_key",
+          "version",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ObjectStatusView": {
+        "description": "对象状态闭集(镜像 `content::ObjectStatus`;无 `Archived`,归档是内容级语义)。",
+        "enum": [
+          "created",
+          "uploading",
+          "uploaded",
+          "processing",
+          "processed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "PageInfo": {
+        "description": "分页元信息:offset 给 total/total_pages,cursor 给 next_cursor/has_more。\n内部标签 `mode` 区分(类型诚实:cursor 模式不可能混入 total);utoipa 生成带 mode 判别的 oneOf。",
+        "oneOf": [
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "offset"
+                ],
+                "type": "string"
+              },
+              "page": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "size": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "total": {
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "total_pages": {
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "page",
+              "size",
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "has_more": {
+                "type": "boolean"
+              },
+              "limit": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "cursor"
+                ],
+                "type": "string"
+              },
+              "next_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "limit",
+              "has_more",
+              "mode"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Page_AdminUserView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "后台用户视图:身份(idm.users)+ 角色(idm)+ 富化的资料(app.profiles;缺/分进程降级 → null)。",
+              "properties": {
+                "avatar_url": {
+                  "description": "富化:相对头像端点路径(悬空/分进程 → null)。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "display_name": {
+                  "description": "富化:app.profiles 的显示名(悬空/分进程 → null)。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "email_verified": {
+                  "type": "boolean"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "roles": {
+                  "description": "idm 角色名(全量;闭集,生成前端 union)。",
+                  "items": {
+                    "$ref": "#/components/schemas/RoleName"
+                  },
+                  "type": "array"
+                },
+                "username": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "username",
+                "email_verified",
+                "created_at",
+                "roles"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_AuthEventRow": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "读模型行(admin 端点返回 / SSE 帧 data)。",
+              "properties": {
+                "actor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "browser": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "channel": {
+                  "$ref": "#/components/schemas/AuthChannel"
+                },
+                "city": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "country": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "event_type": {
+                  "$ref": "#/components/schemas/AuthEventType"
+                },
+                "failure_reason": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/FailureReason"
+                    }
+                  ]
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "identifier_attempted": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "ip": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "occurred_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "os": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "$ref": "#/components/schemas/AuthOutcome"
+                },
+                "session_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "user_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "user_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "event_type",
+                "occurred_at",
+                "channel",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_RoleView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "角色目录项(admin 分配角色的候选集;`GET /roles` 返回)。\n`name`=机器码(唯一稳定,JWT/权限引用),`display_name`=展示名(UI,可改)。",
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "name": {
+                  "$ref": "#/components/schemas/RoleName",
+                  "description": "机器码(闭集,生成前端 union)。"
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "display_name"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_WidgetView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "`Widget` + 富化的 created_by 用户(脏值/已删/无 → `null`)。",
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "created_by": {
+                  "description": "原审计主体标识(actor id 字符串),保留以便排错/审计。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_by_user": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UserBrief",
+                      "description": "富化:created_by 解析到的用户。脏值('system'/非 UUID)、已软删用户 → `None`。"
+                    }
+                  ]
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "updated_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "created_at",
+                "updated_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Perm": {
+        "description": "权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。\nwire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。\n加权限 = 加一个变体 + `rename`,别处不动。",
+        "enum": [
+          "widgets:read",
+          "widgets:read:all",
+          "widgets:write",
+          "widgets:write:all",
+          "widgets:delete",
+          "contents:read",
+          "contents:read:all",
+          "contents:write",
+          "contents:write:all",
+          "contents:delete",
+          "users:admin",
+          "admin:login",
+          "profiles:read",
+          "profiles:write",
+          "profiles:write:all"
+        ],
+        "type": "string"
+      },
+      "PrepareUploadRequest": {
+        "description": "两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体;tenant 单租户默认 nil(同 create)。",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PrepareUploadResponse": {
+        "description": "两步上传①的响应:账 + 格 + 凭证。`upload_url = null` = 后端不支持直传,\n**回退一步上传**(multipart /contents/upload)—— 客户端按此判别。",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ContentResponse"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectResponse"
+          },
+          "upload_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content",
+          "object"
+        ],
+        "type": "object"
+      },
+      "ProfileResponse": {
+        "description": "出参 = 资料字段 + 富化的 `avatar_url`(相对头像端点路径;悬空/未就绪/探测故障 → null)。\n时间戳:`/profiles/me` 在资料未建时回空资料,此时为 null;其余端点恒有值。",
+        "properties": {
+          "avatar_content_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "avatar_url": {
+            "description": "相对路径 `/api/v1/frontend/profiles/{user_id}/avatar`(单域名哲学,无 base-url 变量;\n头像专用端点,只出本人的头像图 —— content 本体经 `contents/{id}/preview` 严格按 owner 隔离)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "description": "资料未建(仅 `/profiles/me` 的空资料)→ null。",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "description": "资料未建(仅 `/profiles/me` 的空资料)→ null。",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "PutProfileRequest": {
+        "description": "PUT 入参 —— **全量替换**:字段 null/缺省 = 清空(PUT 语义;不是 PATCH 的\"跳过不改\")。\ndisplay_name / phone 最长 255;phone 只做长度不做 E.164。",
+        "properties": {
+          "avatar_content_id": {
+            "description": "绑定头像:必须指向**已 confirm** 的本人栅格图 content(png/jpeg/gif/webp)。",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ReasonCount": {
+        "description": "`reasons` group-by 计数的强类型版本(镜像 `TypeCount`)。",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "key": {
+            "$ref": "#/components/schemas/FailureReason"
+          }
+        },
+        "required": [
+          "key",
+          "count"
+        ],
+        "type": "object"
+      },
+      "RegisterRequest": {
+        "description": "注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "type": "object"
+      },
+      "ResetPasswordRequest": {
+        "description": "管理员重置密码(无需旧密码)。",
+        "properties": {
+          "new_password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_password"
+        ],
+        "type": "object"
+      },
+      "RoleName": {
+        "description": "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。",
+        "enum": [
+          "superadmin",
+          "admin",
+          "user"
+        ],
+        "type": "string"
+      },
+      "RoleView": {
+        "description": "角色目录项(admin 分配角色的候选集;`GET /roles` 返回)。\n`name`=机器码(唯一稳定,JWT/权限引用),`display_name`=展示名(UI,可改)。",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "$ref": "#/components/schemas/RoleName",
+            "description": "机器码(闭集,生成前端 union)。"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "SetContentMetadataRequest": {
+        "description": "设置内容元数据(全量替换,upsert)。\n\n**无 `mime_type` 字段 —— 它是服务端所有物**(上传时由字节的实际 Content-Type 定,见\n`into_input`)。理由是安全而非洁癖:presign 出的 URL 只 override disposition,浏览器拿到的\nContent-Type 恒是**对象上传时存进 S3 的那个**;而 inline 安全闸(`is_safe_inline_mime`)与头像\n栅格白名单读的都是**这张表**的 mime。两者若能分叉,攻击者就能 `text/html` 上传、改 mime 成\n`image/png` 骗过闸门,再经 presign 拿回 `Content-Type: text/html` + inline = 存储型 XSS。\n让 mime 不可改,分叉就不存在。",
+        "properties": {
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "checksum_algorithm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_size": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "自由表单 JSONB(省略 → `{}`)。"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tags"
+        ],
+        "type": "object"
+      },
+      "SetRolesRequest": {
+        "description": "全量设角色(原子替换)。传角色 id;未知 id → 422。",
+        "properties": {
+          "roles": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "roles"
+        ],
+        "type": "object"
+      },
+      "SortOrder": {
+        "description": "排序方向(线格式)。默认 `Desc`(最新/最大在前)。",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "type": "string"
+      },
+      "StatBucket": {
+        "description": "仪表盘统计(admin `/auth-events/stats`)。时间序列 + 各维度 group-by 计数。",
+        "properties": {
+          "failure": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "success": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "t": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "t",
+          "success",
+          "failure"
+        ],
+        "type": "object"
+      },
+      "TypeCount": {
+        "description": "`types` group-by 计数的强类型版本。",
+        "properties": {
+          "count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "key": {
+            "$ref": "#/components/schemas/AuthEventType"
+          }
+        },
+        "required": [
+          "key",
+          "count"
+        ],
+        "type": "object"
+      },
+      "UpdateContentRequest": {
+        "description": "**全量更新**内容可编辑字段(PUT 语义:都替换;tenant/owner/status/derivation 不动)。",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateMeRequest": {
+        "description": "**全量更新**当前用户(PUT 语义)。username 必填;email 给值=设置、给 null 或缺省=清空。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username"
+        ],
+        "type": "object"
+      },
+      "UpdateUserRequest": {
+        "description": "改身份(PUT 全量)。`email=None` 即清空(替换 email 会重置 email_verified,idm 语义)。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username"
+        ],
+        "type": "object"
+      },
+      "UpdateWidget": {
+        "description": "更新 widget 的入参(当前只改名,全量替换)。",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "UploadResponse": {
+        "description": "一次性上传的对外响应(内容 + 其主对象)。投影 `content::UploadOutcome`。",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ContentResponse"
+          },
+          "object": {
+            "$ref": "#/components/schemas/ObjectResponse"
+          }
+        },
+        "required": [
+          "content",
+          "object"
+        ],
+        "type": "object"
+      },
+      "UserBrief": {
+        "description": "富化用的用户瘦快照(只含 widget 展示要的字段)。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username"
+        ],
+        "type": "object"
+      },
+      "UserResponse": {
+        "description": "当前用户(me / 登录注册响应)。token 不进此体(走 httponly cookie)。",
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email_verified": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "roles": {
+            "description": "角色名(闭集,生成前端 union)。",
+            "items": {
+              "$ref": "#/components/schemas/RoleName"
+            },
+            "type": "array"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "email_verified",
+          "roles"
+        ],
+        "type": "object"
+      },
+      "UserSortField": {
+        "description": "排序字段(白名单,防注入)。只排 primary-schema(idm.users)自己的列。",
+        "enum": [
+          "created_at",
+          "username",
+          "email",
+          "display_name"
+        ],
+        "type": "string"
+      },
+      "Widget": {
+        "description": "一个 widget(示例资源)+ 基础审计字段。时间是 RFC3339。",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "WidgetEvent": {
+        "description": "widget 变更事件(SSE 帧 data / 总线负载)。帧的 event name = `type` 标签(created/updated/deleted)。",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "created"
+                ],
+                "type": "string"
+              },
+              "widget": {
+                "$ref": "#/components/schemas/Widget"
+              }
+            },
+            "required": [
+              "widget",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "updated"
+                ],
+                "type": "string"
+              },
+              "widget": {
+                "$ref": "#/components/schemas/Widget"
+              }
+            },
+            "required": [
+              "widget",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "created_by": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "deleted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WidgetSortField": {
+        "description": "列表排序字段(白名单)。默认 `created_at`。",
+        "enum": [
+          "created_at",
+          "name"
+        ],
+        "type": "string"
+      },
+      "WidgetStats": {
+        "description": "计数响应(公开 stats / 我的计数 共用)。",
+        "properties": {
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "type": "object"
+      },
+      "WidgetView": {
+        "description": "`Widget` + 富化的 created_by 用户(脏值/已删/无 → `null`)。",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "description": "原审计主体标识(actor id 字符串),保留以便排错/审计。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by_user": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UserBrief",
+                "description": "富化:created_by 解析到的用户。脏值('system'/非 UUID)、已软删用户 → `None`。"
+              }
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "oauth2": {
+        "description": "JWT 认证。Token 由 POST /api/v1/public/auth/login(JSON identifier+password)签发,经 httponly `access_token` cookie 优先、`Authorization: Bearer <token>` 兜底两种方式发送。scopes 为 baserust 权限(由 role 授予;降权令牌有效 scope = role 权限 ∩ per-token scope)。注:本服务无独立 OAuth2 授权服务器,此 password flow 仅为对上述登录的文档映射,交互式 Authorize 不保证可直接调通。",
+        "flows": {
+          "password": {
+            "refreshUrl": "/api/v1/public/auth/refresh",
+            "scopes": {
+              "admin:login": "login admin",
+              "contents:delete": "delete contents",
+              "contents:read": "read contents",
+              "contents:read:all": "read contents (all)",
+              "contents:write": "write contents",
+              "contents:write:all": "write contents (all)",
+              "profiles:read": "read profiles",
+              "profiles:write": "write profiles",
+              "profiles:write:all": "write profiles (all)",
+              "users:admin": "admin users",
+              "widgets:delete": "delete widgets",
+              "widgets:read": "read widgets",
+              "widgets:read:all": "read widgets (all)",
+              "widgets:write": "write widgets",
+              "widgets:write:all": "write widgets (all)"
+            },
+            "tokenUrl": "/api/v1/public/auth/login"
+          }
+        },
+        "type": "oauth2"
+      }
+    }
+  },
+  "info": {
+    "description": "Rust 脚手架",
+    "license": {
+      "name": ""
+    },
+    "title": "baserust API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/admin/auth/auth-events": {
+      "get": {
+        "operationId": "list_auth_events",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "事件类型(闭集;未知值在 Query 提取器被拒 → 400 bad_request,而非静默空结果)。",
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuthEventType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuthOutcome"
+            }
+          },
+          {
+            "description": "联合模糊搜:`actor`(展示用户名/标识)+ `identifier_attempted`(失败场景提交的用户名/邮箱)\n+ `ip`(文本),大小写不敏感子串。**下推到库**(全历史检索),取代前端内存过滤。空 = 不搜。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。强类型 `IpAddr`:\n非法值在 Query 提取器被拒 → 400(而非把裸串 cast 成 `::inet` 让 PG 抛 500;亦对齐内存侧规范化比较)。\nOpenAPI 里仍呈现为 string(utoipa 无 `IpAddr` schema)。",
+            "in": "query",
+            "name": "ip",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuthEventRow"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "审计后端未接线(无 search 投影库)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "page 与 cursor 互斥"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "全局认证审计流(后台安全排障用)。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/auth-events/stats": {
+      "get": {
+        "operationId": "stats_auth_events",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStats"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "审计后端未接线(无 search 投影库)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "认证审计仪表盘(时间序列 + 各维度 group-by 计数 + KPI)。默认区间最近 24h。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/auth-events/stream": {
+      "get": {
+        "operationId": "stream_auth_events",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthEventRow"
+                }
+              }
+            },
+            "description": "SSE 事件流;event = auth_event,data = AuthEventRow JSON"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "审计后端未接线(无 search 投影库)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "认证事件实时推送(SSE)。projector 落库成功后立即推送;镜像 `widget` 的 `widget_events` handler\n的鉴权/心跳范式。best-effort 无回放:断线期间的事件丢失,EventSource 自动重连拿新订阅。\nponytail:总线是单 idm 实例内广播,见 `AuthEventBus` 头注(多实例扇出需换 JetStream 直连)。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/login": {
+      "post": {
+        "operationId": "admin_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "后台登录成功,token 写入 httponly cookie"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "用户名/邮箱或密码错误(同码同文案,防枚举)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "凭据正确但无后台准入(admin:login),不发 token 不设 cookie"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/me": {
+      "get": {
+        "operationId": "admin_get_me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "组闸:无 admin:login(后台准入)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "admin:login"
+            ]
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/roles": {
+      "get": {
+        "operationId": "list_roles",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RoleView"
+                }
+              }
+            },
+            "description": "角色目录(单页,全量存活角色)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "角色目录(admin 分配角色的候选集)。全量存活角色,单页游标包络(has_more=false)。\n供前端 role-select 拉候选;`name`=机器码,`display_name`=展示名。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users": {
+      "get": {
+        "operationId": "list_users",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "用户名模糊(ILIKE 子串)。",
+            "in": "query",
+            "name": "username",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "用户名 + 显示名模糊搜索(仅投影/search 后端支持;无后端 → 422)。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "正选:含任一角色(重复 key,如 `?role=admin&role=user`)。",
+            "explode": true,
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/RoleName"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
+            "description": "反选:不含任一角色。",
+            "explode": true,
+            "in": "query",
+            "name": "role_not",
+            "required": false,
+            "schema": {
+              "items": {
+                "$ref": "#/components/schemas/RoleName"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
+            "in": "query",
+            "name": "created_from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/UserSortField"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortOrder"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AdminUserView"
+                }
+              }
+            },
+            "description": "用户分页列表(display_name/avatar 富化,缺则 null)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限(仅 superadmin)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "cursor 分页 + 非默认 sort_by;或 q/sort_by=display_name 但无 search 投影后端"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。\ncursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。\n`q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;\n未接后端时二者 → 422(回退路只能 idm 直查,不具备搜索能力)。",
+        "tags": [
+          "users"
+        ]
+      },
+      "post": {
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUserView"
+                }
+              }
+            },
+            "description": "已创建(新号 display_name=null)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "username/email 已占用"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败 / 未知角色名"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "建号(原子含角色)。`by` = 当前 superadmin。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}": {
+      "delete": {
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已软删"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 已软删"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不能删除自己的账号"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "软删(注销)。幂等(已删/不存在 → 404)+ best-effort 撤会话。",
+        "tags": [
+          "users"
+        ]
+      },
+      "get": {
+        "operationId": "get_user",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUserView"
+                }
+              }
+            },
+            "description": "找到"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 已软删"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "详情。不存在/软删 → 404(superadmin 看全部,不 404-隐藏 ownership)。",
+        "tags": [
+          "users"
+        ]
+      },
+      "put": {
+        "operationId": "update_user",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUserView"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "username/email 已占用"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "改身份(PUT 全量)。`email=None` 即清空(替换 email 重置 email_verified)。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}/auth-events": {
+      "get": {
+        "operationId": "list_user_auth_events",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "事件类型(闭集;未知值在 Query 提取器被拒 → 400 bad_request,而非静默空结果)。",
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuthEventType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuthOutcome"
+            }
+          },
+          {
+            "description": "联合模糊搜:`actor`(展示用户名/标识)+ `identifier_attempted`(失败场景提交的用户名/邮箱)\n+ `ip`(文本),大小写不敏感子串。**下推到库**(全历史检索),取代前端内存过滤。空 = 不搜。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。强类型 `IpAddr`:\n非法值在 Query 提取器被拒 → 400(而非把裸串 cast 成 `::inet` 让 PG 抛 500;亦对齐内存侧规范化比较)。\nOpenAPI 里仍呈现为 string(utoipa 无 `IpAddr` schema)。",
+            "in": "query",
+            "name": "ip",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuthEventRow"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "审计后端未接线(无 search 投影库)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "page 与 cursor 互斥"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "某用户的认证事件历史(后台用户详情页 / 排障用)。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}/avatar": {
+      "post": {
+        "operationId": "set_user_avatar",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "description": "传头像的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。",
+                "properties": {
+                  "file": {
+                    "description": "图片本体(必填,带 filename + content-type,须 image/*)。",
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "头像已更新并绑定"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "multipart 解析失败"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "缺 file 部分 / 非 image"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "后台传某用户头像(multipart 表单,`file` 部分为图片)。上传即绑定(auto-bind):\ncontent owner = 目标用户,保留现有 display_name/phone,返回更新后的资料。归 `users:admin`。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}/password": {
+      "post": {
+        "operationId": "reset_user_password",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "已重置密码,撤销既有会话"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "用户不存在"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "管理员重置密码(无需旧密码)+ best-effort 撤会话(强制重新登录)。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}/profile": {
+      "get": {
+        "operationId": "get_user_profile",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "用户资料"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "资料未建"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "后台读某用户资料(display_name/phone/avatar)。归 `users:admin`。资料未建 → 404。",
+        "tags": [
+          "users"
+        ]
+      },
+      "put": {
+        "operationId": "set_user_profile",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败 / 头像非法"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "后台改某用户资料(PUT 全量:display_name/phone/avatar_content_id)。归 `users:admin`。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/users/{id}/roles": {
+      "put": {
+        "operationId": "set_user_roles",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetRolesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUserView"
+                }
+              }
+            },
+            "description": "已设角色"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "用户不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不能移除自己的 admin 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未知角色名"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "全量设角色(原子替换)。未知角色名 → 422。",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/admin/widgets": {
+      "get": {
+        "operationId": "admin_list_widgets",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/WidgetSortField"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortOrder"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_WidgetView"
+                }
+              }
+            },
+            "description": "全部 widget(跨所有人,富化)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限(仅 superadmin)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "**superadmin-only**:跨所有人列出全部 widget。gate 在 `users:admin`(seed 里只 superadmin 持有)。\n演示\"role 限制 = gate 一个该 role 专属的 perm\";注意 admin 虽有 `read:all`,无 `users:admin` 仍 403。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/auth/logout-all": {
+      "post": {
+        "operationId": "logout_all",
+        "responses": {
+          "204": {
+            "description": "已撤销所有会话"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/frontend/auth/me": {
+      "delete": {
+        "operationId": "delete_me",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteMeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "已注销"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "密码错"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      },
+      "get": {
+        "operationId": "get_me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      },
+      "put": {
+        "operationId": "update_me",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "新用户名/邮箱已占用"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/v1/frontend/auth/me/password": {
+      "post": {
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "已改密,撤销所有会话(需重新登录)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "旧密码错"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents": {
+      "get": {
+        "operationId": "list_contents",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ContentResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "当前用户的内容列表"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "列当前用户的内容(单租户:tenant=nil)。需 `contents:read`。\n所有权固有:service 按 (owner_id, tenant_id) 列,只回自己创建的。\nponytail: `contents:read:all` 在此**不生效**(content 库 list 签名强制 owner,无\"列全部\"入口);\n单条端点已按 mode 放行。要让越权读贯通列表,需 content 库 list 的 owner 参数改 Option。",
+        "tags": [
+          "contents"
+        ]
+      },
+      "post": {
+        "operationId": "create_content",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateContentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentResponse"
+                }
+              }
+            },
+            "description": "已创建"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "建内容(仅 content 行,status=created)。需 `contents:write`。owner_id = 当前用户。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/upload": {
+      "post": {
+        "operationId": "upload_content",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "description": "一次性上传的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。",
+                "properties": {
+                  "document_type": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "file": {
+                    "description": "文件本体(必填,带 filename + content-type)。",
+                    "format": "binary",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tags": {
+                    "description": "逗号分隔。",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tenant_id": {
+                    "format": "uuid",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadResponse"
+                }
+              }
+            },
+            "description": "已上传(content + object 皆 uploaded)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "multipart 解析失败"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "缺 file 部分"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据、翻状态。需 `contents:write`。\n表单字段:`file`(必填,带 filename + content-type)、`name`、`tags`(逗号分隔)、`document_type`、`tenant_id`(可选)。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/upload-url": {
+      "post": {
+        "operationId": "prepare_upload",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrepareUploadResponse"
+                }
+              }
+            },
+            "description": "账已建(created);upload_url=null 时回退一步上传"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "两步上传①:建账 + 占格 + 签直传凭证(字节不过 app)。需 `contents:write`。\n`upload_url = null` → 后端不支持,回退 multipart 一步上传。传完调 confirm-upload 销账。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}": {
+      "delete": {
+        "operationId": "delete_content",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已软删除"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:delete 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:delete"
+            ]
+          }
+        ],
+        "summary": "软删内容。需 `contents:delete`。不存在 → 404。",
+        "tags": [
+          "contents"
+        ]
+      },
+      "get": {
+        "operationId": "get_content",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentResponse"
+                }
+              }
+            },
+            "description": "找到"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人(不区分,防泄露存在;contents:read:all 可看全部)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "按 id 取内容。需 `contents:read`。不存在 / 已软删 → 404。",
+        "tags": [
+          "contents"
+        ]
+      },
+      "put": {
+        "operationId": "update_content",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateContentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentResponse"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "全量更新内容可编辑字段(PUT)。需 `contents:write`。不存在 → 404。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}/confirm-upload": {
+      "post": {
+        "operationId": "confirm_upload",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentResponse"
+                }
+              }
+            },
+            "description": "已销账(uploaded)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "字节未落桶(先传再销账)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "两步上传③:核对字节已落桶 → 销账(翻 uploaded + 补 size)。需 `contents:write`。\n幂等(重试安全);没传就来 → 409;账不存在 → 404。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}/download": {
+      "get": {
+        "operationId": "download_content",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "字节流(Content-Type/Disposition 取自元数据)"
+          },
+          "307": {
+            "description": "跳转到短时效签名 URL(presign 后端)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:read:all / 无可下载对象(不区分,防泄露存在)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "内容未就绪(状态不允许下载)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "下载内容主对象字节。需 `contents:read`。Content-Type / Content-Disposition 取自元数据。\n内容不存在 → 404;状态不允许下载(未上传完)→ 409。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}/metadata": {
+      "get": {
+        "operationId": "get_content_metadata",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentMetadataResponse"
+                }
+              }
+            },
+            "description": "内容元数据"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:read:all / 无元数据(不区分,防泄露存在)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "取内容元数据。需 `contents:read`。不存在 → 404。",
+        "tags": [
+          "contents"
+        ]
+      },
+      "put": {
+        "operationId": "set_content_metadata",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetContentMetadataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "已设置"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:write 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:write"
+            ]
+          }
+        ],
+        "summary": "全量替换内容元数据(PUT,upsert)。需 `contents:write`。内容不存在 → 404。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}/objects": {
+      "get": {
+        "operationId": "list_content_objects",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ObjectResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "对象列表"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人(不区分,防泄露存在)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "列某内容的对象。需 `contents:read`。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/contents/{id}/preview": {
+      "get": {
+        "operationId": "preview_content",
+        "parameters": [
+          {
+            "description": "content id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "inline 字节(代理回退,Content-Type 取自元数据)"
+          },
+          "307": {
+            "description": "跳转到短时效签名 URL(presign 后端)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 contents:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人且无 contents:read:all(不区分,防泄露存在)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "内容未就绪"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "contents:read"
+            ]
+          }
+        ],
+        "summary": "预览内容(inline 展示,`<img src>` 即用)。需 `contents:read`。\npresign 可用(minio/S3)→ **307** 跳短时效签名 URL(字节直达存储,Range/大文件白送);\n不可用(内存 backend)→ 代理字节。稳定 URL 是本端点 —— 每次跳转都重新过鉴权,签名 URL 只活 5 分钟。",
+        "tags": [
+          "contents"
+        ]
+      }
+    },
+    "/api/v1/frontend/permissions/me": {
+      "get": {
+        "operationId": "get_my_permissions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyPermissionsResponse"
+                }
+              }
+            },
+            "description": "当前令牌的角色与有效权限(role ∩ scope,排序)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "当前令牌能干什么(仅登录零 perm —— 自我操作范式;问\"能干什么\"本身不需要先有权限)。\n逐 perm 走 [`Policy::require_scoped`] 过滤:与所有闸同一评估路径,零漂移;\n降权令牌得到 scope 收窄后的真实集。",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/v1/frontend/profiles/me": {
+      "get": {
+        "description": "**不 404**:未建资料 → 200 + 空资料(时间戳 null),前端照常渲染空表单、保存即 PUT 建行。\n与按 id 读(`get_profile`)刻意不同,理由见 `ProfileService::get_or_empty`。",
+        "operationId": "get_my_profile",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "自己的资料;尚未建则各段为 null(user_id 仍是本人,前端据此 PUT 建资料)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "读**请求者自己**的资料(仅登录,零 perm —— \"自己\"是身份事实不是授权决策,\n对齐 `get_me`/`my_widget_count` 的自我操作范式;`profiles:read` 留给\"读任意人\")。\n静态段 `/profiles/me` 与参数段 `/profiles/{user_id}` 共存,axum 静态优先。",
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/frontend/profiles/{user_id}": {
+      "get": {
+        "operationId": "get_profile",
+        "parameters": [
+          {
+            "description": "idm user id(1:1)",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "资料(avatar_url 为相对 preview 路径;悬空/未就绪 → null)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 profiles:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "该用户尚未建资料"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "profiles:read"
+            ]
+          }
+        ],
+        "summary": "读任意用户的资料(需 `profiles:read`;所有登录角色都有)。\n注意:响应含 phone 等 PII,\"任意登录可读\"是脚手架的刻意选择——收紧时给 GET 加 ownership 或拆敏感字段视图。",
+        "tags": [
+          "profiles"
+        ]
+      },
+      "put": {
+        "operationId": "put_profile",
+        "parameters": [
+          {
+            "description": "idm user id(1:1)",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "已替换"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "首次建立"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 profiles:write / 改别人无 write:all"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败(超长 / 头像不存在或非本人 / 未 confirm / 非 image)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "profiles:write"
+            ]
+          }
+        ],
+        "summary": "全量替换 upsert 自己的资料(`profiles:write`);带 `profiles:write:all` 可替任何人。\n未建 → 201,已有 → 200(PUT 即建即替,RFC 7231 本义;profile 无独立 POST)。",
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/frontend/profiles/{user_id}/avatar": {
+      "get": {
+        "operationId": "get_user_avatar",
+        "parameters": [
+          {
+            "description": "idm user id(1:1)",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "inline 图片字节(代理回退)"
+          },
+          "307": {
+            "description": "跳转到短时效签名 URL(presign 后端)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无资料 / 未绑定头像 / 头像不可用"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "用户头像展示端点(**跨用户可见**:任意登录用户都能看别人的头像 —— 头像是 profile 刻意暴露\n的单张公开图,与\"content 本体严格按 owner 隔离\"分开)。读该用户的 avatar_content_id → 出字节。\n无资料 / 未绑定头像 / 头像 content 已删或未就绪 → 404。\n**只服务被指定为头像的那个 content**(且 put 已校验 owner==本人、image/*),故不重开\n`contents/{id}/preview` 那种\"任意 image 越权读\"的面。仅需登录(头像非敏感展示数据,不额外要 contents:read)。",
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets": {
+      "get": {
+        "operationId": "list_widgets",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/WidgetSortField"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SortOrder"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_WidgetView"
+                }
+              }
+            },
+            "description": "widget 分页列表(按所有权过滤,created_by 富化为用户)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:read 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:read"
+            ]
+          }
+        ],
+        "summary": "分页列出 widget。**user 只列自己创建的**(read:all → 全部)。默认 offset;带 `cursor` 切 keyset。",
+        "tags": [
+          "widgets"
+        ]
+      },
+      "post": {
+        "operationId": "create_widget",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWidget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            },
+            "description": "已创建"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:write 权限"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "name 已存在(存活行内唯一)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:write"
+            ]
+          }
+        ],
+        "summary": "创建一个 widget(需 `widgets:write`)。审计主体(created_by)= 当前登录用户,来自 `AuditContext`。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/events": {
+      "get": {
+        "description": "**行级 ownership 与 list 同口径**:总线是广播(不分频道),过滤落在本 handler —— 逐帧\n`allows_created_by`,不过就跳帧(`continue`),**不**结束流。没这层,无 `read:all` 的 `user`\n能从流里读到 `list_widgets`/`get_widget` 都不给他看的**别人的 widget**(名字等全量 `Widget`)。\n`Access` 在开流时刻算定并随流存活 —— 同下面的鉴权时刻取舍。\n\n鉴权只在开流时刻评估:流存活期间 token 过期/吊销不会断流(SSE 惯例取舍;低敏数据可接受)。\n要收紧:按 claim 的 exp 到点结束流,EventSource 重连即重新鉴权。",
+        "operationId": "widget_events",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetEvent"
+                }
+              }
+            },
+            "description": "SSE 事件流;每帧 event = type(created/updated/deleted),data = WidgetEvent JSON"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:read 权限"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:read"
+            ]
+          }
+        ],
+        "summary": "订阅 widget 变更事件流(SSE)。需登录 + `widgets:read` —— 与列表同权:能看列表就能看变更。\nEventSource 不能自定义 header,凭据靠 httponly cookie(Bearer 兜底给 curl/测试)。\nbest-effort 无回放:断线期间的事件丢失,EventSource 自动重连拿新订阅。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/my-count": {
+      "get": {
+        "operationId": "my_widget_count",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "当前用户创建的 widget 数"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "**仅登录**(authenticated):当前用户创建的 widget 数。要 `CurrentUser`、**无特定 perm**\n(`OP_PERMS` 标 `None` → 文档 `security:[{\"oauth2\":[]}]`)。演示\"只需登录\"形态。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/overview": {
+      "get": {
+        "operationId": "widget_overview",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "全站 widget 计数(读权或管理员)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "widgets:read 与 users:admin 皆无"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "users:admin"
+            ]
+          }
+        ],
+        "summary": "**多权限 OR 样板**:概览 —— 普通读权**或**管理员任一即可。\n`require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/purge-preview": {
+      "get": {
+        "operationId": "purge_preview",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "本人可见域内可删 widget 计数"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "缺 widgets:read 或 widgets:delete 任一"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:read",
+              "widgets:delete"
+            ]
+          }
+        ],
+        "summary": "**多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看\"可删多少\"。\n`require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OP_PERMS` 的 `PermReq::All`)。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/{id}": {
+      "delete": {
+        "operationId": "delete_widget",
+        "parameters": [
+          {
+            "description": "widget id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已软删除"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:delete 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:delete"
+            ]
+          }
+        ],
+        "summary": "软删除 widget(盖 deleted_at,需 `widgets:delete`)。",
+        "tags": [
+          "widgets"
+        ]
+      },
+      "get": {
+        "operationId": "get_widget",
+        "parameters": [
+          {
+            "description": "widget id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            },
+            "description": "找到"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:read 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 非本人(不区分,防泄露存在)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:read"
+            ]
+          }
+        ],
+        "summary": "按 id 取一个存活 widget。**user 只能取自己创建的**:不是自己的 / 不存在 / 已软删 → 404。",
+        "tags": [
+          "widgets"
+        ]
+      },
+      "put": {
+        "operationId": "update_widget",
+        "parameters": [
+          {
+            "description": "widget id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWidget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 widgets:write 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "name 撞已有(存活行内唯一)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "widgets:write"
+            ]
+          }
+        ],
+        "summary": "更新 widget(改名,需 `widgets:write`);updated_by 来自 `AuditContext`,updated_at 由触发器自动盖。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/public/auth/login": {
+      "post": {
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "登录成功,token 写入 httponly cookie"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "用户名/邮箱或密码错误(同码同文案,防枚举)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/public/auth/logout": {
+      "post": {
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "已登出,清除 cookie(幂等)"
+          }
+        },
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/public/auth/refresh": {
+      "post": {
+        "operationId": "refresh",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "刷新成功,新 token 写入 cookie"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "refresh cookie 无效/过期/已撤销"
+          }
+        },
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/public/auth/register": {
+      "post": {
+        "operationId": "register",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "注册成功,token 写入 httponly cookie"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "用户名或邮箱已占用"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/public/widgets/stats": {
+      "get": {
+        "operationId": "widget_stats",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "全站 widget 计数(公开)"
+          }
+        },
+        "summary": "**public**:全站 widget 计数。无 `CurrentUser`/`require_scoped` → 任何人可调\n(不进 `OP_PERMS` → 文档不挂 security)。演示\"无需登录\"形态。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "兼容别名 = livez,保留早期 `/health` 引用不破。",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/livez": {
+      "get": {
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "存活探针:进程活着即 ok,**不查依赖**(给 k8s livenessProbe;失败会被重启)。",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "就绪"
+          },
+          "503": {
+            "description": "依赖未就绪"
+          }
+        },
+        "summary": "就绪探针(给 k8s readinessProbe):DB 模式 ping `SELECT 1`,不通 → 503;内存模式无外部依赖,恒就绪。\n失败只让流量绕开本实例(不重启),与 livez 分工不同。",
+        "tags": [
+          "health"
+        ]
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "健康检查",
+      "name": "health"
+    },
+    {
+      "description": "示例资源",
+      "name": "widgets"
+    },
+    {
+      "description": "内容/对象存储:CRUD / 上传下载 / 元数据",
+      "name": "contents"
+    },
+    {
+      "description": "用户资料:姓名/电话/头像(头像经 content 富化)",
+      "name": "profiles"
+    },
+    {
+      "description": "认证:注册/登录/刷新/登出",
+      "name": "auth"
+    },
+    {
+      "description": "当前用户:资料/改密/注销",
+      "name": "me"
+    },
+    {
+      "description": "后台:管理端登录/当前管理员",
+      "name": "admin"
+    },
+    {
+      "description": "后台用户管理:CRUD/角色/密码/资料/认证审计",
+      "name": "users"
+    }
+  ]
+}

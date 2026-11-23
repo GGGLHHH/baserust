@@ -40,11 +40,19 @@ pg-test-grant:
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance -- --nocapture
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance -- --nocapture
 
 # NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)+ JetStream 发布端冒烟
 test-nats:
     NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features nats-conformance --test event_bus_conformance --test jetstream_smoke -- --nocapture
+
+# 黑盒 HTTP 验收(tests/http_*.rs):真实端口 + reqwest,测试体不认识 web 框架。也包含在 `just test` 里;单独跑用这个。
+test-http:
+    cargo test --test 'http_*'
+
+# OpenAPI 快照:接口有意变更后接受新快照(装了 cargo-insta 也可用 `cargo insta review` 逐处审)
+openapi-snapshot-accept:
+    INSTA_UPDATE=always cargo test --test openapi_snapshot
 
 # 全量:内存层(单测/api/内存 conformance) + app schema 的 PG conformance + NATS 契约
 # (idm 仓储 conformance 随 idm 抽成独立 rust-idm crate 后已迁出本仓)
