@@ -3,7 +3,7 @@
 //!
 //! 内存入口:默认 `cargo test` 就跑。
 //! PG 入口:`cargo test --features pg-conformance --test ops_store_conformance`,连 ops role
-//! (`OPS_DATABASE_URL`,默认 `postgres://ops:pwd@localhost:5821/baserust`;先 `just ops-db-init` + `just migrate-ops`)。
+//! (`OPS_DATABASE_URL`,默认 `postgres://ops:pwd@localhost:5821/baserust`;先 `just db-ensure-roles` + `just migrate-ops`)。
 //! 每次运行用随机的实例名和 1990 年代的随机时间窗,与真实数据、别的运行互不干扰;结束时删掉本次造的行。
 
 use baserust::infra::monitor::hist::Hist;
@@ -235,7 +235,7 @@ mod pg {
         });
         let pool = sqlx::PgPool::connect(&url)
             .await
-            .expect("连 ops 库(先 just ops-db-init + just migrate-ops)");
+            .expect("连 ops 库(先 just db-ensure-roles + just migrate-ops)");
         let f = fixture();
         contract(&PgOpsStore::new(pool.clone()), &f).await;
         // 兜底清理(正常已被 purge 删掉;小时表 / 明细表的 1990 年数据也一并清)

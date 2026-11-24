@@ -1,5 +1,6 @@
-# 生产 compose:**纯镜像消费**(无 build、无源码上服务器)。镜像由 scripts/prod/build-and-export.sh
-# 在本机构建 + docker save 打包,服务器 import-images.sh 做 docker load 后本文件 up -d。
+# 生产 compose:**纯镜像消费**(无 build、无源码上服务器)。镜像和部署包由 baserust-stack 的
+# scripts/prod/build.sh 在本机构建打包,服务器上执行部署包(deploy.sh)载入镜像后,本文件叠加 stack 的
+# compose.web.yml(前端)up -d。
 #
 # 拓扑:nginx 反代 → app(Mount::App,只公钥) + idm(Mount::Idm,私钥+公钥)分进程 + pg + minio + nats。
 # SSL 由外层(LB / 面板 / certbot)终止,nginx 只服 HTTP:80;prod cookie 带 Secure,故外层必须 HTTPS。

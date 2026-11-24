@@ -1,9 +1,31 @@
 # (不写 syntax 指令:那会强制去 Docker Hub 拉 dockerfile frontend,离线/受限网络下 build 直接挂;
 #  本文件没用 cache-mount/heredoc 等扩展特性,buildkit 内置 frontend 足够。)
 
+# ---- git 依赖的本地源码(可选)----
+# 默认是空 stage:cargo 按 Cargo.toml 去 GitHub 拉 idm / content。
+# baserust-stack 的 scripts/prod/build.sh 用 --build-context idm-src=<目录> / content-src=<目录> 换成
+# 本地子模块的源码(提交号与 Cargo.lock 一致,它会先核对),构建时就不用连 GitHub。
+FROM scratch AS idm-src
+FROM scratch AS content-src
+
 # ---- builder:编译 release 二进制 ----
 FROM rust:1.94-bookworm AS builder
 WORKDIR /app
+# 可选:crates.io 镜像(BUILD_MIRROR=cn 时由 baserust-stack 的 scripts/prod/build.sh 传入;不传 = 官方源)。
+ARG CARGO_MIRROR=
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' "$CARGO_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi
+
+# 给了本地源码就用 [patch] 把 git 依赖指过去(没给 = 目录为空,不写 patch)。
+COPY --from=idm-src / /deps/idm/
+COPY --from=content-src / /deps/content/
+RUN if [ -f /deps/idm/Cargo.toml ]; then \
+      printf '\n[patch."https://github.com/GGGLHHH/rust-idm"]\nidm = { path = "/deps/idm" }\n' >> "$CARGO_HOME/config.toml"; \
+    fi \
+ && if [ -f /deps/content/Cargo.toml ]; then \
+      printf '\n[patch."https://github.com/GGGLHHH/rust-content"]\ncontent = { path = "/deps/content" }\n' >> "$CARGO_HOME/config.toml"; \
+    fi
 
 # 先用 manifest + 占位源码缓存依赖层:Cargo.toml/lock 不变时,改源码不重编依赖。
 # 工作区两个 crate(主 crate + crates/core 核心)的 manifest 都要先到位,占位 main / lib 各一个。
@@ -28,6 +50,11 @@ RUN touch src/main.rs crates/core/src/lib.rs && cargo build --release
 
 # ---- sqlx:仅用来产出 sqlx-cli 二进制(构建期 stage,不进任何运行镜像)----
 FROM rust:1.94-bookworm AS sqlx
+# 可选:crates.io 镜像(BUILD_MIRROR=cn 时由 baserust-stack 的 scripts/prod/build.sh 传入;不传 = 官方源)。
+ARG CARGO_MIRROR=
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' "$CARGO_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi
 RUN cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres
 
 # ---- migrate:精简迁移镜像 = slim + sqlx 二进制 + migrations(跑完即退出)----
@@ -35,6 +62,9 @@ RUN cargo install sqlx-cli --version ^0.8 --no-default-features --features rustl
 # ca-certificates:prod 连托管 PG 走 TLS 时要(本地 sslmode=disable 用不上,但留着不亏)。
 # 放在 runtime 之前,使 runtime 仍是 Dockerfile 的默认(最后)stage。
 FROM debian:bookworm-slim AS migrate
+# 可选:Debian 镜像(如 http://mirrors.aliyun.com;不传 = 官方源)。
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then sed -i "s|http://deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -48,6 +78,9 @@ ENTRYPOINT ["sh", "./migrate-all.sh"]
 
 # ---- runtime:精简镜像,只放二进制 ----
 FROM debian:bookworm-slim AS runtime
+# 可选:Debian 镜像(如 http://mirrors.aliyun.com;不传 = 官方源)。
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then sed -i "s|http://deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \

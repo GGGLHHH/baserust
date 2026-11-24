@@ -124,9 +124,10 @@ migrate-ops-revert:
 migrate-ops-info:
     sqlx migrate info --source migrations/ops --database-url "{{ops_db_url}}"
 
-# 老 pg 卷补建 ops role + schema(initdb 只在空卷首次启动时跑)。幂等;之后再 just migrate-ops。
-ops-db-init:
-    docker compose exec -T -e OPS_DB_USER="{{env_var_or_default('OPS_DB_USER', 'ops')}}" -e OPS_DB_PASSWORD="{{env_var_or_default('OPS_DB_PASSWORD', 'pwd')}}" pg sh < scripts/ensure-ops-schema.sh
+# initdb 只在空卷首次启动时跑,后加的 schema 靠这个补;可重复执行,之后再 just migrate。
+# 给已有的 pg 卷补齐各 schema 的 role + schema
+db-ensure-roles:
+    docker compose exec -T pg bash -s < scripts/initdb/00-roles-schemas.sh
 
 # 新建某 schema 的可回滚迁移(内部参数化,创建用):just migrate-add app create_widgets
 migrate-add schema name:

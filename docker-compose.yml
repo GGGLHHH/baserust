@@ -213,7 +213,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       # 首次初始化时建 app/idm/content/search/ops 的 role + schema(role 的 search_path 指向自己 schema)。
-      # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建,或手建 role(ops 见 `just ops-db-init`)。
+      # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建,或 `just db-ensure-roles` 补齐。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]

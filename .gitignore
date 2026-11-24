@@ -12,7 +12,7 @@
 !/keys/dev-ed25519.pub.pem
 !/keys/README.md
 
-# 生产部署包(build-and-export.sh 产出):镜像 tar + 明文密码 .env + 私钥,绝不入库。
+# 生产部署包产出目录(历史:曾由 build-and-export.sh 生成,现在部署包在 baserust-stack 打):绝不入库。
 /prod/
 
 # prod/staging seed 账号文件(含真密码,绝不入库):任意 seed.<env>.toml 自动挡,
