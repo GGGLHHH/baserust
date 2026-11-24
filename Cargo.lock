@@ -1006,8 +1006,8 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "content"
-version = "0.3.0"
-source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.3.0#b8c4f282e6dd7f8c0686075fc047bb15a15ffa58"
+version = "0.3.1"
+source = "git+https://github.com/GGGLHHH/rust-content?tag=v0.3.1#53d3cabc77da41ebfae98d9a85c0f57f88238f13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1019,6 +1019,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2080,7 +2081,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2176,8 +2177,8 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.5.0"
-source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.5.0#2f3854fb73bed5031cc9f81df9c9d110a9f5e307"
+version = "0.5.1"
+source = "git+https://github.com/GGGLHHH/rust-idm?tag=v0.5.1#f23a4233c43d2f0ecc2ec73f22c500963c0a0a23"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2194,6 +2195,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
