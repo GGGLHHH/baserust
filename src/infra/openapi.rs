@@ -269,8 +269,9 @@ mod tests {
             "livez",
             "health",
             "readyz",
-            "widget_stats", // 公开计数:无 CurrentUser/require_scoped
-            "admin_login",  // 验密后 handler 自查 admin:login,非表驱动
+            "widget_stats",         // 公开计数:无 CurrentUser/require_scoped
+            "report_client_errors", // 前端错误上报:登录页也要能报,靠限流 + 截断设防
+            "admin_login",          // 验密后 handler 自查 admin:login,非表驱动
         ];
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
         for (_path, item) in v["paths"].as_object().expect("paths").iter() {

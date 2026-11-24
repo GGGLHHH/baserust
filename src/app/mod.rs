@@ -2,6 +2,7 @@
 //! 依赖方向与 infra 相反 —— 它 import 各业务模块的 repo/router,是唯一耦合所有模块之处。
 
 pub mod adapters;
+pub mod client_errors;
 pub mod mock;
 pub mod monitoring;
 pub mod policy_repo;

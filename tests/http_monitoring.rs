@@ -5,6 +5,7 @@
 //! covers: GET /api/v1/admin/monitoring
 //! covers: GET /api/v1/admin/monitoring/history
 //! covers: GET /api/v1/admin/monitoring/logs
+//! covers: POST /api/v1/public/client-errors
 
 mod http_support;
 
@@ -325,6 +326,62 @@ async fn logs_filter_and_paginate() {
     expect(
         sa.get(&format!("{LOGS}?size=500")).await,
         StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+}
+
+const CLIENT_ERRORS: &str = "/api/v1/public/client-errors";
+
+/// 前端错误上报:免登录可报,进日志库归「web」;页面地址去掉 query;条数越界 422,kind 不认识 400。
+#[tokio::test]
+async fn client_errors_land_in_logs_as_web() {
+    let store = Arc::new(MemoryOpsStore::new());
+    let s = server_with(store).await;
+    let body = serde_json::json!({
+        "errors": [{
+            "kind": "render",
+            "message": "Cannot read properties of undefined (reading 'name')",
+            "stack": "TypeError: ...\n    at UserRow (users.tsx:12:7)",
+            "page": "/admin/users?token=secret",
+            "release": "test-build"
+        }]
+    });
+    expect(
+        s.anon().post_json(CLIENT_ERRORS, &body).await,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let sa = s.login(SUPERADMIN, PASSWORD).await;
+    let v = expect_json(sa.get(&format!("{LOGS}?service=web")).await, StatusCode::OK).await;
+    assert_eq!(v["page_info"]["total"], 1);
+    let item = &v["items"][0];
+    assert_eq!(item["service"], "web");
+    assert_eq!(item["severity"], "ERROR");
+    assert_eq!(item["route"], "/admin/users", "query 去掉了");
+    assert_eq!(item["attributes"]["kind"], "render");
+    assert_eq!(item["attributes"]["release"], "test-build");
+    assert!(item["body"].as_str().unwrap().contains("reading 'name'"));
+    let v = expect_json(sa.get(&format!("{LOGS}?service=app")).await, StatusCode::OK).await;
+    assert_eq!(v["page_info"]["total"], 0, "前端错误不混进 app");
+
+    let one = serde_json::json!({"kind": "error", "message": "boom"});
+    for n in [0, 11] {
+        let batch = serde_json::json!({ "errors": vec![one.clone(); n] });
+        expect(
+            s.anon().post_json(CLIENT_ERRORS, &batch).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+    expect(
+        s.anon()
+            .post_json(
+                CLIENT_ERRORS,
+                &serde_json::json!({"errors": [{"kind": "nope", "message": "x"}]}),
+            )
+            .await,
+        StatusCode::BAD_REQUEST,
     )
     .await;
 }

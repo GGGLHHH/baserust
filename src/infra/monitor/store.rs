@@ -145,13 +145,15 @@ impl Severity {
     }
 }
 
-/// 日志归属的服务:app(业务)/ idm(认证)。分进程部署时就是进程身份;单进程开发时按
-/// [`classify_service`] 推断,口径与 nginx 的分流规则一致。
+/// 日志归属的服务:app(业务)/ idm(认证)/ web(前端,浏览器上报的错误)。app / idm 分进程部署时
+/// 就是进程身份;单进程开发时按 [`classify_service`] 推断,口径与 nginx 的分流规则一致。
+/// web 只来自前端上报接口(`app::client_errors`),不经推断。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
     App,
     Idm,
+    Web,
 }
 
 impl Service {
@@ -159,6 +161,7 @@ impl Service {
         match self {
             Service::App => "app",
             Service::Idm => "idm",
+            Service::Web => "web",
         }
     }
 
@@ -166,6 +169,7 @@ impl Service {
         match s {
             "app" => Some(Service::App),
             "idm" => Some(Service::Idm),
+            "web" => Some(Service::Web),
             _ => None,
         }
     }

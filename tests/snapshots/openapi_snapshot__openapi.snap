@@ -285,6 +285,75 @@ expression: spec
         ],
         "type": "object"
       },
+      "ClientErrorBatch": {
+        "description": "一批前端错误(1~10 条)。",
+        "properties": {
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ClientErrorReport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "errors"
+        ],
+        "type": "object"
+      },
+      "ClientErrorKind": {
+        "description": "错误来源。",
+        "enum": [
+          "error",
+          "unhandled_rejection",
+          "render"
+        ],
+        "type": "string"
+      },
+      "ClientErrorReport": {
+        "description": "一条前端错误。",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ClientErrorKind"
+          },
+          "message": {
+            "description": "错误消息。",
+            "type": "string"
+          },
+          "page": {
+            "description": "出错时的页面路径(`location.pathname`;带了 query / hash 也会被去掉)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release": {
+            "description": "前端版本(构建号)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "出错的脚本位置(`文件:行:列`)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stack": {
+            "description": "调用栈。",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "message"
+        ],
+        "type": "object"
+      },
       "ContentMetadataResponse": {
         "description": "内容元数据的对外响应(投影 `content::ContentMetadata`)。",
         "properties": {
@@ -2202,10 +2271,11 @@ expression: spec
         "type": "object"
       },
       "Service": {
-        "description": "日志归属的服务:app(业务)/ idm(认证)。分进程部署时就是进程身份;单进程开发时按\n[`classify_service`] 推断,口径与 nginx 的分流规则一致。",
+        "description": "日志归属的服务:app(业务)/ idm(认证)/ web(前端,浏览器上报的错误)。app / idm 分进程部署时\n就是进程身份;单进程开发时按 [`classify_service`] 推断,口径与 nginx 的分流规则一致。\nweb 只来自前端上报接口(`app::client_errors`),不经推断。",
         "enum": [
           "app",
-          "idm"
+          "idm",
+          "web"
         ],
         "type": "string"
       },
@@ -6987,6 +7057,53 @@ expression: spec
         },
         "tags": [
           "auth"
+        ]
+      }
+    },
+    "/api/v1/public/client-errors": {
+      "post": {
+        "operationId": "report_client_errors",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientErrorBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "已收下(超出限流的部分静默丢弃)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "JSON 格式不对(如 kind 不认识)"
+          },
+          "413": {
+            "description": "请求体超过 64 KB"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "条数不在 1~10 之间"
+          }
+        },
+        "summary": "前端错误上报(免登录)。进后台「系统监控 → 日志」,服务为「前端」。超出限流的部分静默丢弃,同样回 204。",
+        "tags": [
+          "monitoring"
         ]
       }
     },

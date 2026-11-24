@@ -62,7 +62,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let mut admin = OpenApiRouter::new();
     let mut admin_open = OpenApiRouter::new(); // admin 组闸外(admin_login)
     if needs_app {
-        public = public.merge(widget::public_router());
+        public = public
+            .merge(widget::public_router())
+            .merge(crate::app::client_errors::public_router());
         frontend = frontend
             .merge(widget::router())
             .merge(content::router())
@@ -228,6 +230,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                     "/public",
                     OpenApiRouter::new()
                         .merge(widget::public_router())
+                        .merge(crate::app::client_errors::public_router())
                         .merge(auth::public_router()),
                 )
                 .nest(

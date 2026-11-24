@@ -35,7 +35,7 @@ Go→Rust 后端**脚手架**:提供可复用的**范式**(不是业务逻辑)�
 - **统一不泄露错误契约**:所有出错(含 panic / timeout)→ `ErrorBody` JSON `{code,error}`,原始细节只进日志。
 - **config 零环境变量静默启动**:全字段有默认,不设任何 env 也能跑(内存模式)。
 - **认证**:httponly cookie + Bearer 兜底;app 进程只 decode JWT(roles 在 claim 里),不查 idm 库。
-- **监控**:后台「系统监控」页(`/api/v1/admin/monitoring` 实时 + `/history` + `/logs`,需 `users:admin`)。实时数据在进程内存(`src/infra/monitor/`,15s 一个快照、留 1 小时);每分钟落盘到 **`ops` schema**(`OPS_DB_HOST`;分钟级 15 天 / 小时级 13 个月 / 明细 30 天),WARN 及以上日志 + 5xx + 慢请求经采集层进 `ops.log_record`(15 天、入库前脱敏)。不配 ops 库 = 内存里最近 24 小时。分进程时 app 经 `IDM_INTERNAL_URL` 汇总 idm 实时数据(`app/monitoring.rs`)。埋点函数在 `src/infra/telemetry.rs`(同时写给外部抓取用的 `/metrics`);`/readyz` 逐项检查依赖(`app/probes.rs`)。不引入外部监控套件。
+- **监控**:后台「系统监控」页(`/api/v1/admin/monitoring` 实时 + `/history` + `/logs`,需 `users:admin`)。实时数据在进程内存(`src/infra/monitor/`,15s 一个快照、留 1 小时);每分钟落盘到 **`ops` schema**(`OPS_DB_HOST`;分钟级 15 天 / 小时级 13 个月 / 明细 30 天),WARN 及以上日志 + 5xx + 慢请求经采集层进 `ops.log_record`(15 天、入库前脱敏);前端错误经 `POST /api/v1/public/client-errors`(`app/client_errors.rs`,免登录、进程内限流)直接写同一张表,service = `web`。不配 ops 库 = 内存里最近 24 小时。分进程时 app 经 `IDM_INTERNAL_URL` 汇总 idm 实时数据(`app/monitoring.rs`)。埋点函数在 `src/infra/telemetry.rs`(同时写给外部抓取用的 `/metrics`);`/readyz` 逐项检查依赖(`app/probes.rs`)。不引入外部监控套件。
 
 ## API 约定
 
