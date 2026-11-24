@@ -145,7 +145,8 @@ services:
     # 对外只开 nginx:80。
 
   minio-init:
-    image: pgsty/mc
+    # pgsty/minio 镜像自带 mc,直接复用,少一个镜像(pgsty/mc 不在国内镜像站白名单里)。
+    image: pgsty/minio
     depends_on: [minio]
     env_file: [.env]
     entrypoint: >

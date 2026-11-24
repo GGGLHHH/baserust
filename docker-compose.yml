@@ -278,7 +278,8 @@ services:
   # 一次性:等 minio 起来 + 幂等建桶(minio 镜像无 curl,健康检查交给这个 mc one-shot)。
   # app 用 depends_on service_completed_successfully 等它跑完 → 桶一定先于 app 就绪。
   minio-init:
-    image: pgsty/mc
+    # pgsty/minio 镜像自带 mc,直接复用,少一个镜像(pgsty/mc 不在国内镜像站白名单里)。
+    image: pgsty/minio
     depends_on:
       - minio
     entrypoint: >
