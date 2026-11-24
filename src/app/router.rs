@@ -21,8 +21,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::Level;
+use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
@@ -70,7 +69,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
             .merge(profile::router())
             // permissions/me:app 侧回答"能干什么"(policy 权威;idm 的 /auth/me 只给身份事实)
             .merge(crate::infra::authz::router());
-        admin = admin.merge(widget::admin_router());
+        admin = admin
+            .merge(widget::admin_router())
+            .merge(crate::app::monitoring::admin_router());
     }
     if needs_idm {
         public = public.merge(auth::public_router());
@@ -104,6 +105,12 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let (router, mut api) = api_router.split_for_parts();
     // per-operation security 由单一来源表注入(必须 split 后做,modifier 跑时 paths 还空)。
     openapi::inject_operation_security(&mut api);
+    // 纯 idm 进程:给 app 汇总监控用的内部端点(不进 OpenAPI;nginx 不转发 /internal,外部到不了)。
+    let router = if matches!(mount, Mount::Idm) {
+        router.merge(crate::app::monitoring::internal_router())
+    } else {
+        router
+    };
 
     let router = router
         // 兜底:未知路径 / 方法不对也要出统一 `ErrorBody`。axum 默认给的是**裸状态码 + 空 body** ——
@@ -133,6 +140,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         .layer(middleware::from_fn(timeout_middleware))
         // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
         .layer(CatchPanicLayer::custom(handle_panic))
+        // 请求统计(后台监控页):包在 panic 兜底之外,panic 转成的 500 也记得到;
+        // 作为路由层中间件,读得到 MatchedPath(按路由模板聚合,不按带 id 的真实路径)。
+        .layer(middleware::from_fn(crate::infra::monitor::track_requests))
         // Trace 必须在 panic/timeout **之外**:span 在它们之内才进得去。
         // 放最内(旧接法)时,`handle_panic` 的 error! 是在 unwind 过 Trace 之后才打的、
         // `timeout_or_408` 的 warn! 同理 —— 两条日志都不带 method/path/request_id,
@@ -142,7 +152,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_http_span)
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_response(on_http_response),
         )
         // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
         .layer(axum::Extension(crate::infra::client_context::TrustedHops(
@@ -233,6 +243,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                     "/admin",
                     OpenApiRouter::new()
                         .merge(widget::admin_router())
+                        .merge(crate::app::monitoring::admin_router())
                         .merge(auth::admin_router())
                         .nest(
                             "/auth",
@@ -364,19 +375,52 @@ fn rate_limit_response(err: GovernorError) -> Response {
     }
 }
 
-/// 给每个请求建带 method/path/request_id 的 tracing span,日志即可按 request_id 关联。
+/// 探针 / 抓取路径:不建 span(编排健康检查每 10s、指标抓取每 15s,记下来只是噪音)。
+const QUIET_PATHS: [&str; 5] = [
+    "/health",
+    "/livez",
+    "/readyz",
+    "/metrics",
+    "/internal/monitoring",
+];
+
+/// 给每个请求建带 method/path/route/request_id 的 tracing span,日志即可按 request_id 关联。
 fn make_http_span(req: &Request) -> tracing::Span {
+    if QUIET_PATHS.contains(&req.uri().path()) {
+        return tracing::Span::none();
+    }
     let request_id = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
+    // 路由模板(如 /api/v1/frontend/widgets/{id}):按接口筛日志用,不必从带 id 的真实路径反推。
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_default();
     tracing::info_span!(
         "http",
         method = %req.method(),
         path = %req.uri().path(),
+        route = %route,
         request_id = %request_id,
+        status = tracing::field::Empty,
     )
+}
+
+/// 请求完成日志(探针路径没有 span,跳过)。字段同 tower-http 的 DefaultOnResponse。
+fn on_http_response(res: &Response, latency: std::time::Duration, span: &tracing::Span) {
+    if span.is_disabled() {
+        return;
+    }
+    span.record("status", res.status().as_u16());
+    tracing::info!(
+        status = res.status().as_u16(),
+        latency_ms = latency.as_millis() as u64,
+        "finished processing request"
+    );
 }
 
 #[cfg(test)]

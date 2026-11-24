@@ -76,6 +76,8 @@ pub trait EventPublisher: Send + Sync {
 /// 只标记发布成功的前缀。发布失败即停止本批(避免标记未发的、避免乱序),
 /// 未标记的记录留到下一轮重试 —— at-least-once,JetStream `Nats-Msg-Id` 去重兜底。
 pub struct OutboxRelay {
+    /// 指标 / 链路里的来源名(`idm` / `app`),见 [`OutboxRelay::named`]。
+    name: &'static str,
     source: Arc<dyn OutboxSource>,
     publisher: Arc<dyn EventPublisher>,
     poll_interval: Duration,
@@ -90,6 +92,7 @@ impl OutboxRelay {
         batch: i64,
     ) -> Self {
         Self {
+            name: "outbox",
             source,
             publisher,
             poll_interval,
@@ -97,9 +100,17 @@ impl OutboxRelay {
         }
     }
 
+    /// 来源名(指标标签 `source`、链路 span 字段)。
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+
     /// 一轮:poll → 逐条 publish(id 升序,首次失败即停)→ 标记已发布前缀。
     /// 拆成独立方法是为了脱离真实 sleep/shutdown 循环单测(见 tests)。
     async fn poll_once(&self) {
+        use crate::infra::telemetry;
+        use tracing::Instrument;
         let items = match self.source.poll_unpublished(self.batch).await {
             Ok(items) => items,
             Err(err) => {
@@ -107,7 +118,22 @@ impl OutboxRelay {
                 return;
             }
         };
+        let source = self.name;
+        telemetry::outbox_polled(source, items.len());
+        if items.is_empty() {
+            return; // 空轮询不建 span:每秒一轮,记下来全是噪音
+        }
+        let span = tracing::info_span!("outbox.publish", source, batch = items.len());
+        async move {
+            let published = self.publish_batch(items).await;
+            telemetry::outbox_published(source, published);
+        }
+        .instrument(span)
+        .await;
+    }
 
+    /// 逐条发布(id 升序,首次失败即停)→ 标记已发布前缀。返回成功发布的条数。
+    async fn publish_batch(&self, items: Vec<OutboxItem>) -> usize {
         let mut published_ids = Vec::with_capacity(items.len());
         for item in items {
             match self
@@ -117,6 +143,7 @@ impl OutboxRelay {
             {
                 Ok(()) => published_ids.push(item.id),
                 Err(err) => {
+                    crate::infra::telemetry::outbox_publish_failed(self.name);
                     tracing::warn!(
                         error = %err,
                         event_id = %item.event_id,
@@ -127,16 +154,19 @@ impl OutboxRelay {
             }
         }
 
+        let published = published_ids.len();
         if !published_ids.is_empty() {
             if let Err(err) = self.source.mark_published(&published_ids).await {
                 tracing::warn!(error = %err, "outbox mark_published 失败,下轮重试(可能重复发布)");
             }
         }
+        published
     }
 
     /// 后台循环:poll_once → 睡 `poll_interval` 或等 shutdown。`shutdown` 置 `true`
     /// 或发送端被丢弃(`changed()` 返回 `Err`)都视为退出信号。
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        crate::infra::telemetry::outbox_started(self.name);
         loop {
             if *shutdown.borrow() {
                 break;

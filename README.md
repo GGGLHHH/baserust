@@ -113,6 +113,15 @@ crates/core/              核心 crate baserust-core:kernel(error · pagination 
 - **认证**:httponly cookie + Bearer 兜底;JWT 用 Ed25519 非对称:idm 私钥签发、app 公钥验签(`keys/` dev 对仅开发,prod `just gen-keys`)
 - **分页**:offset(跳页+total)/ cursor(keyset on uuid v7)双模式
 
+## 监控
+
+后台「系统监控」页(前端 `/admin/monitoring`,需 `users:admin`),两个标签页:
+
+- **概览**:依赖健康、请求量 / 错误率 / 延迟(按接口)、数据库操作耗时、连接池、outbox / projector、SSE、进程内存与 CPU。趋势可切 1 小时(进程内实时,15 秒一点)/ 24 小时 / 7 天 / 30 天 / 90 天 / 1 年;点曲线上的点跳到那段时间的日志。
+- **日志**:WARN 及以上的日志 + 失败请求(5xx)+ 慢请求(≥1 秒),按时间段 / 级别 / 进程 / 关键字 / 请求 ID 筛选。敏感字段(密码、token、cookie…)入库前脱敏。
+
+历史与日志存在 `ops` schema(`OPS_DB_HOST`,compose 已配),分层保留:分钟级 15 天、小时级 13 个月、接口与数据库明细 30 天、日志 15 天,过期由进程内的任务每小时清理。不配 ops 库也能用:只留内存里最近 24 小时、重启清空。老的 pg 卷先 `just ops-db-init` 补建 role,再 `just migrate-ops`。接口:`GET /api/v1/admin/monitoring`(实时)、`/history`、`/logs`;分进程部署时 app 经 `IDM_INTERNAL_URL` 汇总 idm 的实时数据,历史和日志两个进程都写同一个 ops 库。外部抓取另有 `/metrics`(`METRICS_ENABLED=true`)。
+
 ## 测试
 
 ```bash

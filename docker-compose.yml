@@ -3,7 +3,7 @@
 #
 # 环境变量(都有默认值、可在同目录 .env 覆盖):
 #   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 baserust)
-#   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD · SEARCH_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
+#   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD · SEARCH_DB_USER/PASSWORD · OPS_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
 #   MINIO_USER / MINIO_PASSWORD · S3_BUCKET           minio 凭据(默认 minio/minio12345)与桶名(默认 content)
 #   NGINX_PORT(80) · APP_PORT(6453) · IDM_PORT(6454) · DBHUB_PORT(3777) · PG_PORT(5821)   主机端口
 #   MINIO_PORT(9862, S3 API) · MINIO_CONSOLE_PORT(9863, 控制台)         minio 主机端口
@@ -65,6 +65,12 @@ services:
       CONTENT_DB_DATABASE: ${POSTGRES_DB:-baserust}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
+      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 1 小时。
+      OPS_DB_HOST: pg
+      OPS_DB_PORT: "5432"
+      OPS_DB_DATABASE: ${POSTGRES_DB:-baserust}
+      OPS_DB_USER: ${OPS_DB_USER:-ops}
+      OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
       # 事件总线选择链最高优先:设了 NATS_URL → widget 事件走 NATS(去掉则回退 PG LISTEN/NOTIFY → 内存)。
       NATS_URL: nats://nats:4222
       # 对象存储:设了 S3_ENDPOINT → content 字节走 minio/S3(去掉则走内存 backend)。
@@ -82,6 +88,8 @@ services:
       # nginx 按 /api/v1/{public,frontend,admin}/auth 分流。
       # 经 Config 解析,只认小写 true/false。
       IDM_EMBEDDED: "false"
+      # 后台「系统监控」页由 app 汇总:经内网拉 idm 的 /internal/monitoring(nginx 不转发 /internal)。
+      IDM_INTERNAL_URL: http://idm:8080
       # app 的鉴权中间件只 decode JWT:非对称 Ed25519,只需公钥。默认用内嵌 dev 公钥;
       # 生产挂 JWT_PUBLIC_KEY_FILE 指向卷内公钥(app 进程不持私钥,被攻破也铸不出 token)。
       # JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
@@ -135,6 +143,12 @@ services:
       SEARCH_DB_DATABASE: ${POSTGRES_DB:-baserust}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
+      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 1 小时。
+      OPS_DB_HOST: pg
+      OPS_DB_PORT: "5432"
+      OPS_DB_DATABASE: ${POSTGRES_DB:-baserust}
+      OPS_DB_USER: ${OPS_DB_USER:-ops}
+      OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
       # idm 进程连 NATS:①outbox relay 把 idm.outbox 事件发到 JetStream ②projector 消费 stream 落投影。
       # 缺它 → idm 事件不外发 + projector 不起(投影只靠 rebuild bin 填)。
       NATS_URL: nats://nats:4222
@@ -173,6 +187,8 @@ services:
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
+      OPS_DB_USER: ${OPS_DB_USER:-ops}
+      OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
     restart: "no"
 
   pg:
@@ -190,12 +206,14 @@ services:
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
+      OPS_DB_USER: ${OPS_DB_USER:-ops}
+      OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
     ports:
       - "${PG_PORT:-5821}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # 首次初始化时建 app/idm/content/search 的 role + schema(role 的 search_path 指向自己 schema)。
-      # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建(或手建 role)。
+      # 首次初始化时建 app/idm/content/search/ops 的 role + schema(role 的 search_path 指向自己 schema)。
+      # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建,或手建 role(ops 见 `just ops-db-init`)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]

@@ -63,6 +63,15 @@ pub struct Config {
     #[serde(default)]
     pub metrics_enabled: bool,
 
+    /// stdout 日志格式,`LOG_FORMAT`:`json`(机器解析)/ `pretty`(彩色易读)。
+    /// 不设 → prod 为 json、其余为 pretty。
+    #[serde(default)]
+    pub log_format: Option<String>,
+    /// idm 进程的内网地址,`IDM_INTERNAL_URL`(如 `http://idm:8080`)。**只在分进程拓扑的 app 进程用**:
+    /// 后台监控页由 app 汇总,app 经它拉 idm 的 `/internal/monitoring`。不设 = 监控页只显示本进程。
+    #[serde(default)]
+    pub idm_internal_url: Option<String>,
+
     /// 信任的反向代理层数(nginx 等),`TRUSTED_PROXY_HOPS`,默认 1。
     /// `ClientContext` 解析真实客户端 IP 时,按此值从 X-Forwarded-For 右数第 (N+1) 跳取值(防伪造最左)。
     /// **直连暴露(前面没有反代)必须设 0**:否则客户端自造的单条 XFF 恰是"右数第 1 跳"而被当可信
@@ -177,6 +186,21 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub search_db_sslmode: String,
 
+    /// ops schema 的数据库连接(role=ops):后台监控的历史指标与日志。app / idm 进程都写。
+    /// `OPS_DB_HOST` 的存在 = 启用持久化;不设 → 监控只有进程内最近 1 小时、日志只留内存里最近一批。
+    #[serde(default)]
+    pub ops_db_host: Option<String>,
+    #[serde(default = "default_db_port")]
+    pub ops_db_port: u16,
+    #[serde(default = "default_db_database")]
+    pub ops_db_database: String,
+    #[serde(default = "default_ops_db_user")]
+    pub ops_db_user: String,
+    #[serde(default = "default_db_password")]
+    pub ops_db_password: String,
+    #[serde(default = "default_db_sslmode")]
+    pub ops_db_sslmode: String,
+
     /// NATS 地址,`NATS_URL`(如 `nats://localhost:2224`,本地 compose 主机端口)—— widget 事件总线选择链的**最高优先**:
     /// 设了 → NatsEventBus(多实例默认);没设但有 app pool → PgEventBus(LISTEN/NOTIFY 退路);
     /// 都没有 → 内存(单实例,最终 fallback)。装配在组合根 `AppState::new`。
@@ -256,6 +280,10 @@ fn default_idm_db_user() -> String {
 fn default_content_db_user() -> String {
     "content".into()
 }
+fn default_ops_db_user() -> String {
+    "ops".to_owned()
+}
+
 fn default_search_db_user() -> String {
     "search".into()
 }
@@ -282,6 +310,8 @@ impl Default for Config {
             rate_limit_per_sec: default_rate_limit_per_sec(),
             rate_limit_burst: default_rate_limit_burst(),
             metrics_enabled: false,
+            log_format: None,
+            idm_internal_url: None,
             trusted_proxy_hops: default_trusted_proxy_hops(),
             idm_embedded: default_idm_embedded(),
             rust_log: None,
@@ -319,6 +349,12 @@ impl Default for Config {
             search_db_user: default_search_db_user(),
             search_db_password: default_db_password(),
             search_db_sslmode: default_db_sslmode(),
+            ops_db_host: None,
+            ops_db_port: default_db_port(),
+            ops_db_database: default_db_database(),
+            ops_db_user: default_ops_db_user(),
+            ops_db_password: default_db_password(),
+            ops_db_sslmode: default_db_sslmode(),
             nats_url: None,
             s3_endpoint: None,
             s3_bucket: default_s3_bucket(),
@@ -415,6 +451,21 @@ impl Config {
                 self.content_db_port,
                 enc(&self.content_db_database),
                 self.content_db_sslmode,
+            )
+        })
+    }
+
+    /// ops schema 的连接串(role=ops)。`None` = 没设 `OPS_DB_HOST` → 监控数据只在进程内存。
+    pub fn ops_database_url(&self) -> Option<String> {
+        self.ops_db_host.as_ref().map(|host| {
+            format!(
+                "postgres://{}:{}@{}:{}/{}?sslmode={}",
+                enc(&self.ops_db_user),
+                enc(&self.ops_db_password),
+                host,
+                self.ops_db_port,
+                enc(&self.ops_db_database),
+                self.ops_db_sslmode,
             )
         })
     }

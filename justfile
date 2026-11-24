@@ -40,7 +40,7 @@ pg-test-grant:
 # PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance -- --nocapture
+    DATABASE_URL="{{app_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance --test ops_store_conformance -- --nocapture
 
 # NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)+ JetStream 发布端冒烟
 test-nats:
@@ -79,9 +79,10 @@ app_db_url := env_var_or_default("APP_DATABASE_URL", "postgres://" + env_var_or_
 idm_db_url := env_var_or_default("IDM_DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 content_db_url := env_var_or_default("CONTENT_DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 search_db_url := env_var_or_default("SEARCH_DATABASE_URL", "postgres://" + env_var_or_default("SEARCH_DB_USER", "search") + ":" + env_var_or_default("SEARCH_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+ops_db_url := env_var_or_default("OPS_DATABASE_URL", "postgres://" + env_var_or_default("OPS_DB_USER", "ops") + ":" + env_var_or_default("OPS_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 
 # 所有 schema 迁移(聚合,像 Go Makefile 的 migrate 总目标)
-migrate: migrate-app migrate-idm migrate-content migrate-search
+migrate: migrate-app migrate-idm migrate-content migrate-search migrate-ops
 
 # ── app schema(role app)──
 migrate-app:
@@ -114,6 +115,18 @@ migrate-search-revert:
     sqlx migrate revert --source migrations/search --database-url "{{search_db_url}}"
 migrate-search-info:
     sqlx migrate info --source migrations/search --database-url "{{search_db_url}}"
+
+# ── ops schema(role ops)── 后台监控的历史指标与日志
+migrate-ops:
+    sqlx migrate run --source migrations/ops --database-url "{{ops_db_url}}"
+migrate-ops-revert:
+    sqlx migrate revert --source migrations/ops --database-url "{{ops_db_url}}"
+migrate-ops-info:
+    sqlx migrate info --source migrations/ops --database-url "{{ops_db_url}}"
+
+# 老 pg 卷补建 ops role + schema(initdb 只在空卷首次启动时跑)。幂等;之后再 just migrate-ops。
+ops-db-init:
+    docker compose exec -T -e OPS_DB_USER="{{env_var_or_default('OPS_DB_USER', 'ops')}}" -e OPS_DB_PASSWORD="{{env_var_or_default('OPS_DB_PASSWORD', 'pwd')}}" pg sh < scripts/ensure-ops-schema.sh
 
 # 新建某 schema 的可回滚迁移(内部参数化,创建用):just migrate-add app create_widgets
 migrate-add schema name:

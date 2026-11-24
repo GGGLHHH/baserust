@@ -26,7 +26,8 @@ src/features/<name>/                   ── main crate: adapters only
   adapters/http/dto.rs   wire DTOs (Serialize/Deserialize + ToSchema, keep stable names) + From/Into domain
   adapters/http/routes.rs #[utoipa::path] handlers returning `Result<_, ApiError>` (thin: extract → DTO.into() → service → Dto::from)
   adapters/http/mod.rs   router()s (OpenApiRouter + routes!)
-  adapters/postgres.rs   sea-query impl: #[derive(Iden)] enum + COLS + <Name>Row (FromRow) → <Name> + base_select() + map_db_err
+  adapters/postgres.rs   sea-query impl: #[derive(Iden)] enum + COLS + <Name>Row (FromRow) → <Name> + base_select() + map_db_err;
+                         every trait method gets #[tracing::instrument(name = "pg.<name>s.<fn>", skip_all)] (feeds the admin monitoring page; see `observability` skill)
 migrations/app/000N_create_<name>s.{up,down}.sql
 tests/http_<name>.rs   black-box HTTP acceptance (real port + reqwest; header `//! covers: METHOD /path` for every endpoint)
 ```

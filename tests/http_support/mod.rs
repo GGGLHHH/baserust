@@ -31,8 +31,8 @@ pub const PASSWORD: &str = "pwd";
 
 /// 把 `state` 挂成完整应用(全部路由 + 中间件栈),在 `listener` 上开始服务。
 /// **换 web 底座 = 换这个函数的实现**;签名(std TcpListener + AppState + Config)与框架无关。
-fn serve(listener: std::net::TcpListener, state: AppState, config: &Config) {
-    let app = baserust::app::build_router(state, config, Mount::Both);
+fn serve(listener: std::net::TcpListener, state: AppState, config: &Config, mount: Mount) {
+    let app = baserust::app::build_router(state, config, mount);
     listener.set_nonblocking(true).unwrap();
     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     tokio::spawn(async move {
@@ -77,10 +77,13 @@ impl TestServer {
 
     /// 起服务前改装配(如换授权策略)。
     pub async fn start_with(customize: impl FnOnce(&mut AppState)) -> Self {
+        Self::start_mounted(Mount::Both, customize).await
+    }
+
+    /// 按指定挂载范围起服务(默认 `Both` 单进程;分进程拓扑的场景用 `App` / `Idm`)。
+    pub async fn start_mounted(mount: Mount, customize: impl FnOnce(&mut AppState)) -> Self {
         let config = test_config();
-        let (mut state, _background) = AppState::new(&config, Mount::Both)
-            .await
-            .expect("内存模式装配");
+        let (mut state, _background) = AppState::new(&config, mount).await.expect("内存模式装配");
         // 内存模式不装审计后端(它读 search 库)→ 换内存实现,让审计端点也能黑盒覆盖。
         let auth_events = Arc::new(InMemoryAuthEventRepo::new());
         state.auth_audit = Some(AuthAuditService::new(auth_events.clone()));
@@ -90,7 +93,7 @@ impl TestServer {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        serve(listener, state, &config);
+        serve(listener, state, &config, mount);
         Self {
             base: format!("http://{addr}"),
             auth_events,

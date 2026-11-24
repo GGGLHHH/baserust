@@ -23,4 +23,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
   create role ${SEARCH_DB_USER} login password '${SEARCH_DB_PASSWORD}';
   create schema ${SEARCH_DB_USER} authorization ${SEARCH_DB_USER};
   alter role ${SEARCH_DB_USER} set search_path to ${SEARCH_DB_USER};
+
+  create role ${OPS_DB_USER} login password '${OPS_DB_PASSWORD}';
+  create schema ${OPS_DB_USER} authorization ${OPS_DB_USER};
+  alter role ${OPS_DB_USER} set search_path to ${OPS_DB_USER};
 EOSQL

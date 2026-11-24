@@ -518,6 +518,39 @@ expression: spec
         ],
         "type": "object"
       },
+      "DbOperationStats": {
+        "description": "单个数据库操作的统计(来自仓储方法上的 `pg.*` span)。",
+        "properties": {
+          "calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "如 `pg.widgets.list`。",
+            "type": "string"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "calls"
+        ],
+        "type": "object"
+      },
       "DeleteMeRequest": {
         "description": "注销账户(需密码确认)。",
         "properties": {
@@ -527,6 +560,35 @@ expression: spec
         },
         "required": [
           "password"
+        ],
+        "type": "object"
+      },
+      "DependencyCheck": {
+        "description": "单项依赖检查。",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "`db_app` / `db_idm` / `db_content` / `db_search` / `nats`。",
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ok",
+          "latency_ms"
         ],
         "type": "object"
       },
@@ -574,6 +636,345 @@ expression: spec
         ],
         "type": "string"
       },
+      "HistoryInstance": {
+        "properties": {
+          "db_operations": {
+            "items": {
+              "$ref": "#/components/schemas/DbOperationStats"
+            },
+            "type": "array"
+          },
+          "points": {
+            "description": "时间升序;没有数据的时间段(进程没跑)不出点。",
+            "items": {
+              "$ref": "#/components/schemas/HistoryPoint"
+            },
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/InstanceRole"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/RouteStats"
+            },
+            "type": "array"
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/TrafficSummary"
+          }
+        },
+        "required": [
+          "role",
+          "traffic",
+          "points",
+          "routes",
+          "db_operations"
+        ],
+        "type": "object"
+      },
+      "HistoryPoint": {
+        "description": "历史曲线上的一个点。",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "cpu_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "db_calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "db_p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "errors_4xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "errors_5xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "in_flight": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "outbox_published": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pool_in_use": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pool_max": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projector_pending": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projector_processed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requests": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rss_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sse_connections": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "at",
+          "requests",
+          "errors_4xx",
+          "errors_5xx",
+          "in_flight",
+          "db_calls",
+          "pool_in_use",
+          "pool_max",
+          "sse_connections",
+          "outbox_published",
+          "projector_processed",
+          "projector_pending"
+        ],
+        "type": "object"
+      },
+      "HistoryRange": {
+        "description": "历史时间范围。",
+        "enum": [
+          "24h",
+          "7d",
+          "30d",
+          "90d",
+          "1y"
+        ],
+        "type": "string"
+      },
+      "HistoryReport": {
+        "description": "历史报告:按进程分组的曲线 + 整个范围的合计 + 接口 / 数据库明细。",
+        "properties": {
+          "details_from": {
+            "description": "接口 / 数据库明细的起点:明细只留 30 天,范围更长时只覆盖最近 30 天。",
+            "format": "date-time",
+            "type": "string"
+          },
+          "from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "instances": {
+            "items": {
+              "$ref": "#/components/schemas/HistoryInstance"
+            },
+            "type": "array"
+          },
+          "persistent": {
+            "description": "数据是否持久化。`false` = 没配 ops 数据库,只有进程内存里最近一段(重启清空)。",
+            "type": "boolean"
+          },
+          "range": {
+            "$ref": "#/components/schemas/HistoryRange"
+          },
+          "step_secs": {
+            "description": "曲线上一个点代表的秒数。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "range",
+          "from",
+          "to",
+          "step_secs",
+          "persistent",
+          "details_from",
+          "instances"
+        ],
+        "type": "object"
+      },
+      "InstanceReport": {
+        "description": "单个进程的监控数据。计数类字段(请求数、发布数…)都是**统计窗口内**的值:\n窗口 = 进程内存里保留的最近一段(默认 1 小时),进程刚启动时从启动算起。",
+        "properties": {
+          "checks": {
+            "description": "依赖检查(与 `/readyz` 同源)。",
+            "items": {
+              "$ref": "#/components/schemas/DependencyCheck"
+            },
+            "type": "array"
+          },
+          "db_operations": {
+            "description": "按数据库操作(仓储方法)统计,按调用次数降序。",
+            "items": {
+              "$ref": "#/components/schemas/DbOperationStats"
+            },
+            "type": "array"
+          },
+          "error": {
+            "description": "拉取失败的原因。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "history": {
+            "description": "历史曲线(每个点是一个采样间隔内的增量或当时的读数),时间升序。",
+            "items": {
+              "$ref": "#/components/schemas/HistoryPoint"
+            },
+            "type": "array"
+          },
+          "in_flight": {
+            "description": "正在处理的请求数。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "outbox": {
+            "items": {
+              "$ref": "#/components/schemas/OutboxStatus"
+            },
+            "type": "array"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/PoolStatus"
+            },
+            "type": "array"
+          },
+          "process": {
+            "$ref": "#/components/schemas/ProcessStatus"
+          },
+          "projectors": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectorStatus"
+            },
+            "type": "array"
+          },
+          "reachable": {
+            "description": "拉取这个进程的报告是否成功(app 汇总 idm 时可能失败)。失败时其余字段为空值。",
+            "type": "boolean"
+          },
+          "role": {
+            "$ref": "#/components/schemas/InstanceRole"
+          },
+          "routes": {
+            "description": "按接口(路由模板)统计,按请求数降序。",
+            "items": {
+              "$ref": "#/components/schemas/RouteStats"
+            },
+            "type": "array"
+          },
+          "sample_interval_secs": {
+            "description": "历史曲线的采样间隔(秒)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sse": {
+            "items": {
+              "$ref": "#/components/schemas/SseStatus"
+            },
+            "type": "array"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/TrafficSummary"
+          },
+          "uptime_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          },
+          "window_secs": {
+            "description": "统计窗口长度(秒)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "role",
+          "reachable",
+          "version",
+          "uptime_secs",
+          "window_secs",
+          "sample_interval_secs",
+          "checks",
+          "process",
+          "in_flight",
+          "pools",
+          "sse",
+          "traffic",
+          "routes",
+          "db_operations",
+          "outbox",
+          "projectors",
+          "history"
+        ],
+        "type": "object"
+      },
+      "InstanceRole": {
+        "description": "实例角色。",
+        "enum": [
+          "app",
+          "idm",
+          "combined"
+        ],
+        "type": "string"
+      },
       "IpStat": {
         "properties": {
           "failures": {
@@ -595,6 +996,84 @@ expression: spec
         ],
         "type": "object"
       },
+      "LogRecordView": {
+        "description": "一条日志。",
+        "properties": {
+          "attributes": {
+            "description": "其余结构化字段(敏感字段已脱敏)。",
+            "type": "object"
+          },
+          "body": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "instance": {
+            "$ref": "#/components/schemas/InstanceRole"
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "route": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "$ref": "#/components/schemas/Service",
+            "description": "归属服务(app / idm)。"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity"
+          },
+          "status": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target": {
+            "description": "产生日志的模块(`http.access` = 失败 / 慢请求记录)。",
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "ts",
+          "instance",
+          "service",
+          "severity",
+          "target",
+          "body",
+          "attributes"
+        ],
+        "type": "object"
+      },
       "LoginRequest": {
         "description": "登录请求(公开)。`identifier` = username 或 email,由 idm 自动识别。",
         "properties": {
@@ -609,6 +1088,26 @@ expression: spec
         "required": [
           "identifier",
           "password"
+        ],
+        "type": "object"
+      },
+      "MonitoringReport": {
+        "description": "整体报告:每个进程一份。",
+        "properties": {
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "instances": {
+            "items": {
+              "$ref": "#/components/schemas/InstanceReport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at",
+          "instances"
         ],
         "type": "object"
       },
@@ -711,6 +1210,46 @@ expression: spec
           "failed"
         ],
         "type": "string"
+      },
+      "OutboxStatus": {
+        "description": "outbox relay(把发件箱里的事件发到 JetStream)。",
+        "properties": {
+          "failures": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_batch": {
+            "description": "最近一轮取到的条数(持续等于批大小 = 有积压)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_poll_at": {
+            "description": "最近一次轮询成功的时间;长时间不动 = relay 卡住。",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "published": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "来源 schema(idm / app)。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "published",
+          "failures",
+          "last_batch"
+        ],
+        "type": "object"
       },
       "PageInfo": {
         "description": "分页元信息:offset 给 total/total_pages,cursor 给 next_cursor/has_more。\n内部标签 `mode` 区分(类型诚实:cursor 模式不可能混入 total);utoipa 生成带 mode 判别的 oneOf。",
@@ -977,6 +1516,100 @@ expression: spec
         ],
         "type": "object"
       },
+      "Page_LogRecordView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "一条日志。",
+              "properties": {
+                "attributes": {
+                  "description": "其余结构化字段(敏感字段已脱敏)。",
+                  "type": "object"
+                },
+                "body": {
+                  "type": "string"
+                },
+                "duration_ms": {
+                  "format": "double",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "instance": {
+                  "$ref": "#/components/schemas/InstanceRole"
+                },
+                "method": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "request_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "route": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "service": {
+                  "$ref": "#/components/schemas/Service",
+                  "description": "归属服务(app / idm)。"
+                },
+                "severity": {
+                  "$ref": "#/components/schemas/Severity"
+                },
+                "status": {
+                  "format": "int32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "description": "产生日志的模块(`http.access` = 失败 / 慢请求记录)。",
+                  "type": "string"
+                },
+                "ts": {
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "ts",
+                "instance",
+                "service",
+                "severity",
+                "target",
+                "body",
+                "attributes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_RoleView": {
         "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
         "properties": {
@@ -1103,6 +1736,43 @@ expression: spec
         ],
         "type": "string"
       },
+      "PoolStatus": {
+        "description": "数据库连接池。",
+        "properties": {
+          "idle": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "in_use": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "schema 名(app / idm / content / search)。",
+            "type": "string"
+          },
+          "size": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "size",
+          "idle",
+          "in_use",
+          "max"
+        ],
+        "type": "object"
+      },
       "PrepareUploadRequest": {
         "description": "两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体;tenant 单租户默认 nil(同 create)。",
         "properties": {
@@ -1180,6 +1850,45 @@ expression: spec
         ],
         "type": "object"
       },
+      "ProcessStatus": {
+        "description": "进程资源(取不到的平台上为空)。",
+        "properties": {
+          "cpu_percent": {
+            "description": "CPU 占用(百分比,按单核计,多核可超过 100)。最近一个采样间隔的均值。",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "open_fds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rss_bytes": {
+            "description": "常驻内存(字节)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "threads": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ProfileResponse": {
         "description": "出参 = 资料字段 + 富化的 `avatar_url`(相对头像端点路径;悬空/未就绪/探测故障 → null)。\n时间戳:`/profiles/me` 在资料未建时回空资料,此时为 null;其余端点恒有值。",
         "properties": {
@@ -1235,6 +1944,56 @@ expression: spec
         ],
         "type": "object"
       },
+      "ProjectorStatus": {
+        "description": "projector(消费 JetStream 事件写读模型)。",
+        "properties": {
+          "ack_pending": {
+            "description": "已投递、还没确认的消息数。",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_lag_ms": {
+            "description": "最近一条消息从发布到处理完的延迟(毫秒)。",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "pending": {
+            "description": "还没投递给它的消息数(积压)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "processed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "processed",
+          "failed"
+        ],
+        "type": "object"
+      },
       "PutProfileRequest": {
         "description": "PUT 入参 —— **全量替换**:字段 null/缺省 = 清空(PUT 语义;不是 PATCH 的\"跳过不改\")。\ndisplay_name / phone 最长 255;phone 只做长度不做 E.164。",
         "properties": {
@@ -1259,6 +2018,56 @@ expression: spec
             ]
           }
         },
+        "type": "object"
+      },
+      "ReadinessCheck": {
+        "description": "单项依赖检查结果。",
+        "properties": {
+          "error": {
+            "description": "失败原因(成功时省略)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "description": "检查耗时(毫秒)。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "latency_ms"
+        ],
+        "type": "object"
+      },
+      "ReadinessReport": {
+        "description": "就绪报告:整体状态 + 每项依赖的检查结果。",
+        "properties": {
+          "checks": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ReadinessCheck"
+            },
+            "description": "每项依赖(`db_app` / `db_idm` / `db_content` / `db_search` / `nats`;内存模式为空)。",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "status": {
+            "description": "`ok`:全部依赖可用;`unavailable`:至少一项不可用(此时 HTTP 503)。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "checks"
+        ],
         "type": "object"
       },
       "ReasonCount": {
@@ -1343,6 +2152,63 @@ expression: spec
         ],
         "type": "object"
       },
+      "RouteStats": {
+        "description": "单个接口的统计。",
+        "properties": {
+          "errors_4xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "errors_5xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "method": {
+            "type": "string"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "requests": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "route": {
+            "description": "路由模板(如 `/api/v1/frontend/widgets/{id}`);没匹配上任何路由的请求记为 `unmatched`。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "method",
+          "route",
+          "requests",
+          "errors_4xx",
+          "errors_5xx"
+        ],
+        "type": "object"
+      },
+      "Service": {
+        "description": "日志归属的服务:app(业务)/ idm(认证)。分进程部署时就是进程身份;单进程开发时按\n[`classify_service`] 推断,口径与 nginx 的分流规则一致。",
+        "enum": [
+          "app",
+          "idm"
+        ],
+        "type": "string"
+      },
       "SetContentMetadataRequest": {
         "description": "设置内容元数据(全量替换,upsert)。\n\n**无 `mime_type` 字段 —— 它是服务端所有物**(上传时由字节的实际 Content-Type 定,见\n`into_input`)。理由是安全而非洁癖:presign 出的 URL 只 override disposition,浏览器拿到的\nContent-Type 恒是**对象上传时存进 S3 的那个**;而 inline 安全闸(`is_safe_inline_mime`)与头像\n栅格白名单读的都是**这张表**的 mime。两者若能分叉,攻击者就能 `text/html` 上传、改 mime 成\n`image/png` 骗过闸门,再经 presign 拿回 `Content-Type: text/html` + inline = 存储型 XSS。\n让 mime 不可改,分叉就不存在。",
         "properties": {
@@ -1402,6 +2268,14 @@ expression: spec
         ],
         "type": "object"
       },
+      "Severity": {
+        "description": "日志级别(只存 WARN 及以上)。",
+        "enum": [
+          "WARN",
+          "ERROR"
+        ],
+        "type": "string"
+      },
       "SortOrder": {
         "description": "排序方向(线格式)。默认 `Desc`(最新/最大在前)。",
         "enum": [
@@ -1409,6 +2283,23 @@ expression: spec
           "desc"
         ],
         "type": "string"
+      },
+      "SseStatus": {
+        "description": "SSE 推送流的在线连接数。",
+        "properties": {
+          "connections": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "stream": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream",
+          "connections"
+        ],
+        "type": "object"
       },
       "StatBucket": {
         "description": "仪表盘统计(admin `/auth-events/stats`)。时间序列 + 各维度 group-by 计数。",
@@ -1430,6 +2321,53 @@ expression: spec
           "t",
           "success",
           "failure"
+        ],
+        "type": "object"
+      },
+      "TrafficSummary": {
+        "description": "窗口内的请求汇总。",
+        "properties": {
+          "errors_4xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "errors_5xx": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "p50_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p99_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "requests": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requests",
+          "errors_4xx",
+          "errors_5xx"
         ],
         "type": "object"
       },
@@ -3438,6 +4376,260 @@ expression: spec
         "summary": "全量设角色(原子替换)。未知角色名 → 422。",
         "tags": [
           "users"
+        ]
+      }
+    },
+    "/api/v1/admin/monitoring": {
+      "get": {
+        "operationId": "get_monitoring",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitoringReport"
+                }
+              }
+            },
+            "description": "各进程的监控数据(生产分进程时含 app 与 idm)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "系统监控:每个进程的依赖健康、请求量 / 错误 / 耗时、数据库操作耗时、连接池、后台任务(outbox / projector)、\nSSE 在线数、进程资源,以及最近一段时间(默认 1 小时,15 秒一个点)的历史曲线。数据只在进程内存里,重启清空。",
+        "tags": [
+          "monitoring"
+        ]
+      }
+    },
+    "/api/v1/admin/monitoring/history": {
+      "get": {
+        "operationId": "get_monitoring_history",
+        "parameters": [
+          {
+            "description": "时间范围,默认 24h。",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/HistoryRange"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryReport"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "历史趋势:按时间范围(24 小时 ~ 1 年)给出各进程的曲线、范围合计,以及接口 / 数据库操作的明细。\n数据来自 ops 数据库(分钟级留 15 天、小时级留 13 个月、明细留 30 天);没配时只有进程内存里最近一段。",
+        "tags": [
+          "monitoring"
+        ]
+      }
+    },
+    "/api/v1/admin/monitoring/logs": {
+      "get": {
+        "operationId": "list_monitoring_logs",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "最低级别:`WARN` = WARN + ERROR,`ERROR` = 只看 ERROR。不给 = 全部。",
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Severity"
+            }
+          },
+          {
+            "in": "query",
+            "name": "instance",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InstanceRole"
+            }
+          },
+          {
+            "description": "服务:app(业务)/ idm(认证)。单进程开发时按接口前缀 / 代码模块推断。",
+            "in": "query",
+            "name": "service",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Service"
+            }
+          },
+          {
+            "description": "消息 / 模块 / 接口的子串,不区分大小写。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "精确匹配请求 id(响应头 `x-request-id`)。",
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "页码,从 1 开始。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "每页条数,1~200,默认 50。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_LogRecordView"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 users:admin 权限"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "参数不合法(size 超出 1~200 / from 晚于 to)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "users:admin",
+              "admin:login"
+            ]
+          }
+        ],
+        "summary": "日志:WARN 及以上的日志、失败请求(5xx)和慢请求(≥1 秒),按时间倒序分页。保留 15 天。",
+        "tags": [
+          "monitoring"
         ]
       }
     },
@@ -5855,7 +7047,7 @@ expression: spec
             "description": ""
           }
         },
-        "summary": "存活探针:进程活着即 ok,**不查依赖**(给 k8s livenessProbe;失败会被重启)。",
+        "summary": "存活探针:进程活着即 ok,**不查依赖**(给 livenessProbe;失败会被重启)。",
         "tags": [
           "health"
         ]
@@ -5866,13 +7058,27 @@ expression: spec
         "operationId": "readyz",
         "responses": {
           "200": {
-            "description": "就绪"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            },
+            "description": "全部依赖可用"
           },
           "503": {
-            "description": "依赖未就绪"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            },
+            "description": "至少一项依赖不可用"
           }
         },
-        "summary": "就绪探针(给 k8s readinessProbe):DB 模式 ping `SELECT 1`,不通 → 503;内存模式无外部依赖,恒就绪。\n失败只让流量绕开本实例(不重启),与 livez 分工不同。",
+        "summary": "就绪探针:并发检查本进程的全部依赖(各 schema 连接池 `select 1`、NATS 连接状态,每项 2s 超时),\n任一项不可用 → 503。失败只让流量绕开本实例(不重启),与 livez 分工不同。",
         "tags": [
           "health"
         ]
@@ -5911,6 +7117,10 @@ expression: spec
     {
       "description": "后台用户管理:CRUD/角色/密码/资料/认证审计",
       "name": "users"
+    },
+    {
+      "description": "后台系统监控:依赖健康/流量/数据库/后台任务/进程资源",
+      "name": "monitoring"
     }
   ]
 }

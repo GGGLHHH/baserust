@@ -67,6 +67,8 @@ pub enum ApplyError {
 
 /// JetStream durable pull consumer + 投影仓储。持有装配好的 consumer 句柄,`run` 消费到停。
 pub struct AuthEventProjector {
+    /// durable 消费者名(指标 / 链路标签)。
+    name: String,
     consumer: jetstream::consumer::Consumer<pull::Config>,
     repo: Arc<dyn AuthEventRepo>,
     /// 落库成功后发布给 SSE 订阅者(`/admin/auth/auth-events/stream`)。`None` = 非 needs_idm 进程。
@@ -103,6 +105,7 @@ impl AuthEventProjector {
             .await
             .with_context(|| format!("创建/绑定 durable consumer {durable_name} 失败"))?;
         Ok(Self {
+            name: durable_name.to_owned(),
             consumer,
             repo,
             bus,
@@ -123,12 +126,18 @@ impl AuthEventProjector {
             }
         };
 
+        use crate::infra::telemetry;
+        use tracing::Instrument;
+        let mut pending_tick = tokio::time::interval(telemetry::CONSUMER_INFO_INTERVAL);
         loop {
             if *shutdown.borrow() {
                 break;
             }
 
             tokio::select! {
+                _ = pending_tick.tick() => {
+                    telemetry::record_consumer_pending(&self.consumer, &self.name).await;
+                }
                 maybe = messages.next() => {
                     let Some(received) = maybe else { break };
                     let msg = match received {
@@ -139,7 +148,9 @@ impl AuthEventProjector {
                         }
                     };
                     // 成功 / 毒消息 → ack(毒消息永不可投,重投无意义、只会死循环);暂时故障 → 不 ack、等重投。
-                    let should_ack = match Self::apply_message(&*self.repo, &msg.payload).await {
+                    let span = telemetry::projector_span(&self.name);
+                    let mut result = "ok";
+                    let should_ack = match Self::apply_message(&*self.repo, &msg.payload).instrument(span).await {
                         Ok(row) => {
                             // SSE 推送:发布失败(无订阅者)不影响落库结果,fire-and-forget。
                             if let (Some(bus), Some(row)) = (&self.bus, row) {
@@ -149,13 +160,16 @@ impl AuthEventProjector {
                         }
                         Err(ApplyError::Poison(why)) => {
                             tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
+                            result = "poison";
                             true
                         }
                         Err(ApplyError::Transient(err)) => {
                             tracing::warn!(error = %err, "projector apply 暂时失败,不 ack、等重投");
+                            result = "transient";
                             false
                         }
                     };
+                    telemetry::record_projector_message(&self.name, result, &msg);
                     if should_ack {
                         if let Err(err) = msg.ack().await {
                             tracing::warn!(error = %err, "projector ack 失败");

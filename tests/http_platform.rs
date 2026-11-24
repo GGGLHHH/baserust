@@ -23,8 +23,10 @@ async fn health_probes() {
             "{path}"
         );
     }
-    // 内存模式无外部依赖 → 恒就绪
-    expect(c.get("/readyz").await, StatusCode::OK).await;
+    // 内存模式无外部依赖 → 恒就绪,逐项检查结果为空
+    let v = expect_json(c.get("/readyz").await, StatusCode::OK).await;
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["checks"], serde_json::json!({}), "{v}");
 }
 
 /// 当前令牌的有效权限:role 展开 ∩ scope;未登录 401。

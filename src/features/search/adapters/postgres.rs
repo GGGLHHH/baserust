@@ -249,6 +249,7 @@ const REBUILD_UPSERT_SQL: &str = "insert into admin_user_index \
 #[async_trait]
 impl SearchIndexRepo for PgSearchIndexRepo {
     #[allow(clippy::too_many_arguments)] // 领域事件字段展开,拆参数对象不值当(仅此一处超阈)
+    #[tracing::instrument(name = "pg.search_index.apply_user_created", skip_all)]
     async fn apply_user_created(
         &self,
         user_id: Uuid,
@@ -273,6 +274,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.apply_user_updated", skip_all)]
     async fn apply_user_updated(
         &self,
         user_id: Uuid,
@@ -293,6 +295,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.apply_roles_set", skip_all)]
     async fn apply_roles_set(
         &self,
         user_id: Uuid,
@@ -309,6 +312,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.apply_user_deleted", skip_all)]
     async fn apply_user_deleted(&self, user_id: Uuid, seq: i64) -> Result<(), AppError> {
         sqlx::query(APPLY_USER_DELETED_SQL)
             .bind(user_id)
@@ -319,6 +323,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.apply_profile_updated", skip_all)]
     async fn apply_profile_updated(
         &self,
         user_id: Uuid,
@@ -335,6 +340,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.rebuild_upsert", skip_all)]
     async fn rebuild_upsert(&self, row: AdminUserIndexRow) -> Result<(), AppError> {
         sqlx::query(REBUILD_UPSERT_SQL)
             .bind(row.user_id)
@@ -353,6 +359,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.search_index.get", skip_all)]
     async fn get(&self, user_id: Uuid) -> Result<Option<AdminUserIndexRow>, AppError> {
         sqlx::query_as::<_, IndexRecord>(GET_SQL)
             .bind(user_id)
@@ -362,6 +369,7 @@ impl SearchIndexRepo for PgSearchIndexRepo {
             .map_err(|e| AppError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.search_index.query", skip_all)]
     async fn query(
         &self,
         filter: &IndexQuery,

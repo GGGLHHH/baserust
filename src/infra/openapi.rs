@@ -38,7 +38,8 @@ use crate::kernel::error::AppError;
         (name = "auth", description = "认证:注册/登录/刷新/登出"),
         (name = "me", description = "当前用户:资料/改密/注销"),
         (name = "admin", description = "后台:管理端登录/当前管理员"),
-        (name = "users", description = "后台用户管理:CRUD/角色/密码/资料/认证审计")
+        (name = "users", description = "后台用户管理:CRUD/角色/密码/资料/认证审计"),
+        (name = "monitoring", description = "后台系统监控:依赖健康/流量/数据库/后台任务/进程资源")
     )
 )]
 pub struct ApiDoc;

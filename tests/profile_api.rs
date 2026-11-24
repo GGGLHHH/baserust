@@ -81,7 +81,8 @@ fn test_app() -> (
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
-        db_pool: None,
+        probes: Default::default(),
+        monitoring: Default::default(),
         cookie_secure: false,
         policy: Arc::new(Policy::from_roles([
             (

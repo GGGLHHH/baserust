@@ -3,7 +3,9 @@
 
 pub mod adapters;
 pub mod mock;
+pub mod monitoring;
 pub mod policy_repo;
+pub mod probes;
 pub mod router;
 pub mod runtime;
 pub mod seed;

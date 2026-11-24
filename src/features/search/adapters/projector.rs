@@ -70,6 +70,8 @@ struct ProfileUpdatedData {
 
 /// JetStream durable pull consumer + 投影仓储。持有装配好的 consumer 句柄,`run` 消费到停。
 pub struct Projector {
+    /// durable 消费者名(指标 / 链路标签)。
+    name: String,
     consumer: jetstream::consumer::Consumer<pull::Config>,
     repo: Arc<dyn SearchIndexRepo>,
 }
@@ -126,7 +128,11 @@ impl Projector {
             )
             .await
             .with_context(|| format!("创建/绑定 durable consumer {durable_name} 失败"))?;
-        Ok(Self { consumer, repo })
+        Ok(Self {
+            name: durable_name.to_owned(),
+            consumer,
+            repo,
+        })
     }
 
     /// 后台循环:拉消息 → `apply_message` → 成功 ack,失败留待重投;`shutdown` 置位即退出。
@@ -139,12 +145,18 @@ impl Projector {
             }
         };
 
+        use crate::infra::telemetry;
+        use tracing::Instrument;
+        let mut pending_tick = tokio::time::interval(telemetry::CONSUMER_INFO_INTERVAL);
         loop {
             if *shutdown.borrow() {
                 break;
             }
 
             tokio::select! {
+                _ = pending_tick.tick() => {
+                    telemetry::record_consumer_pending(&self.consumer, &self.name).await;
+                }
                 maybe = messages.next() => {
                     let Some(received) = maybe else { break };
                     let msg = match received {
@@ -163,15 +175,19 @@ impl Projector {
                     // (共 ~17min,盖住常规 DB 抖动/故障切换),仍失败按毒消息跳过 + error 级告警
                     // (数据可经 bin/rebuild_search 回填)。
                     let mut attempt = 0u32;
+                    let mut result = "ok";
+                    let span = telemetry::projector_span(&self.name);
                     let should_ack = 'retry: loop {
-                        match Self::apply_with_progress(&*self.repo, &msg).await {
+                        match Self::apply_with_progress(&*self.repo, &msg).instrument(span.clone()).await {
                             Ok(()) => break 'retry true,
                             Err(ApplyError::Poison(why)) => {
                                 tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
+                                result = "poison";
                                 break 'retry true;
                             }
                             Err(ApplyError::Transient(err)) if attempt >= 10 => {
                                 tracing::error!(error = %err, attempt, "projector 重试超限,按毒消息跳过(投影缺口需 rebuild_search 回填)");
+                                result = "dropped";
                                 break 'retry true;
                             }
                             Err(ApplyError::Transient(err)) => {
@@ -194,6 +210,7 @@ impl Projector {
                                         _ = tokio::time::sleep(slice) => {}
                                         changed = shutdown.changed() => {
                                             if changed.is_err() || *shutdown.borrow() {
+                                                result = "shutdown";
                                                 break 'retry false; // 关停:不 ack,留待重投
                                             }
                                         }
@@ -203,6 +220,7 @@ impl Projector {
                             }
                         }
                     };
+                    telemetry::record_projector_message(&self.name, result, &msg);
                     if should_ack {
                         if let Err(err) = msg.ack().await {
                             tracing::warn!(error = %err, "projector ack 失败");

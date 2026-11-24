@@ -13,6 +13,7 @@ Go→Rust 后端**脚手架**:提供可复用的**范式**(不是业务逻辑)�
    - 端点要 role/权限/scope 鉴权 → **`authorization`**(判断:perm-not-role / 403 vs 404 / read:all 是 mode 非闸 / doc 由 op_perms 注入不手敲 security)
    - 多步原子写(事务)→ **`transactions`**(原子单元=一个 trait 方法 / Tx 不进签名 / memory 先校验后改 / 跨 repo 不组合一个 tx)
    - 模块要发领域事件 / 实时推送(SSE / EventBus / NATS)→ **`eventbus`**(端口归消费方不做泛型总线 / service 写成功后 fire-and-forget / 行级过滤在 handler 逐帧 / justfile 契约接线最易漏)
+   - 改后台「系统监控」页的数据、加 span / 日志字段,新 PG 仓储方法、后台任务要可观测 → **`observability`**(PG 方法必加 `pg.*` span / 统计键只许闭集 / 空轮询不建 span / 不引入外部监控套件)
    - `ToSchema` 字段只有有限已知取值(status/type/channel/outcome/reason code)→ **`closed-enums`**(闭集枚举而非裸 String,防前端类型漂移 / 无 catch-all 除非多写者版本偏斜 / 读模型强类型、写模型可留 String / 前端 import 生成 union,不手写平行 union)
 2. **照着 `widget` 改**:它是六边形分层的活样板(核心 `model` / `ports` / `service` + `adapters/{http,memory,postgres,bus}`),也是跨模块富化的样板。
 3. **每个改动过 `just check && just test && just lint`**(clippy 是 `-D warnings`,零警告)。`just test` 含黑盒 HTTP 验收(`tests/http_*.rs`)、OpenAPI 快照、架构规则。
@@ -34,6 +35,7 @@ Go→Rust 后端**脚手架**:提供可复用的**范式**(不是业务逻辑)�
 - **统一不泄露错误契约**:所有出错(含 panic / timeout)→ `ErrorBody` JSON `{code,error}`,原始细节只进日志。
 - **config 零环境变量静默启动**:全字段有默认,不设任何 env 也能跑(内存模式)。
 - **认证**:httponly cookie + Bearer 兜底;app 进程只 decode JWT(roles 在 claim 里),不查 idm 库。
+- **监控**:后台「系统监控」页(`/api/v1/admin/monitoring` 实时 + `/history` + `/logs`,需 `users:admin`)。实时数据在进程内存(`src/infra/monitor/`,15s 一个快照、留 1 小时);每分钟落盘到 **`ops` schema**(`OPS_DB_HOST`;分钟级 15 天 / 小时级 13 个月 / 明细 30 天),WARN 及以上日志 + 5xx + 慢请求经采集层进 `ops.log_record`(15 天、入库前脱敏)。不配 ops 库 = 内存里最近 24 小时。分进程时 app 经 `IDM_INTERNAL_URL` 汇总 idm 实时数据(`app/monitoring.rs`)。埋点函数在 `src/infra/telemetry.rs`(同时写给外部抓取用的 `/metrics`);`/readyz` 逐项检查依赖(`app/probes.rs`)。不引入外部监控套件。
 
 ## API 约定
 
@@ -48,7 +50,7 @@ RESTful。写操作用 **PUT 全量替换、禁 PATCH**(更新 DTO 别为"部分
 | `src/infra/` | 适配器侧横切:config / **http**(错误→HTTP、提取器、分页查询、审计提取器、闭集 schema)/ authz(TokenScope 提取器 + 登录中间件)/ openapi / op_perms / pg / outbox / jetstream / objectstore | 稳定 |
 | `src/features/<name>/` | 业务模块的适配器:`mod.rs`(重新导出核心)+ `adapters/`(http / postgres / bus / projector …;auth、content 只有 HTTP 边界,核心在 idm / content 领域库) | **易变,细节看代码** |
 | `src/bin/` | `idm`(分进程入口)、`seed` | 稳定 |
-| `migrations/{app,idm}/` · `tests/` | 各 schema 独立 role;`http_*` 黑盒 HTTP 验收(真实端口 + reqwest,不认识 web 框架,换底座只改 `http_support::serve`)+ `*_api`(axum oneshot)+ `*_conformance` 内存↔PG 对拍 + `openapi_snapshot` + `architecture` | — |
+| `migrations/{app,idm,content,search,ops}/` · `tests/` | 各 schema 独立 role;`http_*` 黑盒 HTTP 验收(真实端口 + reqwest,不认识 web 框架,换底座只改 `http_support::serve`)+ `*_api`(axum oneshot)+ `*_conformance` 内存↔PG 对拍 + `openapi_snapshot` + `architecture` | — |
 
 > 业务模块(`src/features/*`)变化快,本文**不记其细节** —— 要看就读代码 / 测试。文档只钉上面这些稳定骨架。
 

@@ -140,6 +140,7 @@ fn apply_filters(q: &mut sea_query::SelectStatement, f: &AuthEventQuery) {
 
 #[async_trait]
 impl AuthEventRepo for PgAuthEventRepo {
+    #[tracing::instrument(name = "pg.auth_events.insert", skip_all)]
     async fn insert(&self, ev: &NewAuthEvent) -> Result<bool, AppError> {
         // 显式列 INSERT + ON CONFLICT (event_seq) DO NOTHING(幂等)。富化列不写 → DB 默认 null。
         // ip 用 ::inet cast(sea-query 无 inet 类型,用文本 cast 交给 sqlx bind)。
@@ -171,6 +172,7 @@ impl AuthEventRepo for PgAuthEventRepo {
         Ok(res.rows_affected() > 0)
     }
 
+    #[tracing::instrument(name = "pg.auth_events.list", skip_all)]
     async fn list(
         &self,
         f: &AuthEventQuery,
@@ -241,6 +243,7 @@ impl AuthEventRepo for PgAuthEventRepo {
         }
     }
 
+    #[tracing::instrument(name = "pg.auth_events.delete_older_than", skip_all)]
     async fn delete_older_than(&self, cutoff: OffsetDateTime) -> Result<u64, AppError> {
         let r = sqlx::query("delete from auth_event where occurred_at < $1")
             .bind(cutoff)
@@ -251,6 +254,7 @@ impl AuthEventRepo for PgAuthEventRepo {
     }
 
     // 五条固定聚合查询,行形状写死 → 元组 + turbofish 就够(不值当为此上 sea-query)。
+    #[tracing::instrument(name = "pg.auth_events.stats", skip_all)]
     async fn stats(&self, from: OffsetDateTime, to: OffsetDateTime) -> Result<AuthStats, AppError> {
         let activity: Vec<(OffsetDateTime, i64, i64)> = sqlx::query_as(
             r#"SELECT g.t, coalesce(s.success,0) AS success, coalesce(s.failure,0) AS failure

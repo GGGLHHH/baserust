@@ -50,7 +50,8 @@ fn test_app() -> (Router, String) {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
-        db_pool: None, // 内存模式:readyz 恒就绪
+        probes: Default::default(),
+        monitoring: Default::default(),
         cookie_secure: false,
         policy: Arc::new(test_policy()),
         token_signer: Some(signer.clone()),

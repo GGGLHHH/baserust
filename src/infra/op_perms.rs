@@ -60,6 +60,19 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "admin_list_widgets",
         perm: PermReq::All(&[Perm::UsersAdmin]),
     },
+    // 系统监控:同 superadmin-only(进程 / 依赖 / 流量的全局视图)
+    OpAuthz {
+        operation_id: "get_monitoring",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "get_monitoring_history",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
+    OpAuthz {
+        operation_id: "list_monitoring_logs",
+        perm: PermReq::All(&[Perm::UsersAdmin]),
+    },
     OpAuthz {
         operation_id: "widget_events",
         perm: PermReq::All(&[Perm::WidgetRead]),

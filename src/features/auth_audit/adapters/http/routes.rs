@@ -132,7 +132,8 @@ pub async fn stream_auth_events(
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     let bus = state.auth_events_bus.as_ref().ok_or(AppError::NotFound)?;
     let rx = bus.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    let guard = crate::infra::telemetry::SseConnectionGuard::new("auth_events");
+    let stream = futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
         loop {
             match rx.recv().await {
                 Ok(row) => {
@@ -140,7 +141,7 @@ pub async fn stream_auth_events(
                         .event("auth_event")
                         .json_data(AuthEventRow::from(row))
                         .ok()?;
-                    return Some((Ok::<_, Infallible>(frame), rx));
+                    return Some((Ok::<_, Infallible>(frame), (rx, guard)));
                 }
                 // 慢消费者掉队:跳过丢失的继续收,不断流(同 widget 事件总线契约)。
                 Err(RecvError::Lagged(_)) => continue,

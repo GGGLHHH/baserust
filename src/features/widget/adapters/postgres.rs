@@ -165,6 +165,7 @@ impl PgWidgetRepo {
 
 #[async_trait]
 impl WidgetRepo for PgWidgetRepo {
+    #[tracing::instrument(name = "pg.widgets.list", skip_all)]
     async fn list(
         &self,
         page: &PageParams,
@@ -275,6 +276,7 @@ impl WidgetRepo for PgWidgetRepo {
         }
     }
 
+    #[tracing::instrument(name = "pg.widgets.get", skip_all)]
     async fn get(&self, id: Uuid) -> Result<Widget, AppError> {
         let mut q = Self::base_select();
         q.columns(COLS).and_where(Expr::col(Widgets::Id).eq(id));
@@ -287,6 +289,7 @@ impl WidgetRepo for PgWidgetRepo {
             .ok_or(AppError::NotFound)
     }
 
+    #[tracing::instrument(name = "pg.widgets.create", skip_all)]
     async fn create(&self, name: String, by: Option<String>) -> Result<Widget, AppError> {
         let id = Uuid::now_v7();
         // created_at/updated_at 不入列 → 走 DB default;created_by=updated_by=by
@@ -308,6 +311,7 @@ impl WidgetRepo for PgWidgetRepo {
             .map_err(map_db_err) // 重名 → 23505 → Conflict(409)
     }
 
+    #[tracing::instrument(name = "pg.widgets.update", skip_all)]
     async fn update(&self, id: Uuid, name: String, by: Option<String>) -> Result<Widget, AppError> {
         // updated_at 由触发器自动盖;只能改存活行
         let (sql, values) = Query::update()
@@ -326,6 +330,7 @@ impl WidgetRepo for PgWidgetRepo {
             .ok_or(AppError::NotFound)
     }
 
+    #[tracing::instrument(name = "pg.widgets.soft_delete", skip_all)]
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), AppError> {
         // 软删 = 盖 deleted_at(+ updated_by;updated_at 触发器自动);幂等:已删行不再命中
         let (sql, values) = Query::update()
@@ -346,6 +351,7 @@ impl WidgetRepo for PgWidgetRepo {
     }
 
     // ── 父子双表事务范式:整个原子操作 = 一个方法;`Transaction` 只活在方法体,不进 trait 签名。──
+    #[tracing::instrument(name = "pg.widgets.create_with_tags", skip_all)]
     async fn create_with_tags(
         &self,
         name: String,
@@ -398,6 +404,7 @@ impl WidgetRepo for PgWidgetRepo {
         Ok(widget)
     }
 
+    #[tracing::instrument(name = "pg.widgets.tags_of", skip_all)]
     async fn tags_of(&self, widget_id: Uuid) -> Result<Vec<String>, AppError> {
         let (sql, vals) = Query::select()
             .column(WidgetTags::Label)

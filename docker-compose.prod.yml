@@ -32,6 +32,10 @@ services:
       BIND_ADDR: 0.0.0.0:8080
       APP_ENV: prod
       IDM_EMBEDDED: "false"        # 分进程:app 只挂业务(widget+content),auth 归 idm 进程
+      IDM_INTERNAL_URL: http://idm:8080   # 后台监控页由 app 汇总 idm(内网 /internal/monitoring,nginx 不转发)
+      # 后台监控历史 / 日志(ops schema);库/角色/密码走 env_file 的 OPS_DB_{USER,PASSWORD,DATABASE}。
+      OPS_DB_HOST: pg
+      OPS_DB_PORT: "5432"
       # app 只 decode JWT → 只需公钥(被攻破也铸不出 token)。非 dev 公钥 → 过 prod fail-fast。
       JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
       APP_DB_HOST: pg
@@ -82,6 +86,9 @@ services:
       # 库/角色/密码走 env_file 的 SEARCH_DB_{USER,PASSWORD,DATABASE}。
       SEARCH_DB_HOST: pg
       SEARCH_DB_PORT: "5432"
+      # 后台监控历史 / 日志(ops schema);库/角色/密码走 env_file 的 OPS_DB_{USER,PASSWORD,DATABASE}。
+      OPS_DB_HOST: pg
+      OPS_DB_PORT: "5432"
       # 启动 seed 超管:挂 seed.prod.toml(真账号/密码,gitignore 挡)+ 设 SEED_FILE。
       # prod 检测到 SEED_FILE 即幂等建号(无需 IDM_SEED_ON_START);不挂则不建(不用嵌入 pwd 弱默认)。
       # 部署前先 `cp seed.prod.toml.example seed.prod.toml` 填强密码(否则 bind mount 会建成空目录)。
@@ -115,7 +122,7 @@ services:
     env_file: [.env]
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-      # 首次(空 volume)建 app/idm/content/search 的 role + schema(search_path 各指自己 schema)。
+      # 首次(空 volume)建 app/idm/content/search/ops 的 role + schema(search_path 各指自己 schema)。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]

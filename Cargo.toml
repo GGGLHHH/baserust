@@ -114,6 +114,12 @@ toml = "0.8"
 tower_governor = "0.8.0"
 # metrics:Prometheus 请求计数/延迟直方图 + /metrics 端点。opt-in(METRICS_ENABLED)。
 axum-prometheus = "0.10.0"
+# 自定义指标走 metrics facade(与 axum-prometheus 同一个 0.24,共用一个 Prometheus recorder);
+# metrics-process:进程资源(/metrics 与后台监控页都用它的采集函数)
+metrics = "0.24"
+metrics-process = "2"
+# app 进程拉 idm 进程的监控报告(分进程拓扑,IDM_INTERNAL_URL;内网明文 HTTP,不需要 TLS)
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # 事件总线的多实例默认后端(EventBus 选择链:NATS_URL → NATS;无则 PG LISTEN/NOTIFY;再无内存)。
 async-nats = "0.49"
 

@@ -49,7 +49,8 @@ fn test_app() -> Router {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
-        db_pool: None,
+        probes: Default::default(),
+        monitoring: Default::default(),
         cookie_secure: false,
         policy: Arc::new(baserust::kernel::authz::Policy::default()), // 这套契约不测授权
         token_signer: Some(signer.clone()),

@@ -386,18 +386,23 @@ pub async fn widget_events(
     let sub = state.widget_events.subscribe().await?;
     // recv() → SSE 帧;None(总线关)→ 流结束。json_data 对我们的类型不会失败,失败即结束流(ok()?)。
     // 不在可见域内的帧:continue 跳过(丢帧 ≠ 断流 —— 广播里本就混着别人的事件)。
-    let stream = futures_util::stream::unfold((sub, access), |(mut sub, access)| async move {
-        loop {
-            let event = sub.recv().await?;
-            if !access.allows_created_by(event.owner()) {
-                continue;
+    // 在线连接数指标:守卫随流存活,客户端断开(流被丢弃)时自动 -1。
+    let guard = crate::infra::telemetry::SseConnectionGuard::new("widgets");
+    let stream = futures_util::stream::unfold(
+        (sub, access, guard),
+        |(mut sub, access, guard)| async move {
+            loop {
+                let event = sub.recv().await?;
+                if !access.allows_created_by(event.owner()) {
+                    continue;
+                }
+                let frame = Event::default()
+                    .event(event.name())
+                    .json_data(WidgetEvent::from(event))
+                    .ok()?;
+                return Some((Ok::<_, Infallible>(frame), (sub, access, guard)));
             }
-            let frame = Event::default()
-                .event(event.name())
-                .json_data(WidgetEvent::from(event))
-                .ok()?;
-            return Some((Ok::<_, Infallible>(frame), (sub, access)));
-        }
-    });
+        },
+    );
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

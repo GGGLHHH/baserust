@@ -24,8 +24,10 @@ pub async fn emit_auth_event(
     aggregate_id: Uuid,
     data: Value,
 ) {
-    let Some(outbox) = outbox else { return };
     let event_type = event_type.as_str();
+    metrics::counter!(crate::infra::telemetry::AUTH_EVENTS, "event_type" => event_type)
+        .increment(1);
+    let Some(outbox) = outbox else { return };
     if let Err(e) = outbox.emit(event_type, aggregate_id, data).await {
         tracing::warn!(error = %e, event_type, "auth 审计事件发射失败(不阻断认证)");
     }

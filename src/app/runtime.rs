@@ -17,19 +17,31 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
     // config 先于日志:环境变量(含 RUST_LOG/LOG_FILE)全收口在 Config。
     // load 失败时 tracing 尚未 init —— anyhow 错误由 main 落 stderr,不丢。
     let config = Config::load().context("加载配置失败")?;
-    init_tracing(&config);
-
     let mount = select_mount(&config);
+    init_tracing(&config);
+    // 先定进程身份再装配:装配期间(连库、seed…)打出的警告也要标对是 app 还是 idm。
+    crate::infra::monitor::logs::set_instance(
+        crate::app::monitoring::role_for_mount(mount).as_str(),
+    );
+
     let (state, bg) = AppState::new(&config, mount).await?;
+    let probes = state.probes.clone();
+    let monitoring = state.monitoring.clone();
     let app = build_router(state, &config, mount);
     // metrics(opt-in,METRICS_ENABLED):Prometheus 请求计数/延迟直方图 + /metrics 端点。
     // 放这(不进 build_router):prometheus 全局 recorder 只能 install 一次,oneshot 测试多次
     // build_router 会重复 install 而 panic;放进程启动唯一路径就稳。/metrics 内部端点,不进 OpenAPI。
     let app = if config.metrics_enabled {
+        // endpoint 标签用路由模板(/widgets/{id});没匹配上路由的(404 扫描等)一律记 "unmatched",
+        // 否则任意乱打的 URL 都会变成一条新时间序列(标签基数爆炸)。
         let (layer, handle) = axum_prometheus::PrometheusMetricLayerBuilder::new()
+            .with_endpoint_label_type(axum_prometheus::EndpointLabel::MatchedPathWithFallbackFn(
+                |_| "unmatched".to_owned(),
+            ))
             .with_ignore_pattern("/metrics")
             .with_default_metrics()
             .build_pair();
+        crate::infra::telemetry::describe_metrics();
         app.route(
             "/metrics",
             axum::routing::get(move || async move { handle.render() }),
@@ -68,6 +80,26 @@ pub async fn run(select_mount: impl FnOnce(&Config) -> Mount) -> anyhow::Result<
     if let Some(auth_retention) = bg.auth_retention {
         tokio::spawn(auth_retention.run(shutdown_rx.clone()));
     }
+    // 监控采样(后台监控页的历史曲线;开了 /metrics 时顺带刷新进程资源 / 连接池指标)。
+    tokio::spawn(crate::app::monitoring::run_sampler(
+        probes.clone(),
+        config.metrics_enabled,
+        shutdown_rx.clone(),
+    ));
+    // 监控历史与日志:每分钟落盘、日志批量写入、保留期清理(存储是 ops 库,没配就是内存)。
+    tokio::spawn(crate::app::monitoring::run_minute_flusher(
+        monitoring.clone(),
+        probes,
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(crate::app::monitoring::run_log_writer(
+        monitoring.clone(),
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(crate::app::monitoring::run_retention(
+        monitoring,
+        shutdown_rx.clone(),
+    ));
 
     // into_make_service_with_connect_info:给 SmartIpKeyExtractor 的 peer-IP fallback 提供 ConnectInfo
     // (生产 nginx 设 X-Forwarded-For 时走 header;直连/无代理时回落到对端 IP)。
@@ -119,18 +151,23 @@ async fn serve_until_drained(
     Ok(())
 }
 
-/// 结构化日志。按 `config.app_env` 切格式:**prod → JSON**(机器可解析、便于采集);非 prod → 彩色易读。
-/// 级别:`config.log_filter()`(`RUST_LOG` 优先;缺省 prod=info、dev=debug)。
+/// 结构化日志 + 数据库操作计时。日志格式:`LOG_FORMAT`,不设按 `config.app_env`(**prod → JSON**,机器可解析、
+/// 便于采集;非 prod → 彩色易读)。级别:`config.log_filter()`(`RUST_LOG` 优先;缺省 prod=info、dev=debug)。
+///
+/// 过滤是**逐层**的:日志级别只管日志输出;[`DbTimingLayer`](crate::infra::monitor::DbTimingLayer)
+/// 单独只收 `pg.*` span 给后台监控页计时,[`LogCaptureLayer`](crate::infra::monitor::logs::LogCaptureLayer)
+/// 单独收 WARN 及以上进监控日志 —— 改 `RUST_LOG` 不影响这两样。
 fn init_tracing(config: &Config) {
+    use crate::infra::monitor::logs::LogCaptureLayer;
+    use crate::infra::monitor::DbTimingLayer;
     use tracing_subscriber::{
-        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+        filter::filter_fn, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
     };
     let prod = config.app_env.is_prod();
-    let filter = EnvFilter::new(config.log_filter());
 
     // 文件日志**仅在设置了 LOG_FILE 时启用**:
     //   本地开发在 .env 里设 LOG_FILE=logs/dev.log 即可在文件观察(每次启动 truncate);
-    //   容器/生产不设 → 只输出 stdout,由 docker/k8s 收集,绝不在容器内写文件。
+    //   容器/生产不设 → 只输出 stdout,由 docker 收集,绝不在容器内写文件。
     let file_layer = config.log_file.as_ref().map(|path| {
         if let Some(dir) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(dir).ok();
@@ -144,19 +181,27 @@ fn init_tracing(config: &Config) {
         fmt::layer()
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))
+            .with_filter(EnvFilter::new(config.log_filter()))
     });
 
-    // stdout:prod 结构化 JSON / 非 prod 彩色。boxed 统一两分支类型。
-    let stdout_layer = if prod {
+    // stdout:JSON(`LOG_FORMAT=json`,prod 默认)/ 彩色易读(`pretty`,非 prod 默认)。boxed 统一两分支类型。
+    let json = match config.log_format.as_deref() {
+        Some("json") => true,
+        Some("pretty") => false,
+        _ => prod,
+    };
+    let stdout_layer = if json {
         fmt::layer().json().boxed()
     } else {
         fmt::layer().boxed()
-    };
+    }
+    .with_filter(EnvFilter::new(config.log_filter()));
 
     tracing_subscriber::registry()
-        .with(filter)
         .with(file_layer)
         .with(stdout_layer)
+        .with(DbTimingLayer.with_filter(filter_fn(DbTimingLayer::wants)))
+        .with(LogCaptureLayer.with_filter(filter_fn(LogCaptureLayer::wants)))
         .init();
 }
 

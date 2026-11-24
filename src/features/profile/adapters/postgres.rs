@@ -83,6 +83,7 @@ struct UpsertRow {
 
 #[async_trait]
 impl ProfileRepo for PgProfileRepo {
+    #[tracing::instrument(name = "pg.profiles.get", skip_all)]
     async fn get(&self, user_id: Uuid) -> Result<Option<Profile>, AppError> {
         sqlx::query_as::<_, ProfileRow>(GET_SQL)
             .bind(user_id)
@@ -92,6 +93,7 @@ impl ProfileRepo for PgProfileRepo {
             .map_err(|e| AppError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.profiles.find_by_ids", skip_all)]
     async fn find_by_ids(&self, user_ids: &[Uuid]) -> Result<Vec<Profile>, AppError> {
         if user_ids.is_empty() {
             return Ok(Vec::new()); // 空集省一次查询,也避开空 ANY
@@ -104,6 +106,7 @@ impl ProfileRepo for PgProfileRepo {
             .map_err(|e| AppError::Internal(e.into()))
     }
 
+    #[tracing::instrument(name = "pg.profiles.upsert", skip_all)]
     async fn upsert(
         &self,
         user_id: Uuid,

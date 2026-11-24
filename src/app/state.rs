@@ -49,6 +49,8 @@ pub enum Schema {
     Idm,
     Content,
     Search,
+    /// 运维数据(后台监控的历史指标与日志)。
+    Ops,
 }
 
 /// 应用级依赖容器。范式(替代 DI 框架):
@@ -68,8 +70,11 @@ pub struct AppState {
     pub auth: AuthService,
     /// 后台用户管理(idm 身份原语 + app.profiles 富化)。仅 needs_idm 进程装真实现。
     pub user_admin: UserAdminService,
-    /// readyz 就绪探针用:DB 模式持 pool(ping `SELECT 1`),内存模式为 `None`(恒就绪)。
-    pub db_pool: Option<PgPool>,
+    /// 依赖探针(`/readyz` 逐项检查 + 连接池指标):本进程持有的各 schema 连接池 + NATS 连接。
+    /// 内存模式为空(恒就绪)。测试里直接 `Default::default()`。
+    pub probes: super::probes::Probes,
+    /// 后台监控页:本进程的角色(app / idm / 合体)+ 要汇总的远端 idm(分进程拓扑)。测试里 `Default::default()`。
+    pub monitoring: super::monitoring::MonitoringSetup,
     /// 认证 cookie 是否带 `Secure`(prod=true,仅 https 发送;dev http 必须 false 否则浏览器不发)。
     pub cookie_secure: bool,
     /// **授权策略(归 app)**:role→权限,从 `seed.toml` 派生的内存只读 `Policy`。handler 经
@@ -367,7 +372,7 @@ impl AppState {
         let projector = build_projector(config, needs_idm, search_pool.as_ref()).await?;
 
         // auth 审计:写句柄(idm.outbox,handler 发事件用)+ 读句柄(auth_event,admin 查询用)+
-        // projector(消费投影)+ 保留 job,都在 `db_pool: app_pool.or(idm_pool)` **移动 idm_pool 之前**
+        // projector(消费投影)+ 保留 job,都在下方组装 `probes` 之前
         // 用 `.as_ref()` 建好(镜像上面 search_pool/user_search 的写法)。
         let idm_outbox: Option<Arc<dyn idm::OutboxRepo>> = idm_pool
             .as_ref()
@@ -379,7 +384,7 @@ impl AppState {
         });
         // SSE 总线:唯一发布者是下面的 auth_projector,只有它真装起来了总线才该对外暴露 ——
         // 否则 needs_idm 但 nats/search 未配时,`/stream` 会 200 挂着却永不推送(sibling 端点已 404)。
-        // 装配顺序在 `db_pool` 移动 idm_pool 之前 —— 之后还要 `.clone()` 一份塞进 projector。
+        // 装配顺序在组装 `probes` 之前 —— 之后还要 `.clone()` 一份塞进 projector。
         let bus = needs_idm.then(AuthEventBus::new);
         let auth_projector =
             build_auth_event_projector(config, needs_idm, search_pool.as_ref(), bus.clone())
@@ -391,6 +396,37 @@ impl AppState {
             )
         });
 
+        // 依赖探针:本进程实际连着的每个 schema 连接池 + 一条专用 NATS 连接(只看连接状态,不收发)。
+        let probe_nats = match &config.nats_url {
+            Some(url) => Some(
+                async_nats::ConnectOptions::new()
+                    .name("baserust-probe")
+                    .connect(url)
+                    .await
+                    .context("连接 NATS(就绪探针)失败")?,
+            ),
+            None => None,
+        };
+        // ops(运维数据:监控历史与日志):各进程都连;不设 OPS_DB_HOST → 内存(只留最近一段)。
+        let ops_pool = connect_for_schema(config, Schema::Ops).await?;
+        let ops_store: Arc<dyn crate::infra::monitor::store::OpsStore> = match &ops_pool {
+            Some(pool) => Arc::new(crate::infra::monitor::store_pg::PgOpsStore::new(
+                pool.clone(),
+            )),
+            None => Arc::new(crate::infra::monitor::store::MemoryOpsStore::new()),
+        };
+        let probe_pools = [
+            ("app", &app_pool),
+            ("idm", &idm_pool),
+            ("content", &content_pool),
+            ("search", &search_pool),
+            ("ops", &ops_pool),
+        ]
+        .into_iter()
+        .filter_map(|(name, pool)| pool.clone().map(|p| (name, p)))
+        .collect();
+        let probes = super::probes::Probes::new(probe_pools, probe_nats);
+
         Ok((
             Self {
                 widgets: WidgetService::new(widget_repo, user_directory, widget_events.clone()),
@@ -399,8 +435,9 @@ impl AppState {
                 contents,
                 auth,
                 user_admin,
-                // readyz 探针 ping 本进程主库:app 进程→app 库,idm 进程→idm 库。
-                db_pool: app_pool.or(idm_pool),
+                probes,
+                monitoring: super::monitoring::MonitoringSetup::new(config, mount)
+                    .with_store(ops_store),
                 cookie_secure: config.app_env.is_prod(),
                 policy,
                 token_verifier,
@@ -447,21 +484,11 @@ async fn build_outbox_relays(
     if let Some(pool) = idm_src {
         let repo: Arc<dyn OutboxRepo> = Arc::new(PgOutboxRepo::new(pool.clone()));
         let source: Arc<dyn OutboxSource> = Arc::new(IdmOutboxSource::new(repo));
-        relays.push(OutboxRelay::new(
-            source,
-            publisher.clone(),
-            poll_interval,
-            batch,
-        ));
+        relays.push(OutboxRelay::new(source, publisher.clone(), poll_interval, batch).named("idm"));
     }
     if let Some(pool) = app_src {
         let source: Arc<dyn OutboxSource> = Arc::new(PgAppOutbox::new(pool.clone()));
-        relays.push(OutboxRelay::new(
-            source,
-            publisher.clone(),
-            poll_interval,
-            batch,
-        ));
+        relays.push(OutboxRelay::new(source, publisher.clone(), poll_interval, batch).named("app"));
     }
     tracing::info!("装配 {} 个 outbox relay(JetStream 交付)", relays.len());
     Ok(relays)
@@ -517,6 +544,7 @@ pub async fn connect_for_schema(config: &Config, schema: Schema) -> anyhow::Resu
         Schema::Idm => config.idm_database_url(),
         Schema::Content => config.content_database_url(),
         Schema::Search => config.search_database_url(),
+        Schema::Ops => config.ops_database_url(),
     };
     match url {
         Some(url) => Ok(Some(connect_pool(&url).await?)),
