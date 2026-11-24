@@ -5,9 +5,19 @@
 # 拓扑:nginx 反代 → app(Mount::App,只公钥) + idm(Mount::Idm,私钥+公钥)分进程 + pg + minio + nats。
 # SSL 由外层(LB / 面板 / certbot)终止,nginx 只服 HTTP:80;prod cookie 带 Secure,故外层必须 HTTPS。
 # 全部 secret / 端口 / 密钥路径来自同目录 .env(由 .env.prod 生成)。
+# 自家镜像名带项目名(COMPOSE_PROJECT_NAME):同一台服务器上多个项目的镜像互不覆盖。
+
+# 容器日志轮转:docker 默认的 json-file 不限大小,日志会一直涨到把磁盘写满。
+# 每个容器最多留 5 个 20 MB 的文件(约 100 MB);docker logs 照常能看。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
 
 services:
   nginx:
+    logging: *logging
     image: nginx:alpine
     restart: unless-stopped
     depends_on:
@@ -20,7 +30,8 @@ services:
 
   # app + idm 共用同一镜像(runtime 含 baserust + idm 两个二进制),只 entrypoint 不同。
   app:
-    image: baserust-runtime:latest
+    logging: *logging
+    image: ${COMPOSE_PROJECT_NAME:-baserust}-app:latest
     pull_policy: never
     restart: unless-stopped
     depends_on:
@@ -62,7 +73,8 @@ services:
     # 不发布主机端口:对外只经 nginx:80。要本机调试临时加 `ports: ["127.0.0.1:6453:8080"]`。
 
   idm:
-    image: baserust-runtime:latest
+    logging: *logging
+    image: ${COMPOSE_PROJECT_NAME:-baserust}-app:latest
     pull_policy: never
     entrypoint: ["idm"]
     restart: unless-stopped
@@ -108,7 +120,8 @@ services:
 
   # 一次性迁移:pg healthy 后按 schema 迁移,完成即退出。app/idm 等它 completed。
   migrate:
-    image: baserust-migrate:latest
+    logging: *logging
+    image: ${COMPOSE_PROJECT_NAME:-baserust}-migrate:latest
     pull_policy: never
     depends_on:
       pg: { condition: service_healthy }
@@ -118,6 +131,7 @@ services:
     restart: "no"
 
   pg:
+    logging: *logging
     image: postgres:17-alpine
     restart: unless-stopped
     env_file: [.env]
@@ -133,6 +147,7 @@ services:
 
   # 官方 minio/minio、minio/mc 已停更并从 Docker Hub 下架,改用社区维护的 pgsty 构建(命令/参数兼容)。
   minio:
+    logging: *logging
     image: pgsty/minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -145,6 +160,7 @@ services:
     # 对外只开 nginx:80。
 
   minio-init:
+    logging: *logging
     # pgsty/minio 镜像自带 mc,直接复用,少一个镜像(pgsty/mc 不在国内镜像站白名单里)。
     image: pgsty/minio
     depends_on: [minio]
@@ -157,6 +173,7 @@ services:
     restart: "no"
 
   nats:
+    logging: *logging
     image: nats:alpine
     restart: unless-stopped
     # -js:app 的 JetStream 发布端(infra/jetstream.rs)启动即 ensure 流 USER_SEARCH_EVENTS,
