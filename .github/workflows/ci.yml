@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 版本由仓库根的 rust-toolchain.toml 决定(和本机、Dockerfile 一致)。
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # 仓储一致性 / 事件总线等打真 Postgres(just test-pg;内存那一半在上面的 Test 里已经跑过)。
+  pg-conformance:
+    name: PG conformance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: baserust
+          POSTGRES_PASSWORD: baserust
+          POSTGRES_DB: baserust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U baserust"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      PG_HOST: localhost
+      PG_PORT: "5432"
+      POSTGRES_USER: baserust
+      POSTGRES_PASSWORD: baserust
+      POSTGRES_DB: baserust
+      APP_DB_USER: app
+      APP_DB_PASSWORD: pwd
+      IDM_DB_USER: idm
+      IDM_DB_PASSWORD: pwd
+      CONTENT_DB_USER: content
+      CONTENT_DB_PASSWORD: pwd
+      SEARCH_DB_USER: search
+      SEARCH_DB_PASSWORD: pwd
+      OPS_DB_USER: ops
+      OPS_DB_PASSWORD: pwd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
+      # 和生产同一份建库脚本(role / schema / search_path)。
+      - name: Create roles and schemas
+        run: bash scripts/initdb/00-roles-schemas.sh
+        env:
+          PGHOST: localhost
+          PGPASSWORD: baserust
+      - name: Test against Postgres
+        run: just test-pg
