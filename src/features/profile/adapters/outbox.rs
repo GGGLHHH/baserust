@@ -69,8 +69,14 @@ impl PgAppOutbox {
     /// 标记已发布(盖 published_at)。幂等(重复标记/标记不存在的 id 都 Ok)。
     pub async fn mark_published(&self, ids: &[i64]) -> Result<(), AppError> {
         if ids.is_empty() {
-            return Ok(()); // 空集省一次 UPDATE
+            return Ok(()); // 空集省一次 UPDATE,也不建 span(relay 每轮都调)
         }
+        self.mark_nonempty(ids).await
+    }
+
+    /// span 名带 `app_`:单进程模式下 idm 的发件箱也在同一个进程里打 `pg.outbox.*`,同名会并成一行统计。
+    #[tracing::instrument(name = "pg.app_outbox.mark_published", skip_all)]
+    async fn mark_nonempty(&self, ids: &[i64]) -> Result<(), AppError> {
         sqlx::query(MARK_SQL)
             .bind(ids)
             .execute(&self.pool)
@@ -82,6 +88,7 @@ impl PgAppOutbox {
 
 /// 内部 emit 助手,由 `PgProfileRepo` 写方法在其**已有事务**上调用:在给定 `&mut Transaction` 上插
 /// 一行 outbox,不参与 `PgAppOutbox` 自己的连接(`PgAppOutbox` 只 poll/mark,不进写事务)。
+#[tracing::instrument(name = "pg.app_outbox.emit", skip_all)]
 pub(crate) async fn emit_outbox(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     event_type: &str,

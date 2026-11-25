@@ -34,6 +34,9 @@ baserust 的监控是**后台里的「系统监控」页**(`/admin/monitoring`,�
 ## 判断
 
 - **新 PG 仓储方法 → 必须加 `pg.*` span**(照抄 `features/widget/adapters/postgres.rs`):不加,监控页的数据库操作表里就没有它。`skip_all`:参数里有用户数据,别进日志字段。
+  `<表>` 用模块的**主表名**(子表操作也记在主表下,如 `widgets.tags_of`);两个 schema 里同名的表加前缀区分
+  (app 的发件箱是 `pg.app_outbox.*`,idm 的是 `pg.outbox.*`:单进程模式下同名会并成一行)。**已有的 span 名不改**:
+  历史按 span 名存,改名后新旧数据断开(所以 `pg.auth_events.*`、`pg.search_index.*` 保留现名)。
 - **统计的键只许有限小集合**:路由**模板**(`/widgets/{id}`,未匹配一律 `unmatched`)、仓储方法名、relay 来源、projector 名。**用户 id、请求路径原文、错误消息、IP 绝不能当键** —— 每个值一行,内存和页面都会被撑爆。细节进日志。
 - **高频后台循环不建空 span**:每秒一轮的轮询(outbox relay)只在真有活时建 span;`telemetry::outbox_polled` 仍每轮调(页面靠它判断 relay 是否停滞)。
 - **后台组件启动就登记**(`telemetry::outbox_started`、projector 的 `pending_tick` 首拍):没活干时页面上也有这一行、显示 0,而不是不见了。
