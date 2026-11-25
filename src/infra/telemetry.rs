@@ -35,6 +35,8 @@ pub const JETSTREAM_ACK_PENDING: &str = "baserust_jetstream_consumer_ack_pending
 pub const SSE_CONNECTIONS: &str = "baserust_sse_connections";
 /// 认证审计事件数(登录成败 / 刷新 / 登出 / 注册…),标签 `event_type`。
 pub const AUTH_EVENTS: &str = "baserust_auth_events_total";
+/// 前端错误上报超出限流被丢弃的条数。
+pub const CLIENT_ERRORS_DROPPED: &str = "baserust_client_errors_dropped_total";
 
 /// 给指标写说明(`/metrics` 里的 `# HELP`)。装 recorder 后调一次。
 pub fn describe_metrics() {
@@ -60,6 +62,14 @@ pub fn describe_metrics() {
     describe_gauge!(JETSTREAM_ACK_PENDING, "JetStream 消费者已投递未确认");
     describe_gauge!(SSE_CONNECTIONS, "当前打开的 SSE 连接数");
     describe_counter!(AUTH_EVENTS, "认证审计事件数");
+    describe_counter!(CLIENT_ERRORS_DROPPED, "前端错误上报超出限流被丢弃的条数");
+}
+
+// ── 前端错误上报 ──
+
+/// 超出限流丢弃了 `n` 条前端错误。
+pub fn client_errors_dropped(n: usize) {
+    metrics::counter!(CLIENT_ERRORS_DROPPED).increment(n as u64);
 }
 
 /// SSE 连接计数守卫:建流时 +1,流被丢弃(客户端断开 / 服务关停)时 -1。放进 stream 的状态里随流存活。

@@ -7085,10 +7085,7 @@ expression: spec
                 }
               }
             },
-            "description": "JSON 格式不对(如 kind 不认识)"
-          },
-          "413": {
-            "description": "请求体超过 64 KB"
+            "description": "JSON 格式不对(如 kind 不认识),或请求体超过 64 KB"
           },
           "422": {
             "content": {
@@ -7236,7 +7233,7 @@ expression: spec
       "name": "users"
     },
     {
-      "description": "后台系统监控:依赖健康/流量/数据库/后台任务/进程资源",
+      "description": "系统监控:后台监控页(依赖健康/流量/数据库/后台任务/进程资源)与前端错误上报",
       "name": "monitoring"
     }
   ]

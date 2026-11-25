@@ -4,15 +4,16 @@
 //!
 //! 免登录(登录页自己也可能出错),所以按**匿名可达的写入口**设防:
 //! - 一次最多 [`MAX_BATCH`] 条、请求体 [`MAX_BODY_BYTES`] 封顶,各字段按字符截断;
-//! - 进程内限流:每个 IP 每分钟 [`PER_IP_PER_MINUTE`] 条、全站每分钟 [`GLOBAL_PER_MINUTE`] 条。
-//!   超出的静默丢弃,照样回 204 —— 别让前端以为失败而重发;
-//! - 页面地址、脚本地址只留路径(去掉 query / hash,里面可能带 token);
+//! - 进程内限流:每个 IP(IPv6 按 /64 网段)每分钟 [`PER_IP_PER_MINUTE`] 条、全站每分钟
+//!   [`GLOBAL_PER_MINUTE`] 条。超出的丢弃,照样回 204 —— 别让前端以为失败而重发;丢了多少记进
+//!   `/metrics`,每分钟第一次丢弃时打一条 WARN(日志页能看到「有错误没收进来」);
+//! - 页面地址、脚本地址、调用栈里的 URL 去掉 query / hash(里面可能带 token),保留行号列号;
 //! - 不信客户端时间,一律用收到的时间。
 //!
 //! 直接写日志库、不走采集队列:量已被限流封顶,而且写完就能在日志页查到。
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,8 +30,9 @@ use crate::app::state::AppState;
 use crate::infra::client_context::ClientContext;
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
-use crate::infra::monitor::logs;
+use crate::infra::monitor::logs::{self, truncate};
 use crate::infra::monitor::store::{LogEntry, Service, Severity};
+use crate::infra::telemetry;
 use crate::kernel::error::AppError;
 
 /// 一次最多上报几条。
@@ -105,8 +107,7 @@ pub fn public_router() -> OpenApiRouter<AppState> {
     request_body = ClientErrorBatch,
     responses(
         (status = 204, description = "已收下(超出限流的部分静默丢弃)"),
-        (status = 400, description = "JSON 格式不对(如 kind 不认识)", body = ErrorBody),
-        (status = 413, description = "请求体超过 64 KB"),
+        (status = 400, description = "JSON 格式不对(如 kind 不认识),或请求体超过 64 KB", body = ErrorBody),
         (status = 422, description = "条数不在 1~10 之间", body = ErrorBody)
     )
 )]
@@ -119,11 +120,23 @@ pub async fn report_client_errors(
         return Err(AppError::Validation(format!("一次上报 1~{MAX_BATCH} 条")).into());
     }
     let ip = client.ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let admitted = LIMITER.lock().unwrap_or_else(|e| e.into_inner()).admit(
-        ip,
+    let want = batch.errors.len();
+    let (admitted, first_drop) = LIMITER.lock().unwrap_or_else(|e| e.into_inner()).admit(
+        limit_key(ip),
         Instant::now(),
-        batch.errors.len(),
+        want,
     );
+    if admitted < want {
+        telemetry::client_errors_dropped(want - admitted);
+        if first_drop {
+            tracing::warn!(
+                per_ip = PER_IP_PER_MINUTE,
+                global = GLOBAL_PER_MINUTE,
+                "前端错误上报超出限流,本分钟超出的部分丢弃(丢弃总数见 /metrics 的 {})",
+                telemetry::CLIENT_ERRORS_DROPPED
+            );
+        }
+    }
     if admitted == 0 {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -155,11 +168,15 @@ fn to_entry(
         }
     };
     put("kind", Some(r.kind.as_str().to_owned()));
-    put("stack", r.stack.map(|s| truncate(&s, MAX_STACK_CHARS)));
+    put(
+        "stack",
+        r.stack
+            .map(|s| truncate(&strip_url_queries(&s), MAX_STACK_CHARS)),
+    );
     put(
         "source",
         r.source
-            .map(|s| truncate(&strip_query(&s), MAX_SHORT_CHARS)),
+            .map(|s| truncate(&strip_source_query(&s), MAX_SHORT_CHARS)),
     );
     put("release", r.release.map(|s| truncate(&s, MAX_SHORT_CHARS)));
     put("user_agent", user_agent.map(str::to_owned));
@@ -194,14 +211,51 @@ fn strip_query(s: &str) -> String {
     s[..end].to_owned()
 }
 
-/// 按字符截断(不能按字节切:多字节字符会 panic)。
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
+/// 脚本位置 `地址:行:列`:去掉地址里的 query / hash,行号列号留着。
+fn strip_source_query(s: &str) -> String {
+    let mut cut = s.len();
+    // 从末尾拆下最多两段纯数字(行、列)
+    for _ in 0..2 {
+        match s[..cut].rfind(':') {
+            Some(i) if i + 1 < cut && s[i + 1..cut].bytes().all(|b| b.is_ascii_digit()) => cut = i,
+            _ => break,
+        }
+    }
+    format!("{}{}", strip_query(&s[..cut]), &s[cut..])
+}
+
+/// 调用栈里的 URL(含 `://` 的词)去掉 query / hash,到空白、`)`、`:` 为止(后面的行列号留着)。
+/// 不是 URL 的词不动(消息里的问号、私有字段的 `#` 照旧)。
+fn strip_url_queries(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut word_start = 0;
+    let mut skipping = false;
+    for c in s.chars() {
+        let ends_word = c.is_whitespace() || c == '(' || c == ')';
+        if skipping {
+            if ends_word || c == ':' {
+                skipping = false;
+            } else {
+                continue;
+            }
+        }
+        if (c == '?' || c == '#') && out[word_start..].contains("://") {
+            skipping = true;
+            continue;
+        }
+        out.push(c);
+        if ends_word {
+            word_start = out.len();
+        }
+    }
+    out
+}
+
+/// 限流按谁算:IPv4 按地址;IPv6 按 /64 网段(一个用户通常就拿到一整段,按单个地址算等于不限)。
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
     }
 }
 
@@ -215,6 +269,8 @@ struct Limiter {
     window_start: Option<Instant>,
     used_global: u32,
     used_by_ip: HashMap<IpAddr, u32>,
+    /// 本窗口里已经丢弃过(只在第一次丢弃时打 WARN)。
+    dropped: bool,
 }
 
 impl Limiter {
@@ -225,11 +281,12 @@ impl Limiter {
             window_start: None,
             used_global: 0,
             used_by_ip: HashMap::new(),
+            dropped: false,
         }
     }
 
-    /// 想收 `want` 条,返回这次能收几条(0 = 全部丢弃)。
-    fn admit(&mut self, ip: IpAddr, now: Instant, want: usize) -> usize {
+    /// 想收 `want` 条,返回(这次能收几条,是不是本窗口第一次丢弃)。
+    fn admit(&mut self, ip: IpAddr, now: Instant, want: usize) -> (usize, bool) {
         if self
             .window_start
             .is_none_or(|start| now.duration_since(start) >= WINDOW)
@@ -237,6 +294,7 @@ impl Limiter {
             self.window_start = Some(now);
             self.used_global = 0;
             self.used_by_ip.clear();
+            self.dropped = false;
         }
         let used_ip = self.used_by_ip.get(&ip).copied().unwrap_or(0);
         let room = (self.per_ip - used_ip).min(self.global - self.used_global);
@@ -245,7 +303,8 @@ impl Limiter {
             self.used_global += n;
             self.used_by_ip.insert(ip, used_ip + n);
         }
-        n as usize
+        let first_drop = (n as usize) < want && !std::mem::replace(&mut self.dropped, true);
+        (n as usize, first_drop)
     }
 }
 
@@ -261,12 +320,52 @@ mod tests {
     fn limiter_caps_per_ip_and_globally_then_resets() {
         let mut l = Limiter::new(3, 5);
         let t0 = Instant::now();
-        assert_eq!(l.admit(ip(1), t0, 2), 2);
-        assert_eq!(l.admit(ip(1), t0, 2), 1, "同一 IP 本分钟只剩 1 条");
-        assert_eq!(l.admit(ip(1), t0, 1), 0);
-        assert_eq!(l.admit(ip(2), t0, 3), 2, "全站只剩 2 条");
-        assert_eq!(l.admit(ip(3), t0, 1), 0);
-        assert_eq!(l.admit(ip(1), t0 + WINDOW, 3), 3, "下一分钟清零");
+        assert_eq!(l.admit(ip(1), t0, 2), (2, false));
+        assert_eq!(
+            l.admit(ip(1), t0, 2),
+            (1, true),
+            "同一 IP 本分钟只剩 1 条,第一次丢弃"
+        );
+        assert_eq!(l.admit(ip(1), t0, 1), (0, false), "本分钟已经报过丢弃");
+        assert_eq!(l.admit(ip(2), t0, 3), (2, false), "全站只剩 2 条");
+        assert_eq!(l.admit(ip(3), t0, 1), (0, false));
+        assert_eq!(l.admit(ip(1), t0 + WINDOW, 3), (3, false), "下一分钟清零");
+        assert_eq!(l.admit(ip(1), t0 + WINDOW, 1), (0, true), "新窗口重新报");
+    }
+
+    #[test]
+    fn ipv6_is_limited_per_64() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(limit_key(a), limit_key(b));
+        assert_ne!(limit_key(a), limit_key(other));
+        assert_eq!(limit_key(ip(1)), ip(1));
+    }
+
+    #[test]
+    fn source_keeps_line_and_column() {
+        assert_eq!(
+            strip_source_query("https://h/app.js?v=1:10:5"),
+            "https://h/app.js:10:5"
+        );
+        assert_eq!(strip_source_query("/a.js#x:3"), "/a.js:3");
+        assert_eq!(strip_source_query("/a.js:3:4"), "/a.js:3:4");
+        assert_eq!(strip_source_query("/a.js?t=1"), "/a.js");
+    }
+
+    #[test]
+    fn stack_urls_lose_query_but_not_position() {
+        assert_eq!(
+            strip_url_queries(
+                "Error: why?\n    at f (https://h/app.js?token=x:10:5)\n    at #priv (/b.js:1:2)"
+            ),
+            "Error: why?\n    at f (https://h/app.js:10:5)\n    at #priv (/b.js:1:2)"
+        );
+        assert_eq!(
+            strip_url_queries("g@https://h/app.js?v=2#frag:3:4"),
+            "g@https://h/app.js:3:4"
+        );
     }
 
     #[test]

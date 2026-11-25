@@ -384,4 +384,15 @@ async fn client_errors_land_in_logs_as_web() {
         StatusCode::BAD_REQUEST,
     )
     .await;
+    // 请求体超过 64 KB:和别的接口一样回 400(统一错误体),不进日志
+    expect(
+        s.anon()
+            .post_json(
+                CLIENT_ERRORS,
+                &serde_json::json!({"errors": [{"kind": "error", "message": "x".repeat(70 * 1024)}]}),
+            )
+            .await,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
 }

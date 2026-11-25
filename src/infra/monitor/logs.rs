@@ -78,7 +78,8 @@ fn emit(entry: LogEntry) {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// 按字符截断(不能按字节切:多字节字符会 panic),截掉的用 `…` 标出。
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
     } else {
