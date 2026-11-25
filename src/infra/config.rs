@@ -187,7 +187,7 @@ pub struct Config {
     pub search_db_sslmode: String,
 
     /// ops schema 的数据库连接(role=ops):后台监控的历史指标与日志。app / idm 进程都写。
-    /// `OPS_DB_HOST` 的存在 = 启用持久化;不设 → 监控只有进程内最近 1 小时、日志只留内存里最近一批。
+    /// `OPS_DB_HOST` 的存在 = 启用持久化;不设 → 监控历史只留进程内最近 24 小时、日志只留内存里最近一批,重启清空。
     #[serde(default)]
     pub ops_db_host: Option<String>,
     #[serde(default = "default_db_port")]

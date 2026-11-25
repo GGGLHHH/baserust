@@ -42,7 +42,7 @@ services:
     logging: *logging
     # app 与 idm 共用同一镜像(runtime 阶段含 baserust + idm 两个二进制);只 entrypoint 不同。
     # 同名 image + 同 build → compose 只构建一次,idm 服务直接复用,不重复 build。
-    image: baserust-runtime:latest
+    image: ${COMPOSE_PROJECT_NAME:-baserust}-runtime:latest
     build:
       context: .
       target: runtime
@@ -75,7 +75,7 @@ services:
       CONTENT_DB_DATABASE: ${POSTGRES_DB:-baserust}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
-      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 1 小时。
+      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 24 小时、重启清空。
       OPS_DB_HOST: pg
       OPS_DB_PORT: "5432"
       OPS_DB_DATABASE: ${POSTGRES_DB:-baserust}
@@ -127,7 +127,7 @@ services:
   # idm 进程:**同一镜像**(同 image+build → 复用 app 已构建的那份),只 override entrypoint 跑 idm bin。
   idm:
     logging: *logging
-    image: baserust-runtime:latest
+    image: ${COMPOSE_PROJECT_NAME:-baserust}-runtime:latest
     build:
       context: .
       target: runtime
@@ -154,7 +154,7 @@ services:
       SEARCH_DB_DATABASE: ${POSTGRES_DB:-baserust}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
-      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 1 小时。
+      # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 24 小时、重启清空。
       OPS_DB_HOST: pg
       OPS_DB_PORT: "5432"
       OPS_DB_DATABASE: ${POSTGRES_DB:-baserust}
@@ -194,7 +194,7 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
-      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content/search 四 schema 各用同名 role 跑)。
+      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content/search/ops 五个 schema 各用同名 role 跑)。
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
@@ -299,6 +299,11 @@ services:
     image: pgsty/minio
     depends_on:
       - minio
+    # 和 minio 服务同一份凭据;不传进来的话容器里只有默认值,改了 .env 的 MINIO_USER 就一直连不上
+    environment:
+      MINIO_USER: ${MINIO_USER:-minio}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:-minio12345}
+      S3_BUCKET: ${S3_BUCKET:-content}
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 $${MINIO_USER:-minio} $${MINIO_PASSWORD:-minio12345}; do echo 'waiting for minio'; sleep 1; done;
