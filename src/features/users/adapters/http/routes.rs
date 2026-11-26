@@ -1,7 +1,12 @@
 //! 后台用户管理的 **HTTP 适配器**(admin 组,归 idm 进程)。线格式 ↔ 领域互转见 `dto`。每 handler 首行 `require_scoped(UsersAdmin)`
-//! (组闸 admin:login 之上再 gate superadmin 专属的 users:admin)。写操作 `by = ctx.audit_id()`。
+//! (组闸之上再 gate 平台级 users:admin:平台管理员 + superadmin)。写操作 `by = ctx.audit_id()`。
 //! `#[utoipa::path]` **不手写 security** —— op_perms 经 `inject_operation_security` 注入。
 //! path 相对 admin 组(nest 加 `/api/v1/admin/auth`)→ 实际 `/api/v1/admin/auth/users*`。
+//!
+//! 2026-11-26 角色补充的两道闸(都在 handler,判断抽纯函数 / `Policy` 方法):
+//! - **superadmin 不经任何接口授予 / 撤销**(`assert_superadmin_untouched`):建号带它、改角色加上 / 去掉它 → 403;
+//! - **防接管**(`Policy::require_platform_role_authority`):授出平台角色、或目标账号**现有**平台角色(未过滤原始名)
+//!   → 操作者要 `platform:roles`(只有 superadmin)。平台管理员因此碰不到 superadmin 和别的平台管理员。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -19,7 +24,7 @@ use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::kernel::authz::{Perm, Policy};
+use crate::kernel::authz::{Perm, Policy, RoleName};
 use crate::kernel::error::AppError;
 use crate::kernel::pagination::PageParams;
 
@@ -37,7 +42,8 @@ fn assert_not_self(actor: Uuid, target: Uuid) -> Result<(), AppError> {
 }
 
 /// 提权闸:被授的每个角色的权限,授予者(role∩scope)自己都必须持有 —— 不能授出自己没有的权。
-/// superadmin 持全 Perm,恒过;仅当出现"有 users:admin 但非满权"的中间管理员才真正拦。
+/// 这里授的是**平台角色**(落 `user_roles`),故只算该角色给的平台级权限(租户角色写进来不生效,也不给权)。
+/// superadmin 持全部平台级权限,恒过;仅当出现"有 users:admin 但非满权"的中间管理员才真正拦。
 fn assert_no_escalation(
     policy: &Policy,
     granter: &AuthUser,
@@ -45,11 +51,30 @@ fn assert_no_escalation(
     granted_role_names: &[String],
 ) -> Result<(), AppError> {
     for name in granted_role_names {
-        for perm in policy.perms_for(std::slice::from_ref(name)) {
+        for perm in policy.perms_for(std::slice::from_ref(name), &[]) {
             policy.require_scoped(granter, scope, perm)?; // 缺该权 → Forbidden(403)
         }
     }
     Ok(())
+}
+
+/// superadmin 只由 seed 声明(只有一个):任何接口都**不能授出、也不能撤掉**它 —— `current`(目标现有的原始角色名,
+/// 建号时为空)与 `new`(要写入的)里有没有 superadmin 必须一致,否则 403。保留它的改动(如再加个平台管理员)放行。
+/// 持 `platform:roles` 也不行:那条权限管的是平台管理员,不是 superadmin。
+fn assert_superadmin_untouched(current: &[String], new: &[String]) -> Result<(), AppError> {
+    let sa = RoleName::Superadmin.as_str();
+    let had = current.iter().any(|r| r == sa);
+    let has = new.iter().any(|r| r == sa);
+    if had == has {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+/// 目录里留不留这个(平台)角色:superadmin 永不;其余平台角色只给持 `platform:roles` 的调用者。
+fn grantable_in_catalog(role: RoleName, can_grant_platform: bool) -> bool {
+    role != RoleName::Superadmin && can_grant_platform
 }
 
 /// 自锁:改**自己**的角色不能把 `users:admin` 弄没(否则自我降权、锁死后台)。
@@ -59,7 +84,11 @@ fn assert_self_keeps_admin(
     target: Uuid,
     new_role_names: &[String],
 ) -> Result<(), AppError> {
-    if actor == target && !policy.perms_for(new_role_names).contains(&Perm::UsersAdmin) {
+    if actor == target
+        && !policy
+            .perms_for(new_role_names, &[])
+            .contains(&Perm::UsersAdmin)
+    {
         return Err(AppError::Conflict(
             "cannot remove your own admin access".into(),
         ));
@@ -68,6 +97,8 @@ fn assert_self_keeps_admin(
 }
 
 /// 分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。
+/// **平台账号列表**:不论当前租户,列全部账号(不属于任何租户的也在),角色列 / `roles_any` / `roles_none` 都是平台角色。
+/// 接了 search 投影读全局账号目录,没接读 idm。租户成员列表是另外的接口。
 /// cursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。
 /// `q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;
 /// 未接后端时二者 → 422(回退路只能 idm 直查,不具备搜索能力)。
@@ -129,6 +160,11 @@ pub async fn create_user(
     // 提权闸:不能建带"超出自己权限"角色的号。名字经 service 的未过滤目录解析
     // (与落库校验同一实现,未知 id 此处即 422)—— 守卫失明/落库分裂从结构上不可能。
     let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
+    // superadmin 授不出;授任何平台角色(任命平台管理员)要 platform:roles
+    assert_superadmin_untouched(&[], &role_names)?;
+    state
+        .policy
+        .require_platform_role_authority(&user.0, &scope.0, &role_names)?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
     let view = state.user_admin.create(req.into(), ctx.audit_id()).await?;
     Ok((StatusCode::CREATED, Json(view.into())))
@@ -188,9 +224,9 @@ pub async fn update_user(
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
     // 目标现有角色闸(同 delete / reset_password / set_roles):改身份字段也是对目标动手 ——
     // 改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username/email)。
-    // 本模块四个写端点口径统一:够得着目标的全部权,才动得了它。
-    assert_no_escalation(
-        &state.policy,
+    // 本模块四个写端点口径统一:够得着目标的全部权,才动得了它;目标持平台角色还要 platform:roles(防接管)。
+    guard_target(
+        &state,
         &user.0,
         &scope.0,
         &target_role_names(&state, id).await?,
@@ -231,9 +267,9 @@ pub async fn delete_user(
     // 自锁:不能删自己的账号。
     assert_not_self(user.0.id, id)?;
     // 提权闸(同 reset_password,闸目标现有角色):中间管理员不该能删掉比自己权大的账号。
-    // 这条是破坏而非接管,但同属"对更高权目标动手",与本模块的闸口径一致。
-    assert_no_escalation(
-        &state.policy,
+    // 这条是破坏而非接管,但同属"对更高权目标动手",与本模块的闸口径一致;目标持平台角色还要 platform:roles。
+    guard_target(
+        &state,
         &user.0,
         &scope.0,
         &target_role_names(&state, id).await?,
@@ -272,17 +308,18 @@ pub async fn set_user_roles(
     // 提权闸 + 自锁:不能授超出自己的权;改自己的角色不能丢 users:admin。
     // 名字经未过滤目录解析(未知 id 此处即 422,先于自锁 409,错误码不串台)。
     let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
+    let current = target_role_names(&state, id).await?;
+    // superadmin 授不出、撤不掉(含 superadmin 去掉自己的);授出平台角色要 platform:roles。
+    assert_superadmin_untouched(&current, &role_names)?;
+    state
+        .policy
+        .require_platform_role_authority(&user.0, &scope.0, &role_names)?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
     // 目标现有角色闸(同 delete_user / reset_user_password 口径):全量替换角色是对目标的破坏性
     // 操作 —— 少了这道闸,中间管理员传一组"自己也有的角色"就能把 superadmin 整个降权/清空
     // (被授角色闸放行、自锁闸只护 actor 自己),唯一的 superadmin 被剥权后系统再无人能改回。
-    // 本模块三个 destructive 端点里,这条曾是唯一没上闸的。
-    assert_no_escalation(
-        &state.policy,
-        &user.0,
-        &scope.0,
-        &target_role_names(&state, id).await?,
-    )?;
+    // 本模块三个 destructive 端点里,这条曾是唯一没上闸的。目标持平台角色(撤销平台管理员)还要 platform:roles。
+    guard_target(&state, &user.0, &scope.0, &current)?;
     assert_self_keeps_admin(&state.policy, user.0.id, id, &role_names)?;
     Ok(Json(
         state
@@ -293,15 +330,16 @@ pub async fn set_user_roles(
     ))
 }
 
-/// 角色目录(admin 分配角色的候选集)。全量存活角色,单页游标包络(has_more=false)。
+/// 角色目录(分配角色的候选集 = **调用者能授出的平台角色**),单页游标包络(has_more=false)。
 /// 供前端 role-select 拉候选;`name`=机器码,`display_name`=展示名。
+/// superadmin 永不出现(不经接口授予);授平台角色要 `platform:roles`,没有它的调用者(平台管理员)拿到空目录。
 #[utoipa::path(
     get,
     path = "/roles",
     tag = "users",
     params(PageQuery),
     responses(
-        (status = 200, description = "角色目录(单页,全量存活角色)", body = Page<RoleView>),
+        (status = 200, description = "角色目录(单页;调用者能授出的平台角色:不含 superadmin,无 platform:roles 时为空)", body = Page<RoleView>),
         (status = 401, description = "未认证", body = ErrorBody),
         (status = 403, description = "无 users:admin 权限", body = ErrorBody)
     )
@@ -315,8 +353,24 @@ pub async fn list_roles(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    let page = state.user_admin.list_roles().await?;
-    Ok(Json(Page::from_core(page, RoleView::from)))
+    let can_grant_platform = state
+        .policy
+        .require_scoped(&user.0, &scope.0, Perm::PlatformRoles)
+        .is_ok();
+    let items: Vec<model::Role> = state
+        .user_admin
+        .list_roles()
+        .await?
+        .items
+        .into_iter()
+        .filter(|r| grantable_in_catalog(r.name, can_grant_platform))
+        .collect();
+    // 单页包络:limit 跟过滤后的条数走(同 service 的口径)
+    let limit = items.len().max(1) as u64;
+    Ok(Json(Page::from_core(
+        crate::kernel::pagination::Page::cursor(items, limit, None),
+        RoleView::from,
+    )))
 }
 
 /// 管理员重置密码(无需旧密码)+ best-effort 撤会话(强制重新登录)。
@@ -348,8 +402,9 @@ pub async fn reset_user_password(
     // 所以必须"自己已持有目标的全部权"才准改。少了这道闸,"有 users:admin 但非满权"的中间
     // 管理员(role→perms 运行期可改,见 authz)虽被 set_roles 挡着授不出 superadmin,却能直接
     // 把 superadmin 的密码改成自己知道的再登进去 —— 本模块辛苦建的提权闸从这个端点整个绕过。
-    assert_no_escalation(
-        &state.policy,
+    // 平台管理员与 superadmin 的差只在 superadmin 独占权限上,所以目标持平台角色还要 platform:roles(防接管)。
+    guard_target(
+        &state,
         &user.0,
         &scope.0,
         &target_role_names(&state, id).await?,
@@ -365,6 +420,19 @@ async fn target_role_names(state: &AppState, id: Uuid) -> Result<Vec<String>, Ap
     state.user_admin.raw_role_names(id).await
 }
 
+/// 对**目标账号**动手的两道闸(写端点共用):防接管(目标持平台角色 → 要 `platform:roles`)+ 提权闸(够得着目标的全部权)。
+fn guard_target(
+    state: &AppState,
+    actor: &AuthUser,
+    scope: &[Perm],
+    target_roles: &[String],
+) -> Result<(), AppError> {
+    state
+        .policy
+        .require_platform_role_authority(actor, scope, target_roles)?;
+    assert_no_escalation(&state.policy, actor, scope, target_roles)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +442,8 @@ mod tests {
             id: Uuid::now_v7(),
             username: "u".into(),
             roles: roles.iter().map(|s| s.to_string()).collect(),
+            tenant_id: None,
+            tenant_roles: vec![],
         }
     }
 
@@ -389,15 +459,18 @@ mod tests {
 
     #[test]
     fn escalation_blocks_granting_perms_you_lack() {
-        // 中间管理员:有 users:admin,但没有 contents:delete。
+        // 中间管理员:有 users:admin,但没有 tenants:admin(账号管理授的是平台角色,只比平台级权限)。
         let policy = Policy::from_roles([
             ("mgr".to_owned(), vec![Perm::UsersAdmin]),
+            ("tenancy".to_owned(), vec![Perm::TenantsAdmin]),
+            // 租户级权限经平台角色授出不生效,也就不算提权
             ("purger".to_owned(), vec![Perm::ContentDelete]),
         ]);
         let granter = auth(&["mgr"]);
-        // 授 purger(含 contents:delete,granter 没有) → 403
+        assert!(assert_no_escalation(&policy, &granter, &[], &["purger".to_owned()]).is_ok());
+        // 授 tenancy(含 tenants:admin,granter 没有) → 403
         assert!(matches!(
-            assert_no_escalation(&policy, &granter, &[], &["purger".to_owned()]),
+            assert_no_escalation(&policy, &granter, &[], &["tenancy".to_owned()]),
             Err(AppError::Forbidden)
         ));
         // 授自己也有的 mgr → OK;空 → OK
@@ -409,10 +482,39 @@ mod tests {
     fn superadmin_can_grant_anything() {
         let policy = Policy::from_roles([
             ("super".to_owned(), Perm::ALL.to_vec()),
-            ("purger".to_owned(), vec![Perm::ContentDelete]),
+            ("tenancy".to_owned(), vec![Perm::TenantsAdmin]),
         ]);
         let god = auth(&["super"]);
-        assert!(assert_no_escalation(&policy, &god, &[], &["purger".to_owned()]).is_ok());
+        assert!(assert_no_escalation(&policy, &god, &[], &["tenancy".to_owned()]).is_ok());
+    }
+
+    /// superadmin 不经接口授出 / 撤掉:建号带它、加上、去掉都 403;保留它的改动、与它无关的改动放行。
+    #[test]
+    fn superadmin_is_never_granted_or_revoked() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let forbidden = |cur: &[&str], new: &[&str]| {
+            matches!(
+                assert_superadmin_untouched(&s(cur), &s(new)),
+                Err(AppError::Forbidden)
+            )
+        };
+        assert!(forbidden(&[], &["superadmin"]), "授出");
+        assert!(forbidden(&["superadmin"], &[]), "撤掉");
+        assert!(forbidden(&["superadmin"], &["platform_admin"]), "换掉");
+        assert!(assert_superadmin_untouched(
+            &s(&["superadmin"]),
+            &s(&["superadmin", "platform_admin"])
+        )
+        .is_ok());
+        assert!(assert_superadmin_untouched(&s(&[]), &s(&["platform_admin"])).is_ok());
+        assert!(assert_superadmin_untouched(&s(&["platform_admin"]), &s(&[])).is_ok());
+    }
+
+    #[test]
+    fn catalog_hides_superadmin_and_needs_platform_roles() {
+        assert!(!grantable_in_catalog(RoleName::Superadmin, true));
+        assert!(grantable_in_catalog(RoleName::PlatformAdmin, true));
+        assert!(!grantable_in_catalog(RoleName::PlatformAdmin, false));
     }
 
     #[test]

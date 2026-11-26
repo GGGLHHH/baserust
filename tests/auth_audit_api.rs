@@ -28,7 +28,7 @@ use baserust::features::widget::{
 use baserust::kernel::authz::{Perm, Policy};
 use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, RoleRepo};
 
-/// 内存 app + 两个令牌(镜像 `tests/users_api.rs::test_app`):`superadmin`(users:admin,满权)
+/// 内存 app + 两个令牌(镜像 `tests/users_api.rs::test_app`):`superadmin`(满权,含 audit:read)
 /// 与 `admin`(只有 admin:login)。`AppState.auth_events` 装 `InMemoryAuthEventRepo`,手插数据。
 async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
     let signer = Arc::new(AppTokenSigner::dev());
@@ -37,7 +37,10 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
     let mem_users = InMemoryUserRepo::new();
     let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
     for (name, display) in [("superadmin", "Super"), ("admin", "Admin")] {
-        mem_roles.upsert(name, display, None).await.unwrap();
+        mem_roles
+            .upsert(name, display, idm::RoleScope::Platform, None)
+            .await
+            .unwrap();
     }
     let users_repo: Arc<dyn idm::UserRepo> = Arc::new(mem_users);
     let roles_repo: Arc<dyn RoleRepo> = Arc::new(mem_roles);
@@ -77,6 +80,7 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
             forwarded_chain: None,
             user_agent: None,
             request_id: None,
+            tenant_id: None,
             event_seq: 1,
         })
         .await
@@ -94,6 +98,15 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         contents: test_contents(),
         auth: test_auth(signer.clone(), verifier.clone()),
         user_admin,
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -105,6 +118,9 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
             auth_events.clone() as Arc<dyn AuthEventRepo>
         )),
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(
         state,
@@ -117,6 +133,10 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
             vec![],
             900,
         )
@@ -125,7 +145,11 @@ async fn test_app() -> (Router, Arc<InMemoryAuthEventRepo>, String, String) {
         .mint_scoped(
             Uuid::now_v7(),
             "admin",
-            vec!["admin".to_owned()],
+            vec![],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
             vec![],
             900,
         )
@@ -147,8 +171,11 @@ fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> id
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
+        Arc::new(idm::InMemoryMemberRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
+    // 独立的空角色仓储:注册不授租户角色(配置了目录里没有的角色会响亮失败)
+    .signup_roles(Vec::new())
     .signer(signer)
     .verifier(verifier)
     .access_ttl_secs(900)
@@ -192,7 +219,7 @@ async fn auth_events_authz_matrix() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "无 token 应 401");
 
-    // admin(admin:login,无 users:admin)→ 403
+    // admin(admin:login,无 audit:read)→ 403
     let r = app
         .clone()
         .oneshot(get("/api/v1/admin/auth/auth-events", &admin))
@@ -201,7 +228,7 @@ async fn auth_events_authz_matrix() {
     assert_eq!(
         r.status(),
         StatusCode::FORBIDDEN,
-        "admin 无 users:admin 应 403"
+        "admin 无 audit:read 应 403"
     );
 
     // superadmin → 200 + 命中手插行
@@ -234,6 +261,7 @@ async fn list_q_searches_actor_ip_identifier_server_side() {
         forwarded_chain: None,
         user_agent: None,
         request_id: None,
+        tenant_id: None,
         event_seq: seq,
     };
     repo.insert(&mk(10, "alice", "10.1.1.1", None))
@@ -308,7 +336,7 @@ async fn stats_endpoint_returns_shape_and_gates() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "无 token 应 401");
 
-    // admin(admin:login,无 users:admin)→ 403
+    // admin(admin:login,无 audit:read)→ 403
     let r = app
         .clone()
         .oneshot(get("/api/v1/admin/auth/auth-events/stats", &admin))
@@ -317,7 +345,7 @@ async fn stats_endpoint_returns_shape_and_gates() {
     assert_eq!(
         r.status(),
         StatusCode::FORBIDDEN,
-        "admin 无 users:admin 应 403"
+        "admin 无 audit:read 应 403"
     );
 
     // superadmin → 200 + 响应形状(手插的 1 行落在默认 24h 窗口内)
@@ -376,7 +404,10 @@ async fn no_auth_events_backend_is_404_not_panic() {
     let verifier = Arc::new(AppTokenVerifier::dev());
     let mem_users = InMemoryUserRepo::new();
     let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
-    mem_roles.upsert("superadmin", "Super", None).await.unwrap();
+    mem_roles
+        .upsert("superadmin", "Super", idm::RoleScope::Platform, None)
+        .await
+        .unwrap();
     let users_repo: Arc<dyn idm::UserRepo> = Arc::new(mem_users);
     let roles_repo: Arc<dyn RoleRepo> = Arc::new(mem_roles);
     let profile_repo: Arc<dyn ProfileRepo> = Arc::new(InMemoryProfileRepo::new());
@@ -401,6 +432,15 @@ async fn no_auth_events_backend_is_404_not_panic() {
         contents: test_contents(),
         auth: test_auth(signer.clone(), verifier.clone()),
         user_admin,
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -410,6 +450,9 @@ async fn no_auth_events_backend_is_404_not_panic() {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(
         state,
@@ -421,6 +464,10 @@ async fn no_auth_events_backend_is_404_not_panic() {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
             vec![],
             900,
         )

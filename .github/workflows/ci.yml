@@ -63,15 +63,24 @@ jobs:
       SEARCH_DB_PASSWORD: pwd
       OPS_DB_USER: ops
       OPS_DB_PASSWORD: pwd
+      # 多租户账号拆分(10-tenancy-roles.sh):owner 跑迁移 / #[sqlx::test],运行时账号跑仓储,system BYPASSRLS
+      APP_DB_OWNER_PASSWORD: pwd
+      APP_DB_SYSTEM_PASSWORD: pwd
+      CONTENT_DB_OWNER_PASSWORD: pwd
+      CONTENT_DB_SYSTEM_PASSWORD: pwd
+      SEARCH_DB_OWNER_PASSWORD: pwd
+      SEARCH_DB_SYSTEM_PASSWORD: pwd
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
-      # 和生产同一份建库脚本(role / schema / search_path)。
+      # 和生产同一份建库脚本(role / schema / search_path,再拆 owner / 运行时 / system 账号)。
       - name: Create roles and schemas
-        run: bash scripts/initdb/00-roles-schemas.sh
+        run: |
+          bash scripts/initdb/00-roles-schemas.sh
+          bash scripts/initdb/10-tenancy-roles.sh
         env:
           PGHOST: localhost
           PGPASSWORD: baserust

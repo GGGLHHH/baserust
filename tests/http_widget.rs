@@ -13,7 +13,7 @@
 //! covers: GET /api/v1/frontend/widgets/my-count
 //! covers: GET /api/v1/frontend/widgets/overview
 //! covers: GET /api/v1/frontend/widgets/purge-preview
-//! covers: GET /api/v1/public/widgets/stats
+//! covers: GET /api/v1/frontend/widgets/stats
 //! covers: GET /api/v1/admin/widgets
 
 mod http_support;
@@ -25,6 +25,7 @@ use http_support::{
     admin_scoped, expect, expect_error, expect_json, mint, next_sse_event, user_token, Client,
     TestServer,
 };
+use http_support::{ADMIN, DEFAULT_TENANT};
 use reqwest::{Method, StatusCode};
 use serde_json::json;
 use uuid::Uuid;
@@ -45,6 +46,7 @@ fn test_policy() -> Policy {
                 Perm::WidgetWrite,
                 Perm::WidgetWriteAll,
                 Perm::WidgetDelete,
+                Perm::MembersAdmin,
             ],
         ),
         (
@@ -57,7 +59,14 @@ fn test_policy() -> Policy {
 /// 起服务 + admin 会话(满权 admin 令牌)。
 async fn start() -> (TestServer, Client) {
     let s = TestServer::start_with(|st| st.policy = Arc::new(test_policy())).await;
-    let admin = s.bearer(&mint(Uuid::nil(), "admin", &["admin"], vec![]));
+    let admin = s.bearer(&mint(
+        Uuid::nil(),
+        "admin",
+        &[],
+        Some(DEFAULT_TENANT),
+        &["admin"],
+        vec![],
+    ));
     (s, admin)
 }
 
@@ -360,22 +369,36 @@ async fn multi_perm_and_or_endpoints() {
     expect(read_only.get(&overview).await, StatusCode::OK).await;
     let write_only = s.bearer(&admin_scoped(vec![Perm::WidgetWrite]));
     expect(write_only.get(&overview).await, StatusCode::FORBIDDEN).await;
+    // OR 的另一支:本组织成员管理员(members:admin,租户级)
+    let members_admin = s.bearer(&admin_scoped(vec![Perm::MembersAdmin]));
+    expect(members_admin.get(&overview).await, StatusCode::OK).await;
+    // 平台级 users:admin 不是这个租户数据接口的来路:平台管理员在本租户没有租户角色 → 403
+    let platform_only = s.bearer(&mint(
+        Uuid::now_v7(),
+        "superadmin",
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &[],
+        vec![],
+    ));
+    expect(platform_only.get(&overview).await, StatusCode::FORBIDDEN).await;
 }
 
-/// 公开 / 仅登录 / superadmin-only 三种形态。
+/// 仅登录(stats / my-count)/ superadmin-only 两种形态。
 #[tokio::test]
-async fn public_login_only_and_admin_only_shapes() {
+async fn login_only_and_admin_only_shapes() {
     let (s, admin) = start().await;
     let user = s.bearer(&user_token().0);
     create(&user, "x").await;
 
-    // public:无凭据也 200
-    let v = expect_json(
-        s.anon().get("/api/v1/public/widgets/stats").await,
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(v["total"], 1);
+    // stats:仅登录、数当前租户全部(不只自己的);无凭据 401
+    let stats = format!("{W}/stats");
+    expect(s.anon().get(&stats).await, StatusCode::UNAUTHORIZED).await;
+    create(&admin, "y").await;
+    assert_eq!(
+        expect_json(user.get(&stats).await, StatusCode::OK).await["total"],
+        2
+    );
 
     // 仅登录:无凭据 401,有凭据 200(只算自己的)
     let my = format!("{W}/my-count");
@@ -385,15 +408,25 @@ async fn public_login_only_and_admin_only_shapes() {
         1
     );
 
-    // superadmin-only:admin 无 admin:login → admin 组闸 403;superadmin 200 且看到全部
+    // 后台列表:本文件测试策略里的 admin 没有 admin:login → admin 组闸 403;带后台准入的 superadmin 200 且看到全部
     expect(
         admin.get("/api/v1/admin/widgets").await,
         StatusCode::FORBIDDEN,
     )
     .await;
-    let sa = s.bearer(&mint(Uuid::now_v7(), "superadmin", &["superadmin"], vec![]));
+    let sa = s.bearer(&mint(
+        Uuid::now_v7(),
+        "superadmin",
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![],
+    ));
     let v = expect_json(sa.get("/api/v1/admin/widgets").await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 1);
+    assert_eq!(
+        v["page_info"]["total"], 2,
+        "本租户 user 的 x + admin 的 y: {v}"
+    );
 }
 
 /// 排序:offset 下 name asc/desc;cursor + sort_by=name 按 (name, id) keyset 翻页。
@@ -424,4 +457,265 @@ async fn list_sort_by_name_offset_and_cursor() {
     let next = v["page_info"]["next_cursor"].as_str().unwrap().to_owned();
     let v = get(format!("cursor={next}&sort_by=name&order=asc&size=1")).await;
     assert_eq!(first(&v), "b");
+}
+
+// ───────────────────────────── 多租户隔离 ─────────────────────────────
+
+/// 另一个租户(随机新租户)里的满权 admin 会话。租户只从 token 来:同一个服务、换个 token 就是别的租户。
+fn other_tenant_admin(s: &TestServer) -> Client {
+    s.bearer(&mint(
+        Uuid::now_v7(),
+        "other-admin",
+        &[],
+        Some(Uuid::now_v7()),
+        &["admin"],
+        vec![],
+    ))
+}
+
+fn names(v: &serde_json::Value) -> Vec<String> {
+    v["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("应有 items: {v}"))
+        .iter()
+        .map(|w| w["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// 跨租户访问资源 ID → 404(不泄露存在),读写删都一样;本租户的行原样不动。
+#[tokio::test]
+async fn widget_of_other_tenant_is_404() {
+    let (s, admin) = start().await;
+    let other = other_tenant_admin(&s);
+    let id = create(&admin, "tenant-a-widget").await;
+    let path = format!("{W}/{id}");
+    expect_error(other.get(&path).await, StatusCode::NOT_FOUND, "not_found").await;
+    expect_error(
+        other.put_json(&path, &json!({ "name": "pwned" })).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    expect_error(
+        other.delete(&path).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    let got = expect_json(admin.get(&path).await, StatusCode::OK).await;
+    assert_eq!(got["name"], "tenant-a-widget", "别的租户改不动、删不掉");
+}
+
+/// 列表 / 计数只含当前租户的数据(admin 有 read:all 也一样,read:all 只是「本租户内看全部」)。
+#[tokio::test]
+async fn widget_list_only_current_tenant() {
+    let (s, admin) = start().await;
+    let other = other_tenant_admin(&s);
+    create(&admin, "a1").await;
+    create(&admin, "a2").await;
+    create(&other, "b1").await;
+
+    let mine = expect_json(
+        admin.get(&format!("{W}?sort_by=name&order=asc")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(names(&mine), vec!["a1", "a2"]);
+    assert_eq!(mine["page_info"]["total"], 2);
+    let theirs = expect_json(other.get(W).await, StatusCode::OK).await;
+    assert_eq!(names(&theirs), vec!["b1"]);
+    assert_eq!(theirs["page_info"]["total"], 1);
+    // cursor 模式同样只翻本租户
+    let cur = expect_json(
+        admin.get(&format!("{W}?cursor=&size=10")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cur["items"].as_array().unwrap().len(), 2, "{cur}");
+
+    for (c, n) in [(&admin, 2), (&other, 1)] {
+        for p in ["overview", "purge-preview", "my-count"] {
+            let v = expect_json(c.get(&format!("{W}/{p}")).await, StatusCode::OK).await;
+            // 各自的行都是自己建的:overview(本租户全部)与 my-count / purge-preview(本人)同数
+            assert_eq!(v["total"], n, "{p}: {v}");
+        }
+    }
+    // superadmin 专属的「列全部」也只列当前租户
+    let sa = s.bearer(&mint(
+        Uuid::now_v7(),
+        "superadmin",
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![],
+    ));
+    let v = expect_json(sa.get("/api/v1/admin/widgets").await, StatusCode::OK).await;
+    assert_eq!(v["page_info"]["total"], 2, "{v}");
+
+    // 计数(仅登录)也只数当前租户
+    for (c, n) in [(&admin, 2), (&other, 1)] {
+        let v = expect_json(c.get(&format!("{W}/stats")).await, StatusCode::OK).await;
+        assert_eq!(v["total"], n, "stats: {v}");
+    }
+}
+
+/// 名字唯一只在租户内:别的租户可以用同名;同租户重名仍 409。
+#[tokio::test]
+async fn same_name_allowed_in_different_tenants() {
+    let (s, admin) = start().await;
+    let other = other_tenant_admin(&s);
+    create(&admin, "shared").await;
+    create(&other, "shared").await;
+    expect_error(
+        other.post_json(W, &json!({ "name": "shared" })).await,
+        StatusCode::CONFLICT,
+        "conflict",
+    )
+    .await;
+    // 改名撞名同理:只看本租户
+    let id = create(&other, "renamable").await;
+    expect_error(
+        other
+            .put_json(&format!("{W}/{id}"), &json!({ "name": "shared" }))
+            .await,
+        StatusCode::CONFLICT,
+        "conflict",
+    )
+    .await;
+}
+
+/// SSE 先比租户再比 owner:有 read:all 的 admin 也收不到别的租户的事件。
+#[tokio::test]
+async fn sse_does_not_leak_other_tenant_events() {
+    let (s, admin) = start().await;
+    let other = other_tenant_admin(&s);
+    let resp = admin.get(&format!("{W}/events")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+
+    let theirs = create(&other, "other-tenant-secret").await;
+    expect(
+        other.delete(&format!("{W}/{theirs}")).await,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    create(&admin, "own-tenant-widget").await;
+    let event = next_sse_event(&mut stream, &mut buf).await;
+    assert!(
+        !event.contains("other-tenant-secret") && !event.contains(&theirs),
+        "跨租户泄漏: {event}"
+    );
+    assert!(
+        event.contains("own-tenant-widget"),
+        "本租户的必须照收: {event}"
+    );
+}
+
+/// 平台上下文令牌(没有当前租户,哪怕是平台管理员)调租户级 widget 接口 → 403 `tenant_required`。
+#[tokio::test]
+async fn widget_endpoints_require_current_tenant() {
+    let (s, _) = start().await;
+    let platform = s.bearer(&mint(
+        Uuid::now_v7(),
+        "superadmin",
+        &["superadmin"],
+        None,
+        &[],
+        vec![],
+    ));
+    for p in [
+        W.to_owned(),
+        format!("{W}/events"),
+        format!("{W}/my-count"),
+        format!("{W}/stats"),
+        format!("{W}/overview"),
+        format!("{W}/{}", Uuid::now_v7()),
+        "/api/v1/admin/widgets".to_owned(),
+    ] {
+        expect_error(
+            platform.get(&p).await,
+            StatusCode::FORBIDDEN,
+            "tenant_required",
+        )
+        .await;
+    }
+    expect_error(
+        platform.post_json(W, &json!({ "name": "x" })).await,
+        StatusCode::FORBIDDEN,
+        "tenant_required",
+    )
+    .await;
+}
+
+/// 平台管理员在某租户里只是 `user` 角色时:`users:admin` 只让他过 superadmin 专属的闸,
+/// 「列全部」的可见域仍看租户角色 —— 没有租户级 `read:all`,admin 列表只返回他自己建的。
+#[tokio::test]
+async fn admin_list_for_platform_admin_with_user_tenant_role_is_own_only() {
+    let (s, admin) = start().await;
+    let sa = s.bearer(&mint(
+        Uuid::now_v7(),
+        "superadmin",
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &["user"],
+        vec![],
+    ));
+    create(&admin, "someone-elses").await;
+    create(&sa, "mine").await;
+    let v = expect_json(sa.get("/api/v1/admin/widgets").await, StatusCode::OK).await;
+    assert_eq!(names(&v), vec!["mine"], "{v}");
+    assert_eq!(v["page_info"]["total"], 1, "{v}");
+}
+
+/// 租户管理员(租户角色 admin:有 `admin:login` + 租户级 widget 读权)经真实后台登录就能看后台 widget 列表
+/// —— 闸是租户级 `widgets:read`,不再是平台级 `users:admin`;可见域照旧(admin 有 `read:all` → 本租户全部)。
+/// 普通成员没有后台准入 → 组闸 403。文档(前端 access-policies 由它生成)同样不再要求 `users:admin`。
+#[tokio::test]
+async fn tenant_admin_sees_admin_widget_list() {
+    let s = TestServer::start().await; // seed 策略
+                                       // 别人(superadmin 在默认租户里也是 admin)建一个,admin 自己建一个
+    let other = s
+        .login(http_support::SUPERADMIN, http_support::PASSWORD)
+        .await;
+    create(&other, "others-one").await;
+    let admin = s.login_admin(ADMIN, http_support::PASSWORD).await;
+    create(&admin, "admins-one").await;
+
+    let v = expect_json(admin.get("/api/v1/admin/widgets").await, StatusCode::OK).await;
+    let mut got = names(&v);
+    got.sort();
+    assert_eq!(got, vec!["admins-one", "others-one"], "{v}");
+    let user = s.login(http_support::USER, http_support::PASSWORD).await;
+    expect(
+        user.get("/api/v1/admin/widgets").await,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+
+    let spec = serde_json::to_value(baserust::app::router::api_spec()).unwrap();
+    let security = &spec["paths"]["/api/v1/admin/widgets"]["get"]["security"];
+    let reqs: Vec<Vec<String>> = security
+        .as_array()
+        .unwrap_or_else(|| panic!("应有 security: {security}"))
+        .iter()
+        .map(|r| {
+            r["oauth2"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .collect();
+    assert!(
+        reqs.iter().any(
+            |r| r.contains(&"admin:login".to_owned()) && r.contains(&"widgets:read".to_owned())
+        ),
+        "租户管理员那一支 = admin:login + widgets:read: {security}"
+    );
+    assert!(
+        reqs.iter().all(|r| r.contains(&"widgets:read".to_owned())),
+        "每一支都要租户级读权,不能只凭平台权限: {security}"
+    );
 }

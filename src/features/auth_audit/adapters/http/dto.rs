@@ -56,6 +56,8 @@ pub struct AuthEventRow {
     pub city: Option<String>,
     pub os: Option<String>,
     pub browser: Option<String>,
+    /// 事件所在的租户(登录进租户 / 切换 / 刷新该租户的会话等);登录失败等没有租户的事件为 null。
+    pub tenant_id: Option<Uuid>,
 }
 
 impl From<model::AuthEventRow> for AuthEventRow {
@@ -77,6 +79,7 @@ impl From<model::AuthEventRow> for AuthEventRow {
             city: r.city,
             os: r.os,
             browser: r.browser,
+            tenant_id: r.tenant_id,
         }
     }
 }

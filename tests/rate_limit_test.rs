@@ -43,6 +43,7 @@ fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(idm::InMemoryMemberRepo::new()),
             Arc::new(FakeHasher),
             "test-secret",
             900,
@@ -56,6 +57,15 @@ fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -65,6 +75,9 @@ fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let config = Config {
         rate_limit_enabled: true,
@@ -188,6 +201,7 @@ async fn rate_limit_off_by_default_lets_all_through() {
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(idm::InMemoryMemberRepo::new()),
             Arc::new(FakeHasher),
             "test-secret",
             900,
@@ -201,6 +215,15 @@ async fn rate_limit_off_by_default_lets_all_through() {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -210,6 +233,9 @@ async fn rate_limit_off_by_default_lets_all_through() {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(state, &Config::default(), Mount::Both);
     for _ in 0..10 {

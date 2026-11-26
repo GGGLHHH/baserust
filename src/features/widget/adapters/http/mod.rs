@@ -17,18 +17,14 @@ pub fn router() -> OpenApiRouter<AppState> {
             routes::update_widget,
             routes::delete_widget
         ))
+        .routes(routes!(routes::widget_stats))
         .routes(routes!(routes::my_widget_count))
         .routes(routes!(routes::purge_preview))
         .routes(routes!(routes::widget_overview))
         .routes(routes!(routes::widget_events))
 }
 
-/// public 组(无闸):公开样板。
-pub fn public_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(routes::widget_stats))
-}
-
-/// admin 组(组闸「users:admin」由 composition root 上)。
+/// admin 组(组闸「后台准入」= 当前租户 admin:login 或任一平台级权限,由 composition root 上)。
 pub fn admin_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(routes::admin_list_widgets))
 }

@@ -116,6 +116,14 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub app_db_sslmode: String,
 
+    /// app schema 的 **system 账号**(BYPASSRLS,spec §4.4):后台任务、跨租户的平台级读写,单独连接池。
+    /// `APP_DB_SYSTEM_USER`,缺省 = `<APP_DB_USER>_system`(和建库脚本同一套缺省);
+    /// host / port / 库 / sslmode 跟运行时账号相同。没设 `APP_DB_HOST` → 没有 system 池(内存模式)。
+    #[serde(default)]
+    pub app_db_system_user: Option<String>,
+    #[serde(default = "default_db_password")]
+    pub app_db_system_password: String,
+
     /// access token 有效秒数,`IDM_ACCESS_TTL_SECS`,默认 900(15min)。
     #[serde(default = "default_access_ttl_secs")]
     pub idm_access_ttl_secs: i64,
@@ -171,6 +179,14 @@ pub struct Config {
     #[serde(default = "default_db_sslmode")]
     pub content_db_sslmode: String,
 
+    /// content schema 的 **system 账号**(BYPASSRLS,spec §4.4):后台任务、跨租户的平台级读写,单独连接池。
+    /// `CONTENT_DB_SYSTEM_USER`,缺省 = `<CONTENT_DB_USER>_system`(和建库脚本同一套缺省);
+    /// host / port / 库 / sslmode 跟运行时账号相同。没设 `CONTENT_DB_HOST` → 没有 system 池(内存模式)。
+    #[serde(default)]
+    pub content_db_system_user: Option<String>,
+    #[serde(default = "default_db_password")]
+    pub content_db_system_password: String,
+
     /// search schema 的数据库连接,按 role 分字段(role=search,镜像 content_db_*)。
     /// `SEARCH_DB_HOST` 的存在 = 启用投影读模型(projector 写 + P4 list 读);不设 → 无投影(P4 list 回退)。
     #[serde(default)]
@@ -185,6 +201,14 @@ pub struct Config {
     pub search_db_password: String,
     #[serde(default = "default_db_sslmode")]
     pub search_db_sslmode: String,
+
+    /// search schema 的 **system 账号**(BYPASSRLS,spec §4.4):后台任务、跨租户的平台级读写,单独连接池。
+    /// `SEARCH_DB_SYSTEM_USER`,缺省 = `<SEARCH_DB_USER>_system`(和建库脚本同一套缺省);
+    /// host / port / 库 / sslmode 跟运行时账号相同。没设 `SEARCH_DB_HOST` → 没有 system 池(内存模式)。
+    #[serde(default)]
+    pub search_db_system_user: Option<String>,
+    #[serde(default = "default_db_password")]
+    pub search_db_system_password: String,
 
     /// ops schema 的数据库连接(role=ops):后台监控的历史指标与日志。app / idm 进程都写。
     /// `OPS_DB_HOST` 的存在 = 启用持久化;不设 → 监控历史只留进程内最近 24 小时、日志只留内存里最近一批,重启清空。
@@ -324,6 +348,8 @@ impl Default for Config {
             app_db_user: default_app_db_user(),
             app_db_password: default_db_password(),
             app_db_sslmode: default_db_sslmode(),
+            app_db_system_user: None,
+            app_db_system_password: default_db_password(),
             idm_access_ttl_secs: default_access_ttl_secs(),
             idm_refresh_ttl_secs: default_refresh_ttl_secs(),
             jwt_private_key_pem: default_jwt_private_key_pem(),
@@ -343,12 +369,16 @@ impl Default for Config {
             content_db_user: default_content_db_user(),
             content_db_password: default_db_password(),
             content_db_sslmode: default_db_sslmode(),
+            content_db_system_user: None,
+            content_db_system_password: default_db_password(),
             search_db_host: None,
             search_db_port: default_db_port(),
             search_db_database: default_db_database(),
             search_db_user: default_search_db_user(),
             search_db_password: default_db_password(),
             search_db_sslmode: default_db_sslmode(),
+            search_db_system_user: None,
+            search_db_system_password: default_db_password(),
             ops_db_host: None,
             ops_db_port: default_db_port(),
             ops_db_database: default_db_database(),
@@ -373,6 +403,34 @@ impl Default for Config {
 /// `[::1]` 的方括号/冒号)。机制收口在 [`crate::infra::percent`](super::percent)。
 fn enc(s: &str) -> String {
     super::percent::encode(s)
+}
+
+/// 拼 Postgres 连接串(user / password / database 百分号编码,见 [`enc`])。
+fn pg_url(
+    user: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    database: &str,
+    sslmode: &str,
+) -> String {
+    format!(
+        "postgres://{}:{}@{}:{}/{}?sslmode={}",
+        enc(user),
+        enc(password),
+        host,
+        port,
+        enc(database),
+        sslmode,
+    )
+}
+
+/// system 账号名:显式设了(非空)用它,否则 `<运行时账号>_system`(和建库脚本 10-tenancy-roles.sh 同一套缺省)。
+fn system_user(explicit: Option<&str>, runtime: &str) -> String {
+    match explicit.filter(|s| !s.is_empty()) {
+        Some(s) => s.to_owned(),
+        None => format!("{runtime}_system"),
+    }
 }
 
 /// 把 figment 的解析错误**脱敏**成只含键路径的错误。
@@ -410,17 +468,30 @@ impl Config {
         Ok(cfg)
     }
 
-    /// app schema 的连接串(role=app)。`None` = 没设 `APP_DB_HOST` → widget 走内存。
+    /// app schema 的连接串(运行时账号 app)。`None` = 没设 `APP_DB_HOST` → widget 走内存。
     pub fn app_database_url(&self) -> Option<String> {
         self.app_db_host.as_ref().map(|host| {
-            format!(
-                "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                enc(&self.app_db_user),
-                enc(&self.app_db_password),
+            pg_url(
+                &self.app_db_user,
+                &self.app_db_password,
                 host,
                 self.app_db_port,
-                enc(&self.app_db_database),
-                self.app_db_sslmode,
+                &self.app_db_database,
+                &self.app_db_sslmode,
+            )
+        })
+    }
+
+    /// app schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `APP_DB_HOST`。
+    pub fn app_system_database_url(&self) -> Option<String> {
+        self.app_db_host.as_ref().map(|host| {
+            pg_url(
+                &system_user(self.app_db_system_user.as_deref(), &self.app_db_user),
+                &self.app_db_system_password,
+                host,
+                self.app_db_port,
+                &self.app_db_database,
+                &self.app_db_sslmode,
             )
         })
     }
@@ -428,29 +499,44 @@ impl Config {
     /// idm schema 的连接串(role=idm)。`None` = 没设 `IDM_DB_HOST` → idm 走内存。
     pub fn idm_database_url(&self) -> Option<String> {
         self.idm_db_host.as_ref().map(|host| {
-            format!(
-                "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                enc(&self.idm_db_user),
-                enc(&self.idm_db_password),
+            pg_url(
+                &self.idm_db_user,
+                &self.idm_db_password,
                 host,
                 self.idm_db_port,
-                enc(&self.idm_db_database),
-                self.idm_db_sslmode,
+                &self.idm_db_database,
+                &self.idm_db_sslmode,
             )
         })
     }
 
-    /// content schema 的连接串(role=content)。`None` = 没设 `CONTENT_DB_HOST` → content 走内存。
+    /// content schema 的连接串(运行时账号 content)。`None` = 没设 `CONTENT_DB_HOST` → content 走内存。
     pub fn content_database_url(&self) -> Option<String> {
         self.content_db_host.as_ref().map(|host| {
-            format!(
-                "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                enc(&self.content_db_user),
-                enc(&self.content_db_password),
+            pg_url(
+                &self.content_db_user,
+                &self.content_db_password,
                 host,
                 self.content_db_port,
-                enc(&self.content_db_database),
-                self.content_db_sslmode,
+                &self.content_db_database,
+                &self.content_db_sslmode,
+            )
+        })
+    }
+
+    /// content schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `CONTENT_DB_HOST`。
+    pub fn content_system_database_url(&self) -> Option<String> {
+        self.content_db_host.as_ref().map(|host| {
+            pg_url(
+                &system_user(
+                    self.content_db_system_user.as_deref(),
+                    &self.content_db_user,
+                ),
+                &self.content_db_system_password,
+                host,
+                self.content_db_port,
+                &self.content_db_database,
+                &self.content_db_sslmode,
             )
         })
     }
@@ -458,29 +544,41 @@ impl Config {
     /// ops schema 的连接串(role=ops)。`None` = 没设 `OPS_DB_HOST` → 监控数据只在进程内存。
     pub fn ops_database_url(&self) -> Option<String> {
         self.ops_db_host.as_ref().map(|host| {
-            format!(
-                "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                enc(&self.ops_db_user),
-                enc(&self.ops_db_password),
+            pg_url(
+                &self.ops_db_user,
+                &self.ops_db_password,
                 host,
                 self.ops_db_port,
-                enc(&self.ops_db_database),
-                self.ops_db_sslmode,
+                &self.ops_db_database,
+                &self.ops_db_sslmode,
             )
         })
     }
 
-    /// search schema 的连接串(role=search)。`None` = 没设 `SEARCH_DB_HOST` → 无投影 backend。
+    /// search schema 的连接串(运行时账号 search)。`None` = 没设 `SEARCH_DB_HOST` → 无投影 backend。
     pub fn search_database_url(&self) -> Option<String> {
         self.search_db_host.as_ref().map(|host| {
-            format!(
-                "postgres://{}:{}@{}:{}/{}?sslmode={}",
-                enc(&self.search_db_user),
-                enc(&self.search_db_password),
+            pg_url(
+                &self.search_db_user,
+                &self.search_db_password,
                 host,
                 self.search_db_port,
-                enc(&self.search_db_database),
-                self.search_db_sslmode,
+                &self.search_db_database,
+                &self.search_db_sslmode,
+            )
+        })
+    }
+
+    /// search schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `SEARCH_DB_HOST`。
+    pub fn search_system_database_url(&self) -> Option<String> {
+        self.search_db_host.as_ref().map(|host| {
+            pg_url(
+                &system_user(self.search_db_system_user.as_deref(), &self.search_db_user),
+                &self.search_db_system_password,
+                host,
+                self.search_db_port,
+                &self.search_db_database,
+                &self.search_db_sslmode,
             )
         })
     }
@@ -598,6 +696,49 @@ mod tests {
         assert!(!url.contains("p/w"), "保留字符必须被编码: {url}");
         url.parse::<sqlx::postgres::PgConnectOptions>()
             .expect("编码后的连接串必须可解析");
+    }
+
+    /// system 账号(BYPASSRLS 的单独连接池):跟运行时账号同 host/port/库,账号缺省 `<运行时>_system`,
+    /// 可显式覆盖;没设 host → None(零配置内存模式没有 system 池)。
+    #[test]
+    fn system_urls_follow_runtime_host_and_default_to_suffixed_role() {
+        assert!(cfg(None).app_system_database_url().is_none());
+        assert!(Config::default().content_system_database_url().is_none());
+        assert!(Config::default().search_system_database_url().is_none());
+
+        let mut c = cfg(Some("h"));
+        assert_eq!(
+            c.app_system_database_url().unwrap(),
+            "postgres://app_system:pwd@h:6000/db?sslmode=require"
+        );
+        c.app_db_system_user = Some("ops_bot".into());
+        c.app_db_system_password = "s/p".into();
+        let url = c.app_system_database_url().unwrap();
+        assert!(
+            url.starts_with("postgres://ops_bot:s%2Fp@h:6000/db"),
+            "{url}"
+        );
+        // 空串当没设(compose 里 `${X:-}` 会传空串进来)
+        c.app_db_system_user = Some(String::new());
+        assert!(c
+            .app_system_database_url()
+            .unwrap()
+            .starts_with("postgres://app_system:"));
+
+        let c = Config {
+            content_db_host: Some("pg".into()),
+            content_db_user: "media".into(),
+            search_db_host: Some("pg".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            c.content_system_database_url().unwrap(),
+            "postgres://media_system:pwd@pg:5432/baserust?sslmode=disable"
+        );
+        assert_eq!(
+            c.search_system_database_url().unwrap(),
+            "postgres://search_system:pwd@pg:5432/baserust?sslmode=disable"
+        );
     }
 
     #[test]

@@ -63,8 +63,6 @@ async fn post_login(app: &Router, uri: &str, identifier: &str) -> axum::response
 #[tokio::test]
 async fn public_group_reachable_without_token() {
     let (app, _state) = setup().await;
-    let (s, _) = get(&app, "/api/v1/public/widgets/stats", None).await;
-    assert_eq!(s, StatusCode::OK);
     let resp = post_login(&app, "/api/v1/public/auth/login", "user").await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -182,20 +180,31 @@ async fn admin_group_gate_401_403_200() {
     assert!(body.contains("superadmin"), "应返回当前管理员: {body}");
 }
 
-/// admin_login:admin + superadmin(皆有 admin:login)→ 200 + 双 cookie;
-/// user 凭据对但无 admin:login → 403 且**零 Set-Cookie**。
+/// admin_login:superadmin / admin(默认租户 admin)/ user(默认 mock 的演示租户里是 admin,后台登录挑进那里)
+/// → 200 + 双 cookie;刚注册的账号(只在默认租户当 user,哪都没有 admin:login)→ 403 且**零 Set-Cookie**。
 #[tokio::test]
 async fn admin_login_rejects_non_admin_without_tokens() {
     let (app, _state) = setup().await;
 
-    for who in ["superadmin", "admin"] {
+    for who in ["superadmin", "admin", "user"] {
         let resp = post_login(&app, "/api/v1/admin/auth/login", who).await;
         assert_eq!(resp.status(), StatusCode::OK, "{who} 应能登后台");
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 2, "{who}: access + refresh cookie");
     }
 
-    let resp = post_login(&app, "/api/v1/admin/auth/login", "user").await;
+    let reg = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/public/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"plain","password":"pwd"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg.status(), StatusCode::CREATED);
+    let resp = post_login(&app, "/api/v1/admin/auth/login", "plain").await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(
         resp.headers().get("set-cookie").is_none(),

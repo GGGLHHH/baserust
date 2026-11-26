@@ -21,6 +21,15 @@ description: Use when a module needs to publish/subscribe domain events or push 
 
 publish 在 **service 层、repo 写成功之后**(`repo.xxx().await?` 的下一行),签名返回 `()` ——失败只 `tracing::warn!`,**绝不**让写操作失败/回滚。不进事务(PG NOTIFY 走独立连接 autocommit;一致性来自"写成功才发"的顺序纪律,见 `transactions` skill 的边界)。事件=已提交状态的 UI 提示,不是业务状态。
 
+## 多租户:事件带租户,过滤在 handler
+
+- 每个事件变体都带 `tenant_id: TenantId`(样板 `WidgetEvent::tenant_id()`),线格式 DTO 也带上,跨实例(PG NOTIFY / NATS)不丢。
+- 总线**全实例广播,不按租户分频道 / subject**(租户是运行期数据,频道是部署期常量);SSE handler 取 `CurrentTenant`,
+  逐帧 `if event.tenant_id() != tenant || !access.allows_created_by(..) { continue }` —— 跳帧,**不**结束流。
+- 进 outbox 的可靠事件(NATS 投影):payload 写 `tenant_id`,`infra::outbox` 会把合法(非 nil)的抄到信封上;全局事件(如 profile)信封为 null。
+  投影器 / 消费端跨租户写读模型 → 用 `*_system_pool`(BYPASSRLS),每行写对 `tenant_id`。
+- API 集成测试加一条「别的租户的写不出现在我的流里」(样板 `sse_does_not_leak_other_tenant_events`)。
+
 ## 契约:best-effort、无回放
 
 断线丢事件是契约不是 bug。前端必须**先 GET 全量再叠 SSE 增量**;要回放=事件表+游标(另一个范式,别混进来)。
@@ -44,3 +53,4 @@ publish 在 **service 层、repo 写成功之后**(`repo.xxx().await?` 的下一
 - channel/subject 抄样板忘改名 → 跨模块串台
 - 新契约文件没进 justfile `--test` 清单 → PG/NATS 契约静默不跑
 - 发明 `xxx:subscribe` 权限 → 对齐 list 的 read 权限
+- 事件没带 `tenant_id` / SSE 不按当前租户跳帧 / 按租户开频道 → 照 widget:事件带租户、广播、handler 逐帧过滤

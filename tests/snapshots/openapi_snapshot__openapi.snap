@@ -5,6 +5,25 @@ expression: spec
 {
   "components": {
     "schemas": {
+      "AddMemberRequest": {
+        "description": "按**完整用户名**把已有账号加进本租户(精确匹配;查不到 → 404 `account_not_found`)。\n`roles` 只能是租户角色(平台角色 → 422)。",
+        "properties": {
+          "roles": {
+            "items": {
+              "$ref": "#/components/schemas/TenantRoleName"
+            },
+            "type": "array"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "roles"
+        ],
+        "type": "object"
+      },
       "AdminUserView": {
         "description": "后台用户视图:身份(idm.users)+ 角色(idm)+ 富化的资料(app.profiles;缺/分进程降级 → null)。",
         "properties": {
@@ -146,6 +165,14 @@ expression: spec
               "null"
             ]
           },
+          "tenant_id": {
+            "description": "事件所在的租户(登录进租户 / 切换 / 刷新该租户的会话等);登录失败等没有租户的事件为 null。",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "user_agent": {
             "type": [
               "string",
@@ -180,7 +207,8 @@ expression: spec
           "auth.logout_all",
           "auth.password_changed",
           "auth.registered",
-          "auth.account_deleted"
+          "auth.account_deleted",
+          "auth.tenant_switched"
         ],
         "type": "string"
       },
@@ -469,8 +497,12 @@ expression: spec
             "description": "生命周期状态(闭集,生成前端 union)。"
           },
           "tenant_id": {
+            "description": "所属租户;`null` = 个人内容(不属于任何租户,如头像 —— 本模块的端点看不到个人内容,\n但形状上如实反映库的 `Option`)。",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
             "format": "date-time",
@@ -479,7 +511,6 @@ expression: spec
         },
         "required": [
           "id",
-          "tenant_id",
           "owner_id",
           "status",
           "created_at",
@@ -501,7 +532,7 @@ expression: spec
         "type": "string"
       },
       "CreateContentRequest": {
-        "description": "建内容的入参(仅建 content 行,不碰对象/字节)。owner_id 来自认证主体(不入参)。",
+        "description": "建内容的入参(仅建 content 行,不碰对象/字节)。owner_id 来自认证主体、租户来自令牌(都不入参)。",
         "properties": {
           "derivation_type": {
             "type": [
@@ -532,16 +563,24 @@ expression: spec
               "string",
               "null"
             ]
-          },
-          "tenant_id": {
-            "description": "单租户脚手架:省略 → `Uuid::nil()`(多租户隔离是 app authz 的职责,见 routes.rs)。",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
+        "type": "object"
+      },
+      "CreateTenantRequest": {
+        "description": "建租户。slug:1-63 个小写字母 / 数字 / 连字符,不以连字符开头或结尾,全局唯一(含已删的);name 1..=100。",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name"
+        ],
         "type": "object"
       },
       "CreateUserRequest": {
@@ -583,6 +622,29 @@ expression: spec
           }
         },
         "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "CurrentTenantView": {
+        "description": "当前租户的展示信息(`GET /permissions/me` 的 `tenant`)。",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "description": "同上(租户改名后,到 token 过期 / refresh 前仍是旧名)。",
+            "type": "string"
+          },
+          "slug": {
+            "description": "来自登录 / 切换时签进 token 的值;降权令牌没有 → 空串。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
           "name"
         ],
         "type": "object"
@@ -688,6 +750,8 @@ expression: spec
           "unauthorized",
           "conflict",
           "forbidden",
+          "tenant_required",
+          "account_not_found",
           "internal",
           "timeout",
           "rate_limited"
@@ -1160,6 +1224,84 @@ expression: spec
         ],
         "type": "object"
       },
+      "MemberRolesRequest": {
+        "description": "全量设成员的租户角色(原子替换;只能是租户角色,平台角色 → 422)。",
+        "properties": {
+          "roles": {
+            "items": {
+              "$ref": "#/components/schemas/TenantRoleName"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "roles"
+        ],
+        "type": "object"
+      },
+      "MemberStatus": {
+        "description": "成员状态闭集",
+        "enum": [
+          "active",
+          "inactive"
+        ],
+        "type": "string"
+      },
+      "MemberView": {
+        "description": "租户成员:账号 + 该租户里的租户角色 / 成员状态 + 富化的资料(缺 → null)。",
+        "properties": {
+          "avatar_url": {
+            "description": "富化:相对头像端点路径(缺 → null)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "富化:显示名(缺 → null)。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "holds_platform_role": {
+            "description": "该账号持有任一平台角色(superadmin / 平台管理员)。这样的成员只有持 `platform:roles` 的人能改角色 / 移出\n(防接管,否则 403);前端据此隐藏按钮。",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "账号 id(user id)。",
+            "format": "uuid",
+            "type": "string"
+          },
+          "roles": {
+            "description": "该租户里的租户角色(闭集)。",
+            "items": {
+              "$ref": "#/components/schemas/TenantRoleName"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemberStatus"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "roles",
+          "status",
+          "holds_platform_role"
+        ],
+        "type": "object"
+      },
       "MonitoringReport": {
         "description": "整体报告:每个进程一份。",
         "properties": {
@@ -1181,7 +1323,7 @@ expression: spec
         "type": "object"
       },
       "MyPermissionsResponse": {
-        "description": "`GET /permissions/me` 响应。`roles` 来自 token claim;`permissions` 是**有效**集:\nrole 展开(含 implies)∩ scope 收窄,wire 串排序输出。",
+        "description": "`GET /permissions/me` 响应。`roles` 来自 token claim;`permissions` 是**有效**集:\n(平台角色给的平台级 ∪ 当前租户角色给的租户级,含 implies)∩ scope 收窄,wire 串排序输出。",
         "properties": {
           "permissions": {
             "description": "有效权限(闭集,wire 串序输出)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。",
@@ -1191,7 +1333,25 @@ expression: spec
             "type": "array"
           },
           "roles": {
-            "description": "token claim 里的角色名(闭集,生成前端 union)。",
+            "description": "token claim 里的**平台角色**名(闭集,生成前端 union)。",
+            "items": {
+              "$ref": "#/components/schemas/RoleName"
+            },
+            "type": "array"
+          },
+          "tenant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CurrentTenantView",
+                "description": "当前租户;平台上下文(没加入任何组织 / 平台管理员)→ `null`。"
+              }
+            ]
+          },
+          "tenant_roles": {
+            "description": "当前租户内的角色名(平台上下文 → 空)。",
             "items": {
               "$ref": "#/components/schemas/RoleName"
             },
@@ -1200,7 +1360,42 @@ expression: spec
         },
         "required": [
           "roles",
+          "tenant_roles",
           "permissions"
+        ],
+        "type": "object"
+      },
+      "MyTenantView": {
+        "description": "我的一个租户(`GET /auth/tenants` 的元素):当前账号**有效**的成员关系。",
+        "properties": {
+          "current": {
+            "description": "是否是当前 token 所在的租户。",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "roles": {
+            "description": "我在该租户内的角色(闭集,生成前端 union)。",
+            "items": {
+              "$ref": "#/components/schemas/RoleName"
+            },
+            "type": "array"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "name",
+          "roles",
+          "current"
         ],
         "type": "object"
       },
@@ -1550,6 +1745,14 @@ expression: spec
                     "null"
                   ]
                 },
+                "tenant_id": {
+                  "description": "事件所在的租户(登录进租户 / 切换 / 刷新该租户的会话等);登录失败等没有租户的事件为 null。",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "user_agent": {
                   "type": [
                     "string",
@@ -1679,6 +1882,77 @@ expression: spec
         ],
         "type": "object"
       },
+      "Page_MemberView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "租户成员:账号 + 该租户里的租户角色 / 成员状态 + 富化的资料(缺 → null)。",
+              "properties": {
+                "avatar_url": {
+                  "description": "富化:相对头像端点路径(缺 → null)。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "display_name": {
+                  "description": "富化:显示名(缺 → null)。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "holds_platform_role": {
+                  "description": "该账号持有任一平台角色(superadmin / 平台管理员)。这样的成员只有持 `platform:roles` 的人能改角色 / 移出\n(防接管,否则 403);前端据此隐藏按钮。",
+                  "type": "boolean"
+                },
+                "id": {
+                  "description": "账号 id(user id)。",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "roles": {
+                  "description": "该租户里的租户角色(闭集)。",
+                  "items": {
+                    "$ref": "#/components/schemas/TenantRoleName"
+                  },
+                  "type": "array"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/MemberStatus"
+                },
+                "username": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "username",
+                "roles",
+                "status",
+                "holds_platform_role"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_RoleView": {
         "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
         "properties": {
@@ -1702,6 +1976,57 @@ expression: spec
                 "id",
                 "name",
                 "display_name"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_TenantView": {
+        "description": "统一分页响应。utoipa 5 把 `Page<WidgetView>` 渲染成 schema `Page_WidgetView`(泛型自动命名),\npath 自动收集,无需 `#[aliases]`(v5 已移除)。由核心 `Page<T>` 经 [`Page::from_core`] 转来。",
+        "properties": {
+          "items": {
+            "items": {
+              "description": "租户。`slug` 建后不可改、删除后也不复用。",
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/TenantStatus"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "slug",
+                "name",
+                "status",
+                "created_at",
+                "updated_at"
               ],
               "type": "object"
             },
@@ -1798,6 +2123,12 @@ expression: spec
           "contents:write:all",
           "contents:delete",
           "users:admin",
+          "tenants:admin",
+          "ops:read",
+          "audit:read",
+          "platform:roles",
+          "members:read",
+          "members:admin",
           "admin:login",
           "profiles:read",
           "profiles:write",
@@ -1843,7 +2174,7 @@ expression: spec
         "type": "object"
       },
       "PrepareUploadRequest": {
-        "description": "两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体;tenant 单租户默认 nil(同 create)。",
+        "description": "两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体、租户来自令牌(同 create)。",
         "properties": {
           "description": {
             "type": [
@@ -1886,13 +2217,6 @@ expression: spec
               "type": "string"
             },
             "type": "array"
-          },
-          "tenant_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "type": "object"
@@ -2067,7 +2391,7 @@ expression: spec
         "description": "PUT 入参 —— **全量替换**:字段 null/缺省 = 清空(PUT 语义;不是 PATCH 的\"跳过不改\")。\ndisplay_name / phone 最长 255;phone 只做长度不做 E.164。",
         "properties": {
           "avatar_content_id": {
-            "description": "绑定头像:必须指向**已 confirm** 的本人栅格图 content(png/jpeg/gif/webp)。",
+            "description": "绑定头像:必须指向资料主人的**个人内容**(`POST /profiles/me/avatar` 或后台传头像上传的那种;\n租户内容不行)、已 confirm 的栅格图(png/jpeg/gif/webp)。",
             "format": "uuid",
             "type": [
               "string",
@@ -2191,9 +2515,10 @@ expression: spec
         "type": "object"
       },
       "RoleName": {
-        "description": "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。",
+        "description": "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`scope`/`default_permissions`。",
         "enum": [
           "superadmin",
+          "platform_admin",
           "admin",
           "user"
         ],
@@ -2394,6 +2719,70 @@ expression: spec
         ],
         "type": "object"
       },
+      "SwitchTenantRequest": {
+        "description": "切换当前租户(`POST /auth/switch-tenant`)。只能切到自己是**有效成员**的租户(成员 active + 租户 active)。",
+        "properties": {
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "TenantRoleName": {
+        "description": "租户角色闭集(成员关系上能授的角色;平台角色不在内)",
+        "enum": [
+          "admin",
+          "user"
+        ],
+        "type": "string"
+      },
+      "TenantStatus": {
+        "description": "租户状态闭集",
+        "enum": [
+          "active",
+          "suspended"
+        ],
+        "type": "string"
+      },
+      "TenantView": {
+        "description": "租户。`slug` 建后不可改、删除后也不复用。",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TenantStatus"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "name",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "TrafficSummary": {
         "description": "窗口内的请求汇总。",
         "properties": {
@@ -2503,6 +2892,22 @@ expression: spec
         },
         "required": [
           "username"
+        ],
+        "type": "object"
+      },
+      "UpdateTenantRequest": {
+        "description": "改租户(PUT 全量:名称 + 状态;slug 不可改)。`status = suspended` 即停用(立即吊销该租户的会话)。",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TenantStatus"
+          }
+        },
+        "required": [
+          "name",
+          "status"
         ],
         "type": "object"
       },
@@ -2660,10 +3065,14 @@ expression: spec
         "type": "object"
       },
       "WidgetEvent": {
-        "description": "widget 变更事件(SSE 帧 data / 总线负载)。帧的 event name = `type` 标签(created/updated/deleted)。",
+        "description": "widget 变更事件(SSE 帧 data / 总线负载)。帧的 event name = `type` 标签(created/updated/deleted)。\n`tenant_id` = 事件所属租户:总线跨实例扇出(PG NOTIFY / NATS)时靠它让订阅侧先按租户过滤;\nSSE 帧里它总是订阅者自己的当前租户(别的租户的帧在 handler 里就跳过了)。",
         "oneOf": [
           {
             "properties": {
+              "tenant_id": {
+                "format": "uuid",
+                "type": "string"
+              },
               "type": {
                 "enum": [
                   "created"
@@ -2675,6 +3084,7 @@ expression: spec
               }
             },
             "required": [
+              "tenant_id",
               "widget",
               "type"
             ],
@@ -2682,6 +3092,10 @@ expression: spec
           },
           {
             "properties": {
+              "tenant_id": {
+                "format": "uuid",
+                "type": "string"
+              },
               "type": {
                 "enum": [
                   "updated"
@@ -2693,6 +3107,7 @@ expression: spec
               }
             },
             "required": [
+              "tenant_id",
               "widget",
               "type"
             ],
@@ -2710,6 +3125,10 @@ expression: spec
                 "format": "uuid",
                 "type": "string"
               },
+              "tenant_id": {
+                "format": "uuid",
+                "type": "string"
+              },
               "type": {
                 "enum": [
                   "deleted"
@@ -2718,6 +3137,7 @@ expression: spec
               }
             },
             "required": [
+              "tenant_id",
               "id",
               "type"
             ],
@@ -2807,14 +3227,20 @@ expression: spec
             "refreshUrl": "/api/v1/public/auth/refresh",
             "scopes": {
               "admin:login": "login admin",
+              "audit:read": "read audit",
               "contents:delete": "delete contents",
               "contents:read": "read contents",
               "contents:read:all": "read contents (all)",
               "contents:write": "write contents",
               "contents:write:all": "write contents (all)",
+              "members:admin": "admin members",
+              "members:read": "read members",
+              "ops:read": "read ops",
+              "platform:roles": "roles platform",
               "profiles:read": "read profiles",
               "profiles:write": "write profiles",
               "profiles:write:all": "write profiles (all)",
+              "tenants:admin": "admin tenants",
               "users:admin": "admin users",
               "widgets:delete": "delete widgets",
               "widgets:read": "read widgets",
@@ -2966,7 +3392,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 audit:read 权限(superadmin 独占)"
           },
           "404": {
             "content": {
@@ -2992,8 +3418,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "audit:read"
             ]
           }
         ],
@@ -3055,7 +3480,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 audit:read 权限(superadmin 独占)"
           },
           "404": {
             "content": {
@@ -3071,8 +3496,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "audit:read"
             ]
           }
         ],
@@ -3114,7 +3538,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 audit:read 权限(superadmin 独占)"
           },
           "404": {
             "content": {
@@ -3130,8 +3554,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "audit:read"
             ]
           }
         ],
@@ -3163,7 +3586,7 @@ expression: spec
                 }
               }
             },
-            "description": "后台登录成功,token 写入 httponly cookie"
+            "description": "后台登录成功,token 写入 httponly cookie。进入的上下文:有效成员关系里按最近使用挑第一个有 admin:login 的租户;都没有而有平台级权限 → 平台上下文(无当前租户)"
           },
           "401": {
             "content": {
@@ -3183,7 +3606,7 @@ expression: spec
                 }
               }
             },
-            "description": "凭据正确但无后台准入(admin:login),不发 token 不设 cookie"
+            "description": "凭据正确但无后台准入,不发 token 不设 cookie:一个有效成员关系都没有、也没有平台级权限 → `tenant_required`;有成员关系但哪个租户里都没有 admin:login(也没有平台级权限)→ `forbidden`"
           },
           "422": {
             "content": {
@@ -3241,10 +3664,614 @@ expression: spec
             "oauth2": [
               "admin:login"
             ]
+          },
+          {
+            "oauth2": [
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "profiles:write:all"
+            ]
           }
         ],
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/members": {
+      "get": {
+        "operationId": "list_members",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "用户名 + 显示名模糊搜索(仅接了 search 投影后端时可用;未接 → 422)。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_MemberView"
+                }
+              }
+            },
+            "description": "成员分页列表(display_name / avatar 富化,缺则 null)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 members:read 权限 / 没有当前租户(tenant_required)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "q 但无 search 投影后端"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "members:read",
+              "admin:login"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:read",
+              "profiles:write:all"
+            ]
+          }
+        ],
+        "summary": "本租户的成员列表(替代旧的后台「用户」页;数据来自租户成员索引,没接 search 时读 idm)。\n默认 offset;带 `cursor` 切 keyset。`q`(用户名 + 显示名模糊)仅接了 search 投影后端时可用,未接 → 422。",
+        "tags": [
+          "members"
+        ]
+      },
+      "post": {
+        "operationId": "add_member",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMemberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "已加入本租户"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 members:admin 权限 / 授出的角色超出自己的权限 / 对方持平台角色(要 platform:roles)/ 没有当前租户"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "account_not_found:没有这个用户名的账号"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "已是本租户成员"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败 / 平台角色"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "members:admin",
+              "admin:login"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write:all"
+            ]
+          }
+        ],
+        "summary": "按**完整用户名**把已有账号加进本租户(spec §4.5)。精确匹配(邮箱、大小写不同都不算),查不到 → 404\n`account_not_found`(不建账号:账号由平台管理员建)。只能授租户角色,且不能授出自己没有的权限。\n对方持平台角色(superadmin / 平台管理员)→ 要 `platform:roles`(与「移出」同一口径:组织管理员加进来就移不走)。",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/members/{user_id}": {
+      "delete": {
+        "operationId": "remove_member",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已移出,本租户里的会话已吊销"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 members:admin 权限 / 越权 / 目标持平台角色(要 platform:roles)/ 没有当前租户"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不是本租户的成员"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不能移出自己"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "members:admin",
+              "admin:login"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write:all"
+            ]
+          }
+        ],
+        "summary": "把某成员移出本租户,并立即吊销他在本租户的会话(他在别的租户的成员关系 / 会话不动;账号本身不删)。\n别的租户的成员 / 不是成员 → 404;不能移出自己(409);不能移出权限比自己大的成员(403)。",
+        "tags": [
+          "members"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/members/{user_id}/roles": {
+      "put": {
+        "operationId": "set_member_roles",
+        "parameters": [
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberRolesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 members:admin 权限 / 越权 / 目标持平台角色(要 platform:roles)/ 没有当前租户"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不是本租户的成员"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "改自己的角色会丢掉成员管理权"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败 / 平台角色"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "members:admin",
+              "admin:login"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "members:admin",
+              "profiles:write:all"
+            ]
+          }
+        ],
+        "summary": "全量设本租户某成员的租户角色(原子替换)。别的租户的成员 / 不是成员 → 404。\n不能授出自己没有的权限、不能改权限比自己大的成员(403);改自己时不能丢掉 `members:admin`(409)。",
+        "tags": [
+          "members"
         ]
       }
     },
@@ -3302,7 +4329,7 @@ expression: spec
                 }
               }
             },
-            "description": "角色目录(单页,全量存活角色)"
+            "description": "角色目录(单页;调用者能授出的平台角色:不含 superadmin,无 platform:roles 时为空)"
           },
           "401": {
             "content": {
@@ -3328,12 +4355,11 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
-        "summary": "角色目录(admin 分配角色的候选集)。全量存活角色,单页游标包络(has_more=false)。\n供前端 role-select 拉候选;`name`=机器码,`display_name`=展示名。",
+        "summary": "角色目录(分配角色的候选集 = **调用者能授出的平台角色**),单页游标包络(has_more=false)。\n供前端 role-select 拉候选;`name`=机器码,`display_name`=展示名。\nsuperadmin 永不出现(不经接口授予);授平台角色要 `platform:roles`,没有它的调用者(平台管理员)拿到空目录。",
         "tags": [
           "users"
         ]
@@ -3509,12 +4535,11 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
-        "summary": "分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。\ncursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。\n`q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;\n未接后端时二者 → 422(回退路只能 idm 直查,不具备搜索能力)。",
+        "summary": "分页列出用户(过滤 + 排序 + 富化)。默认 offset;带 `cursor` 切 keyset。\n**平台账号列表**:不论当前租户,列全部账号(不属于任何租户的也在),角色列 / `roles_any` / `roles_none` 都是平台角色。\n接了 search 投影读全局账号目录,没接读 idm。租户成员列表是另外的接口。\ncursor + 非默认 sort_by → 422(keyset 恒按 id 序,非默认排序只能配 offset)。\n`q`(用户名 + 显示名模糊)与 `sort_by=display_name` 仅在接了 search 投影后端时可用;\n未接后端时二者 → 422(回退路只能 idm 直查,不具备搜索能力)。",
         "tags": [
           "users"
         ]
@@ -3586,8 +4611,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -3660,8 +4684,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -3729,8 +4752,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -3828,8 +4850,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -3975,7 +4996,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 audit:read 权限(superadmin 独占)"
           },
           "404": {
             "content": {
@@ -4001,8 +5022,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "audit:read"
             ]
           }
         ],
@@ -4087,7 +5107,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 users:admin 权限 / 目标持平台角色而无 platform:roles"
           },
           "422": {
             "content": {
@@ -4103,8 +5123,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -4187,8 +5206,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -4258,8 +5276,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -4321,7 +5338,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 users:admin 权限 / 目标持平台角色而无 platform:roles"
           },
           "422": {
             "content": {
@@ -4337,8 +5354,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -4438,8 +5454,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "users:admin"
             ]
           }
         ],
@@ -4481,14 +5496,13 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 ops:read 权限(superadmin 独占)"
           }
         },
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "ops:read"
             ]
           }
         ],
@@ -4541,14 +5555,13 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 ops:read 权限(superadmin 独占)"
           }
         },
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "ops:read"
             ]
           }
         ],
@@ -4676,7 +5689,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限"
+            "description": "无 ops:read 权限(superadmin 独占)"
           },
           "422": {
             "content": {
@@ -4692,8 +5705,7 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
-              "admin:login"
+              "ops:read"
             ]
           }
         ],
@@ -4703,8 +5715,633 @@ expression: spec
         ]
       }
     },
+    "/api/v1/admin/platform/tenants": {
+      "get": {
+        "operationId": "list_tenants",
+        "parameters": [
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_TenantView"
+                }
+              }
+            },
+            "description": "租户分页列表"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限(平台级)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "租户列表(存活租户,按创建序)。默认 offset;带 `cursor` 切 keyset。",
+        "tags": [
+          "tenants"
+        ]
+      },
+      "post": {
+        "operationId": "create_tenant",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTenantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantView"
+                }
+              }
+            },
+            "description": "已创建"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "slug 已被占用(含已删除的租户,slug 不复用)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败(slug / name 不合规)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "建租户(status = active,还没有成员;用 PUT 成员接口指定第一个管理员)。",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
+    "/api/v1/admin/platform/tenants/{id}": {
+      "get": {
+        "operationId": "get_tenant",
+        "parameters": [
+          {
+            "description": "tenant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantView"
+                }
+              }
+            },
+            "description": "找到"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 已删除"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "租户详情。不存在 / 已删除 → 404。",
+        "tags": [
+          "tenants"
+        ]
+      },
+      "put": {
+        "operationId": "update_tenant",
+        "parameters": [
+          {
+            "description": "tenant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTenantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantView"
+                }
+              }
+            },
+            "description": "已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不存在 / 已删除"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "改租户(PUT 全量:名称 + 状态)。停用(`suspended`)立即吊销该租户里所有人的会话:refresh 立刻 401,\n已发出的 access token 到期前仍有效(最长 = access token 有效期)。恢复(`active`)后成员重新登录即可。",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
+    "/api/v1/admin/platform/tenants/{id}/members": {
+      "get": {
+        "operationId": "list_tenant_members",
+        "parameters": [
+          {
+            "description": "tenant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "提供 ⇒ offset 模式(可跳页),1-based。",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。\nserde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉\n\"cursor 模式首页\"的表达 —— 自定义 deserializer 保住 `Some(\"\")`。",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "每页条数,两模式共用;越界自动 clamp 到 [1,100]。",
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "仅 offset 有意义:是否计算 total(默认 true)。",
+            "in": "query",
+            "name": "with_total",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "用户名 + 显示名模糊搜索(仅接了 search 投影后端时可用;未接 → 422)。",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_MemberView"
+                }
+              }
+            },
+            "description": "成员分页列表"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "租户不存在"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "q 但无 search 投影后端"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "某租户的成员列表(平台管理员看任意租户)。租户不存在 → 404。过滤 / 分页同 `GET /admin/auth/members`。",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
+    "/api/v1/admin/platform/tenants/{id}/members/{user_id}": {
+      "delete": {
+        "operationId": "remove_tenant_member",
+        "parameters": [
+          {
+            "description": "tenant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已移出,该租户里的会话已吊销"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限 / 移出持平台角色的账号而无 platform:roles"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "租户不存在 / 不是该租户的成员"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "把某人移出某租户,并立即吊销他在该租户的会话。租户不存在 / 不是成员 → 404。",
+        "tags": [
+          "tenants"
+        ]
+      },
+      "put": {
+        "operationId": "put_tenant_member",
+        "parameters": [
+          {
+            "description": "tenant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "user id",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberRolesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description": "已加入 / 已更新"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "无 tenants:admin 权限 / 改持平台角色的成员而无 platform:roles"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "租户或账号不存在"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败 / 平台角色"
+          }
+        },
+        "security": [
+          {
+            "oauth2": [
+              "tenants:admin"
+            ]
+          }
+        ],
+        "summary": "设某租户的成员(PUT:不是成员则加入,是成员则全量替换租户角色)。用于给新租户指定第一个管理员。\n只能授租户角色(平台角色 → 422)。租户 / 账号不存在 → 404。",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
     "/api/v1/admin/widgets": {
       "get": {
+        "description": "准入 = admin 组闸(后台准入)+ 租户级 `widgets:read` —— 租户管理员(租户角色 admin)就能看,不要平台级权限(租户数据的后台接口不拿平台权限当闸,spec §4.3)。\n可见域照旧:有当前租户角色给的 `widgets:read:all` → 本租户全部,否则只列自己建的\n(平台管理员在某租户里只是普通成员时也一样)。数据限当前租户(缺 → 403 `tenant_required`)。",
         "operationId": "admin_list_widgets",
         "parameters": [
           {
@@ -4773,7 +6410,7 @@ expression: spec
                 }
               }
             },
-            "description": "全部 widget(跨所有人,富化)"
+            "description": "当前租户内;无租户级 read:all 时只含本人创建的(富化)"
           },
           "401": {
             "content": {
@@ -4793,7 +6430,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 users:admin 权限(仅 superadmin)"
+            "description": "无后台准入(admin 组闸)/ 无 widgets:read 权限 / 没有当前租户(tenant_required)"
           },
           "422": {
             "content": {
@@ -4809,12 +6446,60 @@ expression: spec
         "security": [
           {
             "oauth2": [
-              "users:admin",
+              "widgets:read",
               "admin:login"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "users:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "tenants:admin"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "ops:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "audit:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "platform:roles"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "profiles:read"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "profiles:write"
+            ]
+          },
+          {
+            "oauth2": [
+              "widgets:read",
+              "profiles:write:all"
             ]
           }
         ],
-        "summary": "**superadmin-only**:跨所有人列出全部 widget。gate 在 `users:admin`(seed 里只 superadmin 持有)。\n演示\"role 限制 = gate 一个该 role 专属的 perm\";注意 admin 虽有 `read:all`,无 `users:admin` 仍 403。",
+        "summary": "**后台 widget 列表**:列出**当前租户**的 widget(富化创建人)。",
         "tags": [
           "widgets"
         ]
@@ -5040,6 +6725,109 @@ expression: spec
         ]
       }
     },
+    "/api/v1/frontend/auth/switch-tenant": {
+      "post": {
+        "operationId": "switch_tenant",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitchTenantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "已切换:旧会话吊销,带新租户的 token 写入 httponly cookie"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未登录 / refresh cookie 无效 / refresh 会话不属于当前身份(原会话不动)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "不是该租户的有效成员(含平台管理员切进自己不是成员的租户),原会话不动"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/v1/frontend/auth/tenants": {
+      "get": {
+        "operationId": "list_my_tenants",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MyTenantView"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "当前账号有效的成员关系(租户 active + 成员 active),最近用过的在前;`current` 标出当前 token 所在租户"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "tags": [
+          "me"
+        ]
+      }
+    },
     "/api/v1/frontend/contents": {
       "get": {
         "operationId": "list_contents",
@@ -5075,7 +6863,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           }
         },
         "security": [
@@ -5085,7 +6873,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "列当前用户的内容(单租户:tenant=nil)。需 `contents:read`。\n所有权固有:service 按 (owner_id, tenant_id) 列,只回自己创建的。\nponytail: `contents:read:all` 在此**不生效**(content 库 list 签名强制 owner,无\"列全部\"入口);\n单条端点已按 mode 放行。要让越权读贯通列表,需 content 库 list 的 owner 参数改 Option。",
+        "summary": "列当前用户在**当前租户**里的内容。需 `contents:read`。\n所有权固有:service 按 (当前租户, owner_id) 列,只回自己创建的。\nponytail: `contents:read:all` 在此**不生效**(content 库 list 签名强制 owner,无\"列全部\"入口);\n单条端点已按 mode 放行。要让越权读贯通列表,需 content 库 list 的 owner 参数改 Option。",
         "tags": [
           "contents"
         ]
@@ -5131,7 +6919,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "422": {
             "content": {
@@ -5189,13 +6977,6 @@ expression: spec
                       "string",
                       "null"
                     ]
-                  },
-                  "tenant_id": {
-                    "format": "uuid",
-                    "type": [
-                      "string",
-                      "null"
-                    ]
                   }
                 },
                 "required": [
@@ -5246,7 +7027,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "422": {
             "content": {
@@ -5266,7 +7047,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据、翻状态。需 `contents:write`。\n表单字段:`file`(必填,带 filename + content-type)、`name`、`tags`(逗号分隔)、`document_type`、`tenant_id`(可选)。",
+        "summary": "一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据、翻状态。需 `contents:write`。\n表单字段:`file`(必填,带 filename + content-type)、`name`、`tags`(逗号分隔)、`document_type`。\n内容落当前租户(令牌里的租户)。",
         "tags": [
           "contents"
         ]
@@ -5314,7 +7095,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "422": {
             "content": {
@@ -5377,7 +7158,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:delete 权限"
+            "description": "无 contents:delete 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5387,7 +7168,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:write:all(不区分,防泄露存在)"
           }
         },
         "security": [
@@ -5445,7 +7226,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5455,7 +7236,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人(不区分,防泄露存在;contents:read:all 可看全部)"
+            "description": "不存在 / 别的租户 / 非本人(不区分,防泄露存在;contents:read:all 可看全部)"
           }
         },
         "security": [
@@ -5523,7 +7304,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5533,7 +7314,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:write:all(不区分,防泄露存在)"
           },
           "422": {
             "content": {
@@ -5603,7 +7384,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5613,7 +7394,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:write:all(不区分,防泄露存在)"
           },
           "409": {
             "content": {
@@ -5682,7 +7463,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5692,7 +7473,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:read:all / 无可下载对象(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:read:all / 无可下载对象(不区分,防泄露存在)"
           },
           "409": {
             "content": {
@@ -5762,7 +7543,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5772,7 +7553,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:read:all / 无元数据(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:read:all / 无元数据(不区分,防泄露存在)"
           }
         },
         "security": [
@@ -5833,7 +7614,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:write 权限"
+            "description": "无 contents:write 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5843,7 +7624,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:write:all(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:write:all(不区分,防泄露存在)"
           },
           "422": {
             "content": {
@@ -5916,7 +7697,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5926,7 +7707,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人(不区分,防泄露存在)"
           }
         },
         "security": [
@@ -5985,7 +7766,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 contents:read 权限"
+            "description": "无 contents:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -5995,7 +7776,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人且无 contents:read:all(不区分,防泄露存在)"
+            "description": "不存在 / 别的租户 / 非本人且无 contents:read:all(不区分,防泄露存在)"
           },
           "409": {
             "content": {
@@ -6033,7 +7814,7 @@ expression: spec
                 }
               }
             },
-            "description": "当前令牌的角色与有效权限(role ∩ scope,排序)"
+            "description": "当前令牌的角色、当前租户与有效权限(role ∩ scope,排序)"
           },
           "401": {
             "content": {
@@ -6092,6 +7873,147 @@ expression: spec
         "tags": [
           "profiles"
         ]
+      },
+      "put": {
+        "operationId": "put_my_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "已替换"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "首次建立"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "校验失败(超长 / 头像不是本人的个人内容 / 未 confirm / 非栅格图)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "全量替换 upsert **自己**的资料(仅登录,零 perm;不要当前租户 —— 资料全局一份)。\n未建 → 201,已有 → 200。头像只能绑本人的个人内容(`POST /profiles/me/avatar` 传的那种)。",
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/frontend/profiles/me/avatar": {
+      "post": {
+        "operationId": "upload_my_avatar",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "description": "传头像的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。",
+                "properties": {
+                  "file": {
+                    "description": "图片本体(必填,带 filename + content-type,须 image/*)。",
+                    "format": "binary",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "头像已上传并绑定"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "multipart 解析失败"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "缺 file 部分 / 非栅格图"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "传**自己**的头像(multipart 表单,`file` 部分为栅格图)。仅登录,零 perm,不要当前租户。\n存成个人内容(`ContentScope::Personal`,owner = 本人,不属于任何租户)并立即绑定(保留 display_name / phone),\n返回更新后的资料。换下来的旧头像(本人的个人内容)会被 best-effort 软删(见 `upload_and_bind_avatar`)。",
+        "tags": [
+          "profiles"
+        ]
       }
     },
     "/api/v1/frontend/profiles/{user_id}": {
@@ -6138,7 +8060,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 profiles:read 权限"
+            "description": "无 profiles:read 权限(平台级)"
           },
           "404": {
             "content": {
@@ -6158,7 +8080,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "读任意用户的资料(需 `profiles:read`;所有登录角色都有)。\n注意:响应含 phone 等 PII,\"任意登录可读\"是脚手架的刻意选择——收紧时给 GET 加 ownership 或拆敏感字段视图。",
+        "summary": "按 id 读任意用户的资料(需 `profiles:read`,**平台级**:只有平台管理员有)。\n响应含 phone 等 PII,且资料跨租户全局一份 —— 所以不给租户成员;本人读自己走 `/profiles/me`。",
         "tags": [
           "profiles"
         ]
@@ -6226,7 +8148,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 profiles:write / 改别人无 write:all"
+            "description": "无 profiles:write / 改别人无 write:all(平台级)"
           },
           "422": {
             "content": {
@@ -6236,7 +8158,7 @@ expression: spec
                 }
               }
             },
-            "description": "校验失败(超长 / 头像不存在或非本人 / 未 confirm / 非 image)"
+            "description": "校验失败(超长 / 头像不是目标本人的个人内容 / 未 confirm / 非栅格图)"
           }
         },
         "security": [
@@ -6246,7 +8168,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "全量替换 upsert 自己的资料(`profiles:write`);带 `profiles:write:all` 可替任何人。\n未建 → 201,已有 → 200(PUT 即建即替,RFC 7231 本义;profile 无独立 POST)。",
+        "summary": "按 id 全量替换 upsert 资料(`profiles:write`,**平台级**);带 `profiles:write:all` 可替任何人。\n未建 → 201,已有 → 200(PUT 即建即替,RFC 7231 本义;profile 无独立 POST)。本人改自己走 `PUT /profiles/me`。",
         "tags": [
           "profiles"
         ]
@@ -6399,7 +8321,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:read 权限"
+            "description": "无 widgets:read 权限 / 没有当前租户(tenant_required)"
           },
           "422": {
             "content": {
@@ -6465,7 +8387,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:write 权限"
+            "description": "无 widgets:write 权限 / 没有当前租户(tenant_required)"
           },
           "409": {
             "content": {
@@ -6475,7 +8397,7 @@ expression: spec
                 }
               }
             },
-            "description": "name 已存在(存活行内唯一)"
+            "description": "name 已存在(本租户存活行内唯一)"
           },
           "422": {
             "content": {
@@ -6503,7 +8425,7 @@ expression: spec
     },
     "/api/v1/frontend/widgets/events": {
       "get": {
-        "description": "**行级 ownership 与 list 同口径**:总线是广播(不分频道),过滤落在本 handler —— 逐帧\n`allows_created_by`,不过就跳帧(`continue`),**不**结束流。没这层,无 `read:all` 的 `user`\n能从流里读到 `list_widgets`/`get_widget` 都不给他看的**别人的 widget**(名字等全量 `Widget`)。\n`Access` 在开流时刻算定并随流存活 —— 同下面的鉴权时刻取舍。\n\n鉴权只在开流时刻评估:流存活期间 token 过期/吊销不会断流(SSE 惯例取舍;低敏数据可接受)。\n要收紧:按 claim 的 exp 到点结束流,EventSource 重连即重新鉴权。",
+        "description": "**先比租户、再比 owner**:总线是全实例广播(不分租户、不分频道),过滤落在本 handler —— 逐帧先看\n`event.tenant_id() == 当前租户`,再 `allows_created_by`,不过就跳帧(`continue`),**不**结束流。\n租户这一道在前:`read:all` 的 admin 也只是「本租户全部」,别的租户的帧一律看不见。没这层,无 `read:all` 的 `user`\n能从流里读到 `list_widgets`/`get_widget` 都不给他看的**别人的 widget**(名字等全量 `Widget`)。\n`Access` 在开流时刻算定并随流存活 —— 同下面的鉴权时刻取舍。\n\n鉴权只在开流时刻评估:流存活期间 token 过期/吊销不会断流(SSE 惯例取舍;低敏数据可接受)。\n要收紧:按 claim 的 exp 到点结束流,EventSource 重连即重新鉴权。",
         "operationId": "widget_events",
         "responses": {
           "200": {
@@ -6534,7 +8456,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:read 权限"
+            "description": "无 widgets:read 权限 / 没有当前租户(tenant_required)"
           }
         },
         "security": [
@@ -6562,43 +8484,7 @@ expression: spec
                 }
               }
             },
-            "description": "当前用户创建的 widget 数"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            },
-            "description": "未认证"
-          }
-        },
-        "security": [
-          {
-            "oauth2": []
-          }
-        ],
-        "summary": "**仅登录**(authenticated):当前用户创建的 widget 数。要 `CurrentUser`、**无特定 perm**\n(`OP_PERMS` 标 `None` → 文档 `security:[{\"oauth2\":[]}]`)。演示\"只需登录\"形态。",
-        "tags": [
-          "widgets"
-        ]
-      }
-    },
-    "/api/v1/frontend/widgets/overview": {
-      "get": {
-        "operationId": "widget_overview",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WidgetStats"
-                }
-              }
-            },
-            "description": "全站 widget 计数(读权或管理员)"
+            "description": "当前用户在当前租户里创建的 widget 数"
           },
           "401": {
             "content": {
@@ -6618,7 +8504,53 @@ expression: spec
                 }
               }
             },
-            "description": "widgets:read 与 users:admin 皆无"
+            "description": "没有当前租户(tenant_required)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "**仅登录**(authenticated):当前用户在**当前租户**里创建的 widget 数。要 `CurrentUser`、**无特定 perm**\n(`OP_PERMS` 标 `None` → 文档 `security:[{\"oauth2\":[]}]`)。演示\"只需登录\"形态。\n数的是租户数据,所以仍要当前租户(平台上下文 → 403 `tenant_required`)。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/overview": {
+      "get": {
+        "operationId": "widget_overview",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "当前租户的 widget 计数(读权或本组织成员管理员)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "widgets:read 与 members:admin 皆无 / 没有当前租户(tenant_required)"
           }
         },
         "security": [
@@ -6629,11 +8561,11 @@ expression: spec
           },
           {
             "oauth2": [
-              "users:admin"
+              "members:admin"
             ]
           }
         ],
-        "summary": "**多权限 OR 样板**:概览 —— 普通读权**或**管理员任一即可。\n`require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。",
+        "summary": "**多权限 OR 样板**:概览 —— 普通读权**或**本组织成员管理员(`members:admin`)任一即可。\n两支都是租户级权限:租户数据的接口不拿平台级权限(如 `users:admin`)当闸(spec §4.3)。\n`require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。",
         "tags": [
           "widgets"
         ]
@@ -6671,7 +8603,7 @@ expression: spec
                 }
               }
             },
-            "description": "缺 widgets:read 或 widgets:delete 任一"
+            "description": "缺 widgets:read 或 widgets:delete 任一 / 没有当前租户(tenant_required)"
           }
         },
         "security": [
@@ -6683,6 +8615,53 @@ expression: spec
           }
         ],
         "summary": "**多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看\"可删多少\"。\n`require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OP_PERMS` 的 `PermReq::All`)。",
+        "tags": [
+          "widgets"
+        ]
+      }
+    },
+    "/api/v1/frontend/widgets/stats": {
+      "get": {
+        "description": "曾是免登录的「全站计数」:多租户下匿名请求没有租户,跨租户汇总要绕过 RLS,违背「租户互相看不见」,\n所以移到 frontend 组、只数当前租户。业务里要做公开数字,先想清楚它属于哪个租户。",
+        "operationId": "widget_stats",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WidgetStats"
+                }
+              }
+            },
+            "description": "当前租户的 widget 计数(仅登录)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "未认证"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "没有当前租户(tenant_required)"
+          }
+        },
+        "security": [
+          {
+            "oauth2": []
+          }
+        ],
+        "summary": "**仅登录**:当前租户的 widget 计数。要登录(frontend 组闸)+ 当前租户(`CurrentTenant`,缺 → 403\n`tenant_required`),**无特定 perm**(`OP_PERMS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。",
         "tags": [
           "widgets"
         ]
@@ -6725,7 +8704,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:delete 权限"
+            "description": "无 widgets:delete 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -6735,7 +8714,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在"
+            "description": "不存在 / 非本人 / 别的租户的"
           }
         },
         "security": [
@@ -6793,7 +8772,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:read 权限"
+            "description": "无 widgets:read 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -6803,7 +8782,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在 / 非本人(不区分,防泄露存在)"
+            "description": "不存在 / 非本人 / 别的租户的(不区分,防泄露存在)"
           }
         },
         "security": [
@@ -6871,7 +8850,7 @@ expression: spec
                 }
               }
             },
-            "description": "无 widgets:write 权限"
+            "description": "无 widgets:write 权限 / 没有当前租户(tenant_required)"
           },
           "404": {
             "content": {
@@ -6881,7 +8860,7 @@ expression: spec
                 }
               }
             },
-            "description": "不存在"
+            "description": "不存在 / 非本人 / 别的租户的"
           },
           "409": {
             "content": {
@@ -6891,7 +8870,7 @@ expression: spec
                 }
               }
             },
-            "description": "name 撞已有(存活行内唯一)"
+            "description": "name 撞已有(本租户存活行内唯一)"
           },
           "422": {
             "content": {
@@ -7104,27 +9083,6 @@ expression: spec
         ]
       }
     },
-    "/api/v1/public/widgets/stats": {
-      "get": {
-        "operationId": "widget_stats",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WidgetStats"
-                }
-              }
-            },
-            "description": "全站 widget 计数(公开)"
-          }
-        },
-        "summary": "**public**:全站 widget 计数。无 `CurrentUser`/`require_scoped` → 任何人可调\n(不进 `OP_PERMS` → 文档不挂 security)。演示\"无需登录\"形态。",
-        "tags": [
-          "widgets"
-        ]
-      }
-    },
     "/health": {
       "get": {
         "operationId": "health",
@@ -7229,8 +9187,16 @@ expression: spec
       "name": "admin"
     },
     {
-      "description": "后台用户管理:CRUD/角色/密码/资料/认证审计",
+      "description": "后台账号管理(平台级):CRUD/平台角色/密码/资料/认证审计",
       "name": "users"
+    },
+    {
+      "description": "平台租户管理(平台级):建 / 改名 / 停用租户,管理任意租户的成员",
+      "name": "tenants"
+    },
+    {
+      "description": "本租户成员管理(租户级):成员列表 / 按用户名加入已有账号 / 设租户角色 / 移出",
+      "name": "members"
     },
     {
       "description": "系统监控:后台监控页(依赖健康/流量/数据库/后台任务/进程资源)与前端错误上报",

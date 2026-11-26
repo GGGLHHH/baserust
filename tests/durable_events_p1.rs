@@ -28,6 +28,26 @@ use baserust::infra::config::Config;
 use baserust::kernel::audit::AuditContext;
 use idm::RegisterInput;
 
+/// 迁移要用 owner 账号(spec §4.4:运行时账号只有 DML,建不了表):同一个库,账号换成
+/// `<SCHEMA>_DB_OWNER_USER`(缺省 = 运行时账号名 + `_owner`)/ `<SCHEMA>_DB_OWNER_PASSWORD`(缺省 pwd)。
+async fn owner_pool(
+    runtime: &sqlx::PgPool,
+    prefix: &str,
+    runtime_user: &str,
+) -> anyhow::Result<sqlx::PgPool> {
+    let user = std::env::var(format!("{prefix}_DB_OWNER_USER"))
+        .unwrap_or_else(|_| format!("{runtime_user}_owner"));
+    let password =
+        std::env::var(format!("{prefix}_DB_OWNER_PASSWORD")).unwrap_or_else(|_| "pwd".into());
+    let opts = runtime
+        .connect_options()
+        .as_ref()
+        .clone()
+        .username(&user)
+        .password(&password);
+    Ok(sqlx::PgPool::connect_with(opts).await?)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
     // 1. config from .env → 满 pg+nats(内存模式跑不了本测试)。
@@ -52,7 +72,9 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
         .await?
         .expect("app pool(app_database_url 已断言 Some)");
     sqlx::migrate!("migrations/idm").run(&idm_pool).await?;
-    sqlx::migrate!("migrations/app").run(&app_pool).await?;
+    sqlx::migrate!("migrations/app")
+        .run(&owner_pool(&app_pool, "APP", &config.app_db_user).await?)
+        .await?;
 
     // 3. 起真 app:pg 仓储 + JetStreamPublisher + 装 outbox relay(Task 8 接线)。
     let (state, bg) = AppState::new(&config, Mount::Both).await?;

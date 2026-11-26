@@ -25,7 +25,17 @@ fn test_app() -> (Router, String) {
     let verifier = Arc::new(AppTokenVerifier::dev());
     // admin 满权令牌(roles=[admin],scope 空):mint 即可,不必走真实登录。
     let admin = signer
-        .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], vec![], 900)
+        .mint_scoped(
+            Uuid::nil(),
+            "admin",
+            vec![],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
+            vec![],
+            900,
+        )
         .unwrap();
     let bus: Arc<dyn baserust::features::widget::EventBus> =
         Arc::new(baserust::features::widget::MemoryEventBus::new());
@@ -50,6 +60,15 @@ fn test_app() -> (Router, String) {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -59,6 +78,9 @@ fn test_app() -> (Router, String) {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(
         state,
@@ -107,7 +129,17 @@ fn test_policy() -> Policy {
 fn user_token() -> (String, Uuid) {
     let uid = Uuid::now_v7();
     let t = AppTokenSigner::dev()
-        .mint_scoped(uid, "user", vec!["user".to_owned()], vec![], 900)
+        .mint_scoped(
+            uid,
+            "user",
+            vec![],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["user".to_owned()],
+            }),
+            vec![],
+            900,
+        )
         .unwrap();
     (t, uid)
 }
@@ -118,8 +150,11 @@ fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> Au
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
+        Arc::new(idm::InMemoryMemberRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
+    // 独立的空角色仓储:注册不授租户角色(配置了目录里没有的角色会响亮失败)
+    .signup_roles(Vec::new())
     .signer(signer)
     .verifier(verifier)
     .access_ttl_secs(900)
@@ -613,7 +648,11 @@ async fn sse_requires_read_scope() {
         .mint_scoped(
             Uuid::nil(),
             "admin",
-            vec!["admin".to_owned()],
+            vec![],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
             vec![Perm::WidgetWrite],
             900,
         )
@@ -638,7 +677,17 @@ async fn multi_perm_and_or_endpoints() {
     let signer = AppTokenSigner::dev(); // 与 fixture 同 dev 密钥,可自铸降权令牌
     let narrowed = |scope: Vec<Perm>| {
         signer
-            .mint_scoped(Uuid::nil(), "admin", vec!["admin".to_owned()], scope, 900)
+            .mint_scoped(
+                Uuid::nil(),
+                "admin",
+                vec![],
+                Some(baserust::features::auth::ScopedTenant {
+                    id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                    roles: vec!["admin".to_owned()],
+                }),
+                scope,
+                900,
+            )
             .unwrap()
     };
 

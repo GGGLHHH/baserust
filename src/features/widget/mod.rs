@@ -22,5 +22,5 @@ pub use baserust_core::features::widget::*;
 pub mod adapters;
 
 pub use adapters::bus::{NatsEventBus, PgEventBus};
-pub use adapters::http::{admin_router, public_router, router};
+pub use adapters::http::{admin_router, router};
 pub use adapters::postgres::PgWidgetRepo;

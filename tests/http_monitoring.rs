@@ -19,7 +19,7 @@ use baserust::infra::monitor::store::{
     minute_start, LogEntry, MemoryOpsStore, MinuteRecord, OpsStore, PeriodTotals, RouteTotals,
     Service, Severity,
 };
-use http_support::{expect, expect_json, TestServer, ADMIN, PASSWORD, SUPERADMIN};
+use http_support::{expect, expect_json, mint, TestServer, ADMIN, PASSWORD, SUPERADMIN};
 use reqwest::StatusCode;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
@@ -41,13 +41,26 @@ fn routes(instance: &Value) -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// 只有 `users:admin` 能看:未登录 401、没有 users:admin 的 admin 403。
+/// 只有 `ops:read`(superadmin 独占)能看:未登录 401、租户 admin 403、平台管理员(有 users:admin)也 403。
 #[tokio::test]
-async fn monitoring_requires_users_admin() {
+async fn monitoring_requires_ops_read() {
     let s = TestServer::start().await;
     expect(s.anon().get(MON).await, StatusCode::UNAUTHORIZED).await;
     let admin = s.login(ADMIN, PASSWORD).await;
     expect(admin.get(MON).await, StatusCode::FORBIDDEN).await;
+    expect(platform_admin(&s).get(MON).await, StatusCode::FORBIDDEN).await;
+}
+
+/// 平台管理员令牌(平台上下文,平台角色 platform_admin)。
+fn platform_admin(s: &TestServer) -> http_support::Client {
+    s.bearer(&mint(
+        uuid::Uuid::now_v7(),
+        "pa",
+        &["platform_admin"],
+        None,
+        &[],
+        vec![],
+    ))
 }
 
 /// 单进程:一个 combined 实例;请求按路由模板计数,未匹配的路径归 `unmatched`,
@@ -57,7 +70,11 @@ async fn single_process_report_counts_requests_by_route() {
     let s = TestServer::start().await;
     let sa = s.login(SUPERADMIN, PASSWORD).await;
     for _ in 0..3 {
-        expect(sa.get("/api/v1/public/widgets/stats").await, StatusCode::OK).await;
+        expect(
+            sa.get("/api/v1/frontend/widgets/stats").await,
+            StatusCode::OK,
+        )
+        .await;
     }
     expect(sa.get("/no/such/path").await, StatusCode::NOT_FOUND).await;
     expect(sa.get(MON).await, StatusCode::OK).await;
@@ -76,7 +93,7 @@ async fn single_process_report_counts_requests_by_route() {
     let rs = routes(me);
     let stats = rs
         .iter()
-        .find(|(m, r, _)| m == "GET" && r == "/api/v1/public/widgets/stats")
+        .find(|(m, r, _)| m == "GET" && r == "/api/v1/frontend/widgets/stats")
         .unwrap_or_else(|| panic!("缺 widgets/stats: {rs:?}"));
     assert!(stats.2 >= 3, "{rs:?}");
     assert!(rs.iter().any(|(_, r, _)| r == "unmatched"), "{rs:?}");
@@ -195,14 +212,16 @@ async fn server_with(store: Arc<MemoryOpsStore>) -> TestServer {
     .await
 }
 
-/// 历史与日志同样只给 users:admin。
+/// 历史与日志同样只给 ops:read。
 #[tokio::test]
-async fn history_and_logs_require_users_admin() {
+async fn history_and_logs_require_ops_read() {
     let s = TestServer::start().await;
     let admin = s.login(ADMIN, PASSWORD).await;
+    let pa = platform_admin(&s);
     for path in [HISTORY, LOGS] {
         expect(s.anon().get(path).await, StatusCode::UNAUTHORIZED).await;
         expect(admin.get(path).await, StatusCode::FORBIDDEN).await;
+        expect(pa.get(path).await, StatusCode::FORBIDDEN).await;
     }
 }
 

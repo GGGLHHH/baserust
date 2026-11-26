@@ -7,4 +7,6 @@ pub mod adapters;
 pub use adapters::http::dto::UserResponse;
 pub use adapters::http::middleware::authenticate;
 pub use adapters::http::{admin_login_router, admin_router, me_router, public_router};
-pub use adapters::token::{AppTokenSigner, AppTokenVerifier, NoopSigner};
+pub use adapters::token::{
+    AppTokenSigner, AppTokenVerifier, NoopSigner, ScopedTenant, VerifiedAccess,
+};

@@ -31,7 +31,7 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 
 ## 端点
 
-`/api/v1` 下分三组——`/public` 免登录、`/frontend` 需登录、`/admin` 需 `users:admin`(组级闸 + 端点内细粒度双层)。
+`/api/v1` 下分三组——`/public` 免登录、`/frontend` 需登录、`/admin` 需后台准入(当前租户的 `admin:login` 或任一平台级权限;组级闸 + 端点内细粒度双层)。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -40,13 +40,13 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | POST | `/api/v1/public/auth/login` | 登录(401 同码同文案防枚举) |
 | POST | `/api/v1/public/auth/refresh` | 刷新会话(读 refresh cookie) |
 | POST | `/api/v1/public/auth/logout` | 登出,清 cookie(幂等) |
-| GET | `/api/v1/public/widgets/stats` | 公开计数(免登录样板) |
+| GET | `/api/v1/frontend/widgets/stats` | 当前租户计数(仅登录样板) |
 | GET | `/api/v1/frontend/widgets` | 列表,**双模式分页**(offset `?page=&size=` / cursor `?cursor=&size=`) |
 | POST | `/api/v1/frontend/widgets` | 创建 |
 | GET/PUT/DELETE | `/api/v1/frontend/widgets/{id}` | 取 / 改名 / 软删除 |
 | GET | `/api/v1/frontend/widgets/my-count` | 我创建的 widget 数(仅登录样板) |
 | GET | `/api/v1/frontend/widgets/purge-preview` | 删除预检(多权限 **AND** 样板:`widgets:read`+`widgets:delete`) |
-| GET | `/api/v1/frontend/widgets/overview` | 概览(多权限 **OR** 样板:`widgets:read` 或 `users:admin`) |
+| GET | `/api/v1/frontend/widgets/overview` | 概览(多权限 **OR** 样板:`widgets:read` 或 `members:admin`,两支都是租户级) |
 | GET | `/api/v1/frontend/widgets/events` | SSE 变更事件流(created/updated/deleted;需登录 + `widgets:read`) |
 | POST | `/api/v1/frontend/contents/upload` | 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据 |
 | GET | `/api/v1/frontend/contents` | 列当前用户的内容(单租户) |
@@ -62,15 +62,18 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 | GET | `/api/v1/frontend/contents/{id}/metadata` | 取内容元数据 |
 | PUT | `/api/v1/frontend/contents/{id}/metadata` | 全量替换内容元数据(PUT,upsert) |
 | GET | `/api/v1/frontend/permissions/me` | 当前令牌的角色 + 有效权限(role ∩ scope,排序;仅登录) |
-| GET | `/api/v1/frontend/profiles/me` | 请求者自己的资料(仅登录零 perm;未建 404 引导建资料) |
-| GET | `/api/v1/frontend/profiles/{user_id}` | 读任意用户资料(`avatar_url` 富化为相对 preview 路径) |
-| PUT | `/api/v1/frontend/profiles/{user_id}` | 全量替换 upsert 自己的资料(201 建/200 替);`profiles:write:all` 可改任何人 |
+| GET | `/api/v1/frontend/profiles/me` | 请求者自己的资料(仅登录零 perm;未建 → 200 空资料) |
+| PUT | `/api/v1/frontend/profiles/me` | 全量替换 upsert 自己的资料(仅登录零 perm,不要当前租户;201 建/200 替) |
+| POST | `/api/v1/frontend/profiles/me/avatar` | 传自己的头像(multipart,栅格图):存成个人内容(不属于任何租户)并绑定 |
+| GET | `/api/v1/frontend/profiles/{user_id}` | 按 id 读任意用户资料(`profiles:read`,平台级;资料全局一份) |
+| PUT | `/api/v1/frontend/profiles/{user_id}` | 按 id 全量替换资料(`profiles:write`,平台级);`profiles:write:all` 可改任何人 |
+| GET | `/api/v1/frontend/profiles/{user_id}/avatar` | 某用户的头像(仅登录;个人内容,跨租户可见) |
 | GET/PUT/DELETE | `/api/v1/frontend/auth/me` | 当前用户:查 / 改资料 / 注销(注销需密码) |
 | POST | `/api/v1/frontend/auth/me/password` | 改密(撤销所有会话) |
 | POST | `/api/v1/frontend/auth/logout-all` | 撤销所有会话 |
-| POST | `/api/v1/admin/auth/login` | 后台登录:验密后需 `users:admin`,否则 403 不发 token |
-| GET | `/api/v1/admin/auth/me` | 当前管理员(组闸 `users:admin`) |
-| GET | `/api/v1/admin/widgets` | 管理端全量 widget 列表(原 `/widgets/admin/all`) |
+| POST | `/api/v1/admin/auth/login` | 后台登录:验密后进最近用过的、有 `admin:login` 的租户;都没有而有平台级权限 → 平台上下文;否则 403 不发 token(一个租户都没加入 → `tenant_required`,否则 `forbidden`) |
+| GET | `/api/v1/admin/auth/me` | 当前管理员(组闸:后台准入) |
+| GET | `/api/v1/admin/widgets` | 后台 widget 列表(当前租户;租户级 `widgets:read`,有 `read:all` 看本租户全部、否则只看自己的) |
 | GET | `/docs` | Scalar API 文档 UI |
 | GET | `/api-docs/openapi.{json,yaml}` | OpenAPI 规范 |
 
@@ -108,6 +111,9 @@ crates/core/              核心 crate baserust-core:kernel(error · pagination 
 - **可拔插实现**:`Arc<dyn Repo>` 端口,启动按 `APP_DB_HOST` 注入内存或 Postgres 实现
 - **统一不泄露错误契约**:核心 `AppError` → HTTP 适配器 `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
+- **多租户账号拆分**:app / content / search 各三个账号 —— `<schema>_owner` 跑迁移、拥有表;`<schema>` 运行时只有 DML、非 owner、受 RLS 约束(`infra::pg::tenant_tx` 设事务级 `app.tenant_id`);`<schema>_system` BYPASSRLS,给后台任务的单独连接池。建库脚本 `scripts/initdb/10-tenancy-roles.sh`(幂等,老库 `just db-ensure-roles` 升级);`tests/rls_audit.rs` 守「每张表要么租户隔离、要么在全局表白名单」
+- **search 读模型(多租户)**:`account_index` 账号目录(全局)+ `admin_user_index` 租户成员索引(主键 `(tenant_id, user_id)`,RLS),投影器与保留期任务用 `search_system` 池写(账号目录运行时账号只读);后台「用户」列表 = 平台账号列表(全部账号,读账号目录,运行时池),租户成员列表读成员索引(运行时池 + 租户事务)。**从多租户之前的版本升级**:search 迁移 0003 建出的成员索引是空的,迁移后跑一次 `rebuild_search`(本地 `cargo run --bin rebuild_search`;容器镜像里同名二进制,覆盖 entrypoint 运行,环境变量同 app 进程;baserust-stack 的 deploy.sh 发现索引为空会自动跑)
+- **从多租户之前的版本升级(本机)**:`just db-ensure-roles`(拆账号,**在迁移之前**)→ `just migrate` → `cargo run --bin rebuild_search`。旧数据全部归默认组织;app 启动(和 `seed`)时会把资料引用的旧头像转成个人内容,用 content 的 system 账号改表(UPDATE 权限由 `10-tenancy-roles.sh` 授)。生产步骤见 baserust-stack 的 `scripts/prod/README.md`「从多租户之前的版本升级」
 - **基础实体**:审计字段(created_by/at · updated_by/at)+ 软删除(`deleted_at`,`base_select` 收口);`updated_at` 由 DB 触发器维护
 - **审计上下文**:`AuditContext`(未认证 → Anonymous → created_by NULL;已认证 → 取鉴权中间件 `auth::authenticate` 塞的 `idm::AuthUser` 作 created_by)
 - **认证**:httponly cookie + Bearer 兜底;JWT 用 Ed25519 非对称:idm 私钥签发、app 公钥验签(`keys/` dev 对仅开发,prod `just gen-keys`)
@@ -115,7 +121,7 @@ crates/core/              核心 crate baserust-core:kernel(error · pagination 
 
 ## 监控
 
-后台「系统监控」页(前端 `/admin/monitoring`,需 `users:admin`),两个标签页:
+后台「系统监控」页(前端 `/admin/monitoring`,需 `ops:read`,superadmin 独占),两个标签页:
 
 - **概览**:依赖健康、请求量 / 错误率 / 延迟(按接口)、数据库操作耗时、连接池、outbox / projector、SSE、进程内存与 CPU。趋势可切 1 小时(进程内实时,15 秒一点)/ 24 小时 / 7 天 / 30 天 / 90 天 / 1 年;点曲线上的点跳到那段时间的日志。
 - **日志**:WARN 及以上的日志 + 失败请求(5xx)+ 慢请求(≥1 秒)+ 前端错误,按时间段 / 级别 / 服务(app / idm / 前端)/ 关键字 / 请求 ID 筛选。敏感字段(密码、token、cookie…)入库前脱敏。
@@ -132,8 +138,8 @@ crates/core/              核心 crate baserust-core:kernel(error · pagination 
 ```bash
 just test          # 默认:零 DB,单测 + API 集成 + 黑盒 HTTP 验收 + OpenAPI 快照 + 内存侧仓储 conformance
 just test-http     # 只跑黑盒 HTTP 验收(tests/http_*.rs:真实端口 + reqwest,换 web 框架时原样当验收标准)
-just pg-test-grant # 一次性:给 app role 授 CREATEDB + CREATE ON DATABASE
-just test-pg       # repo conformance 打真 PG(sqlx::test 临时库,与内存同一份契约防漂移)
+just pg-test-grant # 一次性:给 app_owner(sqlx::test 建库 / 迁移的账号)授 CREATEDB + CREATE ON DATABASE
+just test-pg       # repo conformance 打真 PG(sqlx::test 临时库以 app_owner 迁移、仓储走运行时账号 app;再加 RLS 审计)
 just test-all      # 内存 + PG
 ```
 

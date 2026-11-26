@@ -4,8 +4,14 @@
 use std::time::Duration;
 
 use baserust::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
+use baserust::kernel::tenant::{TenantId, DEFAULT_TENANT_ID};
 use tokio::time::timeout;
 use uuid::Uuid;
+
+/// 契约里发事件用的租户(默认租户;第 4 条用例另起一个租户验证租户随负载往返)。
+fn tenant() -> TenantId {
+    DEFAULT_TENANT_ID
+}
 
 /// 5s 内必须收到一条事件,且是 `Deleted{expected}`(契约用 Deleted:payload 最小,断言只看 id)。
 async fn expect_deleted(
@@ -30,6 +36,7 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let mut sub = bus.subscribe().await.expect("订阅应成功");
     let id1 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
+        tenant_id: tenant(),
         id: id1,
         created_by: None,
     })
@@ -41,6 +48,7 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let mut b = bus.subscribe().await.unwrap();
     let id2 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
+        tenant_id: tenant(),
         id: id2,
         created_by: None,
     })
@@ -52,11 +60,36 @@ async fn event_bus_contract(bus: &dyn EventBus) {
     let mut late = bus.subscribe().await.unwrap();
     let id3 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
+        tenant_id: tenant(),
         id: id3,
         created_by: None,
     })
     .await;
     expect_deleted(&mut late, id3).await;
+
+    // 4. 租户随负载往返(PG NOTIFY / NATS 要经 JSON 序列化):订阅侧拿到的 tenant_id 等于发布时的,
+    //    SSE 才能按它先过滤租户。用一个非默认租户,防「反序列化时落到默认值」也能蒙混过关。
+    let other = TenantId::new(Uuid::now_v7()).unwrap();
+    let id4 = Uuid::now_v7();
+    bus.publish(WidgetEvent::Deleted {
+        tenant_id: other,
+        id: id4,
+        created_by: Some("u".into()),
+    })
+    .await;
+    let got = timeout(Duration::from_secs(5), late.recv())
+        .await
+        .expect("5s 内应收到事件")
+        .expect("总线不应关闭");
+    assert_eq!(
+        got,
+        WidgetEvent::Deleted {
+            tenant_id: other,
+            id: id4,
+            created_by: Some("u".into()),
+        },
+        "租户与 owner 都要原样过总线"
+    );
 }
 
 #[tokio::test]
@@ -73,12 +106,14 @@ async fn memory_lagged_subscriber_skips_and_continues() {
     let last = Uuid::now_v7();
     for _ in 0..199 {
         bus.publish(WidgetEvent::Deleted {
+            tenant_id: tenant(),
             id: Uuid::now_v7(),
             created_by: None,
         })
         .await;
     }
     bus.publish(WidgetEvent::Deleted {
+        tenant_id: tenant(),
         id: last,
         created_by: None,
     })
@@ -104,7 +139,8 @@ mod pg {
     use super::*;
     use baserust::features::widget::PgEventBus;
 
-    /// pg_notify 不碰任何表 → 免迁移;`#[sqlx::test]` 的临时库即可。
+    /// pg_notify 不碰任何表 → 免迁移;`#[sqlx::test]` 的临时库即可。LISTEN / NOTIFY 不需要表权限,
+    /// owner / 运行时账号行为一样,这里直接用 sqlx::test 给的池(连接预算见文件头)。
     #[sqlx::test(migrations = false)]
     async fn pg_satisfies_event_bus_contract(pool: sqlx::PgPool) {
         event_bus_contract(&PgEventBus::new(pool)).await;

@@ -1,4 +1,4 @@
-# 生产 seed 账号模板 —— **复制成 `seed.prod.toml`(已被 .gitignore 挡,绝不入库),填真密码**。
+# 生产 seed 模板(租户 + 账号)—— **复制成 `seed.prod.toml`(已被 .gitignore 挡,绝不入库),填真密码**。
 #
 # 【容器 / prod 主路径】把本文件(填好真密码后)作为 secret 挂进容器,进程启动时自动幂等建号:
 #   - 挂载:k8s secret / docker secret / volume → 容器内某路径,如 /run/secrets/seed.prod.toml
@@ -10,20 +10,36 @@
 #   cp seed.prod.toml.example seed.prod.toml && vi seed.prod.toml   # 填强密码
 #   SEED_FILE=seed.prod.toml just seed-prod
 #
-# 只放**账号**(实例数据 + 密码)。角色集 / 权限集是代码闭集(src/infra/authz.rs 的
-# RoleName / Perm),不在此;role→权限默认由启动时 seed_authz 幂等灌 app 表(prod+dev 都跑)。
-# 账号引用的 role 必须是 RoleName 已知变体(superadmin/admin/user),拼错启动即挂。
+# 角色集 / 权限集是代码闭集(crates/core/src/kernel/authz.rs 的 RoleName / Perm),不在此;
+# role→权限默认由启动时 seed_authz 幂等灌 app 表(prod+dev 都跑)。
+# 平台角色写 platform_roles:superadmin(只能有一个,只能在这里声明;多于一个启动即挂)、
+# platform_admin(平台管理员,可多个:管组织和普通账号,看不到监控 / 登录日志、碰不到持平台角色的账号);
+# 租户角色(admin / user)写 tenants = [{ slug, roles }]。
+# 写错位置 / 拼错角色名启动即挂。旧格式([[accounts]] + roles = [...])仍认,按角色作用域自动拆。
 #
-# 密码存库经 Argon2 哈希;幂等 —— 账号已存在则跳过,重启不冲掉运维轮换过的密码。
+# 密码存库经 Argon2 哈希;幂等 —— 账号已存在则跳过,重启不冲掉运维轮换过的密码;
+# 平台角色、成员关系、租户角色按声明补齐(取并集,不清运行期授予的)。
 
-[[accounts]]
+# 默认租户(id 固定,迁移把存量数据归到它)。名称按项目改。
+[[tenants]]
+slug = "default"
+name = "默认组织"
+
+[[users]]
 username = "superadmin"
 email = "superadmin@your-domain.example"
 password = "CHANGE_ME_strong_random_password" # ← 换成强随机密码
-roles = ["superadmin"]
+platform_roles = ["superadmin"]
+# 超管在默认租户兼任 admin(平台角色不自动获得租户内权限;不想让它进租户后台就删掉这行)。
+tenants = [{ slug = "default", roles = ["admin"] }]
 
-# 按需增删下面的默认账号;prod 通常只保留一个引导超管,其余经后台创建。
-# [[accounts]]
+# 按需增删下面的默认账号;prod 通常只保留一个引导超管,其余经后台创建、再加进租户。
+# 平台管理员也可以在这里声明(或由 superadmin 在后台任命):
+# [[users]]
+# username = "ops-lead"
+# password = "CHANGE_ME"
+# platform_roles = ["platform_admin"]
+# [[users]]
 # username = "admin"
 # password = "CHANGE_ME"
-# roles = ["admin"]
+# tenants = [{ slug = "default", roles = ["admin"] }]

@@ -26,12 +26,12 @@ pub trait HttpErrorExt {
 impl HttpErrorExt for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
-            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::NotFound | AppError::AccountNotFound => StatusCode::NOT_FOUND,
             AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Conflict(_) => StatusCode::CONFLICT,
-            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::Forbidden | AppError::TenantRequired => StatusCode::FORBIDDEN,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -40,11 +40,13 @@ impl HttpErrorExt for AppError {
     fn code(&self) -> ErrorCode {
         match self {
             AppError::NotFound => ErrorCode::NotFound,
+            AppError::AccountNotFound => ErrorCode::AccountNotFound,
             AppError::Validation(_) => ErrorCode::Validation,
             AppError::BadRequest(_) => ErrorCode::BadRequest,
             AppError::Unauthorized => ErrorCode::Unauthorized,
             AppError::Conflict(_) => ErrorCode::Conflict,
             AppError::Forbidden => ErrorCode::Forbidden,
+            AppError::TenantRequired => ErrorCode::TenantRequired,
             AppError::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -54,11 +56,13 @@ impl HttpErrorExt for AppError {
     fn client_message(&self) -> String {
         match self {
             AppError::NotFound => "Resource not found".to_owned(),
+            AppError::AccountNotFound => "Account not found".to_owned(),
             AppError::Validation(msg) => format!("Invalid request: {msg}"),
             AppError::BadRequest(_) => "Malformed request".to_owned(),
             AppError::Unauthorized => "Authentication failed".to_owned(),
             AppError::Conflict(msg) => msg.clone(),
             AppError::Forbidden => "Forbidden".to_owned(),
+            AppError::TenantRequired => "A current tenant is required".to_owned(),
             AppError::Internal(_) => "Internal server error".to_owned(),
         }
     }
@@ -86,9 +90,11 @@ impl HttpErrorExt for AppError {
             AppError::Internal(err) => Some(format!("{err:?}")),
             AppError::Validation(msg) => Some(msg.clone()),
             AppError::NotFound
+            | AppError::AccountNotFound
             | AppError::Unauthorized
             | AppError::Conflict(_)
-            | AppError::Forbidden => None,
+            | AppError::Forbidden
+            | AppError::TenantRequired => None,
         }
     }
 }
@@ -103,6 +109,10 @@ pub enum ErrorCode {
     Unauthorized,
     Conflict,
     Forbidden,
+    /// 403:token 没有当前租户,却访问租户级接口(平台上下文 / 还没加入任何组织)。
+    TenantRequired,
+    /// 404:按用户名找不到账号(租户管理员按用户名加成员时)。与 `not_found` 分开,前端据此提示「账号不存在」。
+    AccountNotFound,
     Internal,
     /// 仅 router 全局超时兜底路径产出(绕过 AppError)。
     Timeout,
@@ -119,13 +129,15 @@ impl ErrorCode {
     /// 的穷尽 match(编译不过),但它只让你**手写**一个 wire 串,不校验它等于 serde 的 rename。
     /// 后果:日志字段 `code`(as_str)与出参 `code`(serde)对新变体可能对不上。
     /// 要根治:声明宏单源展开 enum + `ALL` + `as_str`,让漏项不可表达。
-    pub const ALL: [ErrorCode; 9] = [
+    pub const ALL: [ErrorCode; 11] = [
         ErrorCode::NotFound,
         ErrorCode::Validation,
         ErrorCode::BadRequest,
         ErrorCode::Unauthorized,
         ErrorCode::Conflict,
         ErrorCode::Forbidden,
+        ErrorCode::TenantRequired,
+        ErrorCode::AccountNotFound,
         ErrorCode::Internal,
         ErrorCode::Timeout,
         ErrorCode::RateLimited,
@@ -140,6 +152,8 @@ impl ErrorCode {
             ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::Conflict => "conflict",
             ErrorCode::Forbidden => "forbidden",
+            ErrorCode::TenantRequired => "tenant_required",
+            ErrorCode::AccountNotFound => "account_not_found",
             ErrorCode::Internal => "internal",
             ErrorCode::Timeout => "timeout",
             ErrorCode::RateLimited => "rate_limited",
@@ -283,6 +297,23 @@ mod tests {
         assert_eq!(c.status_code(), StatusCode::CONFLICT);
         assert_eq!(c.code().as_str(), "conflict");
         assert_eq!(c.client_message(), "This email is already registered");
+    }
+
+    #[test]
+    fn account_not_found_is_404_with_its_own_code() {
+        let e = AppError::AccountNotFound;
+        assert_eq!(e.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(e.code().as_str(), "account_not_found");
+        assert_eq!(e.client_message(), "Account not found");
+        assert!(e.log_detail().is_none());
+    }
+
+    #[test]
+    fn tenant_required_is_403_with_its_own_code() {
+        let e = AppError::TenantRequired;
+        assert_eq!(e.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(e.code().as_str(), "tenant_required");
+        assert!(e.log_detail().is_none());
     }
 
     #[test]

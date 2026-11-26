@@ -168,6 +168,10 @@ async fn scope_downscopes_below_role_grant() {
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
+            Some(baserust::features::auth::ScopedTenant {
+                id: admin.tenant_id.expect("admin 登录应进默认租户"),
+                roles: admin.tenant_roles.clone(),
+            }),
             vec![Perm::WidgetRead],
             900,
         )
@@ -215,11 +219,15 @@ async fn body_of(app: &Router, method: &str, uri: &str, bearer: Option<&str>) ->
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-/// 经 service 直查某 mock widget 的 id(owner=None 看全部;id 运行期生成,按 name 找)。
+/// 经 service 直查某 mock widget 的 id(默认租户、owner=None 看全部;id 运行期生成,按 name 找)。
 async fn widget_id(state: &AppState, name: &str) -> Uuid {
     state
         .widgets
-        .list(page_query(), None)
+        .list(
+            baserust::kernel::tenant::DEFAULT_TENANT_ID,
+            page_query(),
+            None,
+        )
         .await
         .unwrap()
         .items
@@ -302,21 +310,23 @@ async fn enrichment_fills_created_by_user() {
     );
 }
 
-// ── 其余授权形态:public / 仅登录 / superadmin-only(打真实新增的 /api/v1/frontend/widgets 端点)──
+// ── 其余授权形态:仅登录 / superadmin-only(打真实新增的 /api/v1/frontend/widgets 端点)──
 
-/// public:`/widgets/stats` 无 token 也 200,且统计到 mock seed 的 3 个 widget。
+/// 仅登录:`/widgets/stats` 无 token → 401;登录后 200,数当前租户全部(mock seed 进默认租户的 3 个 widget,
+/// user 自己只有 1 个也照样看到 3 —— 它是计数、不是列表)。
 #[tokio::test]
-async fn public_stats_needs_no_auth() {
+async fn stats_needs_login_and_counts_current_tenant() {
     let (state, _) = setup().await;
     let app = real_app(&state);
     assert_eq!(
-        status(&app, "GET", "/api/v1/public/widgets/stats", None).await,
-        StatusCode::OK
+        status(&app, "GET", "/api/v1/frontend/widgets/stats", None).await,
+        StatusCode::UNAUTHORIZED
     );
-    let body = body_of(&app, "GET", "/api/v1/public/widgets/stats", None).await;
+    let user = login(&state, "user").await.access_token;
+    let body = body_of(&app, "GET", "/api/v1/frontend/widgets/stats", Some(&user)).await;
     assert!(
         body.contains("\"total\":3"),
-        "应统计 mock 的 3 个 widget: {body}"
+        "应统计默认租户里 mock 的 3 个 widget: {body}"
     );
 }
 
@@ -343,10 +353,10 @@ async fn my_count_needs_login_no_perm() {
     );
 }
 
-/// superadmin-only:`/api/v1/admin/widgets` gate `users:admin`。
-/// **关键**:admin 虽有 read:all,但无 users:admin → 403;只有 superadmin → 200。
+/// 后台 widget 列表:admin 组闸(后台准入)+ 租户级 `widgets:read`。
+/// **关键**:租户管理员(admin,有 admin:login)不要平台级 users:admin 就能看;普通 user 没有后台准入 → 403。
 #[tokio::test]
-async fn admin_list_is_superadmin_only() {
+async fn admin_list_needs_admin_entry_and_tenant_read() {
     let (state, _) = setup().await;
     let app = real_app(&state);
     let user = login(&state, "user").await.access_token;
@@ -359,8 +369,8 @@ async fn admin_list_is_superadmin_only() {
     );
     assert_eq!(
         status(&app, "GET", "/api/v1/admin/widgets", Some(&admin)).await,
-        StatusCode::FORBIDDEN,
-        "admin 有 read:all 但无 users:admin → 仍 403"
+        StatusCode::OK,
+        "租户管理员:后台准入 + 租户级读权即可,不要平台级 users:admin"
     );
     assert_eq!(
         status(&app, "GET", "/api/v1/admin/widgets", Some(&superadmin)).await,
@@ -391,6 +401,10 @@ async fn scope_without_read_all_narrows_admin_to_own() {
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
+            Some(baserust::features::auth::ScopedTenant {
+                id: admin.tenant_id.expect("admin 登录应进默认租户"),
+                roles: admin.tenant_roles.clone(),
+            }),
             vec![Perm::WidgetRead],
             900,
         )
@@ -419,9 +433,20 @@ async fn my_permissions_reflect_role_and_scope() {
         .await
         .unwrap();
     let signer = AppTokenSigner::dev();
+    // roles = 默认租户里的租户角色(admin 的权限都是租户级)
     let mint = |roles: Vec<String>, scope: Vec<Perm>| {
         signer
-            .mint_scoped(admin.user.id, "probe", roles, scope, 900)
+            .mint_scoped(
+                admin.user.id,
+                "probe",
+                vec![],
+                Some(baserust::features::auth::ScopedTenant {
+                    id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                    roles,
+                }),
+                scope,
+                900,
+            )
             .unwrap()
     };
     let fetch = |token: String| {
@@ -444,16 +469,28 @@ async fn my_permissions_reflect_role_and_scope() {
         }
     };
 
-    // 满权令牌:admin 全部 14 权(含 admin:login 后台准入,**无** users:admin),含 implies 展开;排序稳定
+    // 满权令牌:admin 全部 13 权(含 admin:login 后台准入、members:read / members:admin 成员管理,
+    // **无** users:admin、无 profiles:* —— 那些是平台级),
+    // 含 implies 展开;排序稳定
     let v = fetch(admin.access_token.clone()).await;
-    assert_eq!(v["roles"], serde_json::json!(["admin"]));
+    assert_eq!(v["roles"], serde_json::json!([]), "admin 没有平台角色");
+    assert_eq!(v["tenant_roles"], serde_json::json!(["admin"]));
+    assert_eq!(
+        v["tenant"]["id"],
+        baserust::kernel::tenant::DEFAULT_TENANT_ID.to_string()
+    );
     let perms: Vec<&str> = v["permissions"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s.as_str().unwrap())
         .collect();
-    assert_eq!(perms.len(), 14, "admin 应 14 权,got {perms:?}");
+    assert_eq!(perms.len(), 13, "admin 应 13 权,got {perms:?}");
+    assert!(perms.contains(&"members:read") && perms.contains(&"members:admin"));
+    assert!(
+        perms.iter().all(|p| !p.starts_with("profiles:")),
+        "资料全局一份:租户管理员没有 profiles:*"
+    );
     assert!(perms.contains(&"widgets:read:all"));
     assert!(
         perms.contains(&"widgets:write:all"),

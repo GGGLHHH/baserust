@@ -38,7 +38,9 @@ async fn permissions_me() {
 
     let user = s.login(USER, PASSWORD).await;
     let v = expect_json(user.get(path).await, StatusCode::OK).await;
-    assert_eq!(v["roles"], serde_json::json!(["user"]));
+    // user 没有平台角色;它的 user 角色是默认租户里的租户角色
+    assert_eq!(v["roles"], serde_json::json!([]));
+    assert_eq!(v["tenant_roles"], serde_json::json!(["user"]));
     let perms: Vec<&str> = v["permissions"]
         .as_array()
         .unwrap()

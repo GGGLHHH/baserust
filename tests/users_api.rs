@@ -27,7 +27,8 @@ use baserust::kernel::authz::{Perm, Policy};
 use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo, RoleRepo};
 
 /// 内存 app + 两个令牌:`superadmin`(有 users:admin,满权)与 `admin`(只有 admin:login)。
-/// idm user/role repo 共享并预置角色(superadmin/admin/user,即 RoleName 闭集);profile repo 三方共享 →
+/// idm user/role repo 共享并预置角色(superadmin/platform_admin/admin/user,即 RoleName 闭集;目录接口不列 superadmin,
+/// 目标高权账号用 platform_admin —— 动持平台角色的账号要 platform:roles,中间管理员没有);profile repo 三方共享 →
 /// 富化可端到端断言。auth 服务用独立占位 repo(本套不测真实登录)。
 async fn test_app() -> (Router, String, String) {
     let signer = Arc::new(AppTokenSigner::dev());
@@ -38,10 +39,14 @@ async fn test_app() -> (Router, String, String) {
     let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
     for (name, display) in [
         ("superadmin", "Super"),
+        ("platform_admin", "Platform Admin"),
         ("admin", "Admin"),
         ("user", "User"),
     ] {
-        mem_roles.upsert(name, display, None).await.unwrap();
+        mem_roles
+            .upsert(name, display, idm::RoleScope::Platform, None)
+            .await
+            .unwrap();
     }
     let users_repo: Arc<dyn idm::UserRepo> = Arc::new(mem_users);
     let roles_repo: Arc<dyn RoleRepo> = Arc::new(mem_roles);
@@ -62,8 +67,17 @@ async fn test_app() -> (Router, String, String) {
     // `useradmin` = **中间管理员**:有 users:admin 但非满权 —— 提权闸真正要拦的那类主体
     // (见 users/adapters/http/routes.rs 头注)。线上 seed 里没有这个角色,但 role→perms 是运行期可改的
     // (`role_permissions` 表),superadmin 随时能造出这类主体,故闸必须对它成立。
+    // 多租户:superadmin(平台角色)只取平台级权限(含 users:admin、profiles:write:all);超管令牌在默认租户里
+    // 兼任的 `tenant_all` 租户角色给全部租户级权限 —— 合起来仍是「满权」。
     let policy = Policy::from_roles([
         ("superadmin".to_owned(), Perm::ALL.to_vec()),
+        (
+            "tenant_all".to_owned(),
+            Perm::ALL
+                .into_iter()
+                .filter(|p| p.scope() == baserust::kernel::authz::PermScope::Tenant)
+                .collect(),
+        ),
         ("admin".to_owned(), vec![Perm::AdminLogin]),
         (
             "useradmin".to_owned(),
@@ -83,6 +97,15 @@ async fn test_app() -> (Router, String, String) {
         contents: test_contents(),
         auth: test_auth(signer.clone(), verifier.clone()),
         user_admin,
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -92,6 +115,9 @@ async fn test_app() -> (Router, String, String) {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(
         state,
@@ -104,6 +130,10 @@ async fn test_app() -> (Router, String, String) {
             Uuid::now_v7(),
             "superadmin",
             vec!["superadmin".to_owned()],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["tenant_all".to_owned()],
+            }),
             vec![],
             900,
         )
@@ -112,7 +142,11 @@ async fn test_app() -> (Router, String, String) {
         .mint_scoped(
             Uuid::now_v7(),
             "admin",
-            vec!["admin".to_owned()],
+            vec![],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["admin".to_owned()],
+            }),
             vec![],
             900,
         )
@@ -136,8 +170,11 @@ fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> id
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
+        Arc::new(idm::InMemoryMemberRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
+    // 独立的空角色仓储:注册不授租户角色(配置了目录里没有的角色会响亮失败)
+    .signup_roles(Vec::new())
     .signer(signer)
     .verifier(verifier)
     .access_ttl_secs(900)
@@ -739,20 +776,24 @@ fn useradmin_token() -> String {
             Uuid::now_v7(),
             "useradmin",
             vec!["useradmin".to_owned()],
+            Some(baserust::features::auth::ScopedTenant {
+                id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                roles: vec!["useradmin".to_owned()],
+            }),
             vec![],
             900,
         )
         .unwrap()
 }
 
-/// **改密码 = 能以对方身份登录**,所以必须闸目标现有角色:中间管理员改不动 superadmin 的密码。
+/// **改密码 = 能以对方身份登录**,所以必须闸目标现有角色:中间管理员改不动持平台角色账号(平台管理员 / superadmin)的密码。
 /// 没这道闸,本模块辛苦建的提权闸(set_roles 挡着授不出 superadmin)就被这个端点整个绕过 ——
 /// 把 superadmin 密码改成自己知道的,登进去就是 Perm::ALL。
 #[tokio::test]
-async fn intermediate_admin_cannot_reset_a_superadmin_password() {
+async fn intermediate_admin_cannot_reset_a_platform_admin_password() {
     let (app, sa, _admin) = test_app().await;
     let ua = useradmin_token();
-    let victim = create_user(&app, &sa, "target-sa", &["superadmin"]).await;
+    let victim = create_user(&app, &sa, "target-sa", &["platform_admin"]).await;
     let plain = create_user(&app, &sa, "target-user", &["user"]).await;
 
     // 打更高权目标 → 403
@@ -768,7 +809,7 @@ async fn intermediate_admin_cannot_reset_a_superadmin_password() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "中间管理员不该能改 superadmin 的密码(改了就能登进去接管)"
+        "中间管理员不该能改平台管理员的密码(改了就能登进去接管)"
     );
 
     // 打同级/更低权目标 → 照常放行(别把闸收成谁都改不了)
@@ -787,7 +828,7 @@ async fn intermediate_admin_cannot_reset_a_superadmin_password() {
         "改普通用户密码是 users:admin 的正常职权"
     );
 
-    // superadmin 自己打 superadmin → 恒过(满权者持有目标全部权)
+    // superadmin 自己打平台管理员 → 过(持 platform:roles + 目标全部权)
     let resp = app
         .oneshot(post_json(
             &format!("/api/v1/admin/auth/users/{victim}/password"),
@@ -799,12 +840,12 @@ async fn intermediate_admin_cannot_reset_a_superadmin_password() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "superadmin 恒过闸");
 }
 
-/// 删号同理:中间管理员删不掉 superadmin(破坏而非接管,但同属"对更高权目标动手")。
+/// 删号同理:中间管理员删不掉平台管理员(破坏而非接管,但同属"对更高权目标动手")。
 #[tokio::test]
-async fn intermediate_admin_cannot_delete_a_superadmin() {
+async fn intermediate_admin_cannot_delete_a_platform_admin() {
     let (app, sa, _admin) = test_app().await;
     let ua = useradmin_token();
-    let victim = create_user(&app, &sa, "del-target-sa", &["superadmin"]).await;
+    let victim = create_user(&app, &sa, "del-target-sa", &["platform_admin"]).await;
     let plain = create_user(&app, &sa, "del-target-user", &["user"]).await;
 
     let resp = app
@@ -818,7 +859,7 @@ async fn intermediate_admin_cannot_delete_a_superadmin() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "中间管理员不该能删 superadmin"
+        "中间管理员不该能删平台管理员"
     );
 
     let resp = app
@@ -835,18 +876,18 @@ async fn intermediate_admin_cannot_delete_a_superadmin() {
     );
 }
 
-/// 全量替换角色也得闸**目标现有角色**:中间管理员不能把 superadmin 降权/清空。
+/// 全量替换角色也得闸**目标现有角色**:中间管理员不能把平台管理员降权/清空。
 /// 被授角色闸只管"授出去的",自锁闸只护 actor 自己 —— 少了这道,传一组"自己也有的角色"
 /// 就能剥掉 superadmin 的权;若那是唯一的 superadmin,系统再无人能改回来。
 #[tokio::test]
-async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
+async fn intermediate_admin_cannot_strip_a_platform_admin_roles() {
     let (app, sa, _admin) = test_app().await;
     let ua = useradmin_token();
-    let victim = create_user(&app, &sa, "roles-target-sa", &["superadmin"]).await;
+    let victim = create_user(&app, &sa, "roles-target-sa", &["platform_admin"]).await;
     let plain = create_user(&app, &sa, "roles-target-user", &["user"]).await;
     let user_ids = role_ids_json(&app, &sa, &["user"]).await;
 
-    // 把 superadmin 降成 user(被授角色 `user` 中间管理员自己够得着 → 只能靠目标闸拦)
+    // 把平台管理员降成 user(被授角色 `user` 中间管理员自己够得着 → 只能靠目标闸拦)
     let resp = app
         .clone()
         .oneshot(put_json(
@@ -859,7 +900,7 @@ async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "中间管理员不该能剥掉 superadmin 的角色"
+        "中间管理员不该能剥掉平台管理员的角色"
     );
 
     // 改同级/更低权目标 → 照常放行
@@ -874,13 +915,13 @@ async fn intermediate_admin_cannot_strip_a_superadmin_roles() {
     assert_eq!(resp.status(), StatusCode::OK, "改普通用户角色是正常职权");
 }
 
-/// 改身份字段同样闸目标现有角色:改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username)。
+/// 改身份字段同样闸目标现有角色:改掉平台管理员的 username 就等于把它锁在门外(登录靠 username)。
 /// 本模块四个写端点(update/delete/reset_password/set_roles)口径必须一致。
 #[tokio::test]
-async fn intermediate_admin_cannot_rename_a_superadmin() {
+async fn intermediate_admin_cannot_rename_a_platform_admin() {
     let (app, sa, _admin) = test_app().await;
     let ua = useradmin_token();
-    let victim = create_user(&app, &sa, "rename-target-sa", &["superadmin"]).await;
+    let victim = create_user(&app, &sa, "rename-target-sa", &["platform_admin"]).await;
     let plain = create_user(&app, &sa, "rename-target-user", &["user"]).await;
 
     let resp = app
@@ -895,7 +936,7 @@ async fn intermediate_admin_cannot_rename_a_superadmin() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "中间管理员不该能改 superadmin 的身份字段"
+        "中间管理员不该能改平台管理员的身份字段"
     );
 
     let resp = app

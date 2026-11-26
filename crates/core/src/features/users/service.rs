@@ -27,6 +27,15 @@ impl From<SortOrder> for idm::SortDir {
     }
 }
 
+/// 读模型的角色列:只显示**平台角色**(闭集内、`scope() == Platform`)。列表的角色列来自 `user_roles` 原样
+/// (idm 列表 / 检索投影都不按作用域过滤),多租户之前遗留在 `user_roles` 里的租户角色行不生效,不显示。
+fn platform_roles(names: Vec<String>) -> Vec<RoleName> {
+    RoleName::parse_lossy(names)
+        .into_iter()
+        .filter(|r| r.scope() == idm::RoleScope::Platform)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct UserAdminService {
     users: Arc<dyn UserRepo>,
@@ -34,7 +43,8 @@ pub struct UserAdminService {
     sessions: Arc<dyn SessionRepo>,
     hasher: Arc<dyn PwHasher>,
     profiles: Arc<dyn ProfileDirectory>,
-    /// 只读检索投影(search 模块);None = 未接 search 后端 → list() 回退 idm 直查(q/DisplayName 排序 422)。
+    /// 只读检索投影(search 模块的**账号目录** `account_index`,全局);None = 未接 search 后端 → list() 回退 idm 直查
+    /// (q/DisplayName 排序 422)。
     search: Option<Arc<dyn UserSearchIndex>>,
 }
 
@@ -57,7 +67,9 @@ impl UserAdminService {
         }
     }
 
-    /// 列表:有 search 投影后端 → 走投影(支持 `q`/`display_name` 排序);无 → 回退 idm 直查
+    /// **平台账号列表**(全部账号,不分租户;角色列 / `roles_any` / `roles_none` 都是**平台角色**)。
+    /// 租户成员列表另有接口(读租户成员索引),不在这里。
+    /// 有 search 投影后端 → 走账号目录(支持 `q`/`display_name` 排序);无 → 回退 idm 直查
     /// (此时 `q`/`sort_by=display_name` → 422,因为回退路无法提供搜索能力)。
     /// `page` 的 cursor + 非默认 sort 的 422 校验在边界(此处只翻译参数)。
     pub async fn list(
@@ -80,7 +92,7 @@ impl UserAdminService {
         }
     }
 
-    /// 投影路:走 search 索引(`q`/角色/时间过滤 + 4 键排序)→ 批量富化 avatar(投影不存 avatar)。
+    /// 投影路:走账号目录(`q`/角色/时间过滤 + 4 键排序)→ 批量富化 avatar(投影不存 avatar)。
     async fn list_via_projection(
         &self,
         search: Arc<dyn UserSearchIndex>,
@@ -111,8 +123,8 @@ impl UserAdminService {
                 email: r.email,
                 email_verified: r.email_verified,
                 created_at: r.created_at,
-                roles: RoleName::parse_lossy(r.roles),
-                display_name: r.display_name, // 投影(可搜键)
+                roles: platform_roles(r.roles), // 账号目录:平台角色
+                display_name: r.display_name,   // 投影(可搜键)
                 avatar_url: briefs.get(&r.id).and_then(|b| b.avatar_url.clone()), // 富化(display-only)
             })
             .collect();
@@ -176,7 +188,7 @@ impl UserAdminService {
                     email: r.email,
                     email_verified: r.email_verified,
                     created_at: r.created_at,
-                    roles: RoleName::parse_lossy(r.roles),
+                    roles: platform_roles(r.roles),
                     display_name: brief.and_then(|b| b.display_name.clone()),
                     avatar_url: brief.and_then(|b| b.avatar_url.clone()),
                 }
@@ -279,7 +291,8 @@ impl UserAdminService {
         self.get(id).await
     }
 
-    /// 角色目录(admin 分配候选)。全量存活角色,包成单页游标(角色小而有界,不真分页)。
+    /// 角色目录(admin 分配候选)。账号管理只授**平台角色**(租户角色经租户成员关系授予),
+    /// 故只列 `scope = platform` 的存活角色,包成单页游标(角色小而有界,不真分页)。
     pub async fn list_roles(&self) -> Result<Page<Role>, AppError> {
         // 不在闭集的角色行(存量脏数据)跳出目录 + warn,不打挂端点。
         let items: Vec<Role> = self
@@ -287,6 +300,7 @@ impl UserAdminService {
             .list()
             .await?
             .into_iter()
+            .filter(|r| r.scope == idm::RoleScope::Platform)
             .filter_map(|r| match Role::try_from(r) {
                 Ok(v) => Some(v),
                 Err(name) => {
@@ -327,7 +341,8 @@ impl UserAdminService {
         Ok(self.roles.roles_for_user(id).await?)
     }
 
-    /// 角色 id → **原始**角色名(未过滤目录;未知 id → 422)。handler 守卫(提权/自锁)与
+    /// 角色 id → **原始**角色名(未过滤目录;未知 id → 422;**租户角色 → 422**:账号管理写的是
+    /// `user_roles` = 平台角色,租户角色写进去不生效,要经租户成员关系授予)。handler 守卫(提权/自锁)与
     /// service 落库校验共用**这一个**实现 —— 守卫与落库看不同目录曾造成提权闸失明,单一实现
     /// 从结构上封死该分裂面;未知 id 在守卫处就 422,也不会让自锁闸抢先误报 409。
     /// ponytail: 守卫与落库各调一次 = 每个管理写操作拉两次全量目录;目录极小,合并需把名字穿透 service 签名。
@@ -335,19 +350,20 @@ impl UserAdminService {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let by_id: HashMap<Uuid, String> = self
+        let by_id: HashMap<Uuid, (String, idm::RoleScope)> = self
             .roles
             .list()
             .await?
             .into_iter()
-            .map(|r| (r.id, r.name))
+            .map(|r| (r.id, (r.name, r.scope)))
             .collect();
         ids.iter()
-            .map(|id| {
-                by_id
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| AppError::Validation(format!("unknown role: {id}")))
+            .map(|id| match by_id.get(id) {
+                None => Err(AppError::Validation(format!("unknown role: {id}"))),
+                Some((name, idm::RoleScope::Tenant)) => Err(AppError::Validation(format!(
+                    "role {name} is a tenant role: grant it through tenant membership, account management only grants platform roles"
+                ))),
+                Some((name, idm::RoleScope::Platform)) => Ok(name.clone()),
             })
             .collect()
     }
@@ -389,7 +405,10 @@ mod tests {
             ("admin", "Admin"),
             ("user", "User"),
         ] {
-            mem_roles.upsert(n, d, None).await.unwrap();
+            mem_roles
+                .upsert(n, d, idm::RoleScope::Platform, None)
+                .await
+                .unwrap();
         }
         UserAdminService::new(
             Arc::new(mem_users),
@@ -703,6 +722,10 @@ mod tests {
             Some("Carol Projection")
         );
         assert_eq!(page.items[0].avatar_url.as_deref(), Some("avatar.png"));
+        assert!(
+            page.items[0].roles.is_empty(),
+            "平台账号列表的角色列只有平台角色(user 是租户角色,不显示)"
+        );
     }
 
     /// 假 search 后端:记录收到的 `UserSearchFilter`(测 `list_via_projection` 组 filter 时是否把
@@ -778,7 +801,13 @@ mod tests {
         let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
         let mut ids = std::collections::HashMap::new();
         for (n, d) in [("admin", "Admin"), ("user", "User"), ("editor", "Editor")] {
-            ids.insert(n, mem_roles.upsert(n, d, None).await.unwrap());
+            ids.insert(
+                n,
+                mem_roles
+                    .upsert(n, d, idm::RoleScope::Platform, None)
+                    .await
+                    .unwrap(),
+            );
         }
         let svc = UserAdminService::new(
             Arc::new(mem_users),

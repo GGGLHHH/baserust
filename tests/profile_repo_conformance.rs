@@ -144,8 +144,12 @@ mod pg {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let repo = baserust::features::profile::PgProfileRepo::new(pool);
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        let repo = baserust::features::profile::PgProfileRepo::new(rt.clone());
         profile_repo_contract(&repo).await;
+        rt.close().await;
         Ok(())
     }
 
@@ -158,8 +162,11 @@ mod pg {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let repo = PgProfileRepo::new(pool.clone());
-        let outbox = PgAppOutbox::new(pool);
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        let repo = PgProfileRepo::new(rt.clone());
+        let outbox = PgAppOutbox::new(rt.clone());
 
         assert!(
             outbox.poll_unpublished(100).await.unwrap().is_empty(),
@@ -209,6 +216,7 @@ mod pg {
         assert_eq!(rows[0].payload["avatar_url"], Value::Null);
         outbox.mark_published(&[rows[0].id]).await.unwrap();
         assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
+        rt.close().await;
         Ok(())
     }
 
@@ -227,11 +235,14 @@ mod pg {
             "alter table profiles add constraint profile_repo_conformance_force_fail \
              check (display_name is distinct from '__force_fail__')",
         )
-        .execute(&pool)
+        .execute(&pool) // DDL 只有 owner 能做
         .await?;
 
-        let repo = PgProfileRepo::new(pool.clone());
-        let outbox = PgAppOutbox::new(pool);
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        let repo = PgProfileRepo::new(rt.clone());
+        let outbox = PgAppOutbox::new(rt.clone());
 
         let uid = Uuid::now_v7();
         let f = ProfileFields {
@@ -249,6 +260,7 @@ mod pg {
             repo.get(uid).await.unwrap().is_none(),
             "失败的 upsert 也不该留下 profile 行(全有或全无)"
         );
+        rt.close().await;
         Ok(())
     }
 }

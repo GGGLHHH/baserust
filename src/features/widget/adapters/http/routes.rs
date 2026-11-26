@@ -16,7 +16,7 @@ use super::dto::{
 use crate::app::state::AppState;
 use crate::features::widget::model;
 use crate::infra::authz::TokenScope;
-use crate::infra::http::audit::{Audit, CurrentUser};
+use crate::infra::http::audit::{Audit, CurrentTenant, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
@@ -24,6 +24,7 @@ use crate::infra::http::sort::SortOrder;
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 use crate::kernel::pagination::PageParams;
+use crate::kernel::tenant::TenantId;
 
 /// 列表排序 query(**第二个 `Query` 提取器**,避免把 sort 塞进共享 `PageQuery`)。
 /// `#[serde(default)]`:两参都缺时回落默认(否则 serde_urlencoded 对必填字段缺失即 400)。
@@ -50,6 +51,9 @@ fn ensure_sort_pagination(params: &PageParams, sort: &WidgetSort) -> Result<(), 
 
 // 三轴授权(详见 `authorization` skill):**必须登录**(`CurrentUser` → 401);RBAC(`require_scoped` → 403);
 // 数据所有权(`data_access` → `owner_filter`/`allows_created_by`:`user` 只看/取自己创建的,有 `read:all` 的看全部)。
+// **租户**(多租户,spec §4.3 / §4.4):租户级接口一律经 `CurrentTenant` 取当前租户(只来自 token;缺 → 403
+// `tenant_required`),原样交给 service / repo。别的租户的 id 在仓储里就查不到 → 404(不泄露存在)。
+// `read:all` / `write:all` 的「全部」都只是**本租户内**的全部。
 
 /// 分页列出 widget。**user 只列自己创建的**(read:all → 全部)。默认 offset;带 `cursor` 切 keyset。
 #[utoipa::path(
@@ -59,13 +63,14 @@ fn ensure_sort_pagination(params: &PageParams, sort: &WidgetSort) -> Result<(), 
     responses(
         (status = 200, description = "widget 分页列表(按所有权过滤,created_by 富化为用户)", body = Page<WidgetView>),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:read 权限", body = ErrorBody),
+        (status = 403, description = "无 widgets:read 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
         (status = 422, description = "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)", body = ErrorBody)
     )
 )]
 pub async fn list_widgets(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Query(query): Query<PageQuery>,
     Query(sort): Query<WidgetSort>,
@@ -82,7 +87,13 @@ pub async fn list_widgets(
     ensure_sort_pagination(&params, &sort)?;
     let page = state
         .widgets
-        .list_enriched(params, owner, sort.sort_by.into(), sort.order.into())
+        .list_enriched(
+            tenant,
+            params,
+            owner,
+            sort.sort_by.into(),
+            sort.order.into(),
+        )
         .await?;
     Ok(Json(Page::from_core(page, WidgetView::from)))
 }
@@ -95,14 +106,15 @@ pub async fn list_widgets(
     responses(
         (status = 201, description = "已创建", body = Widget),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:write 权限", body = ErrorBody),
-        (status = 409, description = "name 已存在(存活行内唯一)", body = ErrorBody),
+        (status = 403, description = "无 widgets:write 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
+        (status = 409, description = "name 已存在(本租户存活行内唯一)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]
 pub async fn create_widget(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Audit(ctx): Audit,
     Json(input): Json<CreateWidget>,
@@ -110,7 +122,7 @@ pub async fn create_widget(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
-    let widget = state.widgets.create(input.into(), &ctx).await?;
+    let widget = state.widgets.create(tenant, input.into(), &ctx).await?;
     Ok((StatusCode::CREATED, Json(widget.into())))
 }
 
@@ -122,13 +134,14 @@ pub async fn create_widget(
     responses(
         (status = 200, description = "找到", body = Widget),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:read 权限", body = ErrorBody),
-        (status = 404, description = "不存在 / 非本人(不区分,防泄露存在)", body = ErrorBody)
+        (status = 403, description = "无 widgets:read 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人 / 别的租户的(不区分,防泄露存在)", body = ErrorBody)
     )
 )]
 pub async fn get_widget(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Widget>, ApiError> {
@@ -138,7 +151,7 @@ pub async fn get_widget(
     let access = state
         .policy
         .data_access(&user.0, &scope.0, Perm::WidgetReadAll);
-    let widget = state.widgets.get(id).await?;
+    let widget = state.widgets.get(tenant, id).await?;
     if access.allows_created_by(widget.created_by.as_deref()) {
         Ok(Json(widget.into()))
     } else {
@@ -155,15 +168,16 @@ pub async fn get_widget(
     responses(
         (status = 200, description = "已更新", body = Widget),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:write 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody),
-        (status = 409, description = "name 撞已有(存活行内唯一)", body = ErrorBody),
+        (status = 403, description = "无 widgets:write 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人 / 别的租户的", body = ErrorBody),
+        (status = 409, description = "name 撞已有(本租户存活行内唯一)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody)
     )
 )]
 pub async fn update_widget(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Audit(ctx): Audit,
     Path(id): Path<Uuid>,
@@ -172,9 +186,13 @@ pub async fn update_widget(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
-    ensure_may_write(&state, &user, &scope, id).await?;
+    ensure_may_write(&state, &user, &scope, tenant, id).await?;
     Ok(Json(
-        state.widgets.update(id, input.into(), &ctx).await?.into(),
+        state
+            .widgets
+            .update(tenant, id, input.into(), &ctx)
+            .await?
+            .into(),
     ))
 }
 
@@ -191,12 +209,13 @@ async fn ensure_may_write(
     state: &AppState,
     user: &CurrentUser,
     scope: &TokenScope,
+    tenant: TenantId,
     id: Uuid,
 ) -> Result<(), AppError> {
     let access = state
         .policy
         .data_access(&user.0, &scope.0, Perm::WidgetWriteAll);
-    let w = state.widgets.get(id).await?; // 不存在 → 404(先于 ownership,口径同 get_widget)
+    let w = state.widgets.get(tenant, id).await?; // 不存在 / 别的租户 → 404(先于 ownership,口径同 get_widget)
     if access.allows_created_by(w.created_by.as_deref()) {
         Ok(())
     } else {
@@ -212,13 +231,14 @@ async fn ensure_may_write(
     responses(
         (status = 204, description = "已软删除"),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:delete 权限", body = ErrorBody),
-        (status = 404, description = "不存在", body = ErrorBody)
+        (status = 403, description = "无 widgets:delete 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
+        (status = 404, description = "不存在 / 非本人 / 别的租户的", body = ErrorBody)
     )
 )]
 pub async fn delete_widget(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Audit(ctx): Audit,
     Path(id): Path<Uuid>,
@@ -226,44 +246,58 @@ pub async fn delete_widget(
     state
         .policy
         .require_scoped(&user.0, &scope.0, Perm::WidgetDelete)?;
-    ensure_may_write(&state, &user, &scope, id).await?;
-    state.widgets.delete(id, &ctx).await?;
+    ensure_may_write(&state, &user, &scope, tenant, id).await?;
+    state.widgets.delete(tenant, id, &ctx).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ── 授权形态样板:除上面"登录 + perm(+ownership)"外,补齐 public / 仅登录 / superadmin-only ──
+// ── 授权形态样板:除上面"登录 + perm(+ownership)"外,补齐 仅登录 / 多权限 AND·OR / 后台组内的租户级接口 ──
+// (平台级接口的样板见 users / monitoring:gate 平台级 `users:admin` / `ops:read`。)
 
-/// **public**:全站 widget 计数。无 `CurrentUser`/`require_scoped` → 任何人可调
-/// (不进 `OP_PERMS` → 文档不挂 security)。演示"无需登录"形态。
+/// **仅登录**:当前租户的 widget 计数。要登录(frontend 组闸)+ 当前租户(`CurrentTenant`,缺 → 403
+/// `tenant_required`),**无特定 perm**(`OP_PERMS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。
+///
+/// 曾是免登录的「全站计数」:多租户下匿名请求没有租户,跨租户汇总要绕过 RLS,违背「租户互相看不见」,
+/// 所以移到 frontend 组、只数当前租户。业务里要做公开数字,先想清楚它属于哪个租户。
 #[utoipa::path(
     get,
     path = "/widgets/stats",
     tag = "widgets",
-    responses((status = 200, description = "全站 widget 计数(公开)", body = WidgetStats))
+    responses(
+        (status = 200, description = "当前租户的 widget 计数(仅登录)", body = WidgetStats),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "没有当前租户(tenant_required)", body = ErrorBody)
+    )
 )]
-pub async fn widget_stats(State(state): State<AppState>) -> Result<Json<WidgetStats>, ApiError> {
+pub async fn widget_stats(
+    State(state): State<AppState>,
+    CurrentTenant(tenant): CurrentTenant,
+) -> Result<Json<WidgetStats>, ApiError> {
     Ok(Json(WidgetStats {
-        total: state.widgets.count(None).await?,
+        total: state.widgets.count(tenant, None).await?,
     }))
 }
 
-/// **仅登录**(authenticated):当前用户创建的 widget 数。要 `CurrentUser`、**无特定 perm**
+/// **仅登录**(authenticated):当前用户在**当前租户**里创建的 widget 数。要 `CurrentUser`、**无特定 perm**
 /// (`OP_PERMS` 标 `None` → 文档 `security:[{"oauth2":[]}]`)。演示"只需登录"形态。
+/// 数的是租户数据,所以仍要当前租户(平台上下文 → 403 `tenant_required`)。
 #[utoipa::path(
     get,
     path = "/widgets/my-count",
     tag = "widgets",
     responses(
-        (status = 200, description = "当前用户创建的 widget 数", body = WidgetStats),
-        (status = 401, description = "未认证", body = ErrorBody)
+        (status = 200, description = "当前用户在当前租户里创建的 widget 数", body = WidgetStats),
+        (status = 401, description = "未认证", body = ErrorBody),
+        (status = 403, description = "没有当前租户(tenant_required)", body = ErrorBody)
     )
 )]
 pub async fn my_widget_count(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
 ) -> Result<Json<WidgetStats>, ApiError> {
     Ok(Json(WidgetStats {
-        total: state.widgets.count(Some(user.0.id)).await?,
+        total: state.widgets.count(tenant, Some(user.0.id)).await?,
     }))
 }
 
@@ -276,76 +310,93 @@ pub async fn my_widget_count(
     responses(
         (status = 200, description = "本人可见域内可删 widget 计数", body = WidgetStats),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "缺 widgets:read 或 widgets:delete 任一", body = ErrorBody)
+        (status = 403, description = "缺 widgets:read 或 widgets:delete 任一 / 没有当前租户(tenant_required)", body = ErrorBody)
     )
 )]
 pub async fn purge_preview(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
 ) -> Result<Json<WidgetStats>, ApiError> {
     state
         .policy
         .require_all(&user.0, &scope.0, &[Perm::WidgetRead, Perm::WidgetDelete])?;
     Ok(Json(WidgetStats {
-        total: state.widgets.count(Some(user.0.id)).await?,
+        total: state.widgets.count(tenant, Some(user.0.id)).await?,
     }))
 }
 
-/// **多权限 OR 样板**:概览 —— 普通读权**或**管理员任一即可。
+/// **多权限 OR 样板**:概览 —— 普通读权**或**本组织成员管理员(`members:admin`)任一即可。
+/// 两支都是租户级权限:租户数据的接口不拿平台级权限(如 `users:admin`)当闸(spec §4.3)。
 /// `require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。
 #[utoipa::path(
     get,
     path = "/widgets/overview",
     tag = "widgets",
     responses(
-        (status = 200, description = "全站 widget 计数(读权或管理员)", body = WidgetStats),
+        (status = 200, description = "当前租户的 widget 计数(读权或本组织成员管理员)", body = WidgetStats),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "widgets:read 与 users:admin 皆无", body = ErrorBody)
+        (status = 403, description = "widgets:read 与 members:admin 皆无 / 没有当前租户(tenant_required)", body = ErrorBody)
     )
 )]
 pub async fn widget_overview(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
 ) -> Result<Json<WidgetStats>, ApiError> {
     state
         .policy
-        .require_any(&user.0, &scope.0, &[Perm::WidgetRead, Perm::UsersAdmin])?;
+        .require_any(&user.0, &scope.0, &[Perm::WidgetRead, Perm::MembersAdmin])?;
     Ok(Json(WidgetStats {
-        total: state.widgets.count(None).await?,
+        total: state.widgets.count(tenant, None).await?,
     }))
 }
 
-/// **superadmin-only**:跨所有人列出全部 widget。gate 在 `users:admin`(seed 里只 superadmin 持有)。
-/// 演示"role 限制 = gate 一个该 role 专属的 perm";注意 admin 虽有 `read:all`,无 `users:admin` 仍 403。
+/// **后台 widget 列表**:列出**当前租户**的 widget(富化创建人)。
+///
+/// 准入 = admin 组闸(后台准入)+ 租户级 `widgets:read` —— 租户管理员(租户角色 admin)就能看,不要平台级权限(租户数据的后台接口不拿平台权限当闸,spec §4.3)。
+/// 可见域照旧:有当前租户角色给的 `widgets:read:all` → 本租户全部,否则只列自己建的
+/// (平台管理员在某租户里只是普通成员时也一样)。数据限当前租户(缺 → 403 `tenant_required`)。
 #[utoipa::path(
     get,
     path = "/widgets",
     tag = "widgets",
     params(PageQuery, WidgetSort),
     responses(
-        (status = 200, description = "全部 widget(跨所有人,富化)", body = Page<WidgetView>),
+        (status = 200, description = "当前租户内;无租户级 read:all 时只含本人创建的(富化)", body = Page<WidgetView>),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限(仅 superadmin)", body = ErrorBody),
+        (status = 403, description = "无后台准入(admin 组闸)/ 无 widgets:read 权限 / 没有当前租户(tenant_required)", body = ErrorBody),
         (status = 422, description = "cursor 分页 + 非默认 sort_by(仅 offset 支持排序)", body = ErrorBody)
     )
 )]
 pub async fn admin_list_widgets(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
     Query(query): Query<PageQuery>,
     Query(sort): Query<WidgetSort>,
 ) -> Result<Json<Page<WidgetView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+    let owner = state
+        .policy
+        .data_access(&user.0, &scope.0, Perm::WidgetReadAll)
+        .owner_filter();
     let params = query.resolve()?;
     ensure_sort_pagination(&params, &sort)?;
     let page = state
         .widgets
-        .list_enriched(params, None, sort.sort_by.into(), sort.order.into())
+        .list_enriched(
+            tenant,
+            params,
+            owner,
+            sort.sort_by.into(),
+            sort.order.into(),
+        )
         .await?;
     Ok(Json(Page::from_core(page, WidgetView::from)))
 }
@@ -354,8 +405,9 @@ pub async fn admin_list_widgets(
 /// EventSource 不能自定义 header,凭据靠 httponly cookie(Bearer 兜底给 curl/测试)。
 /// best-effort 无回放:断线期间的事件丢失,EventSource 自动重连拿新订阅。
 ///
-/// **行级 ownership 与 list 同口径**:总线是广播(不分频道),过滤落在本 handler —— 逐帧
-/// `allows_created_by`,不过就跳帧(`continue`),**不**结束流。没这层,无 `read:all` 的 `user`
+/// **先比租户、再比 owner**:总线是全实例广播(不分租户、不分频道),过滤落在本 handler —— 逐帧先看
+/// `event.tenant_id() == 当前租户`,再 `allows_created_by`,不过就跳帧(`continue`),**不**结束流。
+/// 租户这一道在前:`read:all` 的 admin 也只是「本租户全部」,别的租户的帧一律看不见。没这层,无 `read:all` 的 `user`
 /// 能从流里读到 `list_widgets`/`get_widget` 都不给他看的**别人的 widget**(名字等全量 `Widget`)。
 /// `Access` 在开流时刻算定并随流存活 —— 同下面的鉴权时刻取舍。
 ///
@@ -368,12 +420,13 @@ pub async fn admin_list_widgets(
     responses(
         (status = 200, description = "SSE 事件流;每帧 event = type(created/updated/deleted),data = WidgetEvent JSON", content_type = "text/event-stream", body = WidgetEvent),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 widgets:read 权限", body = ErrorBody)
+        (status = 403, description = "无 widgets:read 权限 / 没有当前租户(tenant_required)", body = ErrorBody)
     )
 )]
 pub async fn widget_events(
     State(state): State<AppState>,
     user: CurrentUser,
+    CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
@@ -390,10 +443,11 @@ pub async fn widget_events(
     let guard = crate::infra::telemetry::SseConnectionGuard::new("widgets");
     let stream = futures_util::stream::unfold(
         (sub, access, guard),
-        |(mut sub, access, guard)| async move {
+        move |(mut sub, access, guard)| async move {
             loop {
                 let event = sub.recv().await?;
-                if !access.allows_created_by(event.owner()) {
+                // 第一道:租户。别的租户的帧连 owner 都不必看。
+                if event.tenant_id() != tenant || !access.allows_created_by(event.owner()) {
                     continue;
                 }
                 let frame = Event::default()

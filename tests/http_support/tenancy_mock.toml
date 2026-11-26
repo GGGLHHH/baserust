@@ -1,0 +1,11 @@
+# http_tenancy 用的 mock:一个演示租户 acme,seed 账号 user 在里面是 admin(默认租户里是 user)。
+# 不灌 widget / profile 样本(同 empty_mock)。
+
+[[tenants]]
+slug = "acme"
+name = "Acme"
+
+[[members]]
+username = "user"
+tenant = "acme"
+roles = ["admin"]

@@ -23,8 +23,18 @@ crate::closed_enum_to_schema!(
 crate::closed_enum_to_schema!(
     RoleNameSchema => RoleName,
     RoleName::ALL,
-    "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。"
+    "角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,\n见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT\nclaim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`scope`/`default_permissions`。"
 );
+
+/// 当前请求令牌的**当前租户**(鉴权中间件验过 token 后塞进 extensions;平台上下文没有)。
+/// `id` 与 `AuthUser.tenant_id` 同值;`slug` / `name` 只作展示(`GET /permissions/me`),
+/// 降权令牌 / 旧 token 没有它们。授权一律看 `AuthUser` + [`crate::infra::http::audit::CurrentTenant`]。
+#[derive(Clone, Debug)]
+pub struct TokenTenant {
+    pub id: uuid::Uuid,
+    pub slug: Option<String>,
+    pub name: Option<String>,
+}
 
 /// 当前请求令牌携带的 scope(per-token 权限子集)。鉴权中间件验过 token 后塞进 extensions;
 /// **空 = 无 scope 限制**(第一方满权令牌)。非空 = 降权令牌,有效权限再 ∩ 它。
@@ -55,9 +65,10 @@ pub async fn require_login(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// 组闸:登录 + `admin:login`(`/api/v1/admin` 组 = 后台准入)。**走 `require_scoped`(role ∩ scope)**,
-/// 与端点内闸、openapi_authz 探针同一评估语义 —— 降权令牌(scope 未含 admin:login)即便 role 够也挡。
-/// 闸的是**准入**(admin+superadmin 皆过);组内 superadmin 专属端点(如列全 widget)再各自 gate `users:admin`。
+/// 组闸:登录 + **后台准入**(`/api/v1/admin` 组):当前租户里的 `admin:login`,或任一平台级权限
+/// (平台管理员不必属于任何租户),见 [`Policy::require_admin_entry`]。**走 `require_scoped`(role ∩ scope)**,
+/// 与端点内闸、openapi_authz 探针同一评估语义 —— 降权令牌(scope 未含任一准入权限)即便 role 够也挡。
+/// 闸的是**准入**(租户 admin + 平台管理员皆过);组内平台能力端点再各自 gate 平台级权限(账号 `users:admin`、监控 `ops:read`、审计 `audit:read`…)。
 /// state 直接吃 `Arc<Policy>`(infra 不 import app 的 AppState,守分层)。
 pub async fn require_admin_login(
     State(policy): State<Arc<Policy>>,
@@ -72,7 +83,7 @@ pub async fn require_admin_login(
         .get::<TokenScope>()
         .cloned()
         .unwrap_or_default();
-    if let Err(e) = policy.require_scoped(&user, &scope.0, Perm::AdminLogin) {
+    if let Err(e) = policy.require_admin_entry(&user, &scope.0) {
         return ApiError::from(e).into_response();
     }
     next.run(req).await
@@ -82,13 +93,28 @@ pub async fn require_admin_login(
 //    infra 引 AppState 有 openapi::doc_routes 先例)。idm 的 /auth/me 只给身份事实,不回答权限
 //    —— idm 进程的 policy 是 seed 嵌入副本,PG 模式下与 app 会漂,放那边文档会说谎。 ──
 
+/// 当前租户的展示信息(`GET /permissions/me` 的 `tenant`)。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CurrentTenantView {
+    pub id: uuid::Uuid,
+    /// 来自登录 / 切换时签进 token 的值;降权令牌没有 → 空串。
+    pub slug: String,
+    /// 同上(租户改名后,到 token 过期 / refresh 前仍是旧名)。
+    pub name: String,
+}
+
 /// `GET /permissions/me` 响应。`roles` 来自 token claim;`permissions` 是**有效**集:
-/// role 展开(含 implies)∩ scope 收窄,wire 串排序输出。
+/// (平台角色给的平台级 ∪ 当前租户角色给的租户级,含 implies)∩ scope 收窄,wire 串排序输出。
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MyPermissionsResponse {
-    /// token claim 里的角色名(闭集,生成前端 union)。
+    /// token claim 里的**平台角色**名(闭集,生成前端 union)。
     #[schema(value_type = Vec<RoleNameSchema>)]
     pub roles: Vec<RoleName>,
+    /// 当前租户内的角色名(平台上下文 → 空)。
+    #[schema(value_type = Vec<RoleNameSchema>)]
+    pub tenant_roles: Vec<RoleName>,
+    /// 当前租户;平台上下文(没加入任何组织 / 平台管理员)→ `null`。
+    pub tenant: Option<CurrentTenantView>,
     /// 有效权限(闭集,wire 串序输出)。前端按钮显隐 / codegen accessPolicies `has()` 的数据源。
     #[schema(value_type = Vec<PermSchema>)]
     pub permissions: Vec<Perm>,
@@ -102,7 +128,7 @@ pub struct MyPermissionsResponse {
     path = "/permissions/me",
     tag = "me",
     responses(
-        (status = 200, description = "当前令牌的角色与有效权限(role ∩ scope,排序)", body = MyPermissionsResponse),
+        (status = 200, description = "当前令牌的角色、当前租户与有效权限(role ∩ scope,排序)", body = MyPermissionsResponse),
         (status = 401, description = "未认证", body = crate::infra::http::error::ErrorBody)
     )
 )]
@@ -110,16 +136,36 @@ pub async fn get_my_permissions(
     State(state): State<crate::app::state::AppState>,
     user: crate::infra::http::audit::CurrentUser,
     scope: TokenScope,
+    tenant: Option<axum::Extension<TokenTenant>>,
 ) -> crate::infra::http::extract::Json<MyPermissionsResponse> {
     let mut permissions: Vec<Perm> = state
         .policy
-        .perms_for(&user.0.roles)
+        .perms_of(&user.0)
         .into_iter()
         .filter(|&p| state.policy.require_scoped(&user.0, &scope.0, p).is_ok())
         .collect();
     permissions.sort_by_key(|p| p.wire()); // 仍按 wire 串序,JSON 输出不变
     let roles = RoleName::parse_lossy(user.0.roles.clone());
-    crate::infra::http::extract::Json(MyPermissionsResponse { roles, permissions })
+    // 租户只认 AuthUser.tenant_id(授权口径);TokenTenant 只补展示用的 slug / 名称。
+    let tenant = user.0.tenant_id.map(|id| {
+        let info = tenant.as_ref().map(|t| &t.0).filter(|t| t.id == id);
+        CurrentTenantView {
+            id,
+            slug: info.and_then(|t| t.slug.clone()).unwrap_or_default(),
+            name: info.and_then(|t| t.name.clone()).unwrap_or_default(),
+        }
+    });
+    let tenant_roles = if tenant.is_some() {
+        RoleName::parse_lossy(user.0.tenant_roles.clone())
+    } else {
+        Vec::new()
+    };
+    crate::infra::http::extract::Json(MyPermissionsResponse {
+        roles,
+        tenant_roles,
+        tenant,
+        permissions,
+    })
 }
 
 /// 本端点的 router,composition root 挂 frontend 组(app 进程,policy 权威侧)。
@@ -137,6 +183,16 @@ mod tests {
             id: Uuid::nil(),
             username: "u".to_owned(),
             roles: roles.iter().map(|s| s.to_string()).collect(),
+            tenant_id: None,
+            tenant_roles: vec![],
+        }
+    }
+
+    fn member(tenant_roles: &[&str]) -> AuthUser {
+        AuthUser {
+            tenant_id: Some(crate::kernel::tenant::DEFAULT_TENANT_ID.as_uuid()),
+            tenant_roles: tenant_roles.iter().map(|s| s.to_string()).collect(),
+            ..user(&[])
         }
     }
 
@@ -195,14 +251,14 @@ mod tests {
         );
         // role 无 admin:login → 403
         assert_eq!(
-            gate_status(mk(Some(user(&["user"])), None), "/t").await,
+            gate_status(mk(Some(member(&["user"])), None), "/t").await,
             StatusCode::FORBIDDEN
         );
         // role 够、scope 收窄(未含 admin:login)→ 403(降权令牌不得穿闸)
         assert_eq!(
             gate_status(
                 mk(
-                    Some(user(&["root"])),
+                    Some(member(&["root"])),
                     Some(TokenScope(vec![Perm::WidgetRead]))
                 ),
                 "/t"
@@ -212,9 +268,24 @@ mod tests {
         );
         // role 够、scope 空(满权令牌)→ 放行
         assert_eq!(
-            gate_status(mk(Some(user(&["root"])), None), "/t").await,
+            gate_status(mk(Some(member(&["root"])), None), "/t").await,
             StatusCode::OK
         );
+        // admin:login 是租户级:同样的角色当平台角色、没有当前租户 → 403(tenant_required)
+        assert_eq!(
+            gate_status(mk(Some(user(&["root"])), None), "/t").await,
+            StatusCode::FORBIDDEN
+        );
+        // 平台管理员(平台角色给了平台级权限):不在任何租户里也能过闸
+        let policy = Arc::new(Policy::from_roles([(
+            "platform".to_owned(),
+            vec![Perm::UsersAdmin],
+        )]));
+        let app = Router::new()
+            .route("/t", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(policy, require_admin_login))
+            .layer(Extension(user(&["platform"])));
+        assert_eq!(gate_status(app, "/t").await, StatusCode::OK);
     }
 
     /// 手写的闭集 schema 与 serde 同源:枚举值逐个等于 wire 串。

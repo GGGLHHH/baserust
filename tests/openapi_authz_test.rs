@@ -3,7 +3,8 @@
 //!
 //! **纯 spec 驱动**:method+path 与广告的 scope 都从 `api_spec()` 取(utoipa 从 `#[utoipa::path]` + nest 派生,
 //! 是路由的唯一真相)—— **不从 OP_PERMS 取 method/path**,故不引第二个路由来源/漂移。
-//! 用 superadmin(持全 Perm,隔离 role 因素让"只有 scope 把门")签**降权令牌**打真实路由:
+//! 用 superadmin(平台角色 superadmin 给全部平台级权限 + 默认租户 admin 给全部租户级权限 = 持全 Perm,
+//! 隔离 role 因素让"只有 scope 把门")签**降权令牌**打真实路由:
 //! - 广告 scope 非空:`scope=[广告的]` → 穿过授权闸(非 401/403);`scope=[不蕴含它的 perm]` → 403。
 //! - 广告 scope 空(仅登录):**零权限**令牌 → 非 403(无暗藏 `require_scoped`)。
 //!
@@ -55,6 +56,14 @@ async fn hit(app: &Router, method: &str, uri: &str, op_id: &str, token: &str) ->
                 r#"{"username":"probe","password":"probe123","roles":[],"new_password":"probe123"}"#,
             )
         }
+        // 租户 / 成员写端点:一份含各 DTO 必填字段的 body(serde 忽略多余键),触达 gate。
+        "create_tenant" | "update_tenant" | "put_tenant_member" | "add_member"
+        | "set_member_roles" => {
+            b = b.header("content-type", "application/json");
+            Body::from(
+                r#"{"slug":"probe","name":"probe","status":"active","username":"probe","roles":[]}"#,
+            )
+        }
         // multipart 端点:require_scoped 在 Multipart 提取后、读字段前跑 → 只需 content-type 合法即可触达 gate。
         "upload_content" | "set_user_avatar" => {
             b = b.header("content-type", "multipart/form-data; boundary=X");
@@ -90,6 +99,10 @@ async fn spec_security_matches_real_enforcement() {
                 su.user.id,
                 &su.user.username,
                 su.user.roles.clone(),
+                Some(baserust::features::auth::ScopedTenant {
+                    id: su.tenant_id.expect("superadmin 登录应进默认租户"),
+                    roles: su.tenant_roles.clone(),
+                }),
                 scope,
                 900,
             )
@@ -125,9 +138,19 @@ async fn spec_security_matches_real_enforcement() {
 
             let union: Vec<Perm> = branches.iter().flatten().copied().collect();
             if union.is_empty() {
-                // 仅登录:零权限令牌(roles + scope 皆空)→ 非 403(无暗藏 require_scoped)
+                // 仅登录:零权限令牌(在默认租户、但平台 / 租户角色与 scope 皆空)→ 非 403(无暗藏 require_scoped)
                 let zero = signer
-                    .mint_scoped(su.user.id, "probe", vec![], vec![], 900)
+                    .mint_scoped(
+                        su.user.id,
+                        "probe",
+                        vec![],
+                        Some(baserust::features::auth::ScopedTenant {
+                            id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                            roles: vec![],
+                        }),
+                        vec![],
+                        900,
+                    )
                     .unwrap();
                 let s = hit(&app, method, &uri, op_id, &zero).await;
                 assert!(

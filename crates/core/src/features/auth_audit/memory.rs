@@ -289,6 +289,7 @@ mod tests {
             forwarded_chain: None,
             user_agent: None,
             request_id: None,
+            tenant_id: None,
             event_seq: seq,
         }
     }

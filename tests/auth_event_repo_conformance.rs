@@ -28,6 +28,8 @@ struct Fixture {
     tag: String,
     ip_a: IpAddr,
     ip_b: IpAddr,
+    /// e1 / e5 所在的租户(其余事件没有租户)。
+    tenant: Uuid,
     /// 按 id 递增序:[e_old, e1, e2, e3, e4, e5]。
     events: Vec<NewAuthEvent>,
 }
@@ -70,11 +72,12 @@ fn fixture() -> Fixture {
             forwarded_chain: None,
             user_agent: Some("conformance".to_owned()),
             request_id: None,
+            tenant_id: None,
             event_seq: seq,
         }
     };
     let m = Duration::minutes;
-    let events = vec![
+    let mut events = vec![
         // 窗口外(一天前):保留期删除用
         ev(
             "auth.logged_out",
@@ -143,6 +146,10 @@ fn fixture() -> Fixture {
             None,
         ),
     ];
+    // 多租户:进了租户的事件记 tenant_id(e1 登录进租户、e5 刷新同一会话);登录失败等没有租户。
+    let tenant = Uuid::now_v7();
+    events[1].tenant_id = Some(tenant);
+    events[5].tenant_id = Some(tenant);
     Fixture {
         t,
         uid,
@@ -150,6 +157,7 @@ fn fixture() -> Fixture {
         tag,
         ip_a,
         ip_b,
+        tenant,
         events,
     }
 }
@@ -180,6 +188,21 @@ fn offset(size: u64) -> PageParams {
     }
 }
 
+/// 多租户(spec §4.4 / §6.1):auth_event 记下事件所在的租户(读回来原样),没有租户的事件为 `None`。
+/// `page` = 按 `fx.uid` 列出的那一页(e5 / e2 / e1 / e0)。
+fn auth_event_records_tenant(
+    page: &Page<baserust::features::auth_audit::AuthEventRow>,
+    fx: &Fixture,
+) {
+    let by_id: HashMap<Uuid, Option<Uuid>> =
+        page.items.iter().map(|r| (r.id, r.tenant_id)).collect();
+    let e = &fx.events;
+    assert_eq!(by_id[&e[1].id], Some(fx.tenant), "登录进租户的事件记租户");
+    assert_eq!(by_id[&e[5].id], Some(fx.tenant));
+    assert_eq!(by_id[&e[2].id], None, "登录失败没有租户");
+    assert_eq!(by_id[&e[0].id], None);
+}
+
 /// 契约唯一真相源。返回窗口统计(PG 入口拿它与内存实现比对)。
 async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStats {
     let e = &fx.events;
@@ -206,6 +229,7 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
         "user 过滤 + id(v7,生成序)倒序"
     );
     assert_eq!(total(&p), Some(4));
+    auth_event_records_tenant(&p, fx);
 
     // ── 3. 类型过滤 ──
     let q = AuthEventQuery {
@@ -379,18 +403,26 @@ mod pg {
         s
     }
 
+    /// 迁移用 owner(`SEARCH_OWNER_DATABASE_URL`,幂等),契约跑在 **system 账号**上
+    /// (`SEARCH_SYSTEM_DATABASE_URL`:auth_event 是平台级表,读写都只走 search_system 池 —— 和生产一样)。
     async fn connect() -> sqlx::PgPool {
-        let url = std::env::var("SEARCH_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://search:pwd@localhost:5821/baserust?sslmode=disable".into()
+        let owner_url = std::env::var("SEARCH_OWNER_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://search_owner:pwd@localhost:5821/baserust?sslmode=disable".into()
         });
-        let pool = sqlx::PgPool::connect(&url).await.expect(
-            "连 search role 失败(先 `just up` + `just migrate-search` + `just pg-test-grant`)",
+        let owner = sqlx::PgPool::connect(&owner_url).await.expect(
+            "连 search_owner 失败(先 `just up` + `just db-ensure-roles` + `just migrate-search`)",
         );
         sqlx::migrate!("migrations/search")
-            .run(&pool)
+            .run(&owner)
             .await
             .expect("跑 migrations/search 失败(幂等,应可重复跑)");
-        pool
+        owner.close().await;
+        let url = std::env::var("SEARCH_SYSTEM_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://search_system:pwd@localhost:5821/baserust?sslmode=disable".into()
+        });
+        sqlx::PgPool::connect(&url)
+            .await
+            .expect("连 search_system 账号失败(先 `just up` + `just db-ensure-roles`)")
     }
 
     #[tokio::test]

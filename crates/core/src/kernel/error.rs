@@ -37,6 +37,17 @@ pub enum AppError {
     #[error("forbidden")]
     Forbidden,
 
+    /// 已认证但**没有当前租户**(平台上下文的 token 访问租户级接口 / 要租户级权限)→ 403,
+    /// 机器码 `tenant_required`(前端据此显示「还没加入任何组织」/ 让用户先进入一个租户)。
+    /// 缺租户绝不悄悄落到默认租户(spec §1「绝不能出现」)。
+    #[error("tenant required")]
+    TenantRequired,
+
+    /// 按用户名找不到账号 → 404,机器码 `account_not_found`(租户管理员按完整用户名把已有账号加进租户,spec §4.5:
+    /// 查不到就提示「账号不存在」;租户管理员借此能确认某用户名是否存在,这个代价是接受的)。
+    #[error("account not found")]
+    AccountNotFound,
+
     /// 兜底:任何 anyhow 错误(DB、IO、依赖)→ 500。原始 source chain 只进日志。
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -50,7 +61,7 @@ impl From<garde::Report> for AppError {
 }
 
 /// idm 库的领域错误 `IdmError` 接进 app 错误体系(领域语义对领域语义;HTTP 形状再由适配层决定)。
-/// idm 是零 HTTP 的纯库,只暴露 4 个领域变体;校验(422)/坏请求(400)是 app 自己的边界产物
+/// idm 是零 HTTP 的纯库,只暴露少数几个领域变体;校验(422)/坏请求(400)是 app 自己的边界产物
 /// (garde / Json 提取器 → `AppError::Validation`/`BadRequest`),不经此映射。
 impl From<idm::IdmError> for AppError {
     fn from(e: idm::IdmError) -> Self {
@@ -60,6 +71,8 @@ impl From<idm::IdmError> for AppError {
             // 失败原因只供审计(handler 发事件时读),HTTP 仍统一 401,防枚举不变。
             idm::IdmError::InvalidCredentials(_) => AppError::Unauthorized,
             idm::IdmError::Conflict(m) => AppError::Conflict(m),
+            // 已认证但不是目标租户的有效成员(切换租户)→ 403。
+            idm::IdmError::Forbidden => AppError::Forbidden,
             idm::IdmError::Internal(e) => AppError::Internal(e),
         }
     }
@@ -77,6 +90,8 @@ impl From<content::ContentError> for AppError {
         match e {
             CE::NotFound => AppError::NotFound,
             CE::NotReady(m) | CE::InvalidState(m) | CE::Conflict(m) => AppError::Conflict(m),
+            // 调用方入参不合法(如 nil 租户作用域)→ 400。
+            CE::InvalidInput(m) => AppError::BadRequest(m),
             // DB 边界解析失败(脏状态串):内部数据完整性故障 → 500,原始脏值只进日志不回传。
             CE::InvalidStatus(m) => {
                 AppError::Internal(anyhow::anyhow!("content status 解析失败(DB 脏值): {m}"))

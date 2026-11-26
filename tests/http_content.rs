@@ -42,6 +42,8 @@ use uuid::Uuid;
 
 const C: &str = "/api/v1/frontend/contents";
 const NIL: &str = "00000000-0000-0000-0000-000000000000";
+/// 默认租户(seed 账号 / `user_token` 登录后的当前租户;内容落当前租户)。
+const DEFAULT_TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
 // ───────────────────────────── 帮手 ─────────────────────────────
 
@@ -88,7 +90,14 @@ fn new_user(s: &TestServer) -> Client {
 
 /// 满权 admin(seed 策略:含 :all 与 delete)的 Bearer 会话,主体是新 uuid。
 fn new_admin(s: &TestServer) -> Client {
-    s.bearer(&mint(Uuid::now_v7(), "admin", &["admin"], vec![]))
+    s.bearer(&mint(
+        Uuid::now_v7(),
+        "admin",
+        &[],
+        Some(http_support::DEFAULT_TENANT),
+        &["admin"],
+        vec![],
+    ))
 }
 
 /// 一步上传的 multipart 表单:file(带文件名 + content-type)+ name + tags(逗号分隔,含空白与空项)。
@@ -386,7 +395,10 @@ async fn upload_then_download_round_trip() {
     assert_eq!(content["status"], "uploaded", "{v}");
     assert_eq!(object["status"], "uploaded", "{v}");
     assert_eq!(content["owner_id"], me["id"], "owner 必须是认证主体");
-    assert_eq!(content["tenant_id"], NIL, "单租户默认 nil");
+    assert_eq!(
+        content["tenant_id"], DEFAULT_TENANT,
+        "落当前租户(seed user 登录进默认租户)"
+    );
     assert_eq!(content["name"], "doc");
     assert_eq!(content["derivation_type"], "original");
     assert_eq!(object["content_id"], content["id"]);
@@ -395,8 +407,8 @@ async fn upload_then_download_round_trip() {
     assert_eq!(object["version"], 1);
     let id = str_of(&content["id"]);
     assert!(
-        str_of(&object["object_key"]).starts_with(&format!("{id}/")),
-        "默认 object_key = {{content_id}}/{{uuid}}: {v}"
+        str_of(&object["object_key"]).starts_with(&format!("tenants/{DEFAULT_TENANT}/{id}/")),
+        "默认 object_key = tenants/{{tenant_id}}/{{content_id}}/{{uuid}}: {v}"
     );
 
     let resp = user.get(&format!("{C}/{id}/download")).await;
@@ -479,7 +491,8 @@ async fn download_disposition_encodes_non_ascii_filename() {
     expect_bytes(resp).await;
 }
 
-/// 一步上传的边界:缺 file 部分 / 超长字段 → 422;tenant_id 非 UUID / 非 multipart → 400;正常的照常 201。
+/// 一步上传的边界:缺 file 部分 / 超长字段 → 422;非 multipart → 400;正常的照常 201。
+/// (`tenant_id` 已不是表单字段:租户只来自令牌,传了也当未知部分忽略,见 `upload_lands_in_current_tenant`。)
 #[tokio::test]
 async fn upload_validation_and_bad_requests() {
     let s = TestServer::start().await;
@@ -536,16 +549,6 @@ async fn upload_validation_and_bad_requests() {
         "validation",
     )
     .await;
-    // tenant_id 不是 UUID → 400
-    let form = Form::new()
-        .part("file", file_part("ok.txt", "text/plain", b"x"))
-        .text("tenant_id", "not-a-uuid");
-    expect_error(
-        user.post_multipart(&up, form).await,
-        StatusCode::BAD_REQUEST,
-        "bad_request",
-    )
-    .await;
     // body 不是 multipart → 400 + 统一错误体(不漏框架默认纯文本)
     expect_error(
         user.post_json(&up, &json!({ "file": "x" })).await,
@@ -556,6 +559,138 @@ async fn upload_validation_and_bad_requests() {
     // 失败的请求都没留下内容;正常的照常 201
     assert!(list_ids(&user).await.is_empty(), "校验失败不应建行");
     upload(&user, "fine.txt", "text/plain", b"x").await;
+}
+
+// ───────────────────────────── 租户隔离 ─────────────────────────────
+
+/// 某租户里的成员会话(随机主体)。
+fn member_of(s: &TestServer, tenant: Uuid, roles: &[&str]) -> Client {
+    s.bearer(&mint(Uuid::now_v7(), "m", &[], Some(tenant), roles, vec![]))
+}
+
+/// 内容落**当前租户**(令牌里的租户):一步上传 / 建内容 / 两步上传的 `tenant_id` 都是它,对象 key 带它的前缀;
+/// 请求里自报的 `tenant_id`(表单部分 / JSON 字段)不再是契约的一部分,一律忽略。
+#[tokio::test]
+async fn upload_lands_in_current_tenant() {
+    let s = TestServer::start().await;
+    let tenant = Uuid::now_v7();
+    let other = Uuid::now_v7().to_string();
+    let c = member_of(&s, tenant, &["user"]);
+    let t = tenant.to_string();
+
+    let form = file_form("a.txt", "text/plain", b"x").text("tenant_id", other.clone());
+    let v = expect_json(
+        c.post_multipart(&format!("{C}/upload"), form).await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(v["content"]["tenant_id"], t, "{v}");
+    let id = str_of(&v["content"]["id"]);
+    assert!(
+        str_of(&v["object"]["object_key"]).starts_with(&format!("tenants/{t}/{id}/")),
+        "key 带当前租户前缀: {v}"
+    );
+
+    let v = expect_json(
+        c.post_json(C, &json!({ "name": "raw", "tenant_id": other }))
+            .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(v["tenant_id"], t, "{v}");
+
+    let v = expect_json(
+        c.post_json(
+            &format!("{C}/upload-url"),
+            &json!({ "file_name": "b.txt", "mime_type": "text/plain", "tenant_id": other }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(v["content"]["tenant_id"], t, "{v}");
+    let id = str_of(&v["content"]["id"]);
+    assert!(str_of(&v["object"]["object_key"]).starts_with(&format!("tenants/{t}/{id}/")));
+    assert_eq!(list_ids(&c).await.len(), 3);
+}
+
+/// 别的租户的内容 → 404(哪怕是同一个用户、哪怕持 `:all`):读 / 改 / 删 / 下载 / 预览 / 对象 / 元数据都碰不到,
+/// 列表里也没有;回到原租户一切照旧。
+#[tokio::test]
+async fn content_of_other_tenant_is_404() {
+    let s = TestServer::start().await;
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let uid = Uuid::now_v7();
+    let in_a = s.bearer(&mint(uid, "u", &[], Some(a), &["admin"], vec![]));
+    let in_b = s.bearer(&mint(uid, "u", &[], Some(b), &["admin"], vec![]));
+    let id = upload_id(&in_a, "secret.txt", "text/plain", b"tenant a").await;
+
+    let item = format!("{C}/{id}");
+    for path in [
+        item.clone(),
+        format!("{item}/download"),
+        format!("{item}/preview"),
+        format!("{item}/objects"),
+        format!("{item}/metadata"),
+    ] {
+        expect_error(in_b.get(&path).await, StatusCode::NOT_FOUND, "not_found").await;
+    }
+    expect_error(
+        in_b.put_json(&item, &json!({ "name": "pwned" })).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    expect_error(
+        in_b.put_json(&format!("{item}/metadata"), &json!({ "tags": ["x"] }))
+            .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    expect_error(
+        in_b.post_empty(&format!("{item}/confirm-upload")).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    expect_error(in_b.delete(&item).await, StatusCode::NOT_FOUND, "not_found").await;
+    assert!(list_ids(&in_b).await.is_empty(), "别的租户的列表看不到");
+
+    let got = expect_json(in_a.get(&item).await, StatusCode::OK).await;
+    assert_eq!(got["name"], "doc", "别的租户改不动、删不掉: {got}");
+    assert_eq!(list_ids(&in_a).await, vec![id]);
+}
+
+/// 没有当前租户的令牌(平台上下文)调 content 接口 → 403 `tenant_required`。
+#[tokio::test]
+async fn content_endpoints_require_current_tenant() {
+    let s = TestServer::start().await;
+    let c = s.bearer(&mint(
+        Uuid::now_v7(),
+        "sa",
+        &["superadmin"],
+        None,
+        &[],
+        vec![],
+    ));
+    expect_error(c.get(C).await, StatusCode::FORBIDDEN, "tenant_required").await;
+    expect_error(
+        c.post_multipart(
+            &format!("{C}/upload"),
+            file_form("a.txt", "text/plain", b"x"),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "tenant_required",
+    )
+    .await;
+    expect_error(
+        c.get(&format!("{C}/{NIL}")).await,
+        StatusCode::FORBIDDEN,
+        "tenant_required",
+    )
+    .await;
 }
 
 // ───────────────────────────── 建 / 改(JSON) ─────────────────────────────
@@ -581,7 +716,7 @@ async fn create_content_then_reads_before_upload() {
     assert_eq!(v["document_type"], "pdf");
     assert_eq!(v["owner_type"], "user");
     assert_eq!(v["derivation_type"], "original", "缺省派生类型 = original");
-    assert_eq!(v["tenant_id"], NIL);
+    assert_eq!(v["tenant_id"], DEFAULT_TENANT);
     let id = str_of(&v["id"]);
 
     let got = expect_json(user.get(&format!("{C}/{id}")).await, StatusCode::OK).await;
@@ -985,7 +1120,14 @@ async fn viewer_without_all_mode_sees_only_own() {
     let s = start_owner_policy().await;
     let alice = new_user(&s);
     let id = upload_id(&alice, "own.txt", "text/plain", b"x").await;
-    let viewer = s.bearer(&mint(Uuid::now_v7(), "viewer", &["viewer"], vec![]));
+    let viewer = s.bearer(&mint(
+        Uuid::now_v7(),
+        "viewer",
+        &[],
+        Some(http_support::DEFAULT_TENANT),
+        &["viewer"],
+        vec![],
+    ));
     expect_error(
         viewer.get(&format!("{C}/{id}")).await,
         StatusCode::NOT_FOUND,
@@ -1050,7 +1192,14 @@ async fn all_perms_imply_base_perms() {
     let s = start_owner_policy().await;
     let alice = new_user(&s);
     let id = upload_id(&alice, "own.txt", "text/plain", b"x").await;
-    let auditor = s.bearer(&mint(Uuid::now_v7(), "auditor", &["auditor"], vec![]));
+    let auditor = s.bearer(&mint(
+        Uuid::now_v7(),
+        "auditor",
+        &[],
+        Some(http_support::DEFAULT_TENANT),
+        &["auditor"],
+        vec![],
+    ));
     expect(auditor.get(&format!("{C}/{id}")).await, StatusCode::OK).await;
     expect(
         auditor.delete(&format!("{C}/{id}")).await,
@@ -1102,7 +1251,9 @@ async fn prepare_upload_on_memory_backend_signals_fallback() {
     assert_eq!(v["object"]["status"], "created");
     assert_eq!(v["object"]["file_name"], "a.txt");
     let id = str_of(&v["content"]["id"]);
-    assert!(str_of(&v["object"]["object_key"]).starts_with(&format!("{id}/")));
+    assert!(
+        str_of(&v["object"]["object_key"]).starts_with(&format!("tenants/{DEFAULT_TENANT}/{id}/"))
+    );
 
     let meta = expect_json(
         user.get(&format!("{C}/{id}/metadata")).await,

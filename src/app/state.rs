@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use super::adapters::{
     ContentAvatarProbe, IdmOutboxSource, InProcessProfileDirectory, InProcessUserDirectory,
-    SearchIndexAdapter,
+    MemberSearchAdapter, SearchIndexAdapter,
 };
 use super::router::Mount;
 use crate::features::auth::{AppTokenSigner, AppTokenVerifier, NoopSigner};
@@ -18,6 +18,7 @@ use crate::features::profile::{
     AvatarProbe, InMemoryProfileRepo, PgAppOutbox, PgProfileRepo, ProfileRepo, ProfileService,
 };
 use crate::features::search::{projector::Projector, PgSearchIndexRepo, SearchIndexRepo};
+use crate::features::tenants::{self, MemberSearchIndex, TenantAdminService};
 use crate::features::users::{self, UserAdminService, UserSearchIndex};
 use crate::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, NatsEventBus, PgEventBus, PgWidgetRepo,
@@ -37,7 +38,11 @@ use idm::{
     PgOutboxRepo, PgRoleRepo, PgSessionRepo, PgUserRepo, RoleRepo, SessionRepo, UserRepo,
 };
 
-/// 数据库 schema(= role = 连接归属)。每个 schema 用自己的 role 连接。
+/// 数据库 schema(= 运行时 role = 连接归属)。每个 schema 用自己的 role 连接。
+///
+/// app / content / search 拆成三个账号(spec §4.4):`<schema>_owner` 跑迁移、拥有表(运行时不用);
+/// `<schema>` 运行时(只有 DML、NOBYPASSRLS,[`connect_for_schema`]);`<schema>_system`
+/// BYPASSRLS(后台任务,[`connect_system_for_schema`])。idm / ops 不拆。
 ///
 /// **跨模块访问范式**:要读别的 schema,用 [`connect_for_schema`] 起对方 schema 的连接、
 /// **走对方模块的 repo** 读 —— 严禁跨 schema join(idm/app 各自 role 的 search_path 物理上也挡着)。
@@ -70,6 +75,8 @@ pub struct AppState {
     pub auth: AuthService,
     /// 后台用户管理(idm 身份原语 + app.profiles 富化)。仅 needs_idm 进程装真实现。
     pub user_admin: UserAdminService,
+    /// 租户 / 成员管理(idm 租户、成员、会话原语 + search 成员索引 + app.profiles 富化)。仅 needs_idm 进程挂路由。
+    pub tenant_admin: TenantAdminService,
     /// 依赖探针(`/readyz` 逐项检查 + 连接池指标):本进程持有的各 schema 连接池 + NATS 连接。
     /// 内存模式为空(恒就绪)。测试里直接 `Default::default()`。
     pub probes: super::probes::Probes,
@@ -92,7 +99,22 @@ pub struct AppState {
     /// 仅当 `auth_projector` 真装起来(needs_idm && NATS_URL && search pool)时 Some ——
     /// 唯一发布者没装,总线就不该对外暴露(否则 SSE 200 挂着永不推送,见 `AuthEventBus` 头注)。
     pub auth_events_bus: Option<AuthEventBus>,
+    /// **system 连接池**(BYPASSRLS 账号 `<schema>_system`,spec §4.4):后台任务(投影器、保留期清理、
+    /// rebuild、seed / mock)和平台级跨租户读用它;请求路径一律走运行时账号的池 + `infra::pg::tenant_tx`。
+    /// app / content 归 needs_app 进程、search 归 needs_idm 进程,各自要设了对应 `*_DB_HOST`;内存模式为 None。
+    pub app_system_pool: Option<PgPool>,
+    pub content_system_pool: Option<PgPool>,
+    pub search_system_pool: Option<PgPool>,
 }
+
+/// idm 仓储五件套(users / sessions / roles / members / tenants),`AppState::new` 按有无 idm 库二选一装配。
+type IdmRepos = (
+    Arc<dyn UserRepo>,
+    Arc<dyn SessionRepo>,
+    Arc<dyn RoleRepo>,
+    Arc<dyn idm::MemberRepo>,
+    Arc<dyn idm::TenantRepo>,
+);
 
 /// 组合根装的后台任务(随 `run` 的优雅退出而停)。P1 outbox relay + P3 search projector,
 /// 都是"装了就 spawn、没装就跳过"的可选后台循环 —— 打包一份返回,省得 `new` 签名越加越长。
@@ -134,6 +156,7 @@ impl AppState {
         };
         let widget_repo: Arc<dyn WidgetRepo> = match &app_pool {
             // pool.clone() 廉价(内部 Arc):一份给 repo,app_pool 留给 readyz 探针。
+            // 运行时账号(非 owner、NOBYPASSRLS)+ 每个方法自己的租户事务。
             Some(pool) => Arc::new(PgWidgetRepo::new(pool.clone())),
             None => {
                 if needs_app {
@@ -160,6 +183,17 @@ impl AppState {
         // 字节后端独立于库:设了 S3_ENDPOINT → minio/S3(S3ObjectStore),否则进程内 InMemoryObjectStore。
         let content_pool = if needs_app {
             connect_for_schema(config, Schema::Content).await?
+        } else {
+            None
+        };
+        // system 池(BYPASSRLS):与运行时池同 host/库,账号不同;只在本进程持有该 schema 时连。
+        let app_system_pool = if needs_app {
+            connect_system_for_schema(config, Schema::App).await?
+        } else {
+            None
+        };
+        let content_system_pool = if needs_app {
+            connect_system_for_schema(config, Schema::Content).await?
         } else {
             None
         };
@@ -214,38 +248,49 @@ impl AppState {
         } else {
             None
         };
-        // search(search schema,读模型归 idm 侧):仅 needs_idm 进程需要,只喂 projector(不进 AppState 字段)。
+        // search(search schema,读模型归 idm 侧):仅 needs_idm 进程需要。运行时池只给请求路径读成员索引
+        // (租户事务 + RLS);投影器 / 保留期 / 认证审计(平台级)用 system 池。
         let search_pool = if needs_idm {
             connect_for_schema(config, Schema::Search).await?
         } else {
             None
         };
-        let (idm_users, idm_sessions, idm_roles): (
-            Arc<dyn UserRepo>,
-            Arc<dyn SessionRepo>,
-            Arc<dyn RoleRepo>,
-        ) = match &idm_pool {
-            Some(pool) => (
-                Arc::new(PgUserRepo::new(pool.clone())),
-                Arc::new(PgSessionRepo::new(pool.clone())),
-                Arc::new(PgRoleRepo::new(pool.clone())),
-            ),
-            None => {
-                if needs_idm {
-                    tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
-                }
-                // user 与 role repo **共享** RoleStore —— 否则 create_with_roles/set_roles 的授予对
-                // roles_for_user/list 不可见(PG 侧靠共表天然一致,内存侧需显式 sharing_with)。
-                let mem_users = InMemoryUserRepo::new();
-                let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
-                (
-                    Arc::new(mem_users) as Arc<dyn UserRepo>,
-                    Arc::new(InMemorySessionRepo::new()),
-                    Arc::new(mem_roles) as Arc<dyn RoleRepo>,
-                )
-            }
+        let search_system_pool = if needs_idm {
+            connect_system_for_schema(config, Schema::Search).await?
+        } else {
+            None
         };
-        // seed.toml 现只载**账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
+        let (idm_users, idm_sessions, idm_roles, idm_members, idm_tenants): IdmRepos =
+            match &idm_pool {
+                Some(pool) => (
+                    Arc::new(PgUserRepo::new(pool.clone())),
+                    Arc::new(PgSessionRepo::new(pool.clone())),
+                    Arc::new(PgRoleRepo::new(pool.clone())),
+                    Arc::new(idm::PgMemberRepo::new(pool.clone())),
+                    Arc::new(idm::PgTenantRepo::new(pool.clone())),
+                ),
+                None => {
+                    if needs_idm {
+                        tracing::warn!("未设 IDM_DB_HOST,idm 仓储使用内存实现");
+                    }
+                    // user 与 role repo **共享** RoleStore —— 否则 create_with_roles/set_roles 的授予对
+                    // roles_for_user/list 不可见(PG 侧靠共表天然一致,内存侧需显式 sharing_with)。
+                    let mem_users = InMemoryUserRepo::new();
+                    // 成员 / 会话仓储同理共享租户存储(登录选租户、会话的租户外键校验看同一批租户)。
+                    let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
+                    let mem_sessions = InMemorySessionRepo::sharing_with(&mem_users);
+                    let mem_members = idm::InMemoryMemberRepo::sharing_with(&mem_users);
+                    let mem_tenants = idm::InMemoryTenantRepo::sharing_with(&mem_users);
+                    (
+                        Arc::new(mem_users) as Arc<dyn UserRepo>,
+                        Arc::new(mem_sessions) as Arc<dyn SessionRepo>,
+                        Arc::new(mem_roles) as Arc<dyn RoleRepo>,
+                        Arc::new(mem_members) as Arc<dyn idm::MemberRepo>,
+                        Arc::new(mem_tenants) as Arc<dyn idm::TenantRepo>,
+                    )
+                }
+            };
+        // seed.toml 载**租户 + 账号**;角色/权限/role→权限默认是代码闭集(authz::{RoleName,Perm})。
         let seed = super::seed::SeedData::load(config.seed_file.as_deref())?;
 
         // 授权策略(归 app),**可拔插**(同 widget):设了 APP_DB_HOST → 读 app schema 的 role_permissions 表
@@ -256,6 +301,7 @@ impl AppState {
         // 它把 `Perm` 代码闭集投影进 permissions/role_permissions,ON CONFLICT 只增补、不覆盖
         // 运行期改动(admin 后台编辑安全)、无密钥非敏感 —— 加权限变体重启即自动进表,无需迁移/手工 seed。
         // 与账号+密码 seed(下方 seed_on_start 门控,prod 不自动建超管)刻意解耦:那个才是"避免启动期意外写库"的对象。
+        // **启动时载入一次**,运行期只读;跨作用域的 role_permissions 行在载入时 WARN 并忽略(spec §6.1)。
         let policy = Arc::new(match &app_pool {
             Some(pool) => {
                 if needs_app {
@@ -265,7 +311,28 @@ impl AppState {
             }
             None => seed.policy(),
         });
-        policy.assert_roles_covered(seed.granted_roles())?; // 启动期不变量:账号引用的 role 都得有策略条目
+        // 旧头像修复(幂等,见 app::avatar_repair):profiles 引用的、还在默认租户里的头像 content 转成个人内容。
+        // 与 seed_authz 同理不门控 seed_on_start —— prod 升级后第一次启动就要修好,否则旧头像全部显示不出来。
+        // 要 app 池(读 profiles)+ content system 池(BYPASSRLS 改 content 各表);内存模式没有旧数据,跳过。
+        if needs_app {
+            if let (Some(app), Some(content_sys)) = (&app_pool, &content_system_pool) {
+                super::avatar_repair::repair_legacy_avatars(app, content_sys).await?;
+            }
+        }
+        // 启动期不变量:账号引用的 role(平台 + 租户)都得有策略条目
+        policy.assert_roles_covered(seed.granted_roles().iter().map(String::as_str))?;
+        let idm_seed_repos = super::seed::IdmSeedRepos {
+            users: idm_users.as_ref(),
+            roles: idm_roles.as_ref(),
+            tenants: idm_tenants.as_ref(),
+            members: idm_members.as_ref(),
+        };
+
+        // 启动期不变量(不受 seed_on_start 控制):持 superadmin 的存活账号最多一个。改动前能经接口授出,存量库里
+        // 可能已有多个,而现在接口撤不掉 —— 拒绝启动并指向清理办法。先于 seed:报错信息直接说清理,不被 seed 的冲突掩盖。
+        if needs_idm {
+            super::seed::ensure_single_superadmin(idm_users.as_ref()).await?;
+        }
 
         // 进程内 seed:idm-mounting 进程 + 开启时,幂等写默认 role/账号(复用 &seed)。
         // memory 与 PG 都生效 —— dev 内存模式也有 superadmin/admin/user 登录。
@@ -273,8 +340,7 @@ impl AppState {
         // (真密码)才开 —— 容器无 `just`/`cargo`,靠此在启动幂等建号,不再依赖外部 seed bin。
         if needs_idm && config.seed_on_start() {
             super::seed::apply(
-                idm_users.as_ref(),
-                idm_roles.as_ref(),
+                idm_seed_repos,
                 &Argon2Hasher,
                 &seed,
                 Some("system".to_owned()),
@@ -300,10 +366,16 @@ impl AppState {
         //
         if should_apply_mock(config, needs_app, needs_idm) {
             let mock = super::mock::MockData::load(config.mock_file.as_deref())?;
+            // mock 是后台写入(spec §4.4:seed / mock 用 _system 账号);仓储照样按租户写、照样走租户事务。
+            let mock_widgets: Arc<dyn WidgetRepo> = match &app_system_pool {
+                Some(sys) => Arc::new(PgWidgetRepo::new(sys.clone())),
+                None => widget_repo.clone(),
+            };
             super::mock::apply(
-                widget_repo.as_ref(),
+                mock_widgets.as_ref(),
                 profile_repo.as_ref(),
-                idm_users.as_ref(),
+                idm_seed_repos,
+                &Argon2Hasher,
                 &mock,
             )
             .await?;
@@ -337,9 +409,9 @@ impl AppState {
         // idm repos 被 AuthService::builder move 走 —— user_admin 先 clone(Arc,廉价)。
         let profile_directory: Arc<dyn users::ProfileDirectory> =
             Arc::new(InProcessProfileDirectory::new(profile_repo.clone()));
-        // 配了 search pool(SEARCH_DB_HOST + needs_idm)→ list 读投影(q/display_name 搜/排);
-        // 否则 None → list 回退 idm 直查 + q/display_name-sort 422。读侧独立建 PgSearchIndexRepo(与
-        // build_projector 的写侧各持 pool.clone(),廉价 Arc,读写解耦、不共享实例)。
+        // 配了 search pool(SEARCH_DB_HOST + needs_idm)→ 平台账号列表读全局账号目录 account_index
+        // (q/display_name 搜/排);否则 None → list 回退 idm 直查 + q/display_name-sort 422。读侧用**运行时池**
+        // (account_index 不开 RLS,运行时账号只有 SELECT);写侧(build_projector)用 system 池,各建各的 PgSearchIndexRepo。
         let user_search: Option<Arc<dyn UserSearchIndex>> = search_pool.as_ref().map(|pool| {
             let repo: Arc<dyn SearchIndexRepo> = Arc::new(PgSearchIndexRepo::new(pool.clone()));
             Arc::new(SearchIndexAdapter::new(repo)) as Arc<dyn UserSearchIndex>
@@ -352,8 +424,25 @@ impl AppState {
             profile_directory,
             user_search,
         );
+        // 租户 / 成员管理:成员列表读 search 的租户成员索引(**运行时池**:repo 的 query 每次在租户事务里查,RLS 兜底);
+        // 没接 search → None → 回退 idm 直查(q 422)。资料富化同 user_admin(恒包 profile_repo)。
+        let member_search: Option<Arc<dyn MemberSearchIndex>> = search_pool.as_ref().map(|pool| {
+            let repo: Arc<dyn SearchIndexRepo> = Arc::new(PgSearchIndexRepo::new(pool.clone()));
+            Arc::new(MemberSearchAdapter::new(repo)) as Arc<dyn MemberSearchIndex>
+        });
+        let tenant_admin = TenantAdminService::new(
+            idm_tenants.clone(),
+            idm_members.clone(),
+            idm_users.clone(),
+            idm_roles.clone(),
+            idm_sessions.clone(),
+            Arc::new(InProcessProfileDirectory::new(profile_repo.clone()))
+                as Arc<dyn tenants::MemberProfiles>,
+            member_search,
+        );
 
-        let auth = AuthService::builder(idm_users, idm_sessions, idm_roles)
+        // 成员仓储必填:登录进最近用过的租户、refresh 校验成员关系、切换租户、注册加入默认租户。
+        let auth = AuthService::builder(idm_users, idm_sessions, idm_roles, idm_members)
             .hasher(Arc::new(Argon2Hasher))
             .signer(signer_port)
             .verifier(token_verifier.clone())
@@ -366,10 +455,11 @@ impl AppState {
             needs_idm,
             needs_app,
             idm_pool.as_ref(),
-            app_pool.as_ref(),
+            // 后台任务一律走 system 池(spec §4.4)。它和运行时池同由 APP_DB_HOST 决定,有 app 池就有它。
+            app_system_pool.as_ref(),
         )
         .await?;
-        let projector = build_projector(config, needs_idm, search_pool.as_ref()).await?;
+        let projector = build_projector(config, needs_idm, search_system_pool.as_ref()).await?;
 
         // auth 审计:写句柄(idm.outbox,handler 发事件用)+ 读句柄(auth_event,admin 查询用)+
         // projector(消费投影)+ 保留 job,都在下方组装 `probes` 之前
@@ -377,7 +467,8 @@ impl AppState {
         let idm_outbox: Option<Arc<dyn idm::OutboxRepo>> = idm_pool
             .as_ref()
             .map(|p| Arc::new(PgOutboxRepo::new(p.clone())) as Arc<dyn idm::OutboxRepo>);
-        let auth_audit = search_pool.as_ref().map(|p| {
+        // auth_event 是平台级表(spec §6.1:只给平台管理员看,含无租户的行):读写都走 search 的 system 池。
+        let auth_audit = search_system_pool.as_ref().map(|p| {
             AuthAuditService::new(
                 Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>
             )
@@ -387,10 +478,10 @@ impl AppState {
         // 装配顺序在组装 `probes` 之前 —— 之后还要 `.clone()` 一份塞进 projector。
         let bus = needs_idm.then(AuthEventBus::new);
         let auth_projector =
-            build_auth_event_projector(config, needs_idm, search_pool.as_ref(), bus.clone())
+            build_auth_event_projector(config, needs_idm, search_system_pool.as_ref(), bus.clone())
                 .await?;
         let auth_events_bus = if auth_projector.is_some() { bus } else { None };
-        let auth_retention = search_pool.as_ref().map(|p| {
+        let auth_retention = search_system_pool.as_ref().map(|p| {
             AuthRetentionJob::new(
                 Arc::new(PgAuthEventRepo::new(p.clone())) as Arc<dyn AuthEventRepo>
             )
@@ -435,6 +526,7 @@ impl AppState {
                 contents,
                 auth,
                 user_admin,
+                tenant_admin,
                 probes,
                 monitoring: super::monitoring::MonitoringSetup::new(config, mount)
                     .with_store(ops_store),
@@ -445,6 +537,9 @@ impl AppState {
                 idm_outbox,
                 auth_audit,
                 auth_events_bus,
+                app_system_pool,
+                content_system_pool,
+                search_system_pool,
             },
             BackgroundTasks {
                 relays: outbox_relays,
@@ -464,6 +559,7 @@ async fn build_outbox_relays(
     needs_idm: bool,
     needs_app: bool,
     idm_pool: Option<&PgPool>,
+    // app 的 system 池(后台任务);app.outbox 是全局表。
     app_pool: Option<&PgPool>,
 ) -> anyhow::Result<Vec<OutboxRelay>> {
     use std::time::Duration;
@@ -496,6 +592,7 @@ async fn build_outbox_relays(
 
 /// 装配 projector:needs_idm 进程 + NATS_URL + search pool 三者齐才起(它连 nats consume + 写 search)。
 /// 否则 None(无投影;P4 list 回退)。durable name 固定 "admin_user_projector"。
+/// `search_pool` 传 **system 池**:账号 / 资料事件要改该用户在所有租户里的成员行,只有 BYPASSRLS 改得到。
 async fn build_projector(
     config: &Config,
     needs_idm: bool,
@@ -513,7 +610,7 @@ async fn build_projector(
     ))
 }
 
-/// 装配 auth_event 投影器:needs_idm + NATS_URL + search pool 三者齐才起。镜像 `build_projector`;
+/// 装配 auth_event 投影器:needs_idm + NATS_URL + search pool(system 池)三者齐才起。镜像 `build_projector`;
 /// 独立 durable name "auth_event_projector",消费 `events.idm.auth.>`(见 `AuthEventProjector::connect`)。
 /// `bus`:落库成功后发布给 SSE 订阅者,转发给 `AuthEventProjector::connect`。
 async fn build_auth_event_projector(
@@ -547,17 +644,49 @@ pub async fn connect_for_schema(config: &Config, schema: Schema) -> anyhow::Resu
         Schema::Ops => config.ops_database_url(),
     };
     match url {
-        Some(url) => Ok(Some(connect_pool(&url).await?)),
+        Some(url) => Ok(Some(connect_pool(&url, RUNTIME_POOL_MAX).await?)),
+        None => Ok(None),
+    }
+}
+
+/// 运行时账号连接池上限(请求路径)。
+const RUNTIME_POOL_MAX: u32 = 10;
+/// system 账号连接池上限:只跑后台任务 / 平台级读,用不了几条。
+const SYSTEM_POOL_MAX: u32 = 4;
+
+/// 按 `schema` 起 **system 账号**(`<schema>_system`,BYPASSRLS)的连接池。只有拆了账号的
+/// app / content / search 有;idm / ops 不拆 → `None`。未配置对应 `*_DB_HOST` → `None`(内存模式)。
+///
+/// 只给后台任务 / 平台级跨租户读用 —— 请求路径用 [`connect_for_schema`] 的运行时账号 + `tenant_tx`。
+pub async fn connect_system_for_schema(
+    config: &Config,
+    schema: Schema,
+) -> anyhow::Result<Option<PgPool>> {
+    let url = match schema {
+        Schema::App => config.app_system_database_url(),
+        Schema::Content => config.content_system_database_url(),
+        Schema::Search => config.search_system_database_url(),
+        Schema::Idm | Schema::Ops => None,
+    };
+    match url {
+        Some(url) => Ok(Some(
+            connect_pool(&url, SYSTEM_POOL_MAX).await.with_context(|| {
+                format!(
+                    "连接 {schema:?} 的 system 账号失败(老库先补账号:just db-ensure-roles,\
+                     或部署脚本跑 scripts/initdb/10-tenancy-roles.sh)"
+                )
+            })?,
+        )),
         None => Ok(None),
     }
 }
 
 /// 连接 Postgres 并建连接池。范式:`PgPool` 自带连接池,无需 deadpool。
-async fn connect_pool(url: &str) -> anyhow::Result<PgPool> {
+async fn connect_pool(url: &str, max_connections: u32) -> anyhow::Result<PgPool> {
     // 不在 app 启动时跑迁移:schema 变更由 sqlx-cli 显式执行(just migrate),是受控部署步骤,
     // 而非 app 启动副作用 —— 避免多实例并发抢迁移、回滚困难、启动期改 schema 等风险。
     PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
         .connect(url)
         .await
         .context("连接 Postgres 失败")
@@ -602,6 +731,36 @@ mod tests {
     #[test]
     fn dev_monolith_applies_demo_data() {
         assert!(should_apply_mock(&Config::default(), true, true));
+    }
+
+    /// 零配置(内存模式)照常启动,三个 system 池都是 None。
+    #[tokio::test]
+    async fn memory_mode_has_no_system_pools() {
+        let (state, _) = match AppState::new(&Config::default(), Mount::Both).await {
+            Ok(v) => v,
+            Err(e) => panic!("零配置应能启动: {e:#}"),
+        };
+        assert!(state.app_system_pool.is_none());
+        assert!(state.content_system_pool.is_none());
+        assert!(state.search_system_pool.is_none());
+    }
+
+    /// idm / ops 不拆账号:没有 system 池(即使配了 host)。
+    #[tokio::test]
+    async fn idm_and_ops_have_no_system_pool() {
+        let cfg = Config {
+            idm_db_host: Some("unreachable.invalid".into()),
+            ops_db_host: Some("unreachable.invalid".into()),
+            ..Config::default()
+        };
+        assert!(connect_system_for_schema(&cfg, Schema::Idm)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(connect_system_for_schema(&cfg, Schema::Ops)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// prod + 内嵌 dev 密钥 → 启动拒(公钥全进程;私钥仅 needs_idm)。

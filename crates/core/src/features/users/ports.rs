@@ -28,8 +28,8 @@ pub trait ProfileDirectory: Send + Sync {
     async fn batch(&self, user_ids: &[Uuid]) -> Result<HashMap<Uuid, ProfileBrief>, AppError>;
 }
 
-/// users 的**只读检索端口**:列表/搜索走 search 模块的 CQRS 投影,但 users 不 import search
-/// 的具体类型(`IndexQuery`/`AdminUserIndexRow` 等)——只认这套窄类型。适配在 `app/adapters/`。
+/// users 的**只读检索端口**:平台账号列表 / 搜索走 search 模块的 CQRS 投影(**账号目录** `account_index`,全局),
+/// 但 users 不 import search 的具体类型(`IndexQuery`/`AccountIndexRow` 等)——只认这套窄类型。适配在 `app/adapters/`。
 #[derive(Debug, Clone, Default)]
 pub struct UserSearchFilter {
     pub username: Option<String>,
@@ -51,6 +51,7 @@ pub enum UserSearchSort {
 
 /// 列表一行。**不含 avatar_url**——投影不存 avatar,service 用 [`ProfileDirectory`] 另行补齐。
 /// `display_name` 取自投影(可搜键),`username`/`created_at` 恒有值(适配器映射时已保证)。
+/// `roles` = 平台角色名(账号目录里的 `user.roles_set`)。
 #[derive(Debug, Clone)]
 pub struct UserSearchRow {
     pub id: Uuid,
@@ -72,6 +73,7 @@ pub struct UserSearchPage {
 
 #[async_trait]
 pub trait UserSearchIndex: Send + Sync {
+    /// 全部账号(平台级)。
     async fn query(
         &self,
         filter: &UserSearchFilter,

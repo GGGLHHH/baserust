@@ -32,3 +32,30 @@ phone = "13800000001"
 owner = "user"
 display_name = "Uma User"
 phone = "13800000002"
+
+# 演示平台管理员(2026-11-26 角色补充;非 prod 才有):能管组织和普通账号,看不到「系统监控」「登录日志」,
+# 也碰不到 superadmin / 别的平台管理员。格式同 seed.toml 的 [[users]];superadmin 不许写在这里(只能有一个)。
+[[users]]
+username = "platform_admin"
+password = "pwd"
+platform_roles = ["platform_admin"]
+
+[[profiles]]
+owner = "platform_admin"
+display_name = "Pat Platform"
+
+# 演示租户(本地试「切换租户」用;非 prod 才有)。账号来自 seed.toml:
+# admin 在默认租户是 admin、在演示组织是 user;user 反过来 —— 两个人都能在两个租户之间切换。
+[[tenants]]
+slug = "demo"
+name = "演示组织"
+
+[[members]]
+username = "admin"
+tenant = "demo"
+roles = ["user"]
+
+[[members]]
+username = "user"
+tenant = "demo"
+roles = ["admin"]

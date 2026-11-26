@@ -39,6 +39,10 @@ pub trait OutboxSource: Send + Sync {
 /// 各 schema 适配器共用的 wire-format 组装,唯一定义处。`schema` 是 `"idm"`/`"app"`;
 /// `id` 是源表行 id(per-schema 自增,兼作 envelope 里的 `seq` —— 后续 P3 projector 拿它当
 /// 该 schema 的水位线,不用解析 subject/event_id 字符串)。
+///
+/// **`tenant_id`**(多租户,spec §4.4):payload 里带合法(非 nil)的 `tenant_id` 就抄到信封上,否则为
+/// `null`。租户事件(idm 的 `tenant.*`)、进了租户的认证事件都带;`user.*` / `profile.*`(账号、资料全局)
+/// 不带 —— **消费方不得要求它**(按需用 payload 里的那份)。outbox 表本身是全局表,不加列。
 pub(crate) fn build_outbox_item(
     schema: &str,
     id: i64,
@@ -53,6 +57,7 @@ pub(crate) fn build_outbox_item(
         "type": event_type,
         "aggregate_id": aggregate_id,
         "seq": id,
+        "tenant_id": payload_tenant(payload),
         "data": payload,
     });
     OutboxItem {
@@ -62,6 +67,15 @@ pub(crate) fn build_outbox_item(
         payload: serde_json::to_vec(&envelope)
             .expect("envelope 只含字符串/数字/已验证过的 Value,序列化不会失败"),
     }
+}
+
+/// payload 里的 `tenant_id`(合法 UUID 且非 nil)→ 信封上的 `tenant_id`;没有 / 不合法 → None。
+fn payload_tenant(payload: &Value) -> Option<Uuid> {
+    payload
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .filter(|t| !t.is_nil())
 }
 
 /// relay 发布事件依赖的窄端口 —— relay 只认这个 trait,不认具体 `JetStreamPublisher`,
@@ -207,6 +221,31 @@ mod tests {
         assert_eq!(envelope["seq"], 42);
         assert_eq!(envelope["aggregate_id"], aggregate_id.to_string());
         assert_eq!(envelope["data"], payload);
+        assert!(
+            envelope["tenant_id"].is_null(),
+            "账号事件没有租户:信封上 tenant_id = null"
+        );
+    }
+
+    /// 多租户:payload 带 tenant_id → 信封上带同一个;nil / 非 UUID 不当租户。
+    #[test]
+    fn envelope_carries_tenant_id_from_payload() {
+        let tenant = Uuid::now_v7();
+        let user = Uuid::now_v7();
+        let payload = json!({ "tenant_id": tenant, "user_id": user, "roles": ["admin"] });
+        let item = build_outbox_item("idm", 7, "tenant.member_added", tenant, &payload);
+        let envelope: Value = serde_json::from_slice(&item.payload).unwrap();
+        assert_eq!(envelope["tenant_id"], tenant.to_string());
+        assert_eq!(envelope["data"], payload, "payload 原样不动");
+
+        for bad in [
+            json!({ "tenant_id": Uuid::nil() }),
+            json!({ "tenant_id": "nope" }),
+        ] {
+            let item = build_outbox_item("idm", 8, "tenant.member_added", tenant, &bad);
+            let envelope: Value = serde_json::from_slice(&item.payload).unwrap();
+            assert!(envelope["tenant_id"].is_null(), "{bad}: 不是合法租户");
+        }
     }
 
     // ---- OutboxRelay::poll_once —— fake source/publisher,零 NATS/DB 依赖 ----

@@ -54,6 +54,8 @@ services:
       APP_DB_PORT: "5432"
       CONTENT_DB_HOST: pg
       CONTENT_DB_PORT: "5432"
+      # app / content 的 system 账号池(BYPASSRLS,后台任务)沿用上面的 host/port,账号密码走 env_file 的
+      # APP_DB_SYSTEM_{USER,PASSWORD} / CONTENT_DB_SYSTEM_{USER,PASSWORD}。
       IDM_DB_HOST: pg              # 跨模块预留(needs_idm=false 不实连,见架构文档)
       IDM_DB_PORT: "5432"
       NATS_URL: nats://nats:4222
@@ -96,7 +98,8 @@ services:
       # search pool:auth_audit 读句柄 + auth_event 投影器都要它(state.rs 的 auth_audit /
       # auth_events_bus 都是 needs_idm && NATS_URL && search pool 三者齐才 Some)。
       # 少了它 → /admin/auth/auth-events 返回 404「审计后端未接线」,前端 auth-log 页空转。
-      # 库/角色/密码走 env_file 的 SEARCH_DB_{USER,PASSWORD,DATABASE}。
+      # 库/角色/密码走 env_file 的 SEARCH_DB_{USER,PASSWORD,DATABASE};system 账号池(投影器等后台路径,
+      # BYPASSRLS)同 host,账号密码走 SEARCH_DB_SYSTEM_{USER,PASSWORD}。
       SEARCH_DB_HOST: pg
       SEARCH_DB_PORT: "5432"
       # 后台监控历史 / 日志(ops schema);库/角色/密码走 env_file 的 OPS_DB_{USER,PASSWORD,DATABASE}。
@@ -119,6 +122,7 @@ services:
     # 不发布主机端口:对外只经 nginx:80。
 
   # 一次性迁移:pg healthy 后按 schema 迁移,完成即退出。app/idm 等它 completed。
+  # app / content / search 以 *_DB_OWNER_{USER,PASSWORD}(owner 账号)迁移,都在 env_file 里。
   migrate:
     logging: *logging
     image: ${COMPOSE_PROJECT_NAME:-baserust}-migrate:latest
@@ -137,7 +141,8 @@ services:
     env_file: [.env]
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-      # 首次(空 volume)建 app/idm/content/search/ops 的 role + schema(search_path 各指自己 schema)。
+      # 首次(空 volume)建 app/idm/content/search/ops 的 role + schema(search_path 各指自己 schema),
+      # 再拆 app/content/search 的 owner / 运行时 / system 账号(10-tenancy-roles.sh)。老卷由 deploy.sh 每次迁移前补跑。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]

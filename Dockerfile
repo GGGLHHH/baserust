@@ -88,6 +88,9 @@ RUN apt-get update \
 # 两个进程二进制:baserust(app,默认 ENTRYPOINT)+ idm(分进程,compose 里 override entrypoint)。
 COPY --from=builder /app/target/release/baserust /usr/local/bin/baserust
 COPY --from=builder /app/target/release/idm /usr/local/bin/idm
+# 运维工具:search 读模型全量回填(多租户升级后成员索引是空的,要跑一次;投影漂移时也用它)。
+# 用法:同一镜像覆盖 entrypoint,环境变量与 app 进程相同(要 idm / app / search 三个库)。
+COPY --from=builder /app/target/release/rebuild_search /usr/local/bin/rebuild_search
 USER app
 
 # 容器内不写文件日志:不设 LOG_FILE → 只输出 stdout,由 docker/k8s 收集。

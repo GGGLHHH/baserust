@@ -20,10 +20,20 @@ Model the whole atomic operation as a single coarse-grained method on the repo t
 
 | | Postgres | in-memory |
 |---|---|---|
-| boundary | `let mut tx = pool.begin()?; … .execute(&mut *tx) … tx.commit()?` | one `store.lock()` |
+| boundary | tenant data: `let mut tx = tenant_tx(&pool, tenant).await?; … .execute(&mut *tx) … tx.commit()?` (global tables: `pool.begin()`) | one `store.lock()` |
 | rollback | any `?` drops `tx` → auto `ROLLBACK` | **validate BEFORE any mutation** → an early `return Err` leaves the store untouched |
 
 **Memory discipline (load-bearing): validate-before-mutate.** Run every check first; write only once all pass. `mutate-then-fail` leaves half-written rows → loses atomicity and drifts from PG. Use one `now_utc()` for all rows in the unit (mirrors PG defaults/trigger).
+
+## multi-tenancy: the transaction is also the tenant context
+
+On tenant tables (FORCE RLS) the tenant is set **per transaction**: `infra::pg::tenant_tx(&pool, tenant)` = `begin` + `select set_config('app.tenant_id', $1, true)` (third arg `true` = transaction-local; it vanishes at commit / rollback, so a pooled connection never carries a tenant into the next request). Consequences:
+- **every** PG repo method on tenant data opens its own `tenant_tx` — even single-statement reads (a bare `pool.fetch` without it sees 0 rows and inserts fail the policy's WITH CHECK);
+- the tenant is a plain `TenantId` parameter of the trait method (not a transaction / connection), so this doesn't break the "tx not in the signature" rule;
+- never `SET app.tenant_id` (session-level) — it leaks across pooled connections;
+- the SQL still says `tenant_id = $1` (index + defence in depth); RLS is the second line;
+- cross-tenant background work uses the `*_system_pool` (BYPASSRLS) with a plain `begin()` and writes the per-row `tenant_id` itself;
+- the memory impl mirrors it by filtering on the tenant inside the same lock (another tenant's row = missing).
 
 ## conformance pins what a single statement can't show
 

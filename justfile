@@ -31,16 +31,25 @@ test:
     cargo test --workspace
 
 # ───── 仓储一致性测试(同一契约对内存/PG 各跑一遍,防 drift)─────
-# 一次性:给测试集群 app role 授权(只动本地 dev pg,不碰 prod):
+# 一次性:给测试集群授权(只动本地 dev pg,不碰 prod):
 #   CREATEDB —— #[sqlx::test] 建临时库;CREATE ON DATABASE —— 在 base 库建 _sqlx_test 元数据 schema。
+#   app_owner 是 baserust 里跑 #[sqlx::test] 的账号(临时库里以 owner 跑迁移,仓储再用运行时账号 app 连);
+#   _sqlx_test 已被别的账号建过(老库里是 app)时,再给 app_owner 授它的权限。
+#   运行时账号 app 拆分后不再跑 #[sqlx::test](仓储连 sqlx::test 建好的临时库),不授 CREATEDB;
+#   idm / content / search 的授权留给 rust-idm / rust-content 自己的 PG 测试用。
 # 没装本机 psql 可改:docker compose exec -T pg psql -U <super> -d <db> -c "<同样的 SQL>"
 pg-test-grant:
-    psql "postgres://{{env_var_or_default('POSTGRES_USER','baserust')}}:{{env_var_or_default('POSTGRES_PASSWORD','baserust')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{env_var_or_default('APP_DB_USER','app')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('APP_DB_USER','app')}}; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}}; alter role {{env_var_or_default('SEARCH_DB_USER','search')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('SEARCH_DB_USER','search')}};"
+    psql "postgres://{{env_var_or_default('POSTGRES_USER','baserust')}}:{{env_var_or_default('POSTGRES_PASSWORD','baserust')}}@{{pg_host}}:{{pg_port}}/{{pg_db}}" -c "alter role {{app_owner_user}} createdb; grant create on database {{pg_db}} to {{app_owner_user}}; do \$\$ begin if exists (select 1 from pg_namespace where nspname = '_sqlx_test') then grant usage, create on schema _sqlx_test to {{app_owner_user}}; grant all on all tables in schema _sqlx_test to {{app_owner_user}}; grant all on all sequences in schema _sqlx_test to {{app_owner_user}}; end if; end \$\$; alter role {{env_var_or_default('IDM_DB_USER','idm')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('IDM_DB_USER','idm')}}; alter role {{env_var_or_default('CONTENT_DB_USER','content')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('CONTENT_DB_USER','content')}}; alter role {{env_var_or_default('SEARCH_DB_USER','search')}} createdb; grant create on database {{pg_db}} to {{env_var_or_default('SEARCH_DB_USER','search')}};"
 
-# PG conformance(连 app role,search_path=app 由 role 配置继承;先起 pg)。
+# PG conformance(先起 pg 并 just migrate)。账号拆分之后(spec §4.4):
+#   DATABASE_URL = app_owner —— #[sqlx::test] 用它建临时库、跑迁移(tests/support);
+#   仓储走运行时账号 APP_DB_USER / APP_DB_PASSWORD(非 owner,RLS 真的生效);
+#   SEARCH_OWNER_DATABASE_URL 跑 search 迁移;search 契约写走 SEARCH_SYSTEM_DATABASE_URL(system,同投影器)、
+#   读走 SEARCH_DATABASE_URL(运行时,RLS 生效);auth_event(平台级)走 system;
+#   rls_audit 以 *_OWNER_DATABASE_URL 迁移三个 schema,再用 APP_DATABASE_URL(运行时)查系统目录、试 tenant_tx。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
-    DATABASE_URL="{{app_db_url}}" SEARCH_DATABASE_URL="{{search_db_url}}" OPS_DATABASE_URL="{{ops_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance --test ops_store_conformance -- --nocapture
+    DATABASE_URL="{{app_owner_db_url}}" APP_DATABASE_URL="{{app_db_url}}" APP_OWNER_DATABASE_URL="{{app_owner_db_url}}" CONTENT_OWNER_DATABASE_URL="{{content_owner_db_url}}" SEARCH_DATABASE_URL="{{search_db_url}}" SEARCH_SYSTEM_DATABASE_URL="{{search_system_db_url}}" SEARCH_OWNER_DATABASE_URL="{{search_owner_db_url}}" OPS_DATABASE_URL="{{ops_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance --test ops_store_conformance --test rls_audit --test avatar_repair_pg -- --nocapture
 
 # NATS conformance(事件总线契约打真 NATS;先 `just up` 起 nats)+ JetStream 发布端冒烟
 test-nats:
@@ -66,11 +75,14 @@ test-durable:
 
 # search 投影 e2e(pg+nats;先 just up + just migrate-search)
 test-search: pg-test-grant
-    NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features pg-conformance,nats-conformance --test search_projection_p3 -- --nocapture --test-threads=1
+    SEARCH_DATABASE_URL="{{search_db_url}}" SEARCH_OWNER_DATABASE_URL="{{search_owner_db_url}}" NATS_URL="nats://localhost:{{env_var_or_default('NATS_PORT','2224')}}" cargo test --features pg-conformance,nats-conformance --test search_projection_p3 -- --nocapture --test-threads=1
 
 # ───── 数据库迁移(sqlx-cli,类似 goose;显式执行,不在 app 启动时跑)─────
-# 每个 schema 用同名 role 连接(role 的 search_path = 同名 schema),各自独立 _sqlx_migrations,
-# 互不冲突。完整串可用 APP_DATABASE_URL/IDM_DATABASE_URL 覆盖,或只覆盖密码 APP_DB_PASSWORD 等。
+# 每个 schema 各自独立 _sqlx_migrations,互不冲突;连接账号的 search_path = 该 schema。
+# app / content / search 拆了账号(spec §4.4):迁移用 **<schema>_owner**(拥有表),
+# 运行时账号 <schema> 只有 DML —— 所以下面这三个 schema 的迁移串是 *_owner_db_url。idm / ops 不拆。
+# 完整串可用 APP_OWNER_DATABASE_URL / APP_DATABASE_URL(运行时)等覆盖,或只覆盖账号密码
+# APP_DB_OWNER_USER / APP_DB_OWNER_PASSWORD 等(owner 账号名缺省 = 运行时账号名 + _owner)。
 # pg 的 host/port/db 也从 env 读(和 compose 同一套:PG_PORT 等),默认连本地 compose pg。
 pg_host := env_var_or_default("PG_HOST", "localhost")
 pg_port := env_var_or_default("PG_PORT", "5821")
@@ -79,18 +91,28 @@ app_db_url := env_var_or_default("APP_DATABASE_URL", "postgres://" + env_var_or_
 idm_db_url := env_var_or_default("IDM_DATABASE_URL", "postgres://" + env_var_or_default("IDM_DB_USER", "idm") + ":" + env_var_or_default("IDM_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 content_db_url := env_var_or_default("CONTENT_DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 search_db_url := env_var_or_default("SEARCH_DATABASE_URL", "postgres://" + env_var_or_default("SEARCH_DB_USER", "search") + ":" + env_var_or_default("SEARCH_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+app_owner_user := env_var_or_default("APP_DB_OWNER_USER", env_var_or_default("APP_DB_USER", "app") + "_owner")
+content_owner_user := env_var_or_default("CONTENT_DB_OWNER_USER", env_var_or_default("CONTENT_DB_USER", "content") + "_owner")
+search_owner_user := env_var_or_default("SEARCH_DB_OWNER_USER", env_var_or_default("SEARCH_DB_USER", "search") + "_owner")
+app_owner_db_url := env_var_or_default("APP_OWNER_DATABASE_URL", "postgres://" + app_owner_user + ":" + env_var_or_default("APP_DB_OWNER_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+content_owner_db_url := env_var_or_default("CONTENT_OWNER_DATABASE_URL", "postgres://" + content_owner_user + ":" + env_var_or_default("CONTENT_DB_OWNER_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+search_system_db_url := env_var_or_default("SEARCH_SYSTEM_DATABASE_URL", "postgres://" + env_var_or_default("SEARCH_DB_SYSTEM_USER", env_var_or_default("SEARCH_DB_USER", "search") + "_system") + ":" + env_var_or_default("SEARCH_DB_SYSTEM_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+search_owner_db_url := env_var_or_default("SEARCH_OWNER_DATABASE_URL", "postgres://" + search_owner_user + ":" + env_var_or_default("SEARCH_DB_OWNER_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
 ops_db_url := env_var_or_default("OPS_DATABASE_URL", "postgres://" + env_var_or_default("OPS_DB_USER", "ops") + ":" + env_var_or_default("OPS_DB_PASSWORD", "pwd") + "@" + pg_host + ":" + pg_port + "/" + pg_db + "?sslmode=disable")
+
+# 10-tenancy-roles.sh 要的 owner / system 账号与密码(缺省同 docker-compose.yml)
+tenancy_role_env := "-e APP_DB_OWNER_USER=" + app_owner_user + " -e APP_DB_OWNER_PASSWORD=" + env_var_or_default("APP_DB_OWNER_PASSWORD", "pwd") + " -e APP_DB_SYSTEM_USER=" + env_var_or_default("APP_DB_SYSTEM_USER", env_var_or_default("APP_DB_USER", "app") + "_system") + " -e APP_DB_SYSTEM_PASSWORD=" + env_var_or_default("APP_DB_SYSTEM_PASSWORD", "pwd") + " -e CONTENT_DB_OWNER_USER=" + content_owner_user + " -e CONTENT_DB_OWNER_PASSWORD=" + env_var_or_default("CONTENT_DB_OWNER_PASSWORD", "pwd") + " -e CONTENT_DB_SYSTEM_USER=" + env_var_or_default("CONTENT_DB_SYSTEM_USER", env_var_or_default("CONTENT_DB_USER", "content") + "_system") + " -e CONTENT_DB_SYSTEM_PASSWORD=" + env_var_or_default("CONTENT_DB_SYSTEM_PASSWORD", "pwd") + " -e SEARCH_DB_OWNER_USER=" + search_owner_user + " -e SEARCH_DB_OWNER_PASSWORD=" + env_var_or_default("SEARCH_DB_OWNER_PASSWORD", "pwd") + " -e SEARCH_DB_SYSTEM_USER=" + env_var_or_default("SEARCH_DB_SYSTEM_USER", env_var_or_default("SEARCH_DB_USER", "search") + "_system") + " -e SEARCH_DB_SYSTEM_PASSWORD=" + env_var_or_default("SEARCH_DB_SYSTEM_PASSWORD", "pwd")
 
 # 所有 schema 迁移(聚合,像 Go Makefile 的 migrate 总目标)
 migrate: migrate-app migrate-idm migrate-content migrate-search migrate-ops
 
-# ── app schema(role app)──
+# ── app schema(迁移用 app_owner;运行时 app、后台 app_system)──
 migrate-app:
-    sqlx migrate run --source migrations/app --database-url "{{app_db_url}}"
+    sqlx migrate run --source migrations/app --database-url "{{app_owner_db_url}}"
 migrate-app-revert:
-    sqlx migrate revert --source migrations/app --database-url "{{app_db_url}}"
+    sqlx migrate revert --source migrations/app --database-url "{{app_owner_db_url}}"
 migrate-app-info:
-    sqlx migrate info --source migrations/app --database-url "{{app_db_url}}"
+    sqlx migrate info --source migrations/app --database-url "{{app_owner_db_url}}"
 
 # ── idm schema(role idm)──
 migrate-idm:
@@ -100,21 +122,21 @@ migrate-idm-revert:
 migrate-idm-info:
     sqlx migrate info --source migrations/idm --database-url "{{idm_db_url}}"
 
-# ── content schema(role content)── 表来自 rust-content crate 的 migrations(拷进 migrations/content)
+# ── content schema(迁移用 content_owner)── 表来自 rust-content crate 的 migrations(拷进 migrations/content)
 migrate-content:
-    sqlx migrate run --source migrations/content --database-url "{{content_db_url}}"
+    sqlx migrate run --source migrations/content --database-url "{{content_owner_db_url}}"
 migrate-content-revert:
-    sqlx migrate revert --source migrations/content --database-url "{{content_db_url}}"
+    sqlx migrate revert --source migrations/content --database-url "{{content_owner_db_url}}"
 migrate-content-info:
-    sqlx migrate info --source migrations/content --database-url "{{content_db_url}}"
+    sqlx migrate info --source migrations/content --database-url "{{content_owner_db_url}}"
 
-# ── search schema(role search)── CQRS 读模型:admin_user_index(projector 写,P4 list 读)
+# ── search schema(迁移用 search_owner)── CQRS 读模型:account_index + admin_user_index(租户成员索引)、auth_event(projector 写,list 读)
 migrate-search:
-    sqlx migrate run --source migrations/search --database-url "{{search_db_url}}"
+    sqlx migrate run --source migrations/search --database-url "{{search_owner_db_url}}"
 migrate-search-revert:
-    sqlx migrate revert --source migrations/search --database-url "{{search_db_url}}"
+    sqlx migrate revert --source migrations/search --database-url "{{search_owner_db_url}}"
 migrate-search-info:
-    sqlx migrate info --source migrations/search --database-url "{{search_db_url}}"
+    sqlx migrate info --source migrations/search --database-url "{{search_owner_db_url}}"
 
 # ── ops schema(role ops)── 后台监控的历史指标与日志
 migrate-ops:
@@ -124,20 +146,23 @@ migrate-ops-revert:
 migrate-ops-info:
     sqlx migrate info --source migrations/ops --database-url "{{ops_db_url}}"
 
-# initdb 只在空卷首次启动时跑,后加的 schema 靠这个补;可重复执行,之后再 just migrate。
-# 给已有的 pg 卷补齐各 schema 的 role + schema
+# initdb 只在空卷首次启动时跑,后加的 schema / 账号靠这个补;可重复执行,之后再 just migrate。
+# 00 补 role + schema;10 做多租户的账号拆分(owner / 运行时 / system,表转给 owner、运行时账号只留 DML)。
+# owner / system 的账号密码从这里显式传进去 —— 老的 pg 容器建的时候还没有这几个环境变量。
+# 给已有的 pg 卷补齐各 schema 的 role + schema,并拆分 owner / 运行时 / system 账号
 db-ensure-roles:
     docker compose exec -T pg bash -s < scripts/initdb/00-roles-schemas.sh
+    docker compose exec -T {{tenancy_role_env}} pg bash -s < scripts/initdb/10-tenancy-roles.sh
 
 # 新建某 schema 的可回滚迁移(内部参数化,创建用):just migrate-add app create_widgets
 migrate-add schema name:
     sqlx migrate add -r --source migrations/{{schema}} {{name}}
 
-# seed 默认数据:idm(role/账号/授予)+ app authz(permissions / role_permissions)。幂等,可重复跑。
+# seed 默认数据:idm(role/账号/授予)+ app authz(permissions / role_permissions)+ 旧头像修复(content system 账号)。幂等,可重复跑。
 # 先 `just migrate`(建两 schema 的表)。idm 连 idm role、app 连 app role。
 # seed bin 与 app 进程同一套 Config 字段(IDM_DB_*/APP_DB_*),此处只补齐 host/port/db 指向 compose pg。
 seed:
-    IDM_DB_HOST="{{pg_host}}" IDM_DB_PORT="{{pg_port}}" IDM_DB_DATABASE="{{pg_db}}" APP_DB_HOST="{{pg_host}}" APP_DB_PORT="{{pg_port}}" APP_DB_DATABASE="{{pg_db}}" cargo run --bin seed
+    IDM_DB_HOST="{{pg_host}}" IDM_DB_PORT="{{pg_port}}" IDM_DB_DATABASE="{{pg_db}}" APP_DB_HOST="{{pg_host}}" APP_DB_PORT="{{pg_port}}" APP_DB_DATABASE="{{pg_db}}" CONTENT_DB_HOST="{{pg_host}}" CONTENT_DB_PORT="{{pg_port}}" CONTENT_DB_DATABASE="{{pg_db}}" cargo run --bin seed
 
 # prod seed:读外部账号文件(默认 seed.prod.toml,.gitignore 已挡,含真密码),不碰仓库里的 pwd 默认。
 # 先 `cp seed.prod.toml.example seed.prod.toml` 填强密码。DB 指向经 IDM_DB_*/APP_DB_* env 或此处覆盖。

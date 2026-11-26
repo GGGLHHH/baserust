@@ -13,7 +13,8 @@ use crate::features::profile::model;
 pub struct PutProfileRequest {
     pub display_name: Option<String>,
     pub phone: Option<String>,
-    /// 绑定头像:必须指向**已 confirm** 的本人栅格图 content(png/jpeg/gif/webp)。
+    /// 绑定头像:必须指向资料主人的**个人内容**(`POST /profiles/me/avatar` 或后台传头像上传的那种;
+    /// 租户内容不行)、已 confirm 的栅格图(png/jpeg/gif/webp)。
     pub avatar_content_id: Option<Uuid>,
 }
 

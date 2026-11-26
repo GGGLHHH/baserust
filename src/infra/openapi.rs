@@ -38,7 +38,9 @@ use crate::kernel::error::AppError;
         (name = "auth", description = "认证:注册/登录/刷新/登出"),
         (name = "me", description = "当前用户:资料/改密/注销"),
         (name = "admin", description = "后台:管理端登录/当前管理员"),
-        (name = "users", description = "后台用户管理:CRUD/角色/密码/资料/认证审计"),
+        (name = "users", description = "后台账号管理(平台级):CRUD/平台角色/密码/资料/认证审计"),
+        (name = "tenants", description = "平台租户管理(平台级):建 / 改名 / 停用租户,管理任意租户的成员"),
+        (name = "members", description = "本租户成员管理(租户级):成员列表 / 按用户名加入已有账号 / 设租户角色 / 移出"),
         (name = "monitoring", description = "系统监控:后台监控页(依赖健康/流量/数据库/后台任务/进程资源)与前端错误上报")
     )
 )]
@@ -122,13 +124,7 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
                 PermReq::Any(ps) => ps.iter().map(|&p| vec![perm_wire(p)]).collect(),
             };
             if admin_group {
-                // 组闸拦**所有**分支 → OR 的每支都并入 admin:login(去重),少写任何一支文档就是骗人。
-                let admin = perm_wire(Perm::AdminLogin);
-                for r in &mut reqs {
-                    if !r.contains(&admin) {
-                        r.push(admin.clone());
-                    }
-                }
+                reqs = with_admin_entry(reqs);
             }
             op.security = Some(
                 reqs.into_iter()
@@ -137,6 +133,41 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
             );
         }
     }
+}
+
+/// admin 组闸(后台准入 = `admin:login` **或**任一平台级权限,见 `Policy::require_admin_entry`)并入文档:
+/// 组闸拦**所有**分支,而准入本身是 OR → 每个 requirement × 每个准入权限取并集(AND),再删掉被更小
+/// requirement 蕴含的(A ⊂ B 时满足 B 必满足 A,B 多余)。准入清单与执行同源(`admin_entry_perms`)。
+fn with_admin_entry(reqs: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let gates: Vec<String> = crate::kernel::authz::admin_entry_perms()
+        .into_iter()
+        .map(perm_wire)
+        .collect();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for r in &reqs {
+        for g in &gates {
+            let mut combined = r.clone();
+            if !combined.contains(g) {
+                combined.push(g.clone());
+            }
+            if !out.iter().any(|o| same_set(o, &combined)) {
+                out.push(combined);
+            }
+        }
+    }
+    let minimal: Vec<Vec<String>> = out
+        .iter()
+        .filter(|b| {
+            !out.iter()
+                .any(|a| a.len() < b.len() && a.iter().all(|s| b.contains(s)))
+        })
+        .cloned()
+        .collect();
+    minimal
+}
+
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|s| b.contains(s))
 }
 
 /// 暴露 `/api-docs/openapi.json` 与 `/api-docs/openapi.yaml`。
@@ -269,7 +300,6 @@ mod tests {
             "livez",
             "health",
             "readyz",
-            "widget_stats",         // 公开计数:无 CurrentUser/require_scoped
             "report_client_errors", // 前端错误上报:登录页也要能报,靠限流 + 截断设防
             "admin_login",          // 验密后 handler 自查 admin:login,非表驱动
         ];
@@ -311,12 +341,16 @@ mod tests {
         }
     }
 
-    /// admin 组注入:`/api/v1/admin/` 下**表内** op 的 scopes 必含 admin:login(组闸=后台准入进文档,文档不骗人);
+    /// admin 组注入:`/api/v1/admin/` 下**表内** op 的每个 requirement 都含一个后台准入权限
+    /// (`admin:login` 或平台级权限;组闸=后台准入进文档,文档不骗人);仅登录的 op 恰好是「每个准入权限一支」。
     /// 不在表(admin_login)= public,无 security,跳过。
     #[test]
-    fn admin_group_ops_carry_admin_login_scope() {
+    fn admin_group_ops_carry_admin_entry_scope() {
         let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
-        let admin_wire = perm_wire(Perm::AdminLogin);
+        let entry: Vec<String> = crate::kernel::authz::admin_entry_perms()
+            .into_iter()
+            .map(perm_wire)
+            .collect();
         let mut seen = 0;
         for (path, item) in v["paths"].as_object().expect("paths").iter() {
             if !path.starts_with("/api/v1/admin/") {
@@ -337,9 +371,24 @@ mod tests {
                         .map(|s| s.as_str().unwrap())
                         .collect();
                     assert!(
-                        scopes.contains(&admin_wire.as_str()),
-                        "admin 组 `{id}` 每个 requirement 都应含 admin:login,got {scopes:?}"
+                        scopes.iter().any(|s| entry.iter().any(|e| e == s)),
+                        "admin 组 `{id}` 每个 requirement 都应含一个后台准入权限,got {scopes:?}"
                     );
+                }
+                if id == "admin_get_me" {
+                    let branches: Vec<Vec<String>> = reqs
+                        .iter()
+                        .map(|r| {
+                            r[OAUTH2_SCHEME]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|s| s.as_str().unwrap().to_owned())
+                                .collect()
+                        })
+                        .collect();
+                    let expect: Vec<Vec<String>> = entry.iter().map(|e| vec![e.clone()]).collect();
+                    assert_eq!(branches, expect, "仅登录的 admin op = 每个准入权限一支(OR)");
                 }
                 seen += 1;
             }
@@ -383,7 +432,7 @@ mod tests {
             find("widget_overview"),
             vec![
                 vec!["widgets:read".to_owned()],
-                vec!["users:admin".to_owned()]
+                vec!["members:admin".to_owned()]
             ],
             "OR 应是双 requirement 各单 scope"
         );

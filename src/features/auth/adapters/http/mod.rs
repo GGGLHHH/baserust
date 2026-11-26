@@ -18,7 +18,7 @@ pub fn public_router() -> OpenApiRouter<AppState> {
         .routes(routes!(routes::logout))
 }
 
-/// frontend 组(闸:登录):当前用户资料/改密/全登出。
+/// frontend 组(闸:登录):当前用户资料/改密/全登出/我的租户/切换租户。
 pub fn me_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::logout_all))
@@ -28,6 +28,8 @@ pub fn me_router() -> OpenApiRouter<AppState> {
             routes::delete_me
         ))
         .routes(routes!(routes::change_password))
+        .routes(routes!(routes::list_my_tenants))
+        .routes(routes!(routes::switch_tenant))
 }
 
 /// admin 组闸内:当前管理员。

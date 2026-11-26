@@ -41,12 +41,15 @@ fn now_rfc3339() -> String {
 
 /// 成功类事件 payload(注册/登录/刷新等,有确定 `user_id` 时用)。`actor` = 展示用用户名
 /// (读模型 `AuthEventRow.actor`),未知时传 `None`(前端回退展示 `user_id`)。
+/// `tenant_id` = 事件所在的租户(登录进入的 / 会话所在的 / 切换后的;平台上下文 `None`),
+/// outbox 信封会把它抄到 `tenant_id` 上,auth_event 据此记租户。
 pub fn success_data(
     ctx: &ClientContext,
     channel: AuthChannel,
     user_id: Uuid,
     session_id: Option<Uuid>,
     actor: Option<&str>,
+    tenant_id: Option<Uuid>,
 ) -> Value {
     json!({
         "occurred_at": now_rfc3339(),
@@ -55,6 +58,7 @@ pub fn success_data(
         "user_id": user_id,
         "session_id": session_id,
         "actor": actor,
+        "tenant_id": tenant_id,
         "ip": ctx.ip,
         "forwarded_chain": ctx.forwarded_chain,
         "user_agent": ctx.user_agent,
@@ -64,19 +68,22 @@ pub fn success_data(
 
 /// 失败类事件 payload。`user_id` 多数失败场景未知(防枚举,传 `None`);
 /// `admin_access_denied` 例外 —— 验密已过、有确定 user_id,传 `Some`。`actor` 复用
-/// `identifier`(提交的用户名/邮箱原文,失败场景没有更可信的展示名)。
+/// `identifier`(提交的用户名/邮箱原文,失败场景没有更可信的展示名)。`tenant_id` 同理:
+/// 只有 `admin_access_denied`(登录已选定了租户)才有。
 pub fn failure_data(
     ctx: &ClientContext,
     channel: AuthChannel,
     user_id: Option<Uuid>,
     identifier: Option<&str>,
     reason: FailureReason,
+    tenant_id: Option<Uuid>,
 ) -> Value {
     json!({
         "occurred_at": now_rfc3339(),
         "channel": channel,
         "outcome": "failure",
         "user_id": user_id,
+        "tenant_id": tenant_id,
         "identifier_attempted": identifier,
         "actor": identifier,
         "failure_reason": reason,

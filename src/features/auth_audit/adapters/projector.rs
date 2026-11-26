@@ -23,6 +23,9 @@ use crate::infra::jetstream::STREAM_NAME;
 struct Envelope {
     r#type: String,
     seq: i64,
+    /// 信封上的租户(`infra::outbox::build_outbox_item` 从 payload 抄出来的);老格式没有这个键 → None。
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
     data: serde_json::Value,
 }
 
@@ -53,6 +56,9 @@ struct AuthEventData {
     user_agent: Option<String>,
     #[serde(default)]
     request_id: Option<String>,
+    /// 事件所在的租户(emit 时写进 payload;信封上那份是它的拷贝)。没有 = 平台上下文 / 登录失败。
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
 }
 fn default_method() -> String {
     "password".into()
@@ -222,6 +228,8 @@ impl AuthEventProjector {
             forwarded_chain: d.forwarded_chain,
             user_agent: d.user_agent,
             request_id: d.request_id,
+            // payload 为准,信封兜底;nil 不是合法租户,当没有。
+            tenant_id: d.tenant_id.or(env.tenant_id).filter(|t| !t.is_nil()),
             event_seq: env.seq,
         };
         // 闭集校验在信任边界:to_row 是唯一解析权威,wire 串不在枚举内 → Poison
@@ -268,6 +276,45 @@ mod tests {
             .await
             .unwrap(); // 同 seq 幂等
         assert_eq!(repo.len(), 1);
+    }
+
+    /// 多租户:事件带 `tenant_id`(payload 里)→ 落行记下;没带 → None;`auth.tenant_switched` 是已知类型。
+    #[tokio::test]
+    async fn auth_event_records_tenant() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        let tenant = uuid::Uuid::now_v7();
+        let row = AuthEventProjector::apply_message(
+            repo.as_ref(),
+            &envelope(
+                1,
+                "auth.tenant_switched",
+                json!({
+                    "occurred_at": "2026-11-25T10:00:00Z", "channel": "public", "outcome": "success",
+                    "user_id": uuid::Uuid::now_v7(), "tenant_id": tenant,
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("已知类型应落库");
+        assert_eq!(row.event_type, AuthEventType::TenantSwitched);
+        assert_eq!(row.tenant_id, Some(tenant));
+
+        let row = AuthEventProjector::apply_message(
+            repo.as_ref(),
+            &envelope(
+                2,
+                "auth.login_failed",
+                json!({
+                    "occurred_at": "2026-11-25T10:00:00Z", "channel": "public", "outcome": "failure",
+                    "failure_reason": "bad_password",
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.tenant_id, None, "登录失败没有租户");
     }
 
     #[tokio::test]

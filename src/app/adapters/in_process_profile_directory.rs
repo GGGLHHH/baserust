@@ -1,4 +1,5 @@
-//! `users::ProfileDirectory` 的**进程内适配器**:复用 app 的 `ProfileRepo` 批量读 + 映射成 `ProfileBrief`。
+//! `users::ProfileDirectory` / `tenants::MemberProfiles` 的**进程内适配器**:复用 app 的 `ProfileRepo` 批量读 +
+//! 映射成各自的瘦快照(两个消费方各定义自己的端口,同一份资料源)。
 //! 薄翻译(map + 转调,无业务判断)。单体 `Both` 用它;分进程 idm(无 app pool)→ `StaticProfileDirectory::empty()`。
 //! avatar_url 复用 profile 现成口径:`avatar_content_id` → 相对 preview 路径;无绑定 → None。
 
@@ -9,6 +10,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::features::profile::ProfileRepo;
+use crate::features::tenants::{MemberProfile, MemberProfiles};
 use crate::features::users::{ProfileBrief, ProfileDirectory};
 use crate::kernel::error::AppError;
 
@@ -46,6 +48,26 @@ impl ProfileDirectory for InProcessProfileDirectory {
     }
 }
 
+#[async_trait]
+impl MemberProfiles for InProcessProfileDirectory {
+    async fn batch(&self, user_ids: &[Uuid]) -> Result<HashMap<Uuid, MemberProfile>, AppError> {
+        // 同一份映射口径(display_name + 相对头像路径),换成 tenants 的瘦类型。
+        Ok(ProfileDirectory::batch(self, user_ids)
+            .await?
+            .into_iter()
+            .map(|(id, b)| {
+                (
+                    id,
+                    MemberProfile {
+                        display_name: b.display_name,
+                        avatar_url: b.avatar_url,
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,7 +96,9 @@ mod tests {
 
         let dir = InProcessProfileDirectory::new(repo);
         let missing = Uuid::now_v7();
-        let got = dir.batch(&[with_avatar, no_avatar, missing]).await.unwrap();
+        let got = ProfileDirectory::batch(&dir, &[with_avatar, no_avatar, missing])
+            .await
+            .unwrap();
 
         assert_eq!(
             got.get(&with_avatar).unwrap().display_name.as_deref(),
@@ -89,5 +113,15 @@ mod tests {
         assert!(brief.avatar_url.is_none());
         // 查不到的 id 不进 map(调用方降级 null)
         assert!(!got.contains_key(&missing));
+
+        // tenants 的端口:同一份口径
+        let members = MemberProfiles::batch(&dir, &[with_avatar, missing])
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[&with_avatar].avatar_url.as_deref(),
+            Some(format!("/api/v1/frontend/profiles/{with_avatar}/avatar").as_str())
+        );
     }
 }

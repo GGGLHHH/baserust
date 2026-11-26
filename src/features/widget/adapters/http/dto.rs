@@ -11,6 +11,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::features::widget::{events, model, ports};
+use crate::kernel::error::AppError;
+use crate::kernel::tenant::TenantId;
 
 /// 一个 widget(示例资源)+ 基础审计字段。时间是 RFC3339。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -148,16 +150,21 @@ pub struct WidgetStats {
 }
 
 /// widget 变更事件(SSE 帧 data / 总线负载)。帧的 event name = `type` 标签(created/updated/deleted)。
+/// `tenant_id` = 事件所属租户:总线跨实例扇出(PG NOTIFY / NATS)时靠它让订阅侧先按租户过滤;
+/// SSE 帧里它总是订阅者自己的当前租户(别的租户的帧在 handler 里就跳过了)。
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WidgetEvent {
     Created {
+        tenant_id: Uuid,
         widget: Widget,
     },
     Updated {
+        tenant_id: Uuid,
         widget: Widget,
     },
     Deleted {
+        tenant_id: Uuid,
         id: Uuid,
         created_by: Option<String>,
     },
@@ -166,28 +173,51 @@ pub enum WidgetEvent {
 impl From<events::WidgetEvent> for WidgetEvent {
     fn from(e: events::WidgetEvent) -> Self {
         match e {
-            events::WidgetEvent::Created { widget } => Self::Created {
+            events::WidgetEvent::Created { tenant_id, widget } => Self::Created {
+                tenant_id: tenant_id.as_uuid(),
                 widget: widget.into(),
             },
-            events::WidgetEvent::Updated { widget } => Self::Updated {
+            events::WidgetEvent::Updated { tenant_id, widget } => Self::Updated {
+                tenant_id: tenant_id.as_uuid(),
                 widget: widget.into(),
             },
-            events::WidgetEvent::Deleted { id, created_by } => Self::Deleted { id, created_by },
+            events::WidgetEvent::Deleted {
+                tenant_id,
+                id,
+                created_by,
+            } => Self::Deleted {
+                tenant_id: tenant_id.as_uuid(),
+                id,
+                created_by,
+            },
         }
     }
 }
 
-impl From<WidgetEvent> for events::WidgetEvent {
-    fn from(e: WidgetEvent) -> Self {
-        match e {
-            WidgetEvent::Created { widget } => Self::Created {
+/// 线格式 → 领域事件(总线订阅侧)。`tenant_id` 是 nil → 拒(nil 永远不是合法租户),订阅侧当坏 payload 跳过。
+impl TryFrom<WidgetEvent> for events::WidgetEvent {
+    type Error = AppError;
+
+    fn try_from(e: WidgetEvent) -> Result<Self, Self::Error> {
+        Ok(match e {
+            WidgetEvent::Created { tenant_id, widget } => Self::Created {
+                tenant_id: TenantId::new(tenant_id)?,
                 widget: widget.into(),
             },
-            WidgetEvent::Updated { widget } => Self::Updated {
+            WidgetEvent::Updated { tenant_id, widget } => Self::Updated {
+                tenant_id: TenantId::new(tenant_id)?,
                 widget: widget.into(),
             },
-            WidgetEvent::Deleted { id, created_by } => Self::Deleted { id, created_by },
-        }
+            WidgetEvent::Deleted {
+                tenant_id,
+                id,
+                created_by,
+            } => Self::Deleted {
+                tenant_id: TenantId::new(tenant_id)?,
+                id,
+                created_by,
+            },
+        })
     }
 }
 
@@ -207,20 +237,42 @@ mod tests {
             updated_by: None,
             updated_at: now,
         };
+        let t = TenantId::new(Uuid::now_v7()).unwrap();
         for e in [
-            events::WidgetEvent::Created { widget: w.clone() },
-            events::WidgetEvent::Updated { widget: w.clone() },
+            events::WidgetEvent::Created {
+                tenant_id: t,
+                widget: w.clone(),
+            },
+            events::WidgetEvent::Updated {
+                tenant_id: t,
+                widget: w.clone(),
+            },
             events::WidgetEvent::Deleted {
+                tenant_id: t,
                 id: w.id,
                 created_by: None,
             },
         ] {
             let wire = serde_json::to_value(WidgetEvent::from(e.clone())).unwrap();
             assert_eq!(wire["type"].as_str(), Some(e.name()));
-            // 往返:线格式 → 领域,无损
-            let back: events::WidgetEvent =
-                serde_json::from_value::<WidgetEvent>(wire).unwrap().into();
+            // 租户随线格式走(跨实例总线负载靠它让订阅侧先按租户过滤)
+            assert_eq!(wire["tenant_id"], serde_json::json!(t.as_uuid()));
+            // 往返:线格式 → 领域,无损(含租户)
+            let back =
+                events::WidgetEvent::try_from(serde_json::from_value::<WidgetEvent>(wire).unwrap())
+                    .unwrap();
             assert_eq!(back, e);
         }
+    }
+
+    /// 负载里的 nil 租户 → 转领域事件失败(订阅侧当坏 payload 跳过,不当成任何租户的事件)。
+    #[test]
+    fn nil_tenant_on_the_wire_is_rejected() {
+        let wire = WidgetEvent::Deleted {
+            tenant_id: Uuid::nil(),
+            id: Uuid::now_v7(),
+            created_by: None,
+        };
+        assert!(events::WidgetEvent::try_from(wire).is_err());
     }
 }

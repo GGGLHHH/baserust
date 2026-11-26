@@ -175,18 +175,20 @@ impl Service {
     }
 }
 
-/// 归 idm 的接口前缀:与 nginx.conf 把请求转给 idm 容器的规则相同(`^/api/v1/(public|frontend|admin)/auth/`)。
-const IDM_ROUTE_PREFIXES: [&str; 3] = [
+/// 归 idm 的接口前缀:与 nginx.conf 把请求转给 idm 容器的规则相同(`^/api/v1/((public|frontend|admin)/auth|admin/platform)/`)。
+const IDM_ROUTE_PREFIXES: [&str; 4] = [
     "/api/v1/public/auth/",
     "/api/v1/frontend/auth/",
     "/api/v1/admin/auth/",
+    "/api/v1/admin/platform/",
 ];
 
 /// 归 idm 的代码模块(生产上它们只装在 idm 进程里):认证、后台用户管理、认证审计、搜索投影,以及 idm 领域库。
-const IDM_TARGETS: [&str; 5] = [
+const IDM_TARGETS: [&str; 6] = [
     "idm",
     "baserust::features::auth",
     "baserust::features::users",
+    "baserust::features::tenants",
     "baserust::features::auth_audit",
     "baserust::features::search",
 ];
@@ -573,6 +575,18 @@ mod tests {
                 "baserust::infra::http::error",
                 Some("/api/v1/admin/auth/users/{id}")
             ),
+            Service::Idm
+        );
+        assert_eq!(
+            c(
+                "baserust::infra::http::error",
+                Some("/api/v1/admin/platform/tenants/{id}")
+            ),
+            Service::Idm,
+            "平台租户管理归 idm(nginx 同样转给 idm)"
+        );
+        assert_eq!(
+            c("baserust::features::tenants::adapters::http", None),
             Service::Idm
         );
         assert_eq!(

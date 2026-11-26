@@ -20,6 +20,7 @@ use baserust::features::widget::{
     EventBus, InMemoryWidgetRepo, MemoryEventBus, StaticUserDirectory, WidgetService,
 };
 use baserust::kernel::authz::{Perm, Policy};
+use baserust::kernel::tenant::DEFAULT_TENANT_ID;
 use idm::{
     AuthService, FakeHasher, InMemoryOutboxRepo, InMemoryRoleRepo, InMemorySessionRepo,
     InMemoryUserRepo, OutboxRecord, OutboxRepo, RoleRepo,
@@ -29,7 +30,7 @@ const PASSWORD: &str = "password123";
 
 /// 内存 app:auth 用**共享** idm user/role repo(admin_login 用例要直接授角色,无 HTTP 授角色端点
 /// 可用);`AppState.idm_outbox` 装 `InMemoryOutboxRepo`(与 user repo 共享存储,镜像
-/// `idm::InMemoryOutboxRepo::sharing_with` 的既有约定)。`policy`:role "admin" → `AdminLogin`。
+/// `idm::InMemoryOutboxRepo::sharing_with` 的既有约定)。`policy`:租户角色 "admin" → `AdminLogin`,平台角色 "ops" → `UsersAdmin`。
 async fn test_app() -> (Router, Arc<InMemoryOutboxRepo>, Arc<dyn RoleRepo>) {
     test_app_with_config(baserust::infra::config::Config::default()).await
 }
@@ -39,24 +40,53 @@ async fn test_app() -> (Router, Arc<InMemoryOutboxRepo>, Arc<dyn RoleRepo>) {
 async fn test_app_with_config(
     config: baserust::infra::config::Config,
 ) -> (Router, Arc<InMemoryOutboxRepo>, Arc<dyn RoleRepo>) {
+    let t = tenancy_app(config).await;
+    (t.app, t.outbox, t.roles)
+}
+
+/// 完整 harness:多带租户 / 成员仓储(与用户仓储共享存储),多租户用例自己建租户、加成员。
+struct Harness {
+    app: Router,
+    outbox: Arc<InMemoryOutboxRepo>,
+    roles: Arc<dyn RoleRepo>,
+    tenants: Arc<dyn idm::TenantRepo>,
+    members: Arc<dyn idm::MemberRepo>,
+}
+
+async fn tenancy_app(config: baserust::infra::config::Config) -> Harness {
     let signer = Arc::new(AppTokenSigner::dev());
     let verifier = Arc::new(AppTokenVerifier::dev());
 
     let mem_users = InMemoryUserRepo::new();
     let mem_roles = InMemoryRoleRepo::sharing_with(&mem_users);
     let outbox = Arc::new(InMemoryOutboxRepo::sharing_with(&mem_users));
+    let members_repo: Arc<dyn idm::MemberRepo> =
+        Arc::new(idm::InMemoryMemberRepo::sharing_with(&mem_users));
+    let sessions_repo: Arc<dyn idm::SessionRepo> =
+        Arc::new(InMemorySessionRepo::sharing_with(&mem_users));
+    let tenants_repo: Arc<dyn idm::TenantRepo> =
+        Arc::new(idm::InMemoryTenantRepo::sharing_with(&mem_users));
 
     let users_repo: Arc<dyn idm::UserRepo> = Arc::new(mem_users);
     let roles_repo: Arc<dyn RoleRepo> = Arc::new(mem_roles);
-    let sessions_repo: Arc<dyn idm::SessionRepo> = Arc::new(InMemorySessionRepo::new());
+    // 注册加入默认租户并授租户角色 user:目录里要有它(否则注册响亮失败)。
+    roles_repo
+        .upsert("user", "User", idm::RoleScope::Tenant, None)
+        .await
+        .unwrap();
 
-    let auth = AuthService::builder(users_repo.clone(), sessions_repo, roles_repo.clone())
-        .hasher(Arc::new(FakeHasher))
-        .signer(signer.clone())
-        .verifier(verifier.clone())
-        .access_ttl_secs(900)
-        .refresh_ttl_secs(604_800)
-        .build();
+    let auth = AuthService::builder(
+        users_repo.clone(),
+        sessions_repo,
+        roles_repo.clone(),
+        members_repo.clone(),
+    )
+    .hasher(Arc::new(FakeHasher))
+    .signer(signer.clone())
+    .verifier(verifier.clone())
+    .access_ttl_secs(900)
+    .refresh_ttl_secs(604_800)
+    .build();
 
     let profile_repo: Arc<dyn baserust::features::profile::ProfileRepo> =
         Arc::new(InMemoryProfileRepo::new());
@@ -70,7 +100,11 @@ async fn test_app_with_config(
         None,
     );
 
-    let policy = Policy::from_roles([("admin".to_owned(), vec![Perm::AdminLogin])]);
+    // admin(租户角色)→ admin:login;ops(平台角色)→ users:admin(平台管理员凭平台级权限进后台)。
+    let policy = Policy::from_roles([
+        ("admin".to_owned(), vec![Perm::AdminLogin]),
+        ("ops".to_owned(), vec![Perm::UsersAdmin]),
+    ]);
     let bus: Arc<dyn EventBus> = Arc::new(MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
@@ -83,6 +117,15 @@ async fn test_app_with_config(
         contents: test_contents(),
         auth,
         user_admin,
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -92,9 +135,18 @@ async fn test_app_with_config(
         idm_outbox: Some(outbox.clone() as Arc<dyn OutboxRepo>),
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     let app = build_router(state, &config, Mount::Both);
-    (app, outbox, roles_repo)
+    Harness {
+        app,
+        outbox,
+        roles: roles_repo,
+        tenants: tenants_repo,
+        members: members_repo,
+    }
 }
 
 fn test_contents() -> content::ContentService {
@@ -412,8 +464,12 @@ async fn admin_login_success_emits_login_succeeded_admin_channel() {
         .unwrap()
         .parse()
         .unwrap();
-    let admin_role_id = roles_repo.upsert("admin", "Admin", None).await.unwrap();
-    roles_repo.grant(id, admin_role_id, None).await.unwrap();
+    // 平台角色 ops(有平台级权限)→ 后台准入(不依赖租户角色)
+    let ops_role_id = roles_repo
+        .upsert("ops", "Ops", idm::RoleScope::Platform, None)
+        .await
+        .unwrap();
+    roles_repo.grant(id, ops_role_id, None).await.unwrap();
 
     let resp = login(&app, "/api/v1/admin/auth/login", "boss", PASSWORD).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -529,4 +585,115 @@ async fn login_headers_use_configured_trusted_hops_not_extractor_default() {
         "trusted_hops=2 须从 config 接线到提取器 → 取 XFF[len-2];\
          若只是巧合/兜底值 1,会解成 XFF[len-1]=\"10.0.0.1\""
     );
+}
+
+// ── 多租户:事件 payload 带 tenant_id(outbox 信封据此抄出,auth_event 据此记租户) ──
+
+/// 建好默认租户的 harness:注册即加入默认租户(角色 user),登录进入默认租户。
+async fn tenancy_harness() -> Harness {
+    let h = tenancy_app(baserust::infra::config::Config::default()).await;
+    h.tenants
+        .upsert_fixed(DEFAULT_TENANT_ID.as_uuid(), "default", "Default", None)
+        .await
+        .unwrap();
+    h
+}
+
+async fn all_events(outbox: &InMemoryOutboxRepo) -> Vec<OutboxRecord> {
+    outbox.poll_unpublished(1000).await.unwrap()
+}
+
+#[tokio::test]
+async fn login_success_event_carries_tenant_id() {
+    let h = tenancy_harness().await;
+    register(&h.app, "alice", PASSWORD).await;
+    let resp = login(&h.app, "/api/v1/public/auth/login", "alice", PASSWORD).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ev = find_event(&h.outbox, "auth.login_succeeded")
+        .await
+        .expect("应发 auth.login_succeeded");
+    assert_eq!(
+        ev.payload["tenant_id"],
+        DEFAULT_TENANT_ID.as_uuid().to_string(),
+        "登录进入的租户记在 payload 上"
+    );
+}
+
+#[tokio::test]
+async fn login_failure_event_has_no_tenant_id() {
+    let h = tenancy_harness().await;
+    register(&h.app, "alice", PASSWORD).await;
+    let resp = login(&h.app, "/api/v1/public/auth/login", "alice", "wrong").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let ev = find_event(&h.outbox, "auth.login_failed")
+        .await
+        .expect("应发 auth.login_failed");
+    assert!(ev.payload["tenant_id"].is_null(), "登录失败没有租户");
+}
+
+#[tokio::test]
+async fn switch_tenant_emits_tenant_switched_only_on_success() {
+    let h = tenancy_harness().await;
+    let reg = register(&h.app, "alice", PASSWORD).await;
+    let user_id: uuid::Uuid = serde_json::from_str::<serde_json::Value>(&body_string(reg).await)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second = h.tenants.create("second", "Second", None).await.unwrap();
+    h.members.add(second.id, user_id, &[], None).await.unwrap();
+    let stranger = h
+        .tenants
+        .create("stranger", "Stranger", None)
+        .await
+        .unwrap();
+
+    let login_resp = login(&h.app, "/api/v1/public/auth/login", "alice", PASSWORD).await;
+    let cookie = format!(
+        "access_token={}; refresh_token={}",
+        cookie_value(&login_resp, "access_token").unwrap(),
+        cookie_value(&login_resp, "refresh_token").unwrap()
+    );
+    let switch = |cookie: String, tenant: uuid::Uuid| {
+        let app = h.app.clone();
+        async move {
+            app.oneshot(req_with_cookie(
+                "POST",
+                "/api/v1/frontend/auth/switch-tenant",
+                &cookie,
+                Some(&format!(r#"{{"tenant_id":"{tenant}"}}"#)),
+            ))
+            .await
+            .unwrap()
+        }
+    };
+
+    // 失败:不是该租户的成员 → 403,不发事件(原会话不动)。
+    let resp = switch(cookie.clone(), stranger.id).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        find_event(&h.outbox, "auth.tenant_switched")
+            .await
+            .is_none(),
+        "切换失败不该发 auth.tenant_switched"
+    );
+
+    // 成功:发 auth.tenant_switched,payload 的 tenant_id = 切换后的租户。
+    let resp = switch(cookie, second.id).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let switched: Vec<OutboxRecord> = all_events(&h.outbox)
+        .await
+        .into_iter()
+        .filter(|r| r.event_type == "auth.tenant_switched")
+        .collect();
+    assert_eq!(switched.len(), 1, "成功切换恰好发一条");
+    let ev = &switched[0];
+    assert_eq!(ev.payload["tenant_id"], second.id.to_string());
+    assert_eq!(ev.payload["user_id"], user_id.to_string());
+    assert_eq!(ev.payload["outcome"], "success");
+    assert!(ev.payload["session_id"].is_string(), "带新会话 id");
+    assert_eq!(ev.aggregate_id, user_id);
 }

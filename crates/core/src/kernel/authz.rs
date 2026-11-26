@@ -19,6 +19,26 @@ use uuid::Uuid;
 use crate::kernel::error::AppError;
 use idm::AuthUser;
 
+/// 权限的**作用域**(spec §4.3)。有效权限 = 平台角色给的**平台级**权限 ∪ 当前租户角色给的**租户级**权限;
+/// 平台角色不自动获得任何租户的租户级权限,租户角色也拿不到平台级权限。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PermScope {
+    /// 平台级:跨租户的管理能力(账号管理、系统监控、租户管理、按 id 读写全局资料)。只由平台角色(token `roles`)授予。
+    Platform,
+    /// 租户级:租户内的业务能力(widget、content、后台准入…)。只由当前租户角色(`tenant_roles`)授予,
+    /// 且 token 必须带当前租户,否则 403 `tenant_required`。
+    Tenant,
+}
+
+impl From<idm::RoleScope> for PermScope {
+    fn from(s: idm::RoleScope) -> Self {
+        match s {
+            idm::RoleScope::Platform => PermScope::Platform,
+            idm::RoleScope::Tenant => PermScope::Tenant,
+        }
+    }
+}
+
 /// 权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。
 /// wire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。
 /// 加权限 = 加一个变体 + `rename`,别处不动。
@@ -50,11 +70,34 @@ pub enum Perm {
     ContentWriteAll,
     #[serde(rename = "contents:delete")]
     ContentDelete,
+    /// 账号管理(平台级):建号 / 改账号信息 / 重置密码 / 删号 / 授平台角色、后台改任意人的资料。
+    /// 平台管理员与 superadmin 都持;对**持有平台角色的账号**动手另要 [`Perm::PlatformRoles`](只有 superadmin)。
     #[serde(rename = "users:admin")]
     UsersAdmin,
-    /// 后台准入(backend gate)。`/api/v1/admin` 组闸 + admin_login 自查用它。
-    /// 与 `users:admin` **拆开**:admin+superadmin 皆持(能进后台);`users:admin` 仍 superadmin 专属
-    /// (用户管理 + 跨用户列全 widget 等真·超管操作)。故名为 admin 的账号能登后台,但仍够不到 superadmin 专属端点。
+    /// 租户管理(平台级):建 / 改名 / 停用租户、管理任意租户的成员。平台管理员与 superadmin 都持。
+    #[serde(rename = "tenants:admin")]
+    TenantsAdmin,
+    /// 运维(平台级,superadmin 独占):后台「系统监控」(实时 / 历史指标 / 日志查询)。
+    #[serde(rename = "ops:read")]
+    OpsRead,
+    /// 认证审计(平台级,superadmin 独占):登录日志查询 / 统计 / 实时流、某账号的认证事件。
+    #[serde(rename = "audit:read")]
+    AuditRead,
+    /// 平台角色管理(平台级,superadmin 独占):授予 / 撤销平台角色(任命平台管理员),
+    /// 以及对**持有任一平台角色的账号**做账号管理写操作、在组织里改角色 / 移出(防接管)。
+    /// superadmin 角色本身不经任何接口授予 / 撤销(只由 seed 声明),这条权限也授不出它。
+    #[serde(rename = "platform:roles")]
+    PlatformRoles,
+    /// 本租户成员列表(租户级):租户管理员看「成员」页。
+    #[serde(rename = "members:read")]
+    MembersRead,
+    /// 本租户成员管理(租户级):按用户名把已有账号加进本租户、设租户角色、移出。**不能**建账号 / 改密 / 删号
+    /// (账号是全局的,那是平台级 `users:admin`)。
+    #[serde(rename = "members:admin")]
+    MembersAdmin,
+    /// 后台准入(backend gate,租户级)。`/api/v1/admin` 组闸 + admin_login 自查用它。
+    /// 与平台级权限**拆开**:租户 admin 持它进后台;平台角色(平台管理员 / superadmin)凭任一平台级权限进后台。
+    /// 故名为 admin 的租户管理员能登后台,但够不到账号管理 / 监控等平台能力。
     #[serde(rename = "admin:login")]
     AdminLogin,
     #[serde(rename = "profiles:read")]
@@ -78,7 +121,7 @@ impl Perm {
     /// seed 权限词表都从它派生 —— 漏一个变体 = superadmin 静默缺权 + 该 scope 不进文档 + 不入库,
     /// 且两个看似能拦住的测试都拦不住(它们两边都从 `ALL` 派生,自洽通过)。
     /// 要根治:用声明宏单源展开 enum + `ALL` + 各投影,让"漏项"不可表达。
-    pub const ALL: [Perm; 15] = [
+    pub const ALL: [Perm; 21] = [
         Perm::WidgetRead,
         Perm::WidgetReadAll,
         Perm::WidgetWrite,
@@ -90,6 +133,12 @@ impl Perm {
         Perm::ContentWriteAll,
         Perm::ContentDelete,
         Perm::UsersAdmin,
+        Perm::TenantsAdmin,
+        Perm::OpsRead,
+        Perm::AuditRead,
+        Perm::PlatformRoles,
+        Perm::MembersRead,
+        Perm::MembersAdmin,
         Perm::AdminLogin,
         Perm::ProfileRead,
         Perm::ProfileWrite,
@@ -111,6 +160,11 @@ impl Perm {
             | Perm::ContentWriteAll
             | Perm::ContentDelete => "contents",
             Perm::UsersAdmin => "users",
+            Perm::TenantsAdmin => "tenants",
+            Perm::OpsRead => "ops",
+            Perm::AuditRead => "audit",
+            Perm::PlatformRoles => "platform",
+            Perm::MembersRead | Perm::MembersAdmin => "members",
             Perm::AdminLogin => "admin",
             Perm::ProfileRead | Perm::ProfileWrite | Perm::ProfileWriteAll => "profiles",
         }
@@ -125,7 +179,10 @@ impl Perm {
             Perm::ContentRead | Perm::ContentReadAll => "read",
             Perm::ContentWrite | Perm::ContentWriteAll => "write",
             Perm::ContentDelete => "delete",
-            Perm::UsersAdmin => "admin",
+            Perm::UsersAdmin | Perm::TenantsAdmin | Perm::MembersAdmin => "admin",
+            Perm::MembersRead | Perm::OpsRead | Perm::AuditRead => "read",
+            // 「平台角色」:动作即管理平台角色(`platform:roles`,用户 2026-11-26 定名,不硬凑动词)
+            Perm::PlatformRoles => "roles",
             Perm::AdminLogin => "login",
             Perm::ProfileRead => "read",
             Perm::ProfileWrite | Perm::ProfileWriteAll => "write",
@@ -170,6 +227,38 @@ impl Perm {
         }
     }
 
+    /// 作用域(**穷尽 match**:加变体编译不过,逼你判断它是平台级还是租户级)。
+    ///
+    /// `admin:login`(后台准入)是**租户级**:租户管理员靠它进后台。平台管理员不靠它 —— 持有任一平台级
+    /// 权限即可进后台(见 [`Policy::require_admin_entry`])。
+    pub fn scope(&self) -> PermScope {
+        match self {
+            // 资料全局一份(spec §6.2):按 id 读 / 改任何人的资料是平台级能力,租户管理员没有;
+            // 本人读 / 改自己的资料走 `/profiles/me`(仅登录,不需要权限)。
+            Perm::UsersAdmin
+            | Perm::TenantsAdmin
+            | Perm::OpsRead
+            | Perm::AuditRead
+            | Perm::PlatformRoles
+            | Perm::ProfileRead
+            | Perm::ProfileWrite
+            | Perm::ProfileWriteAll => PermScope::Platform,
+            Perm::WidgetRead
+            | Perm::WidgetReadAll
+            | Perm::WidgetWrite
+            | Perm::WidgetWriteAll
+            | Perm::WidgetDelete
+            | Perm::ContentRead
+            | Perm::ContentReadAll
+            | Perm::ContentWrite
+            | Perm::ContentWriteAll
+            | Perm::ContentDelete
+            | Perm::MembersRead
+            | Perm::MembersAdmin
+            | Perm::AdminLogin => PermScope::Tenant,
+        }
+    }
+
     /// 人读说明(落 `permissions` 表 / 权限清单)。曾在 `seed.toml` `[[permissions]]`,
     /// 现收进代码 —— **enum 是唯一真相**,词表不再另存镜像。
     pub fn description(&self) -> &'static str {
@@ -184,24 +273,42 @@ impl Perm {
             Perm::ContentWrite => "创建 / 上传 / 修改内容与元数据",
             Perm::ContentWriteAll => "修改 / 删除任何人的内容(而非仅自己)",
             Perm::ContentDelete => "删除内容",
-            Perm::UsersAdmin => "用户管理(superadmin 专属)",
+            Perm::UsersAdmin => {
+                "账号管理:建号 / 改账号信息 / 重置密码 / 删号、后台改资料(平台级;平台管理员 + superadmin)"
+            }
+            Perm::TenantsAdmin => {
+                "租户管理:建 / 改名 / 停用租户、管理任意租户的成员(平台级;平台管理员 + superadmin)"
+            }
+            Perm::OpsRead => "运维:系统监控、历史指标、日志查询(superadmin 独占)",
+            Perm::AuditRead => "认证审计:登录日志查询 / 统计 / 实时流(superadmin 独占)",
+            Perm::PlatformRoles => {
+                "平台角色管理:任命 / 撤销平台管理员,管理持有平台角色的账号(superadmin 独占)"
+            }
+            Perm::MembersRead => "查看本租户的成员列表(租户级)",
+            Perm::MembersAdmin => {
+                "管理本租户的成员:按用户名加入已有账号、设租户角色、移出(租户级;不能建账号 / 改密 / 删号)"
+            }
             Perm::AdminLogin => {
                 "后台准入:登进 /admin 组(admin + superadmin 皆持;与 users:admin 拆开)"
             }
-            Perm::ProfileRead => "查看任意用户资料",
-            Perm::ProfileWrite => "修改自己的资料",
-            Perm::ProfileWriteAll => "修改任何人的资料(而非仅自己)",
+            Perm::ProfileRead => "按 id 查看任意用户资料(平台级;本人读自己走 /profiles/me)",
+            Perm::ProfileWrite => "按 id 修改资料(平台级;本人改自己走 /profiles/me)",
+            Perm::ProfileWriteAll => "按 id 修改任何人的资料(平台级,而非仅自己)",
         }
     }
 }
 
 /// 角色名的**唯一真相**(封闭集)。角色本身不做动态 CRUD(角色**有哪些权限**才可运行时改,
 /// 见 `role_permissions` 表);故角色集编进代码。wire 串经 `rename`,与 idm.roles.name / JWT
-/// claim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`default_permissions`。
+/// claim / `role_permissions.role_name` 同源。加角色 = 加变体 + 补 `ALL`/`display_name`/`scope`/`default_permissions`。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum RoleName {
+    /// 超级管理员(平台角色,**只有一个**,只由 seed 声明,不经任何接口授予 / 撤销)。
     #[serde(rename = "superadmin")]
     Superadmin,
+    /// 平台管理员(平台角色):superadmin 独占项(运维 / 认证审计 / 平台角色管理)以外的平台能力。
+    #[serde(rename = "platform_admin")]
+    PlatformAdmin,
     #[serde(rename = "admin")]
     Admin,
     #[serde(rename = "user")]
@@ -212,14 +319,29 @@ impl RoleName {
     /// 全部变体(seed / 目录 / round-trip 测试用)。
     /// 加变体必补这里 —— 同 `Perm::ALL`,**漏了没有任何东西会发现**(数组字面量,不编译失败;
     /// round-trip 测试遍历的就是它)。`as_str()` 的穷尽 match 会逼你回到本 impl,但补 `ALL` 靠自觉。
-    pub const ALL: [RoleName; 3] = [RoleName::Superadmin, RoleName::Admin, RoleName::User];
+    pub const ALL: [RoleName; 4] = [
+        RoleName::Superadmin,
+        RoleName::PlatformAdmin,
+        RoleName::Admin,
+        RoleName::User,
+    ];
 
     /// wire 串(== serde `rename`;单一来源,`role_name_wire_matches` 测试钉死不漂移)。
     pub fn as_str(&self) -> &'static str {
         match self {
             RoleName::Superadmin => "superadmin",
+            RoleName::PlatformAdmin => "platform_admin",
             RoleName::Admin => "admin",
             RoleName::User => "user",
+        }
+    }
+
+    /// 角色作用域(seed 写 idm `roles.scope`):superadmin / platform_admin 是**平台角色**(经 `user_roles`、进 JWT `roles`);
+    /// admin / user 是**租户角色**(经 `member_roles` 按租户授予)。同一角色名只属于一类(spec §4.1)。
+    pub fn scope(&self) -> idm::RoleScope {
+        match self {
+            RoleName::Superadmin | RoleName::PlatformAdmin => idm::RoleScope::Platform,
+            RoleName::Admin | RoleName::User => idm::RoleScope::Tenant,
         }
     }
 
@@ -227,16 +349,24 @@ impl RoleName {
     pub fn display_name(&self) -> &'static str {
         match self {
             RoleName::Superadmin => "超级管理员",
+            RoleName::PlatformAdmin => "平台管理员",
             RoleName::Admin => "管理员",
             RoleName::User => "普通用户",
         }
     }
 
     /// **bootstrap 默认**权限(seed 写进 `role_permissions`,`ON CONFLICT DO NOTHING` 不覆盖运行期改动)。
-    /// superadmin = `Perm::ALL`(随闭集自动增长,消除"加权限忘补超管"漂移)。运行期真值以库为准。
+    /// 每个角色只配**与自己作用域相同**的权限(跨作用域的行载入时会被忽略,见 [`Policy::from_roles`])。
+    /// superadmin = 全部**平台级**权限(随闭集自动增长,消除"加平台权限忘补超管"漂移);它的租户级能力
+    /// 来自在租户里兼任的租户角色(默认租户的 admin)。platform_admin = 全部平台级权限**减去** superadmin 独占的
+    /// [`SUPERADMIN_ONLY`](运维 / 认证审计 / 平台角色管理)。运行期真值以库为准。
     pub fn default_permissions(&self) -> Vec<Perm> {
+        let platform = Perm::ALL
+            .into_iter()
+            .filter(|p| p.scope() == PermScope::Platform);
         match self {
-            RoleName::Superadmin => Perm::ALL.to_vec(),
+            RoleName::Superadmin => platform.collect(),
+            RoleName::PlatformAdmin => platform.filter(|p| !SUPERADMIN_ONLY.contains(p)).collect(),
             RoleName::Admin => vec![
                 Perm::WidgetRead,
                 Perm::WidgetReadAll,
@@ -248,20 +378,27 @@ impl RoleName {
                 Perm::ContentWrite,
                 Perm::ContentWriteAll,
                 Perm::ContentDelete,
-                Perm::ProfileRead,
-                Perm::ProfileWrite,
-                Perm::ProfileWriteAll,
+                Perm::MembersRead,
+                Perm::MembersAdmin,
                 Perm::AdminLogin,
             ],
-            RoleName::User => vec![
-                Perm::WidgetRead,
-                Perm::ContentRead,
-                Perm::ContentWrite,
-                Perm::ProfileRead,
-                Perm::ProfileWrite,
-            ],
+            RoleName::User => vec![Perm::WidgetRead, Perm::ContentRead, Perm::ContentWrite],
         }
     }
+}
+
+/// superadmin 独占的平台级权限:平台管理员默认不给(运维、认证审计、平台角色管理)。
+pub const SUPERADMIN_ONLY: [Perm; 3] = [Perm::OpsRead, Perm::AuditRead, Perm::PlatformRoles];
+
+/// 这组**原始**平台角色名(`user_roles` 原样,未经闭集过滤)里有没有平台角色 —— 防接管闸用它判断目标账号。
+/// 闭集内按 [`RoleName::scope`];**闭集外的名字一律算平台角色**(fail-closed:`user_roles` 里本就只该有平台角色,
+/// 运维手工塞的未知角色可能持有真权限,宁可让 superadmin 来管,也不让闸因脏数据失明)。闭集内的租户角色
+/// (多租户之前遗留在 `user_roles` 的 admin / user 行,不生效)不算。
+pub fn holds_platform_role(raw_role_names: &[String]) -> bool {
+    raw_role_names.iter().any(|n| {
+        n.parse::<RoleName>()
+            .map_or(true, |r| r.scope() == idm::RoleScope::Platform)
+    })
 }
 
 impl RoleName {
@@ -307,7 +444,10 @@ impl std::str::FromStr for RoleName {
 
 /// role → 权限集。默认从 `RoleName::default_permissions()` 派生(见 `app::seed::SeedData::policy`);
 /// 设 `APP_DB_HOST` 时改从 `role_permissions` 表载(运行期可改)。装进 `AppState`
-/// (`Arc`,廉价 Clone)。**不可变**:载入一次,运行期只读。
+/// (`Arc`,廉价 Clone)。**不可变**:启动时载入一次,运行期只读。
+///
+/// **作用域**(spec §4.3):平台角色(token `roles`)只贡献平台级权限,当前租户角色(`tenant_roles`)只贡献
+/// 租户级权限;token 没带当前租户时租户角色一律不算。闭集内角色的跨作用域映射行载入时 WARN 并忽略(§6.1)。
 #[derive(Default, Debug)]
 pub struct Policy {
     by_role: HashMap<String, HashSet<Perm>>,
@@ -316,11 +456,29 @@ pub struct Policy {
 impl Policy {
     /// 从 (role 名, 权限) 序列构建。同名 role 的权限取并集;权限为空的 role 也建条目(算"已覆盖")。
     /// **载入期按 `implies` 展开**(`read:all ⇒ read`):配 `read:all` 即自动有 `read`,从根消除漏底权 footgun。
+    ///
+    /// **跨作用域的行 WARN 并忽略**(spec §6.1):`RoleName` 闭集内的角色作用域已知(`RoleName::scope`),
+    /// 映射到别的作用域的权限(如库里遗留的 `superadmin → widgets:read`)不进策略。闭集外的角色名
+    /// (测试 / 下游自定义)作用域未知,载入时不过滤 —— 判定时 [`Self::perms_for`] 仍按权限作用域只取对的那一半。
     pub fn from_roles(roles: impl IntoIterator<Item = (String, Vec<Perm>)>) -> Self {
         let mut by_role: HashMap<String, HashSet<Perm>> = HashMap::new();
         for (role, perms) in roles {
-            let set = by_role.entry(role).or_default();
+            let role_scope = role
+                .parse::<RoleName>()
+                .ok()
+                .map(|r| PermScope::from(r.scope()));
+            let set = by_role.entry(role.clone()).or_default();
             for p in perms {
+                if let Some(rs) = role_scope.filter(|rs| *rs != p.scope()) {
+                    tracing::warn!(
+                        role = %role,
+                        permission = %p.wire(),
+                        role_scope = ?rs,
+                        permission_scope = ?p.scope(),
+                        "role_permissions 行跨了作用域(平台角色只取平台级权限、租户角色只取租户级权限),忽略该行"
+                    );
+                    continue;
+                }
                 set.insert(p);
                 set.extend(p.implies().iter().copied());
             }
@@ -328,14 +486,33 @@ impl Policy {
         Self { by_role }
     }
 
-    /// 用户(经其 roles)拥有的全部权限并集。
-    pub fn perms_for(&self, roles: &[String]) -> HashSet<Perm> {
-        roles
-            .iter()
-            .filter_map(|r| self.by_role.get(r))
-            .flatten()
-            .copied()
+    /// 平台角色 + 租户角色给的权限并集:平台角色**只贡献平台级**权限,租户角色**只贡献租户级**权限。
+    /// 纯按角色算,不看 token 有没有当前租户 —— 判定请求用 [`Self::perms_of`]。
+    pub fn perms_for(&self, platform_roles: &[String], tenant_roles: &[String]) -> HashSet<Perm> {
+        let pick = |roles: &[String], scope: PermScope| -> Vec<Perm> {
+            roles
+                .iter()
+                .filter_map(|r| self.by_role.get(r))
+                .flatten()
+                .copied()
+                .filter(|p| p.scope() == scope)
+                .collect()
+        };
+        pick(platform_roles, PermScope::Platform)
+            .into_iter()
+            .chain(pick(tenant_roles, PermScope::Tenant))
             .collect()
+    }
+
+    /// 某个已认证身份按角色拿到的权限(未 ∩ scope)。**没有当前租户时租户角色不算**(防御:token 带了
+    /// `tenant_roles` 却缺 `tenant_id` 是畸形令牌,不让它借租户角色拿权)。
+    pub fn perms_of(&self, user: &AuthUser) -> HashSet<Perm> {
+        let tenant_roles: &[String] = if user.tenant_id.is_some() {
+            &user.tenant_roles
+        } else {
+            &[]
+        };
+        self.perms_for(&user.roles, tenant_roles)
     }
 
     /// **RBAC gate**:用户的 role 给了该权限 → Ok,否则 → 403。token 里的 roles 内存展开,不查库。
@@ -345,14 +522,20 @@ impl Policy {
 
     /// **RBAC + scope gate**:有效权限 = `role 权限 ∩ scope`(`scope` 空 = 无 scope 限制,即满 role 权限)。
     /// scope 只能收窄不能放大 —— 降权令牌(PAT/第三方)即便 role 够,scope 没给也拒。
+    ///
+    /// 租户级权限要求 token 带**当前租户**:没有 → `AppError::TenantRequired`(403 `tenant_required`),
+    /// 不论角色(平台管理员也一样,不能借平台角色读租户数据)。
     pub fn require_scoped(
         &self,
         user: &AuthUser,
         scope: &[Perm],
         perm: Perm,
     ) -> Result<(), AppError> {
-        let role_grants = self.perms_for(&user.roles).contains(&perm); // role 侧已在 from_roles 展开 implies
-                                                                       // scope 侧同样吃 implies:scope 含 `read:all` 即视为含 `read`,与 role 侧一致,降权令牌不踩漏底权坑。
+        if perm.scope() == PermScope::Tenant && user.tenant_id.is_none() {
+            return Err(AppError::TenantRequired);
+        }
+        let role_grants = self.perms_of(user).contains(&perm); // role 侧已在 from_roles 展开 implies
+                                                               // scope 侧同样吃 implies:scope 含 `read:all` 即视为含 `read`,与 role 侧一致,降权令牌不踩漏底权坑。
         let in_scope = scope.is_empty()
             || scope.contains(&perm)
             || scope.iter().any(|s| s.implies().contains(&perm));
@@ -393,6 +576,77 @@ impl Policy {
         }
     }
 
+    /// **平台角色闸(防接管)**:`roles` = 要授出的平台角色名,或目标账号**现有**的原始平台角色名(`user_roles` 原样)。
+    /// 里面有平台角色(见 [`holds_platform_role`],闭集外名字算平台角色)→ 操作者须持 `platform:roles`
+    /// (经 [`Self::require_scoped`],role ∩ scope),否则 403;没有 → 放行(普通账号由各端点自己的闸管)。
+    /// 账号管理(改信息 / 改资料 / 重置密码 / 删号 / 改角色)与组织成员接口(改角色 / 移出)共用这一道。
+    pub fn require_platform_role_authority(
+        &self,
+        user: &AuthUser,
+        scope: &[Perm],
+        roles: &[String],
+    ) -> Result<(), AppError> {
+        if holds_platform_role(roles) {
+            self.require_scoped(user, scope, Perm::PlatformRoles)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// **后台准入**(`/admin` 组闸与后台登录共用,spec §4.2「当前租户角色或平台角色里有后台权限」):
+    /// 当前租户里有 `admin:login`,**或**持有任一平台级权限(平台管理员,不必属于任何租户)。
+    /// 都经 [`Self::require_scoped`](role ∩ scope)判定;可选的「准入权限」清单见 [`admin_entry_perms`]
+    /// (OpenAPI 文档按同一份清单注入)。拒绝:没有当前租户且没有任何平台级权限 → `TenantRequired`,否则 `Forbidden`。
+    pub fn require_admin_entry(&self, user: &AuthUser, scope: &[Perm]) -> Result<(), AppError> {
+        if admin_entry_perms()
+            .into_iter()
+            .any(|p| self.require_scoped(user, scope, p).is_ok())
+        {
+            return Ok(());
+        }
+        if user.tenant_id.is_none() && !self.has_platform_perm(&user.roles) {
+            Err(AppError::TenantRequired)
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+
+    /// **后台登录挑进哪里**(spec §4.2 后台登录 + Task 10b):`tenants` = 有效成员关系
+    /// `(租户 id, 该租户里的角色)`,按 `last_used_at` 倒序。
+    /// - 第一个「租户角色给了 `admin:login`」的租户 → `Ok(Some(id))`(平台角色不参与这一步:平台管理员在某租户里
+    ///   只是普通成员,不因平台权限就进那个租户);
+    /// - 都没有、但平台角色给了任一平台级权限 → `Ok(None)`(平台上下文);
+    /// - 否则:一个有效成员关系都没有 → `TenantRequired`(前端显示「还没加入任何组织」),有 → `Forbidden`。
+    ///
+    /// 与 [`Self::require_admin_entry`] 同一准入口径(登录后的 token 必然过组闸);那边判一个已定的 token,这里挑 token 进哪里。
+    pub fn admin_login_entry<'a>(
+        &self,
+        platform_roles: &[String],
+        tenants: impl IntoIterator<Item = (Uuid, &'a [String])>,
+    ) -> Result<Option<Uuid>, AppError> {
+        let mut any_membership = false;
+        for (tenant, roles) in tenants {
+            any_membership = true;
+            if self.perms_for(&[], roles).contains(&Perm::AdminLogin) {
+                return Ok(Some(tenant));
+            }
+        }
+        if self.has_platform_perm(platform_roles) {
+            Ok(None)
+        } else if any_membership {
+            Err(AppError::Forbidden)
+        } else {
+            Err(AppError::TenantRequired)
+        }
+    }
+
+    /// 平台角色给了任一平台级权限(= 平台管理员,可不属于任何租户进后台)。
+    fn has_platform_perm(&self, platform_roles: &[String]) -> bool {
+        self.perms_for(platform_roles, &[])
+            .iter()
+            .any(|p| p.scope() == PermScope::Platform)
+    }
+
     /// **数据可见域(ownership mode)**:边缘的 RBAC∩scope 推出"能不能看全部"——有 `all_perm`(经
     /// `require_scoped`,故 role 与 scope 都参与)→ [`Access::All`],否则只看自己 → [`Access::Own`]。
     /// 这是三轴的扣点:类型级判定(RBAC∩scope)**参数化**行级 ownership;真正的过滤在查询里(见 `Access`)。
@@ -418,6 +672,18 @@ impl Policy {
         }
         Ok(())
     }
+}
+
+/// 后台准入可凭的权限(任一即可):租户级的 `admin:login` + 全部平台级权限。
+/// [`Policy::require_admin_entry`] 与 OpenAPI 的 admin 组注入共用这一份(文档与执行同源)。
+pub fn admin_entry_perms() -> Vec<Perm> {
+    std::iter::once(Perm::AdminLogin)
+        .chain(
+            Perm::ALL
+                .into_iter()
+                .filter(|p| p.scope() == PermScope::Platform),
+        )
+        .collect()
 }
 
 /// **数据可见域(行级 ownership)**。RBAC∩scope 在边缘算出它(见 [`Policy::data_access`]),
@@ -464,12 +730,249 @@ impl Access {
 mod tests {
     use super::*;
 
+    /// 平台上下文身份:只有平台角色。
     fn user(roles: &[&str]) -> AuthUser {
         AuthUser {
             id: Uuid::nil(),
             username: "u".to_owned(),
             roles: roles.iter().map(|s| s.to_string()).collect(),
+            tenant_id: None,
+            tenant_roles: vec![],
         }
+    }
+
+    /// 在默认租户里、带租户角色的身份。
+    fn member(tenant_roles: &[&str]) -> AuthUser {
+        AuthUser {
+            tenant_id: Some(crate::kernel::tenant::DEFAULT_TENANT_ID.as_uuid()),
+            tenant_roles: tenant_roles.iter().map(|s| s.to_string()).collect(),
+            ..user(&[])
+        }
+    }
+
+    /// 每个变体都标了作用域;平台级 = 账号管理、租户管理、**资料**(资料全局一份,spec §6.2:
+    /// 租户管理员不能改所有人的资料);各角色的默认权限与角色作用域一致
+    /// (否则载入时被当成跨作用域行忽略,默认策略自己就会 WARN)。
+    #[test]
+    fn perm_scopes_cover_all_variants() {
+        let platform: Vec<Perm> = Perm::ALL
+            .into_iter()
+            .filter(|p| p.scope() == PermScope::Platform)
+            .collect();
+        assert_eq!(
+            platform,
+            vec![
+                Perm::UsersAdmin,
+                Perm::TenantsAdmin,
+                Perm::OpsRead,
+                Perm::AuditRead,
+                Perm::PlatformRoles,
+                Perm::ProfileRead,
+                Perm::ProfileWrite,
+                Perm::ProfileWriteAll,
+            ]
+        );
+        // superadmin 独占三项都是平台级
+        for p in SUPERADMIN_ONLY {
+            assert_eq!(p.scope(), PermScope::Platform, "{p:?}");
+        }
+        assert_eq!(
+            Perm::ALL
+                .iter()
+                .filter(|p| p.scope() == PermScope::Tenant)
+                .count(),
+            Perm::ALL.len() - platform.len()
+        );
+        // 成员管理是租户级:租户管理员(admin)默认两样都有,普通成员(user)一样没有,平台角色不给
+        for p in [Perm::MembersRead, Perm::MembersAdmin] {
+            assert_eq!(p.scope(), PermScope::Tenant, "{p:?}");
+            assert!(
+                RoleName::Admin.default_permissions().contains(&p),
+                "admin 应持 {p:?}"
+            );
+            assert!(
+                !RoleName::User.default_permissions().contains(&p),
+                "user 不该持 {p:?}"
+            );
+            assert!(
+                !RoleName::Superadmin.default_permissions().contains(&p),
+                "平台角色不给 {p:?}"
+            );
+        }
+        for r in RoleName::ALL {
+            let rs = PermScope::from(r.scope());
+            for p in r.default_permissions() {
+                assert_eq!(p.scope(), rs, "{r:?} 的默认权限 {p:?} 跨了作用域");
+                for q in p.implies() {
+                    assert_eq!(q.scope(), p.scope(), "implies 不得跨作用域");
+                }
+            }
+        }
+    }
+
+    /// 资料是全局的:租户角色(含租户管理员)默认不带任何 `profiles:*`,平台管理员带全部;
+    /// 即使旧库里还有 admin → profiles:write:all 的行,当租户角色用也拿不到(跨作用域行被忽略)。
+    #[test]
+    fn profile_perms_are_platform_only() {
+        for r in [RoleName::Admin, RoleName::User] {
+            assert!(
+                r.default_permissions()
+                    .iter()
+                    .all(|p| p.resource() != "profiles"),
+                "{r:?} 不该默认持有资料权限"
+            );
+        }
+        let sa = RoleName::Superadmin.default_permissions();
+        for p in [Perm::ProfileRead, Perm::ProfileWrite, Perm::ProfileWriteAll] {
+            assert!(sa.contains(&p), "superadmin 应持 {p:?}");
+        }
+        let legacy = Policy::from_roles([(
+            "admin".to_owned(),
+            vec![Perm::AdminLogin, Perm::ProfileWriteAll],
+        )]);
+        let tenant_admin = member(&["admin"]);
+        assert!(matches!(
+            legacy.require(&tenant_admin, Perm::ProfileWriteAll),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            legacy.data_access(&tenant_admin, &[], Perm::ProfileWriteAll),
+            Access::Own(_)
+        ));
+    }
+
+    /// 平台角色只贡献平台级、租户角色只贡献租户级;没有当前租户时租户级权限 → TenantRequired。
+    #[test]
+    fn platform_and_tenant_roles_contribute_only_their_scope() {
+        let policy = Policy::from_roles([
+            // 闭集外角色名:载入不过滤,判定时按权限作用域取
+            ("mixed".to_owned(), vec![Perm::UsersAdmin, Perm::WidgetRead]),
+        ]);
+        let as_platform = policy.perms_for(&["mixed".to_owned()], &[]);
+        assert_eq!(as_platform, HashSet::from([Perm::UsersAdmin]));
+        let as_tenant = policy.perms_for(&[], &["mixed".to_owned()]);
+        assert_eq!(as_tenant, HashSet::from([Perm::WidgetRead]));
+
+        // 平台上下文:平台级过,租户级 → tenant_required(不是普通 403)
+        let platform_only = user(&["mixed"]);
+        assert!(policy.require(&platform_only, Perm::UsersAdmin).is_ok());
+        assert!(matches!(
+            policy.require(&platform_only, Perm::WidgetRead),
+            Err(AppError::TenantRequired)
+        ));
+        // 租户里:租户角色给租户级,不给平台级
+        let m = member(&["mixed"]);
+        assert!(policy.require(&m, Perm::WidgetRead).is_ok());
+        assert!(matches!(
+            policy.require(&m, Perm::UsersAdmin),
+            Err(AppError::Forbidden)
+        ));
+        // 畸形令牌:有 tenant_roles 没 tenant_id → 租户角色不算
+        let malformed = AuthUser {
+            tenant_roles: vec!["mixed".to_owned()],
+            ..user(&[])
+        };
+        assert!(policy.perms_of(&malformed).is_empty());
+    }
+
+    /// 后台准入:租户里的 admin:login,或任一平台级权限;都不满足时按有没有租户区分 403 的机器码。
+    #[test]
+    fn admin_entry_by_tenant_admin_login_or_platform_perm() {
+        let policy = default_policy();
+        // 租户管理员:靠默认租户里的 admin:login
+        assert!(policy.require_admin_entry(&member(&["admin"]), &[]).is_ok());
+        // 平台管理员:不属于任何租户也能进(凭 users:admin / tenants:admin)
+        let sa = user(&["superadmin"]);
+        assert!(policy.require_admin_entry(&sa, &[]).is_ok());
+        assert!(policy
+            .require_admin_entry(&sa, &[Perm::TenantsAdmin])
+            .is_ok());
+        // scope 收窄掉全部准入权限 → Forbidden(角色够也不行)
+        assert!(matches!(
+            policy.require_admin_entry(&sa, &[Perm::WidgetRead]),
+            Err(AppError::Forbidden)
+        ));
+        // 普通成员 → Forbidden;没租户也没平台权限 → TenantRequired
+        assert!(matches!(
+            policy.require_admin_entry(&member(&["user"]), &[]),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            policy.require_admin_entry(&user(&[]), &[]),
+            Err(AppError::TenantRequired)
+        ));
+    }
+
+    /// 后台登录挑租户:最近用过的租户里没有 admin:login → 跳到下一个有的;都没有 → 有平台权限进平台上下文,
+    /// 没有 → 有成员关系 Forbidden / 一个都没有 TenantRequired。平台角色不让「没有 admin:login 的租户」入选。
+    #[test]
+    fn admin_login_entry_picks_first_tenant_with_admin_login() {
+        let policy = default_policy();
+        let (t1, t2, t3) = (
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+            Uuid::from_u128(13),
+        );
+        let user_r = vec!["user".to_owned()];
+        let admin_r = vec!["admin".to_owned()];
+        let none: Vec<String> = vec![];
+        let sa = vec!["superadmin".to_owned()];
+
+        let pick = |platform: &[String], ts: &[(Uuid, &Vec<String>)]| {
+            policy.admin_login_entry(platform, ts.iter().map(|(t, r)| (*t, r.as_slice())))
+        };
+        assert_eq!(
+            pick(&none, &[(t1, &user_r), (t2, &admin_r), (t3, &admin_r)]).unwrap(),
+            Some(t2),
+            "按顺序挑第一个有 admin:login 的"
+        );
+        assert_eq!(pick(&sa, &[(t1, &user_r)]).unwrap(), None, "平台上下文");
+        assert_eq!(pick(&sa, &[]).unwrap(), None);
+        assert_eq!(
+            pick(&sa, &[(t1, &user_r), (t2, &admin_r)]).unwrap(),
+            Some(t2),
+            "有后台权限的租户优先于平台上下文"
+        );
+        assert!(matches!(
+            pick(&none, &[(t1, &user_r)]),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(pick(&none, &[]), Err(AppError::TenantRequired)));
+        // 租户角色名塞进平台角色不算平台权限
+        assert!(matches!(pick(&admin_r, &[]), Err(AppError::TenantRequired)));
+    }
+
+    /// 默认策略(同 seed 的 RoleName 默认映射)。
+    fn default_policy() -> Policy {
+        Policy::from_roles(
+            RoleName::ALL
+                .iter()
+                .map(|r| (r.as_str().to_owned(), r.default_permissions())),
+        )
+    }
+
+    /// 闭集内角色的跨作用域映射行(如旧库里的 superadmin → widgets:read)载入时忽略。
+    #[test]
+    fn cross_scope_rows_of_known_roles_are_ignored() {
+        let policy = Policy::from_roles([
+            (
+                "superadmin".to_owned(),
+                vec![Perm::UsersAdmin, Perm::WidgetRead],
+            ),
+            ("admin".to_owned(), vec![Perm::UsersAdmin, Perm::AdminLogin]),
+        ]);
+        // superadmin 当租户角色用也拿不到 widgets:read —— 那一行根本没进策略
+        assert!(policy.perms_for(&[], &["superadmin".to_owned()]).is_empty());
+        assert_eq!(
+            policy.perms_for(&["superadmin".to_owned()], &[]),
+            HashSet::from([Perm::UsersAdmin])
+        );
+        // admin 当平台角色用拿不到 users:admin
+        assert!(policy.perms_for(&["admin".to_owned()], &[]).is_empty());
+        assert_eq!(
+            policy.perms_for(&[], &["admin".to_owned()]),
+            HashSet::from([Perm::AdminLogin])
+        );
     }
 
     /// round-trip:每个变体的 wire 串(serde rename)== `resource:action[:qualifier]` 三段投影。
@@ -498,6 +1001,100 @@ mod tests {
         );
     }
 
+    /// 作用域闭集(spec §4.1 + 2026-11-26 角色补充):superadmin / platform_admin 是平台角色,admin / user 是租户角色。
+    #[test]
+    fn role_scope_platform_for_platform_roles() {
+        for r in RoleName::ALL {
+            let expect = if matches!(r, RoleName::Superadmin | RoleName::PlatformAdmin) {
+                idm::RoleScope::Platform
+            } else {
+                idm::RoleScope::Tenant
+            };
+            assert_eq!(r.scope(), expect, "{r:?}");
+        }
+        assert_eq!(RoleName::PlatformAdmin.as_str(), "platform_admin");
+        assert_eq!(
+            "platform_admin".parse::<RoleName>(),
+            Ok(RoleName::PlatformAdmin)
+        );
+        assert_eq!(RoleName::PlatformAdmin.display_name(), "平台管理员");
+    }
+
+    /// 平台管理员默认 = 全部平台级权限减去 superadmin 独占三项;superadmin 仍是全部平台级(含新权限)。
+    #[test]
+    fn platform_admin_defaults_exclude_superadmin_only() {
+        let pa: HashSet<Perm> = RoleName::PlatformAdmin
+            .default_permissions()
+            .into_iter()
+            .collect();
+        let sa: HashSet<Perm> = RoleName::Superadmin
+            .default_permissions()
+            .into_iter()
+            .collect();
+        for p in SUPERADMIN_ONLY {
+            assert!(!pa.contains(&p), "平台管理员不该有 {p:?}");
+            assert!(sa.contains(&p), "superadmin 应有 {p:?}");
+        }
+        for p in [
+            Perm::UsersAdmin,
+            Perm::TenantsAdmin,
+            Perm::ProfileRead,
+            Perm::ProfileWrite,
+            Perm::ProfileWriteAll,
+        ] {
+            assert!(pa.contains(&p), "平台管理员应有 {p:?}");
+        }
+        assert_eq!(pa.len() + SUPERADMIN_ONLY.len(), sa.len());
+        // 平台管理员凭平台级权限进后台(不属于任何租户也行)
+        let policy = default_policy();
+        assert!(policy
+            .require_admin_entry(&user(&["platform_admin"]), &[])
+            .is_ok());
+    }
+
+    /// 目标账号是否持平台角色:闭集内按作用域;闭集外的名字算(fail-closed);遗留的租户角色行不算。
+    #[test]
+    fn holds_platform_role_is_fail_closed() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(holds_platform_role(&s(&["superadmin"])));
+        assert!(holds_platform_role(&s(&["platform_admin"])));
+        assert!(holds_platform_role(&s(&["auditor"])), "闭集外 → 算平台角色");
+        assert!(
+            !holds_platform_role(&s(&["admin", "user"])),
+            "遗留租户角色行不算"
+        );
+        assert!(!holds_platform_role(&[]));
+    }
+
+    /// 平台角色闸:目标 / 授出的角色里有平台角色 → 要 platform:roles(superadmin 有,平台管理员没有;scope 收窄掉也不行)。
+    #[test]
+    fn platform_role_authority_requires_platform_roles() {
+        let policy = default_policy();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let sa = user(&["superadmin"]);
+        let pa = user(&["platform_admin"]);
+        for target in [s(&["superadmin"]), s(&["platform_admin"]), s(&["legacy"])] {
+            assert!(policy
+                .require_platform_role_authority(&sa, &[], &target)
+                .is_ok());
+            assert!(matches!(
+                policy.require_platform_role_authority(&pa, &[], &target),
+                Err(AppError::Forbidden)
+            ));
+            assert!(matches!(
+                policy.require_platform_role_authority(&sa, &[Perm::UsersAdmin], &target),
+                Err(AppError::Forbidden)
+            ));
+        }
+        // 普通账号 → 不设这道闸
+        assert!(policy
+            .require_platform_role_authority(&pa, &[], &s(&[]))
+            .is_ok());
+        assert!(policy
+            .require_platform_role_authority(&member(&["admin"]), &[], &s(&["user"]))
+            .is_ok());
+    }
+
     #[test]
     fn role_name_wire_matches() {
         for r in RoleName::ALL {
@@ -510,8 +1107,11 @@ mod tests {
         }
         assert_eq!(
             RoleName::Superadmin.default_permissions().len(),
-            Perm::ALL.len(),
-            "superadmin 默认应持全权闭集"
+            Perm::ALL
+                .iter()
+                .filter(|p| p.scope() == PermScope::Platform)
+                .count(),
+            "superadmin 默认应持全部平台级权限"
         );
     }
 
@@ -520,10 +1120,10 @@ mod tests {
     fn read_all_implies_read_role_and_scope() {
         let policy = Policy::from_roles([("mgr".to_owned(), vec![Perm::WidgetReadAll])]);
         // role 侧:perms_for 已含被蕴含的 read
-        let perms = policy.perms_for(&["mgr".to_owned()]);
+        let perms = policy.perms_for(&[], &["mgr".to_owned()]);
         assert!(perms.contains(&Perm::WidgetRead), "read:all 应蕴含 read");
         assert!(perms.contains(&Perm::WidgetReadAll));
-        let u = user(&["mgr"]);
+        let u = member(&["mgr"]);
         assert!(
             policy.require(&u, Perm::WidgetRead).is_ok(),
             "顶层 read 闸不应 403"
@@ -545,8 +1145,12 @@ mod tests {
             ("ops".to_owned(), vec![Perm::WidgetRead, Perm::WidgetDelete]),
             ("aud".to_owned(), vec![Perm::UsersAdmin]),
         ]);
-        let both = user(&["ops"]);
-        let admin_only = user(&["aud"]);
+        // ops 的权限是租户级(租户角色),aud 的 users:admin 是平台级(平台角色)
+        let both = member(&["ops"]);
+        let admin_only = AuthUser {
+            roles: vec!["aud".to_owned()],
+            ..member(&[])
+        };
         let need = [Perm::WidgetRead, Perm::WidgetDelete];
         // AND:全有 → Ok;role 缺(aud 无 read/delete)→ Err
         assert!(policy.require_all(&both, &[], &need).is_ok());
@@ -561,7 +1165,7 @@ mod tests {
         assert!(policy.require_any(&both, &[], &either).is_ok());
         // OR:两支全无 → Err
         assert!(policy
-            .require_any(&user(&["nobody"]), &[], &either)
+            .require_any(&member(&["nobody"]), &[], &either)
             .is_err());
         // OR + scope 收窄:scope 只给 users:admin → read 支被收窄,靠 admin 支过
         assert!(policy
@@ -573,6 +1177,6 @@ mod tests {
             .is_err());
         // OR:implies 经由生效(read:all 蕴含 read → read 支过)
         let p2 = Policy::from_roles([("mgr".to_owned(), vec![Perm::WidgetReadAll])]);
-        assert!(p2.require_any(&user(&["mgr"]), &[], &either).is_ok());
+        assert!(p2.require_any(&member(&["mgr"]), &[], &either).is_ok());
     }
 }

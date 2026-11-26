@@ -30,11 +30,14 @@ pub enum AuthEventType {
     Registered,
     #[serde(rename = "auth.account_deleted")]
     AccountDeleted,
+    /// 切换当前租户(多租户):旧会话吊销、换发带新租户的会话。`tenant_id` 记切换**后**的租户。
+    #[serde(rename = "auth.tenant_switched")]
+    TenantSwitched,
 }
 
 impl AuthEventType {
     /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
-    pub const ALL: [AuthEventType; 9] = [
+    pub const ALL: [AuthEventType; 10] = [
         AuthEventType::LoginSucceeded,
         AuthEventType::LoginFailed,
         AuthEventType::AdminAccessDenied,
@@ -44,6 +47,7 @@ impl AuthEventType {
         AuthEventType::PasswordChanged,
         AuthEventType::Registered,
         AuthEventType::AccountDeleted,
+        AuthEventType::TenantSwitched,
     ];
 
     /// 发射到 outbox 的线上串(`idm::OutboxRepo::emit` 只吃 `&str`)。
@@ -58,6 +62,7 @@ impl AuthEventType {
             AuthEventType::PasswordChanged => "auth.password_changed",
             AuthEventType::Registered => "auth.registered",
             AuthEventType::AccountDeleted => "auth.account_deleted",
+            AuthEventType::TenantSwitched => "auth.tenant_switched",
         }
     }
 }
@@ -216,6 +221,9 @@ pub struct NewAuthEvent {
     pub forwarded_chain: Option<String>,
     pub user_agent: Option<String>,
     pub request_id: Option<String>,
+    /// 事件所在的租户(多租户,spec §4.4):登录进某租户、切换、刷新该租户的会话等;登录失败、
+    /// 平台上下文的事件没有租户 → `None`。
+    pub tenant_id: Option<Uuid>,
     pub event_seq: i64,
 }
 
@@ -239,6 +247,8 @@ pub struct AuthEventRow {
     pub city: Option<String>,
     pub os: Option<String>,
     pub browser: Option<String>,
+    /// 事件所在的租户;没有租户的事件(登录失败等)为 `None`。
+    pub tenant_id: Option<Uuid>,
 }
 
 /// `NewAuthEvent`(写模型,String)→ 读模型强类型行。**唯一的闭集解析权威**:
@@ -262,6 +272,7 @@ pub fn to_row(e: &NewAuthEvent) -> Result<AuthEventRow, String> {
         city: None,
         os: None,
         browser: None,
+        tenant_id: e.tenant_id,
     })
 }
 

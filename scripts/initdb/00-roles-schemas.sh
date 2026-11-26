@@ -3,9 +3,13 @@
 # 连该 role 即默认操作对应 schema(代码/迁移都不写 schema 前缀),权限天然隔离。
 # role 名与密码都从环境变量读 —— 每个 schema 一对独立变量。
 #
+# 这里建的是**运行时账号**。app / content / search 随后由 10-tenancy-roles.sh 拆成 owner / 运行时 / system
+# 三个账号(schema 和表转给 <schema>_owner,运行时账号只留 DML);idm、ops 不拆,这里建的 role 就是 owner。
+# 本脚本只在 schema 不存在时才以运行时账号建它,不会把已转给 owner 的 schema 改回来。
+#
 # 两处调用,所以必须**可重复执行**(已有的跳过,密码按环境变量重设):
 #   1. pg 首次初始化空卷时,docker-entrypoint-initdb.d 以 superuser 执行;
-#   2. 每次部署(baserust-stack 的 scripts/prod/deploy.sh、本仓库 just db-ensure-roles)对**已有的卷**再跑一遍
+#   2. 每次部署(baserust-stack 的 scripts/prod/deploy.sh、本仓库 just db-ensure-roles)对**已有的卷**再跑一遍(之后跑 10)
 #      —— initdb 只在空卷跑一次,后来新加的 schema(如 ops)靠这一步补上,不用重建卷。
 # `-u`:少一个 *_DB_USER/PASSWORD 就当场炸,不留半初始化的状态。
 set -eu

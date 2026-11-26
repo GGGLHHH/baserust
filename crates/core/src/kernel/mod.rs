@@ -10,3 +10,4 @@ pub mod authz;
 pub mod error;
 pub mod pagination;
 pub mod sort;
+pub mod tenant;

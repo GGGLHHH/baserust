@@ -26,7 +26,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::app::AppState;
-use crate::features::{auth, auth_audit, content, profile, users, widget};
+use crate::features::{auth, auth_audit, content, profile, tenants, users, widget};
 use crate::health;
 use crate::infra::config::Config;
 use crate::infra::http::error::{ErrorBody, ErrorCode};
@@ -36,7 +36,7 @@ use crate::infra::openapi;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 路由挂载范围。本地开发单进程挂 `Both`;生产分进程各挂 `App` / `Idm`,
-/// 由 nginx 按 `/api/v1/{public,frontend,admin}/auth` 前缀分流(→ idm 容器,其余 → app 容器)。
+/// 由 nginx 按 `/api/v1/{public,frontend,admin}/auth` 与 `/api/v1/admin/platform` 前缀分流(→ idm 容器,其余 → app 容器)。
 #[derive(Clone, Copy, Debug)]
 pub enum Mount {
     /// 只 app 业务(widget) —— 生产 app 进程。
@@ -62,9 +62,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let mut admin = OpenApiRouter::new();
     let mut admin_open = OpenApiRouter::new(); // admin 组闸外(admin_login)
     if needs_app {
-        public = public
-            .merge(widget::public_router())
-            .merge(crate::app::client_errors::public_router());
+        public = public.merge(crate::app::client_errors::public_router());
         frontend = frontend
             .merge(widget::router())
             .merge(content::router())
@@ -82,13 +80,19 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         // (Mount::Both)时挂 —— 纯 idm 进程的 profiles/contents 是内存占位 repo,挂上去
         // 写操作会 200 却静默丢失、重启蒸发(fail-closed:不挂 → 404,镜像 auth_audit 未接线范式)。
         // ponytail: 分进程拓扑要启用它,需给 idm 进程连 app 库,或把路径挪出 /admin/auth 前缀归 app 进程。
+        // 租户成员管理(租户级)和账号管理同挂 /admin/auth;平台租户管理挂 /admin/platform —— 两者都是 idm 的
+        // 租户 / 成员 / 会话原语,归 idm 进程(nginx 把 /api/v1/admin/platform/ 也转给 idm)。
         let mut auth_admin = OpenApiRouter::new()
             .merge(users::admin_router())
+            .merge(tenants::members_router())
             .merge(auth_audit::admin_router());
         if needs_app {
             auth_admin = auth_admin.merge(profile::admin_router());
         }
-        admin = admin.merge(auth::admin_router()).nest("/auth", auth_admin);
+        admin = admin
+            .merge(auth::admin_router())
+            .nest("/auth", auth_admin)
+            .nest("/platform", tenants::platform_router());
         admin_open = admin_open.merge(auth::admin_login_router());
     }
     // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
@@ -229,7 +233,6 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                 .nest(
                     "/public",
                     OpenApiRouter::new()
-                        .merge(widget::public_router())
                         .merge(crate::app::client_errors::public_router())
                         .merge(auth::public_router()),
                 )
@@ -252,9 +255,11 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                             "/auth",
                             OpenApiRouter::new()
                                 .merge(users::admin_router())
+                                .merge(tenants::members_router())
                                 .merge(profile::admin_router())
                                 .merge(auth_audit::admin_router()),
                         )
+                        .nest("/platform", tenants::platform_router())
                         .merge(auth::admin_login_router()),
                 ),
         )
@@ -403,14 +408,26 @@ fn make_http_span(req: &Request) -> tracing::Span {
         .get::<axum::extract::MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default();
-    tracing::info_span!(
+    // 鉴权中间件在 Trace 层之外先跑,验过的身份已在 extensions:user_id / tenant_id 进根 span,
+    // 该请求的每条日志都带上它们(未认证 / 平台上下文的字段留空)。
+    let user = req.extensions().get::<idm::AuthUser>();
+    let span = tracing::info_span!(
         "http",
         method = %req.method(),
         path = %req.uri().path(),
         route = %route,
         request_id = %request_id,
+        user_id = tracing::field::Empty,
+        tenant_id = tracing::field::Empty,
         status = tracing::field::Empty,
-    )
+    );
+    if let Some(u) = user {
+        span.record("user_id", tracing::field::display(u.id));
+        if let Some(t) = u.tenant_id {
+            span.record("tenant_id", tracing::field::display(t));
+        }
+    }
+    span
 }
 
 /// 请求完成日志(探针路径没有 span,跳过)。字段同 tower-http 的 DefaultOnResponse。
@@ -458,6 +475,61 @@ mod tests {
         );
         assert!(s.contains("Internal server error"));
         assert!(!s.contains("boom-secret"), "原始 panic 信息不可泄露: {s}");
+    }
+
+    /// 鉴权身份进 http 根 span:user_id / tenant_id 字段有值(日志按租户、按人筛)。
+    #[test]
+    fn http_span_records_user_and_tenant() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// 收集 span 上记录的字段(name=value)。
+        struct Fields(Arc<Mutex<Vec<String>>>);
+        struct Visit<'a>(&'a mut Vec<String>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={v:?}", f.name()));
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _: &tracing::span::Id,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                attrs.record(&mut Visit(&mut self.0.lock().unwrap()));
+            }
+            fn on_record(
+                &self,
+                _: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                values.record(&mut Visit(&mut self.0.lock().unwrap()));
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Fields(seen.clone()));
+        let user = uuid::Uuid::from_u128(7);
+        let tenant = uuid::Uuid::from_u128(1);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut req = Request::get("/api/v1/frontend/widgets")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(idm::AuthUser {
+                id: user,
+                username: "u".into(),
+                roles: vec![],
+                tenant_id: Some(tenant),
+                tenant_roles: vec![],
+            });
+            let _span = make_http_span(&req);
+        });
+        let seen = seen.lock().unwrap().join(" ");
+        assert!(seen.contains(&format!("user_id={user}")), "{seen}");
+        assert!(seen.contains(&format!("tenant_id={tenant}")), "{seen}");
     }
 
     /// 横切错误契约:**超时也回统一 `ErrorBody`**(408 + `{code:"timeout"}`),不是空体。

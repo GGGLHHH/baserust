@@ -146,7 +146,7 @@ impl RemoteInstance {
     }
 }
 
-/// admin 组(组闸 + 端点内 `users:admin`)。只在挂了 app 的进程上(App / Both)。
+/// admin 组(组闸 + 端点内 `ops:read`,superadmin 独占)。只在挂了 app 的进程上(App / Both)。
 pub fn admin_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(get_monitoring))
@@ -168,7 +168,7 @@ pub fn internal_router() -> Router<AppState> {
     responses(
         (status = 200, description = "各进程的监控数据(生产分进程时含 app 与 idm)", body = MonitoringReport),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody)
+        (status = 403, description = "无 ops:read 权限(superadmin 独占)", body = ErrorBody)
     )
 )]
 pub async fn get_monitoring(
@@ -178,7 +178,7 @@ pub async fn get_monitoring(
 ) -> Result<Json<MonitoringReport>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::OpsRead)?;
     let local = local_report(&state);
     let instances = match &state.monitoring.remote_idm {
         Some(remote) => {
@@ -256,7 +256,7 @@ pub async fn run_sampler(
     responses(
         (status = 200, body = HistoryReport),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody)
+        (status = 403, description = "无 ops:read 权限(superadmin 独占)", body = ErrorBody)
     )
 )]
 pub async fn get_monitoring_history(
@@ -267,7 +267,7 @@ pub async fn get_monitoring_history(
 ) -> Result<Json<HistoryReport>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::OpsRead)?;
     let report = build_history(
         &*state.monitoring.store,
         query.range,
@@ -290,7 +290,7 @@ pub async fn get_monitoring_history(
     responses(
         (status = 200, body = Page<LogRecordView>),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 403, description = "无 ops:read 权限(superadmin 独占)", body = ErrorBody),
         (status = 422, description = "参数不合法(size 超出 1~200 / from 晚于 to)", body = ErrorBody)
     )
 )]
@@ -302,7 +302,7 @@ pub async fn list_monitoring_logs(
 ) -> Result<Json<Page<LogRecordView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::OpsRead)?;
     if !(1..=200).contains(&query.size) || query.page == 0 {
         return Err(AppError::Validation("size 需在 1~200 之间,page 从 1 开始".to_owned()).into());
     }

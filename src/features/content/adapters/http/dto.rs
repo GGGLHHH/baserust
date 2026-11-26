@@ -2,7 +2,7 @@
 //! 出参 DTO:`Serialize` + `ToSchema`,`status` 投影成闭集视图枚举(镜像库里的 typed 枚举);
 //! 入参 DTO:`Deserialize` + garde `Validate`,handler 校验后 `.into_input()` 成库的领域 input。
 //!
-//! owner/tenant 约定见 routes.rs:owner_id = 认证主体的 UUID(不入参);tenant_id 单租户脚手架默认 nil。
+//! owner/tenant 约定见 routes.rs:owner_id = 认证主体的 UUID(不入参);租户 = 当前租户(只来自令牌,请求里没有 tenant_id)。
 
 use garde::Validate;
 use serde::{Deserialize, Serialize};
@@ -72,7 +72,9 @@ impl From<ObjectStatus> for ObjectStatusView {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ContentResponse {
     pub id: Uuid,
-    pub tenant_id: Uuid,
+    /// 所属租户;`null` = 个人内容(不属于任何租户,如头像 —— 本模块的端点看不到个人内容,
+    /// 但形状上如实反映库的 `Option`)。
+    pub tenant_id: Option<Uuid>,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,
@@ -188,7 +190,6 @@ pub struct UploadForm {
     /// 逗号分隔。
     pub tags: Option<String>,
     pub document_type: Option<String>,
-    pub tenant_id: Option<Uuid>,
 }
 
 /// 一次性上传的对外响应(内容 + 其主对象)。投影 `content::UploadOutcome`。
@@ -207,12 +208,9 @@ impl From<UploadOutcome> for UploadResponse {
     }
 }
 
-/// 建内容的入参(仅建 content 行,不碰对象/字节)。owner_id 来自认证主体(不入参)。
+/// 建内容的入参(仅建 content 行,不碰对象/字节)。owner_id 来自认证主体、租户来自令牌(都不入参)。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct CreateContentRequest {
-    /// 单租户脚手架:省略 → `Uuid::nil()`(多租户隔离是 app authz 的职责,见 routes.rs)。
-    #[garde(skip)]
-    pub tenant_id: Option<Uuid>,
     #[garde(inner(length(max = 64)))]
     pub owner_type: Option<String>,
     #[garde(inner(length(max = 255)))]
@@ -297,11 +295,9 @@ impl SetContentMetadataRequest {
     }
 }
 
-/// 两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体;tenant 单租户默认 nil(同 create)。
+/// 两步上传①的入参(仅声明,不带字节)。owner_id 来自认证主体、租户来自令牌(同 create)。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 pub struct PrepareUploadRequest {
-    #[garde(skip)]
-    pub tenant_id: Option<Uuid>,
     #[garde(inner(length(max = 64)))]
     pub owner_type: Option<String>,
     #[garde(inner(length(max = 255)))]
@@ -331,7 +327,6 @@ pub struct PrepareUploadResponse {
 impl PrepareUploadRequest {
     pub fn into_input(self, owner_id: Uuid) -> PrepareUploadInput {
         PrepareUploadInput {
-            tenant_id: self.tenant_id.unwrap_or(Uuid::nil()),
             owner_id,
             owner_type: self.owner_type,
             name: self.name,

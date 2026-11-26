@@ -8,7 +8,7 @@ use utoipa_axum::routes;
 
 use crate::app::state::AppState;
 
-/// admin 组(组闸「admin:login」由 composition root 上;端点内再 gate「users:admin」)。
+/// admin 组(组闸「admin:login」由 composition root 上;端点内再 gate「audit:read」,superadmin 独占)。
 pub fn admin_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(routes::list_user_auth_events))

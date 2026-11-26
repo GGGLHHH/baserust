@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use baserust::app::{AppState, Mount};
-use baserust::features::auth::AppTokenSigner;
+use baserust::features::auth::{AppTokenSigner, ScopedTenant};
 use baserust::features::auth_audit::{AuthAuditService, AuthEventBus, InMemoryAuthEventRepo};
 use baserust::infra::config::Config;
 use baserust::kernel::authz::Perm;
@@ -21,11 +21,15 @@ use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// seed.toml 里的默认账号(密码都是 `pwd`)。
+/// seed.toml 里的默认账号(密码都是 `pwd`)。都是默认租户的成员:superadmin(平台角色 superadmin +
+/// 默认租户 admin)、admin(默认租户 admin)、user(默认租户 user)—— 登录即进默认租户。
 pub const SUPERADMIN: &str = "superadmin";
 pub const ADMIN: &str = "admin";
 pub const USER: &str = "user";
 pub const PASSWORD: &str = "pwd";
+
+/// 默认租户(seed 的 `slug = "default"`,固定 id)。
+pub const DEFAULT_TENANT: Uuid = Uuid::from_u128(1);
 
 // ───────────────────────────── 唯一绑定框架的地方 ─────────────────────────────
 
@@ -80,9 +84,29 @@ impl TestServer {
         Self::start_mounted(Mount::Both, customize).await
     }
 
+    /// 换一份 mock 数据起服务(`tests/http_support/<file>`):演示租户 / 成员关系等经组合根的 mock 装进去,
+    /// 测试体仍只走 HTTP。
+    pub async fn start_with_mock(file: &str) -> Self {
+        let config = Config {
+            mock_file: Some(format!(
+                "{}/tests/http_support/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+            ..test_config()
+        };
+        Self::start_config(config, Mount::Both, |_| {}).await
+    }
+
     /// 按指定挂载范围起服务(默认 `Both` 单进程;分进程拓扑的场景用 `App` / `Idm`)。
     pub async fn start_mounted(mount: Mount, customize: impl FnOnce(&mut AppState)) -> Self {
-        let config = test_config();
+        Self::start_config(test_config(), mount, customize).await
+    }
+
+    async fn start_config(
+        config: Config,
+        mount: Mount,
+        customize: impl FnOnce(&mut AppState),
+    ) -> Self {
         let (mut state, _background) = AppState::new(&config, mount).await.expect("内存模式装配");
         // 内存模式不装审计后端(它读 search 库)→ 换内存实现,让审计端点也能黑盒覆盖。
         let auth_events = Arc::new(InMemoryAuthEventRepo::new());
@@ -123,7 +147,8 @@ impl TestServer {
         }
     }
 
-    /// 前台登录(`/public/auth/login`)→ 带 httponly cookie 的会话。
+    /// 前台登录(`/public/auth/login`)→ 带 httponly cookie 的会话。seed 账号登录即进默认租户
+    /// (token 带 `tenant_id` = [`DEFAULT_TENANT`] 和该租户里的角色)。
     pub async fn login(&self, identifier: &str, password: &str) -> Client {
         let c = self.anon();
         let resp = c
@@ -260,26 +285,57 @@ pub async fn next_sse_event(
 
 // ───────────────────────────── 令牌 ─────────────────────────────
 
-/// 自铸令牌(`dev()` 固定内嵌密钥对:服务端 verifier 照验)。`scope` 空 = 不收窄。
-pub fn mint(id: Uuid, username: &str, roles: &[&str], scope: Vec<Perm>) -> String {
+/// 自铸令牌(`dev()` 固定内嵌密钥对:服务端 verifier 照验)。
+/// `platform_roles` = 平台角色(token `roles`);`tenant` = 当前租户(`None` = 平台上下文,租户级接口 403
+/// `tenant_required`),`tenant_roles` = 该租户里的角色(没有租户时忽略);`scope` 空 = 不收窄。
+pub fn mint(
+    id: Uuid,
+    username: &str,
+    platform_roles: &[&str],
+    tenant: Option<Uuid>,
+    tenant_roles: &[&str],
+    scope: Vec<Perm>,
+) -> String {
+    let owned = |rs: &[&str]| rs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
     AppTokenSigner::dev()
         .mint_scoped(
             id,
             username,
-            roles.iter().map(|r| (*r).to_owned()).collect(),
+            owned(platform_roles),
+            tenant.map(|id| ScopedTenant {
+                id,
+                roles: owned(tenant_roles),
+            }),
             scope,
             900,
         )
         .unwrap()
 }
 
-/// 一个新 `user` 主体的令牌。返回 (token, user_id)。
-pub fn user_token() -> (String, Uuid) {
-    let id = Uuid::now_v7();
-    (mint(id, "user", &["user"], vec![]), id)
+/// 默认租户里、只有租户角色的令牌(最常用:普通成员 / 租户管理员)。
+pub fn member_token(id: Uuid, username: &str, tenant_roles: &[&str], scope: Vec<Perm>) -> String {
+    mint(id, username, &[], Some(DEFAULT_TENANT), tenant_roles, scope)
 }
 
-/// 收窄 scope 的 admin 令牌(scope 只收窄不放大)。
+/// 平台管理员令牌:平台角色 superadmin + 默认租户 admin(= seed 里 superadmin 登录后的样子)。
+pub fn superadmin_token(id: Uuid, scope: Vec<Perm>) -> String {
+    mint(
+        id,
+        SUPERADMIN,
+        &[SUPERADMIN],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        scope,
+    )
+}
+
+/// 一个新 `user` 主体的令牌(默认租户的 user)。返回 (token, user_id)。
+pub fn user_token() -> (String, Uuid) {
+    let id = Uuid::now_v7();
+    (member_token(id, "user", &["user"], vec![]), id)
+}
+
+/// 收窄 scope 的 admin 令牌(默认租户的 admin;scope 只收窄不放大)。
 pub fn admin_scoped(scope: Vec<Perm>) -> String {
-    mint(Uuid::nil(), "admin", &["admin"], scope)
+    member_token(Uuid::nil(), "admin", &["admin"], scope)
 }

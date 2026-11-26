@@ -1,5 +1,9 @@
 //! auth_audit 仓储端口的 **Postgres 适配器**。数据库形状(列、`AuthEventRecord` 行、闭集文本列的解码)
 //! 只活在这个文件;出门一律是领域读模型 `AuthEventRow`。
+//!
+//! `auth_event` 是**平台级**表(多租户 spec §6.1:认证审计只给平台管理员看,能看到无租户的行),不开 RLS;
+//! 组合根用 search 的 **system 池**装配它(投影器写、保留期删、admin 读)。行上记 `tenant_id` 备以后的
+//! 租户级登录日志用。
 
 use async_trait::async_trait;
 use sea_query::{Expr, ExprTrait, Iden, Order, PostgresQueryBuilder, Query};
@@ -47,6 +51,7 @@ struct AuthEventRecord {
     city: Option<String>,
     os: Option<String>,
     browser: Option<String>,
+    tenant_id: Option<Uuid>,
 }
 
 /// 闭集文本列解码失败 → Internal(数据完整性故障)。
@@ -79,6 +84,7 @@ impl TryFrom<AuthEventRecord> for AuthEventRow {
             city: r.city,
             os: r.os,
             browser: r.browser,
+            tenant_id: r.tenant_id,
         })
     }
 }
@@ -146,8 +152,9 @@ impl AuthEventRepo for PgAuthEventRepo {
         // ip 用 ::inet cast(sea-query 无 inet 类型,用文本 cast 交给 sqlx bind)。
         let sql = r#"insert into auth_event
             (id, event_type, occurred_at, channel, auth_method, user_id, identifier_attempted,
-             session_id, actor, outcome, failure_reason, ip, forwarded_chain, user_agent, request_id, event_seq)
-            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::inet,$13,$14,$15,$16)
+             session_id, actor, outcome, failure_reason, ip, forwarded_chain, user_agent, request_id, event_seq,
+             tenant_id)
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::inet,$13,$14,$15,$16,$17)
             on conflict (event_seq) do nothing"#;
         let res = sqlx::query(sql)
             .bind(ev.id)
@@ -166,6 +173,7 @@ impl AuthEventRepo for PgAuthEventRepo {
             .bind(&ev.user_agent)
             .bind(&ev.request_id)
             .bind(ev.event_seq)
+            .bind(ev.tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
@@ -181,7 +189,7 @@ impl AuthEventRepo for PgAuthEventRepo {
         // SELECT list 固定(含 Phase 1 恒 null 的 country/city/os/browser),与 AuthEventRow 列序一致。
         const SEL: &str = r#"id, event_type, occurred_at, channel, user_id, identifier_attempted,
             session_id, actor, outcome, failure_reason, host(ip) as ip, user_agent,
-            country, city, os, browser from auth_event"#;
+            country, city, os, browser, tenant_id from auth_event"#;
         match page {
             PageParams::Offset {
                 page,

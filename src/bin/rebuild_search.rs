@@ -1,17 +1,20 @@
-//! 重建/回填 CLI:从 idm + profile 的**当前状态**(非事件流)全量灌注 `admin_user_index`。
+//! 重建/回填 CLI:从 idm + profile 的**当前状态**(非事件流)全量灌注账号目录 `account_index` 与
+//! 租户成员索引 `admin_user_index`(一个成员关系一行)。多租户升级(search 迁移 0003 建出空的成员索引)后要跑一次。
 //! 两个场景:bootstrap(早于事件投影接线就存在的用户)、漂移恢复(projector 挂了/丢消息后拉回一致)。
 //!
 //! 核心逻辑在 `baserust::features::search::rebuild`(零 DB 单测覆盖);本文件只做装配:连三个
 //! schema 的 pool、读各自 outbox 的快照水位、建 PG 仓储、调 `rebuild`、打印结果。
 //! **前提是配好**——idm/app/search 的 `*_DB_HOST` 都须设(rebuild 天然需要三个真实源),缺一即报错退出。
+//! app / search 用 **system 账号**(BYPASSRLS,spec §4.4:后台任务一律用 `_system`):成员索引按租户 RLS,
+//! 跨租户回填只有 system 账号写得进;app.outbox 的水位锁也用它。idm 不拆账号,用 idm 账号。
 
 use anyhow::Context;
 use baserust::app::adapters::ProfileDisplayNames;
-use baserust::app::state::{connect_for_schema, Schema};
+use baserust::app::state::{connect_for_schema, connect_system_for_schema, Schema};
 use baserust::features::profile::PgProfileRepo;
-use baserust::features::search::{rebuild, PgSearchIndexRepo};
+use baserust::features::search::{rebuild, IdmSources, PgSearchIndexRepo};
 use baserust::infra::config::Config;
-use idm::PgUserRepo;
+use idm::{PgMemberRepo, PgTenantRepo, PgUserRepo};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,24 +27,34 @@ async fn main() -> anyhow::Result<()> {
     let idm_pool = connect_for_schema(&config, Schema::Idm)
         .await?
         .context("需设 IDM_DB_HOST(重建读 idm.users 全量)")?;
-    let app_pool = connect_for_schema(&config, Schema::App)
+    let app_pool = connect_system_for_schema(&config, Schema::App)
         .await?
         .context("需设 APP_DB_HOST(重建读 app.profiles 全量)")?;
-    let search_pool = connect_for_schema(&config, Schema::Search)
+    let search_pool = connect_system_for_schema(&config, Schema::Search)
         .await?
-        .context("需设 SEARCH_DB_HOST(重建写 admin_user_index)")?;
+        .context("需设 SEARCH_DB_HOST(重建写 account_index / admin_user_index)")?;
 
     // 快照水位:**先读 P、再读数据**(P 是回填时刻各 outbox 的水位,**下界**;之后 id>P 的新事件
     // 才会再覆写投影行,旧重投被 projector 的守卫挡住)。search_path 令 `outbox` 落各自 schema。
     let p_idm = read_outbox_watermark(&idm_pool, "idm").await?;
     let p_app = read_outbox_watermark(&app_pool, "app").await?;
 
-    let users = PgUserRepo::new(idm_pool);
+    let users = PgUserRepo::new(idm_pool.clone());
+    let tenants = PgTenantRepo::new(idm_pool.clone());
+    let members = PgMemberRepo::new(idm_pool);
     let profiles = ProfileDisplayNames::new(std::sync::Arc::new(PgProfileRepo::new(app_pool)));
     let index = PgSearchIndexRepo::new(search_pool);
 
-    let count = rebuild(&users, &profiles, &index, p_idm, p_app).await?;
-    println!("✅ rebuild_search 完成:回填 {count} 条(idm_seq={p_idm}, profile_seq={p_app})");
+    let idm = IdmSources {
+        users: &users,
+        tenants: &tenants,
+        members: &members,
+    };
+    let counts = rebuild(idm, &profiles, &index, p_idm, p_app).await?;
+    println!(
+        "✅ rebuild_search 完成:账号目录 {} 条、成员索引 {} 条(idm_seq={p_idm}, profile_seq={p_app})",
+        counts.accounts, counts.members
+    );
     Ok(())
 }
 

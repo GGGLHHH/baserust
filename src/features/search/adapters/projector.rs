@@ -19,8 +19,11 @@ use uuid::Uuid;
 use crate::features::search::ports::SearchIndexRepo;
 use crate::infra::jetstream::STREAM_NAME;
 use crate::kernel::error::AppError;
+use crate::kernel::tenant::TenantId;
 
 /// P1 envelope 的 wire 形状(见 `infra::outbox::build_outbox_item`)。`data` 按 `r#type` 分支再解。
+/// `tenant_id`(多租户)只有租户事件带;`user.*` / `profile.*` 没有,本投影器也不依赖它 —— 成员事件
+/// 用 `data.tenant_id`(payload 是权威,信封上那份是它的拷贝)。
 #[derive(Debug, Deserialize)]
 struct Envelope {
     #[allow(dead_code)] // 路由只按 r#type 分支,schema 暂无消费者用得上,留字段保 envelope 形状完整
@@ -32,6 +35,10 @@ struct Envelope {
     seq: i64,
     data: serde_json::Value,
 }
+
+/// 订阅的主题:idm 账号事件 + idm 租户 / 成员事件 + app 资料事件。**排除 events.idm.auth.>**(auth_audit
+/// projector 的域,同一 stream 平行消费)。
+const FILTER_SUBJECTS: [&str; 3] = ["events.idm.user.>", "events.idm.tenant.>", "events.app.>"];
 
 #[derive(Debug, Deserialize)]
 struct UserCreatedData {
@@ -67,6 +74,27 @@ struct ProfileUpdatedData {
     user_id: Uuid,
     display_name: Option<String>,
 }
+
+/// `tenant.member_*` 的 data(idm `member_payload`):`status` / `roles` 视事件类型可缺。
+/// `tenant_id` 反序列化成 `TenantId`:nil → 解析失败 → 毒消息(nil 永远不是合法租户)。
+#[derive(Debug, Deserialize)]
+struct MemberData {
+    tenant_id: TenantId,
+    user_id: Uuid,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    roles: Option<Vec<String>>,
+}
+
+/// `tenant.deleted` 的 data(只用得上 tenant_id)。
+#[derive(Debug, Deserialize)]
+struct TenantData {
+    tenant_id: TenantId,
+}
+
+/// 成员事件里缺 status 时的默认(`member_added` 一定带;老格式兜底)。
+const DEFAULT_MEMBER_STATUS: &str = "active";
 
 /// JetStream durable pull consumer + 投影仓储。持有装配好的 consumer 句柄,`run` 消费到停。
 pub struct Projector {
@@ -104,30 +132,41 @@ impl Projector {
             .get_stream(STREAM_NAME)
             .await
             .with_context(|| format!("获取 JetStream 流 {STREAM_NAME} 失败"))?;
-        let consumer = stream
-            .get_or_create_consumer(
-                durable_name,
-                pull::Config {
-                    durable_name: Some(durable_name.to_owned()),
-                    ack_policy: AckPolicy::Explicit,
-                    // 只订阅本 projector 的域:idm 用户事件(events.idm.user.>)+ app profile
-                    // 事件(events.app.>)。**排除 events.idm.auth.>** —— 那是 auth_audit projector
-                    // 的域(同一 stream 平行消费)。注意同 ack_wait:只对**新建** durable 生效
-                    // (get_or_create 对已存在的只绑定不更新),存量 durable 仍会收到 auth.*,
-                    // 由 apply_message 顶部显式跳过兜底。
-                    filter_subjects: vec![
-                        "events.idm.user.>".to_owned(),
-                        "events.app.>".to_owned(),
-                    ],
-                    // 盖过 run() 退避梯子的单次最长 sleep(512s)。注意:**只对新建 durable 生效**
-                    // (get_or_create 对已存在的 durable 只绑定、不更新配置)—— 存量部署仍是默认
-                    // 30s,故 run() 的退避另切 ≤15s 片、每片发 AckKind::Progress 续期兜底。
-                    ack_wait: std::time::Duration::from_secs(600),
-                    ..Default::default()
-                },
-            )
+        let desired = pull::Config {
+            durable_name: Some(durable_name.to_owned()),
+            ack_policy: AckPolicy::Explicit,
+            // 只订阅本 projector 的域(见 FILTER_SUBJECTS);auth.* 归 auth_audit projector。
+            filter_subjects: FILTER_SUBJECTS.iter().map(|s| (*s).to_owned()).collect(),
+            // 盖过 run() 退避梯子的单次最长 sleep(512s)。存量 durable 的配置见下方的更新兜底;
+            // run() 的退避另切 ≤15s 片、每片发 AckKind::Progress 续期。
+            ack_wait: std::time::Duration::from_secs(600),
+            ..Default::default()
+        };
+        let mut consumer = stream
+            .get_or_create_consumer(durable_name, desired.clone())
             .await
             .with_context(|| format!("创建/绑定 durable consumer {durable_name} 失败"))?;
+        // get_or_create 对已存在的 durable 只绑定、不更新配置。多租户之前建的 durable 只过滤
+        // user.> / app.>,收不到 tenant.*(成员索引就永远是空的)→ 过滤主题不一致时更新它(NATS 2.10+
+        // 允许改 filter_subjects)。没设过滤的老 durable 本就收全量,不动(auth.* 在 apply_message 顶部跳过)。
+        let current = &consumer.cached_info().config;
+        let has_filter = !current.filter_subjects.is_empty() || !current.filter_subject.is_empty();
+        if has_filter && current.filter_subjects != desired.filter_subjects {
+            match stream.update_consumer(desired).await {
+                Ok(updated) => {
+                    tracing::info!(
+                        durable = durable_name,
+                        "projector durable 的过滤主题已更新(加 tenant.*)"
+                    );
+                    consumer = updated;
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    durable = durable_name,
+                    "更新 projector durable 的过滤主题失败:收不到 tenant.* 事件,成员索引要靠 rebuild_search 回填"
+                ),
+            }
+        }
         Ok(Self {
             name: durable_name.to_owned(),
             consumer,
@@ -322,6 +361,52 @@ impl Projector {
                     .await
                     .map_err(ApplyError::Transient)?;
             }
+            // ── 租户成员(多租户):成员索引一行 = 一个成员关系 ──
+            "tenant.member_added" => {
+                let d = member_data(env.data, "tenant.member_added")?;
+                repo.apply_member_added(
+                    d.tenant_id,
+                    d.user_id,
+                    d.status.as_deref().unwrap_or(DEFAULT_MEMBER_STATUS),
+                    &d.roles.unwrap_or_default(),
+                    env.seq,
+                )
+                .await
+                .map_err(ApplyError::Transient)?;
+            }
+            "tenant.member_updated" => {
+                let d = member_data(env.data, "tenant.member_updated")?;
+                let status = d.status.ok_or_else(|| {
+                    ApplyError::Poison("tenant.member_updated data: 缺 status".to_owned())
+                })?;
+                repo.apply_member_updated(d.tenant_id, d.user_id, &status, env.seq)
+                    .await
+                    .map_err(ApplyError::Transient)?;
+            }
+            "tenant.member_roles_set" => {
+                let d = member_data(env.data, "tenant.member_roles_set")?;
+                let roles = d.roles.ok_or_else(|| {
+                    ApplyError::Poison("tenant.member_roles_set data: 缺 roles".to_owned())
+                })?;
+                repo.apply_member_roles_set(d.tenant_id, d.user_id, &roles, env.seq)
+                    .await
+                    .map_err(ApplyError::Transient)?;
+            }
+            "tenant.member_removed" => {
+                let d = member_data(env.data, "tenant.member_removed")?;
+                repo.apply_member_removed(d.tenant_id, d.user_id, env.seq)
+                    .await
+                    .map_err(ApplyError::Transient)?;
+            }
+            "tenant.deleted" => {
+                let d: TenantData = serde_json::from_value(env.data)
+                    .map_err(|e| ApplyError::Poison(format!("tenant.deleted data: {e}")))?;
+                repo.apply_tenant_deleted(d.tenant_id, env.seq)
+                    .await
+                    .map_err(ApplyError::Transient)?;
+            }
+            // 租户建 / 改名 / 停用:成员索引不存租户信息,不用投影(停用租户的成员照样在列表里)。
+            "tenant.created" | "tenant.updated" => {}
             other => {
                 tracing::debug!(
                     event_type = other,
@@ -332,6 +417,11 @@ impl Projector {
 
         Ok(())
     }
+}
+
+/// 解成员事件的 data;解不开 = 毒消息。
+fn member_data(data: serde_json::Value, what: &str) -> Result<MemberData, ApplyError> {
+    serde_json::from_value(data).map_err(|e| ApplyError::Poison(format!("{what} data: {e}")))
 }
 
 #[cfg(test)]
@@ -368,7 +458,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get(user_id).await.unwrap().expect("行已写入");
+        let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.username.as_deref(), Some("alice"));
         assert_eq!(row.idm_seq, Some(5));
         assert!(!row.deleted);
@@ -390,7 +480,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get(user_id).await.unwrap().expect("行已写入");
+        let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.display_name.as_deref(), Some("D"));
         assert_eq!(row.profile_seq, Some(2));
     }
@@ -411,7 +501,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get(user_id).await.unwrap().expect("行已写入");
+        let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.roles, vec!["admin".to_string()]);
     }
 
@@ -431,7 +521,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get(user_id).await.unwrap().expect("行已写入");
+        let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert!(row.deleted);
     }
 
@@ -451,7 +541,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(repo.get(user_id).await.unwrap().is_none());
+        assert!(repo.get_account(user_id).await.unwrap().is_none());
     }
 
     /// auth.* 属 auth_audit projector 的域(同一 stream 平行消费):user-search projector
@@ -472,7 +562,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(repo.get(user_id).await.unwrap().is_none());
+        assert!(repo.get_account(user_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -514,7 +604,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get(user_id).await.unwrap().expect("行已写入");
+        let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.username.as_deref(), Some("alice"));
         assert_eq!(row.idm_seq, Some(5));
     }
@@ -548,5 +638,160 @@ mod tests {
             matches!(result, Err(ApplyError::Poison(_))),
             "非 envelope 载荷应判毒消息"
         );
+    }
+
+    fn env(seq: i64, schema: &str, ty: &str, data: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema": schema,
+            "type": ty,
+            "aggregate_id": Uuid::now_v7(),
+            "seq": seq,
+            "data": data,
+        }))
+        .unwrap()
+    }
+
+    /// 多租户:`tenant.member_*` 落成员索引(一个成员关系一行,账号列从账号目录抄),
+    /// `profile.updated` 刷新该用户在所有租户里的行,`tenant.deleted` 让该租户的成员不再出现。
+    #[tokio::test]
+    async fn projector_handles_member_events() {
+        let repo = InMemorySearchIndexRepo::new();
+        let a = TenantId::new(Uuid::now_v7()).unwrap();
+        let b = TenantId::new(Uuid::now_v7()).unwrap();
+        let u = Uuid::now_v7();
+        let apply = |bytes: Vec<u8>| {
+            let repo = &repo;
+            async move { Projector::apply_message(repo, &bytes).await.unwrap() }
+        };
+
+        apply(env(
+            1,
+            "idm",
+            "user.created",
+            json!({
+                "user_id": u, "username": "alice", "email": null, "email_verified": false,
+                "roles": ["superadmin"], "created_at": created_at_fixture(),
+            }),
+        ))
+        .await;
+        // 成员事件的 aggregate_id 是租户 id;信封上也带 tenant_id(投影器用 data 里那份)。
+        apply(env(
+            2,
+            "idm",
+            "tenant.member_added",
+            json!({
+                "tenant_id": a, "user_id": u, "status": "active", "roles": ["admin"],
+            }),
+        ))
+        .await;
+        apply(env(
+            3,
+            "idm",
+            "tenant.member_added",
+            json!({
+                "tenant_id": b, "user_id": u, "status": "active", "roles": ["user"],
+            }),
+        ))
+        .await;
+        let row = repo.get_member(a, u).await.unwrap().expect("a 的成员行");
+        assert_eq!(row.username.as_deref(), Some("alice"), "账号列从账号目录抄");
+        assert_eq!(
+            row.roles,
+            vec!["admin".to_owned()],
+            "roles 是租户角色,不是平台角色"
+        );
+        assert_eq!(row.status.as_deref(), Some("active"));
+        assert_eq!(row.member_seq, Some(2));
+
+        apply(env(
+            4,
+            "idm",
+            "tenant.member_roles_set",
+            json!({
+                "tenant_id": a, "user_id": u, "roles": ["user"],
+            }),
+        ))
+        .await;
+        apply(env(
+            5,
+            "idm",
+            "tenant.member_updated",
+            json!({
+                "tenant_id": a, "user_id": u, "status": "inactive",
+            }),
+        ))
+        .await;
+        let row = repo.get_member(a, u).await.unwrap().unwrap();
+        assert_eq!(row.roles, vec!["user".to_owned()]);
+        assert_eq!(row.status.as_deref(), Some("inactive"));
+
+        // 资料全局:一个 profile.updated 刷新两个租户的行。
+        apply(env(
+            1,
+            "app",
+            "profile.updated",
+            json!({ "user_id": u, "display_name": "Alice" }),
+        ))
+        .await;
+        for t in [a, b] {
+            let row = repo.get_member(t, u).await.unwrap().unwrap();
+            assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        }
+
+        apply(env(
+            6,
+            "idm",
+            "tenant.member_removed",
+            json!({ "tenant_id": b, "user_id": u }),
+        ))
+        .await;
+        assert!(repo.get_member(b, u).await.unwrap().unwrap().removed);
+        apply(env(
+            7,
+            "idm",
+            "tenant.deleted",
+            json!({ "tenant_id": a, "slug": "a" }),
+        ))
+        .await;
+        assert!(repo.get_member(a, u).await.unwrap().unwrap().removed);
+
+        // 租户建 / 改名:成员索引不存租户信息 → 无操作、不报错。
+        apply(env(
+            8,
+            "idm",
+            "tenant.created",
+            json!({
+                "tenant_id": Uuid::now_v7(), "slug": "c", "name": "C", "status": "active",
+            }),
+        ))
+        .await;
+    }
+
+    /// 成员事件的 data 坏(nil 租户 / 缺必需字段)= 毒消息(ack 跳过),不是暂时故障。
+    #[tokio::test]
+    async fn bad_member_events_are_poison() {
+        let repo = InMemorySearchIndexRepo::new();
+        let u = Uuid::now_v7();
+        for (ty, data) in [
+            (
+                "tenant.member_added",
+                json!({ "tenant_id": Uuid::nil(), "user_id": u }),
+            ),
+            (
+                "tenant.member_updated",
+                json!({ "tenant_id": Uuid::now_v7(), "user_id": u }),
+            ),
+            (
+                "tenant.member_roles_set",
+                json!({ "tenant_id": Uuid::now_v7(), "user_id": u }),
+            ),
+            ("tenant.member_removed", json!({ "user_id": u })),
+        ] {
+            let r = Projector::apply_message(&repo, &env(1, "idm", ty, data)).await;
+            assert!(
+                matches!(r, Err(ApplyError::Poison(_))),
+                "{ty} 坏 data 应判毒消息"
+            );
+        }
     }
 }

@@ -71,6 +71,38 @@ pub struct UserResponse {
     pub roles: Vec<RoleName>,
 }
 
+/// 切换当前租户(`POST /auth/switch-tenant`)。只能切到自己是**有效成员**的租户(成员 active + 租户 active)。
+#[derive(Debug, Deserialize, ToSchema, Validate)]
+pub struct SwitchTenantRequest {
+    #[garde(skip)]
+    pub tenant_id: Uuid,
+}
+
+/// 我的一个租户(`GET /auth/tenants` 的元素):当前账号**有效**的成员关系。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MyTenantView {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    /// 我在该租户内的角色(闭集,生成前端 union)。
+    #[schema(value_type = Vec<crate::infra::authz::RoleNameSchema>)]
+    pub roles: Vec<RoleName>,
+    /// 是否是当前 token 所在的租户。
+    pub current: bool,
+}
+
+impl MyTenantView {
+    pub fn from_membership(m: idm::Membership, current: Option<Uuid>) -> Self {
+        Self {
+            id: m.tenant.id,
+            slug: m.tenant.slug,
+            name: m.tenant.name,
+            roles: RoleName::parse_lossy(m.roles),
+            current: current == Some(m.tenant.id),
+        }
+    }
+}
+
 // ── 边界转换:app DTO ↔ idm 领域类型 ──
 
 impl From<RegisterRequest> for idm::RegisterInput {

@@ -30,12 +30,20 @@ Go→Rust 后端**脚手架**:提供可复用的**范式**(不是业务逻辑)�
   - **可拔插仓储**:service 持 `Arc<dyn Repo>` 端口;内存实现是默认(零 DB 跑测试、也是核心单测的假适配器),PG 实现按 `*_DB_HOST` 启动时二选一。
   - **核心业务 = 一次同步调用 + 一个本地事务**;事件只做请求外副作用(先进程内,需要可靠投递再 outbox + MQ,消费端幂等)。
 - **composition root = `src/app/`**:唯一耦合所有模块处 —— `router.rs`(Mount 枚举 + 中间件栈)、`runtime.rs`(`run`)、`state.rs`(`AppState::new` 装配 + `connect_for_schema`)、`adapters/`(跨模块适配器)。**业务模块彼此零 import**,胶水只在这。
-- **多进程拓扑**:开发单体 `Both`(一个进程挂全);生产 app / idm 分进程 + nginx 按 `/api/v1/{public,frontend,admin}/auth/` 三前缀分流。`Mount` 枚举驱动挂哪些模块 + 连哪个库。
+- **多进程拓扑**:开发单体 `Both`(一个进程挂全);生产 app / idm 分进程 + nginx 按 `/api/v1/{public,frontend,admin}/auth/` 与 `/api/v1/admin/platform/`(平台组织管理)两类前缀分流到 idm,其余到 app(`nginx.conf` 与 stack 的 `deploy/nginx.conf` 由 `scripts/check-nginx-drift.sh` 对齐)。`Mount` 枚举驱动挂哪些模块 + 连哪个库。
+- **多租户(单机共享实例,组织 = 租户)**:账号全局一份(idm),组织 / 成员关系 / 租户角色也在 idm;token 的 `roles` = 平台角色、`tenant_id` = 当前组织(平台上下文缺省)、`tenant_roles` = 当前组织角色。没有「关闭多租户」开关,单租户项目就是只有默认组织 `DEFAULT_TENANT_ID`(`…0001`)。
+  - **租户只从 token 来**:handler 用 `CurrentTenant` 提取器(缺 → 403 `tenant_required`,绝不落默认组织),不收请求里的 `tenant_id`;核心用 `kernel::tenant::TenantId`(nil 构造即报错)。跨组织的资源 id → **404**。
+  - **每张业务表**带 `tenant_id` + `CHECK <> nil` + `ENABLE`/`FORCE ROW LEVEL SECURITY` + `tenant_isolation` 策略;PG 仓储每个方法用 `infra::pg::tenant_tx`(事务级 `set_config('app.tenant_id', …, true)`,**禁会话级 SET**)且 SQL 再写 `tenant_id = $1`。全局表(字典、账号目录、outbox、迁移台账…)登记在 `tests/rls_audit.rs` 的 `GLOBAL_TABLES`;`rls_audit`(`just test-pg`)守「每张表要么隔离、要么在白名单」+ 运行时账号非 owner、无 BYPASSRLS。
+  - **PG 账号三分**(app / content / search):`<schema>_owner` 跑迁移、拥有表;`<schema>` 运行时只有 DML、受 RLS;`<schema>_system` BYPASSRLS,只给后台任务 / 投影器 / 平台级读的单独连接池(`AppState` 的 `*_system_pool`)。建库 `scripts/initdb/10-tenancy-roles.sh`(幂等,老库 `just db-ensure-roles` 在迁移**之前**跑)。idm、ops 不拆。
+  - **权限有作用域**:`Perm::scope()` / `RoleName::scope()` 穷尽 match,平台级权限只由平台角色给、租户级只由当前组织角色给(细节 → `authorization` skill)。
+  - **角色 4 级**(2026-11-26):平台角色 `superadmin`(只有一个,只由 seed 声明,任何接口都授不出 / 撤不掉)、`platform_admin`(平台管理员);组织角色 `admin` / `user`。superadmin 独占 `ops:read`(监控)/ `audit:read`(登录日志)/ `platform:roles`(任命平台管理员、管持平台角色的账号);平台管理员 = 其余平台级权限。**防接管**:对持平台角色的账号做账号管理写操作、在组织里改角色 / 移出,要 `platform:roles`(`Policy::require_platform_role_authority`,目标角色用未过滤原始名)。
+  - **领域事件带 `tenant_id`**,总线全实例广播,SSE handler 逐帧过滤当前组织;outbox 信封带 `tenant_id`(全局事件为 null)。content 的个人内容(头像)= `ContentScope::Personal`,不属于任何组织。
+  - 新模块的租户清单(TenantId 入参 / tenant_tx / RLS 迁移 / 跨租户黑盒测试 / rls_audit)→ `adding-a-feature` skill。
 - **跨 schema 隔离**:app / idm 各自 role 的 search_path 物理隔离。**禁跨 schema join**;跨模块只读走 `connect_for_schema(对方)` + 对方 repo;引用用标识(字符串)非 FK。
 - **统一不泄露错误契约**:所有出错(含 panic / timeout)→ `ErrorBody` JSON `{code,error}`,原始细节只进日志。
 - **config 零环境变量静默启动**:全字段有默认,不设任何 env 也能跑(内存模式)。
 - **认证**:httponly cookie + Bearer 兜底;app 进程只 decode JWT(roles 在 claim 里),不查 idm 库。
-- **监控**:后台「系统监控」页(`/api/v1/admin/monitoring` 实时 + `/history` + `/logs`,需 `users:admin`)。实时数据在进程内存(`src/infra/monitor/`,15s 一个快照、留 1 小时);每分钟落盘到 **`ops` schema**(`OPS_DB_HOST`;分钟级 15 天 / 小时级 13 个月 / 明细 30 天),WARN 及以上日志 + 5xx + 慢请求经采集层进 `ops.log_record`(15 天、入库前脱敏);前端错误经 `POST /api/v1/public/client-errors`(`app/client_errors.rs`,免登录、进程内限流)直接写同一张表,service = `web`。不配 ops 库 = 内存里最近 24 小时。分进程时 app 经 `IDM_INTERNAL_URL` 汇总 idm 实时数据(`app/monitoring.rs`)。埋点函数在 `src/infra/telemetry.rs`(同时写给外部抓取用的 `/metrics`);`/readyz` 逐项检查依赖(`app/probes.rs`)。不引入外部监控套件。
+- **监控**:后台「系统监控」页(`/api/v1/admin/monitoring` 实时 + `/history` + `/logs`,需 `ops:read`,superadmin 独占)。实时数据在进程内存(`src/infra/monitor/`,15s 一个快照、留 1 小时);每分钟落盘到 **`ops` schema**(`OPS_DB_HOST`;分钟级 15 天 / 小时级 13 个月 / 明细 30 天),WARN 及以上日志 + 5xx + 慢请求经采集层进 `ops.log_record`(15 天、入库前脱敏);前端错误经 `POST /api/v1/public/client-errors`(`app/client_errors.rs`,免登录、进程内限流)直接写同一张表,service = `web`。不配 ops 库 = 内存里最近 24 小时。分进程时 app 经 `IDM_INTERNAL_URL` 汇总 idm 实时数据(`app/monitoring.rs`)。埋点函数在 `src/infra/telemetry.rs`(同时写给外部抓取用的 `/metrics`);`/readyz` 逐项检查依赖(`app/probes.rs`)。不引入外部监控套件。
 
 ## API 约定
 

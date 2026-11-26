@@ -27,10 +27,15 @@ pub async fn authenticate(
         .map(|c| c.value().to_owned())
         .or_else(|| bearer_token(&req).map(str::to_owned));
     if let Some(token) = token {
-        // 单次验签同时出身份 + scope(热路径;语义 == idm::authenticate_token + scope_of)。
-        if let Ok((user, scope)) = state.token_verifier.verify_with_scope(&token) {
-            req.extensions_mut().insert(user);
-            req.extensions_mut().insert(TokenScope(scope));
+        // 单次验签同时出身份 + scope + 当前租户(热路径;语义 == idm::authenticate_token + scope_of)。
+        // user_id / tenant_id 进 tracing 根 span:鉴权层在 TraceLayer 之外(先跑),`make_http_span`
+        // 建 span 时从这里塞的 `AuthUser` 读出来(见 app::router)。
+        if let Ok(v) = state.token_verifier.verify_with_scope(&token) {
+            req.extensions_mut().insert(v.user);
+            req.extensions_mut().insert(TokenScope(v.scope));
+            if let Some(t) = v.tenant {
+                req.extensions_mut().insert(t);
+            }
         }
     }
     next.run(req).await

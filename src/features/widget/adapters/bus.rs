@@ -6,6 +6,8 @@
 //!
 //! 负载格式 = HTTP 线格式 `adapters::http::dto::WidgetEvent`(SSE 帧与总线负载同一线格式):
 //! 发布时领域事件 → DTO → JSON,订阅时反向,出这个文件的一律是领域事件。
+//! **租户随负载走**(`tenant_id` 字段):频道 / subject 不分租户(全实例广播),订阅侧(SSE handler)逐帧先比租户;
+//! 负载里租户缺失 / 是 nil → 当坏 payload 跳过,绝不当成任何租户的事件。
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -16,6 +18,21 @@ use super::http::dto::WidgetEvent as Wire;
 use crate::features::widget::events::WidgetEvent;
 use crate::features::widget::ports::{EventBus, EventSubscription};
 use crate::kernel::error::AppError;
+
+/// 总线负载 → 领域事件。形状不对(serde 失败)或租户非法(nil)→ `None`(落 warn,订阅方跳过、不断流)。
+fn decode(parsed: Result<Wire, serde_json::Error>) -> Option<WidgetEvent> {
+    match parsed.map(WidgetEvent::try_from) {
+        Ok(Ok(e)) => Some(e),
+        Ok(Err(e)) => {
+            tracing::warn!(error = ?e, "widget 事件 payload 租户非法,跳过");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "widget 事件 payload 非法,跳过");
+            None
+        }
+    }
+}
 
 // ── PG 实现:pg_notify / LISTEN(多实例扇出)──
 // 注意:publish 走**自己的 pool 连接、独立 autocommit**,不在任何调用方事务里 ——
@@ -81,9 +98,9 @@ impl EventSubscription for PgSubscription {
         loop {
             match self.0.recv().await {
                 // 坏 payload(未来版本混发/人为 NOTIFY):跳过,不断流。
-                Ok(n) => match serde_json::from_str::<Wire>(n.payload()) {
-                    Ok(e) => return Some(e.into()),
-                    Err(e) => tracing::warn!(error = %e, "widget 事件 payload 非法,跳过"),
+                Ok(n) => match decode(serde_json::from_str::<Wire>(n.payload())) {
+                    Some(e) => return Some(e),
+                    None => continue,
                 },
                 // PgListener 自带断线重连;到这说明不可恢复 → 结束流(客户端 EventSource 自动重连)。
                 Err(e) => {
@@ -152,9 +169,9 @@ impl EventSubscription for NatsSubscription {
         loop {
             match self.0.next().await {
                 // 坏 payload(版本混发/人为发布):跳过,不断流(同 PG 实现的契约)。
-                Some(msg) => match serde_json::from_slice::<Wire>(&msg.payload) {
-                    Ok(e) => return Some(e.into()),
-                    Err(e) => tracing::warn!(error = %e, "widget 事件 payload 非法,跳过"),
+                Some(msg) => match decode(serde_json::from_slice::<Wire>(&msg.payload)) {
+                    Some(e) => return Some(e),
+                    None => continue,
                 },
                 // 断线由 Client 自动重连、订阅存续(窗口内丢事件,best-effort);
                 // 到 None 说明客户端已关闭 → 结束流(客户端 EventSource 自动重连)。

@@ -1,5 +1,5 @@
 //! 认证审计的 **HTTP 适配器**(admin 组,归 idm 进程)。线格式 ↔ 领域互转见 `dto`。镜像 `features::users` 的 `list_users` handler
-//! 的守卫 + 分页范式:`require_scoped(UsersAdmin)` + `PageQuery` + 过滤 DTO。
+//! 的守卫 + 分页范式:`require_scoped(AuditRead)` + `PageQuery` + 过滤 DTO。
 //! `AppState.auth_audit` 为 `None`(非 needs_idm 进程 / 无 search pool)时 → 404。
 
 use std::convert::Infallible;
@@ -30,7 +30,7 @@ use crate::kernel::error::AppError;
     responses(
         (status = 200, body = Page<AuthEventRow>),
         (status = 401, body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 403, description = "无 audit:read 权限(superadmin 独占)", body = ErrorBody),
         (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
         (status = 422, description = "page 与 cursor 互斥", body = ErrorBody),
     )
@@ -45,7 +45,7 @@ pub async fn list_user_auth_events(
 ) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
     let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
     let page = svc
         .list_for_user(id, filter.into(), page.resolve()?)
@@ -62,7 +62,7 @@ pub async fn list_user_auth_events(
     responses(
         (status = 200, body = Page<AuthEventRow>),
         (status = 401, body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 403, description = "无 audit:read 权限(superadmin 独占)", body = ErrorBody),
         (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
         (status = 422, description = "page 与 cursor 互斥", body = ErrorBody),
     )
@@ -76,7 +76,7 @@ pub async fn list_auth_events(
 ) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
     let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
     let page = svc.list(filter.into(), page.resolve()?).await?;
     Ok(Json(Page::from_core(page, AuthEventRow::from)))
@@ -91,7 +91,7 @@ pub async fn list_auth_events(
     responses(
         (status = 200, body = AuthStats),
         (status = 401, body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 403, description = "无 audit:read 权限(superadmin 独占)", body = ErrorBody),
         (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
     )
 )]
@@ -103,7 +103,7 @@ pub async fn stats_auth_events(
 ) -> Result<Json<AuthStats>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
     let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
     Ok(Json(svc.stats(q.from, q.to).await?.into()))
 }
@@ -118,7 +118,7 @@ pub async fn stats_auth_events(
     responses(
         (status = 200, description = "SSE 事件流;event = auth_event,data = AuthEventRow JSON", content_type = "text/event-stream", body = AuthEventRow),
         (status = 401, body = ErrorBody),
-        (status = 403, description = "无 users:admin 权限", body = ErrorBody),
+        (status = 403, description = "无 audit:read 权限(superadmin 独占)", body = ErrorBody),
         (status = 404, description = "审计后端未接线(无 search 投影库)", body = ErrorBody),
     )
 )]
@@ -129,7 +129,7 @@ pub async fn stream_auth_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
     let bus = state.auth_events_bus.as_ref().ok_or(AppError::NotFound)?;
     let rx = bus.subscribe();
     let guard = crate::infra::telemetry::SseConnectionGuard::new("auth_events");

@@ -1,4 +1,4 @@
-//! `users::UserSearchIndex` 的适配器:桥接 search 模块的 CQRS 读投影(`SearchIndexRepo::query`)。
+//! `users::UserSearchIndex` 的适配器:桥接 search 模块的 CQRS 读投影(账号目录,`SearchIndexRepo::query_accounts`)。
 //! 薄翻译(map + 转调,无业务判断)。组合根唯一同时认识 users + search 两侧具体类型的地方。
 
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl UserSearchIndex for SearchIndexAdapter {
         };
         let result = self
             .inner
-            .query(&query, map_sort(sort), order, page)
+            .query_accounts(&query, map_sort(sort), order, page)
             .await?;
         let rows = result
             .rows
@@ -87,13 +87,14 @@ mod tests {
     use time::macros::datetime;
     use uuid::Uuid;
 
+    /// 只造账号(不属于任何租户):平台账号列表照样列得出来。
     async fn seed(repo: &InMemorySearchIndexRepo, id: Uuid, username: &str, display_name: &str) {
         repo.apply_user_created(
             id,
             username,
             Some(&format!("{username}@example.com")),
             true,
-            &["user".to_string()],
+            &["superadmin".to_string()],
             datetime!(2026-01-01 00:00 UTC),
             1,
         )
@@ -135,7 +136,7 @@ mod tests {
         assert_eq!(row.email.as_deref(), Some("alice@example.com"));
         assert!(row.email_verified);
         assert_eq!(row.display_name.as_deref(), Some("Alice A"));
-        assert_eq!(row.roles, vec!["user".to_string()]);
+        assert_eq!(row.roles, vec!["superadmin".to_string()], "平台角色");
     }
 
     #[tokio::test]

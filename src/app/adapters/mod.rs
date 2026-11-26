@@ -7,6 +7,7 @@ mod content_avatar_probe;
 mod idm_outbox_source;
 mod idm_user_directory;
 mod in_process_profile_directory;
+mod member_search_index;
 mod profile_display_names;
 mod user_search_index;
 
@@ -14,5 +15,6 @@ pub use content_avatar_probe::ContentAvatarProbe;
 pub use idm_outbox_source::IdmOutboxSource;
 pub use idm_user_directory::InProcessUserDirectory;
 pub use in_process_profile_directory::InProcessProfileDirectory;
+pub use member_search_index::MemberSearchAdapter;
 pub use profile_display_names::ProfileDisplayNames;
 pub use user_search_index::SearchIndexAdapter;

@@ -4,6 +4,9 @@
 # 环境变量(都有默认值、可在同目录 .env 覆盖):
 #   POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB   pg 凭据与库名(默认 baserust)
 #   APP_DB_USER/PASSWORD · IDM_DB_USER/PASSWORD · CONTENT_DB_USER/PASSWORD · SEARCH_DB_USER/PASSWORD · OPS_DB_USER/PASSWORD   各 schema role 凭据(默认 <role>/pwd)
+#   {APP,CONTENT,SEARCH}_DB_OWNER_USER/PASSWORD · {APP,CONTENT,SEARCH}_DB_SYSTEM_USER/PASSWORD
+#                                                     多租户账号拆分:owner(迁移、拥有表)/ system(BYPASSRLS,后台任务),
+#                                                     默认 <role>_owner / <role>_system,密码 pwd(见 scripts/initdb/10-tenancy-roles.sh)
 #   MINIO_USER / MINIO_PASSWORD · S3_BUCKET           minio 凭据(默认 minio/minio12345)与桶名(默认 content)
 #   NGINX_PORT(80) · APP_PORT(6453) · IDM_PORT(6454) · DBHUB_PORT(3777) · PG_PORT(5821)   主机端口
 #   MINIO_PORT(9862, S3 API) · MINIO_CONSOLE_PORT(9863, 控制台)         minio 主机端口
@@ -69,12 +72,17 @@ services:
       APP_DB_DATABASE: ${POSTGRES_DB:-baserust}
       APP_DB_USER: ${APP_DB_USER:-app}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
+      # app schema 的 system 账号(BYPASSRLS):后台任务 / 平台级跨租户读的单独连接池,同 host/库。
+      APP_DB_SYSTEM_USER: ${APP_DB_SYSTEM_USER:-app_system}
+      APP_DB_SYSTEM_PASSWORD: ${APP_DB_SYSTEM_PASSWORD:-pwd}
       # 连 content schema(role=content):content/object 元数据进 PG(字节进下面的 minio)。
       CONTENT_DB_HOST: pg
       CONTENT_DB_PORT: "5432"
       CONTENT_DB_DATABASE: ${POSTGRES_DB:-baserust}
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
+      CONTENT_DB_SYSTEM_USER: ${CONTENT_DB_SYSTEM_USER:-content_system}
+      CONTENT_DB_SYSTEM_PASSWORD: ${CONTENT_DB_SYSTEM_PASSWORD:-pwd}
       # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 24 小时、重启清空。
       OPS_DB_HOST: pg
       OPS_DB_PORT: "5432"
@@ -123,7 +131,7 @@ services:
     ports:
       - "${APP_PORT:-6453}:8080"
 
-  # idm 进程:同一镜像,override entrypoint 跑 idm bin,只挂 auth(分 public/frontend/admin 三组前缀)。连 idm schema。
+  # idm 进程:同一镜像,override entrypoint 跑 idm bin,只挂 auth(public/frontend/admin 三组 `/auth/` 前缀)+ 平台租户管理(`/admin/platform/`)。连 idm schema。
   # idm 进程:**同一镜像**(同 image+build → 复用 app 已构建的那份),只 override entrypoint 跑 idm bin。
   idm:
     logging: *logging
@@ -154,6 +162,9 @@ services:
       SEARCH_DB_DATABASE: ${POSTGRES_DB:-baserust}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
+      # search 的 system 账号(BYPASSRLS):投影器、审计平台级读等后台路径的单独连接池。
+      SEARCH_DB_SYSTEM_USER: ${SEARCH_DB_SYSTEM_USER:-search_system}
+      SEARCH_DB_SYSTEM_PASSWORD: ${SEARCH_DB_SYSTEM_PASSWORD:-pwd}
       # 后台监控的历史指标与日志(ops schema,role=ops)。不设 OPS_DB_HOST = 只有进程内最近 24 小时、重启清空。
       OPS_DB_HOST: pg
       OPS_DB_PORT: "5432"
@@ -194,13 +205,20 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-pwd}
       IDM_DB_USER: ${IDM_DB_USER:-idm}
       IDM_DB_PASSWORD: ${IDM_DB_PASSWORD:-pwd}
-      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content/search/ops 五个 schema 各用同名 role 跑)。
+      # content schema 也由本容器迁移(migrate-all.sh 按 app/idm/content/search/ops 五个 schema 跑)。
       CONTENT_DB_USER: ${CONTENT_DB_USER:-content}
       CONTENT_DB_PASSWORD: ${CONTENT_DB_PASSWORD:-pwd}
       SEARCH_DB_USER: ${SEARCH_DB_USER:-search}
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
       OPS_DB_USER: ${OPS_DB_USER:-ops}
       OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
+      # app / content / search 以 owner 账号迁移(拥有表;运行时账号只有 DML)。
+      APP_DB_OWNER_USER: ${APP_DB_OWNER_USER:-app_owner}
+      APP_DB_OWNER_PASSWORD: ${APP_DB_OWNER_PASSWORD:-pwd}
+      CONTENT_DB_OWNER_USER: ${CONTENT_DB_OWNER_USER:-content_owner}
+      CONTENT_DB_OWNER_PASSWORD: ${CONTENT_DB_OWNER_PASSWORD:-pwd}
+      SEARCH_DB_OWNER_USER: ${SEARCH_DB_OWNER_USER:-search_owner}
+      SEARCH_DB_OWNER_PASSWORD: ${SEARCH_DB_OWNER_PASSWORD:-pwd}
     restart: "no"
 
   pg:
@@ -221,12 +239,26 @@ services:
       SEARCH_DB_PASSWORD: ${SEARCH_DB_PASSWORD:-pwd}
       OPS_DB_USER: ${OPS_DB_USER:-ops}
       OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:-pwd}
+      # 10-tenancy-roles.sh 用:app / content / search 拆出的 owner / system 账号
+      APP_DB_OWNER_USER: ${APP_DB_OWNER_USER:-app_owner}
+      APP_DB_OWNER_PASSWORD: ${APP_DB_OWNER_PASSWORD:-pwd}
+      APP_DB_SYSTEM_USER: ${APP_DB_SYSTEM_USER:-app_system}
+      APP_DB_SYSTEM_PASSWORD: ${APP_DB_SYSTEM_PASSWORD:-pwd}
+      CONTENT_DB_OWNER_USER: ${CONTENT_DB_OWNER_USER:-content_owner}
+      CONTENT_DB_OWNER_PASSWORD: ${CONTENT_DB_OWNER_PASSWORD:-pwd}
+      CONTENT_DB_SYSTEM_USER: ${CONTENT_DB_SYSTEM_USER:-content_system}
+      CONTENT_DB_SYSTEM_PASSWORD: ${CONTENT_DB_SYSTEM_PASSWORD:-pwd}
+      SEARCH_DB_OWNER_USER: ${SEARCH_DB_OWNER_USER:-search_owner}
+      SEARCH_DB_OWNER_PASSWORD: ${SEARCH_DB_OWNER_PASSWORD:-pwd}
+      SEARCH_DB_SYSTEM_USER: ${SEARCH_DB_SYSTEM_USER:-search_system}
+      SEARCH_DB_SYSTEM_PASSWORD: ${SEARCH_DB_SYSTEM_PASSWORD:-pwd}
     ports:
       - "${PG_PORT:-5821}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # 首次初始化时建 app/idm/content/search/ops 的 role + schema(role 的 search_path 指向自己 schema)。
-      # 注意只在**空 volume** 首次启动时跑:加了新 schema 后老 volume 需 down -v 重建,或 `just db-ensure-roles` 补齐。
+      # 首次初始化时建 app/idm/content/search/ops 的 role + schema(role 的 search_path 指向自己 schema),
+      # 再按 10-tenancy-roles.sh 拆 app/content/search 的 owner / 运行时 / system 账号。
+      # 注意只在**空 volume** 首次启动时跑:老 volume 用 `just db-ensure-roles` 补齐(可重复执行),再 just migrate。
       - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baserust} -d ${POSTGRES_DB:-baserust}"]

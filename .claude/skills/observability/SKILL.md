@@ -6,7 +6,7 @@ description: Use when adding or changing monitoring in baserust - the admin 系�
 # 监控 / 可观测性
 
 baserust 的监控是**后台里的「系统监控」页**(`/admin/monitoring`,前端 `basereact`),数据来自**进程内存**,
-不依赖任何外部组件:后端 `GET /api/v1/admin/monitoring`(需 `users:admin`)现算一份报告。
+不依赖任何外部组件:后端 `GET /api/v1/admin/monitoring`(需 `ops:read`,superadmin 独占)现算一份报告。
 **不要再引入 Grafana / Prometheus / Loki / Tempo / OTel 这类外部套件**(用户明确否决过:要的是后台里的页面)。
 
 ## 数据从哪来

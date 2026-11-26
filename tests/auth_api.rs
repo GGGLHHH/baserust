@@ -49,6 +49,15 @@ fn test_app() -> Router {
             Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
             None,
         ),
+        tenant_admin: baserust::features::tenants::TenantAdminService::new(
+            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
+            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
+            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
+            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
+            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
+            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+            None,
+        ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
@@ -58,6 +67,9 @@ fn test_app() -> Router {
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
+        app_system_pool: None,
+        content_system_pool: None,
+        search_system_pool: None,
     };
     build_router(
         state,
@@ -72,8 +84,11 @@ fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> Au
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
+        Arc::new(idm::InMemoryMemberRepo::new()),
     )
     .hasher(Arc::new(FakeHasher))
+    // 独立的空角色仓储:注册不授租户角色(配置了目录里没有的角色会响亮失败)
+    .signup_roles(Vec::new())
     .signer(signer)
     .verifier(verifier)
     .access_ttl_secs(900)

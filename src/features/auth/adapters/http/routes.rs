@@ -3,7 +3,7 @@
 //! cookie(Bearer 兜底)。业务逻辑全在 idm 库的 `AuthService` —— 这里只做校验 + cookie + DTO 翻译。
 //!
 //! 端点分三组挂载(public:register/login/refresh/logout;frontend:me*/logout-all;
-//! admin:admin_login/admin_get_me),nginx 按 `/api/v1/{public,frontend,admin}/auth/` 三前缀分流。
+//! admin:admin_login/admin_get_me),nginx 按 `/api/v1/{public,frontend,admin}/auth/` 三组前缀 + `/api/v1/admin/platform/`(平台租户管理)分流到 idm。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -12,8 +12,8 @@ use garde::Validate;
 use uuid::Uuid;
 
 use super::dto::{
-    ChangePasswordRequest, DeleteMeRequest, LoginRequest, RegisterRequest, UpdateMeRequest,
-    UserResponse,
+    ChangePasswordRequest, DeleteMeRequest, LoginRequest, MyTenantView, RegisterRequest,
+    SwitchTenantRequest, UpdateMeRequest, UserResponse,
 };
 use crate::app::state::AppState;
 use crate::features::auth::adapters::emit::{emit_auth_event, failure_data, success_data};
@@ -22,7 +22,6 @@ use crate::infra::client_context::ClientContext;
 use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
-use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 
 const ACCESS_COOKIE: &str = "access_token";
@@ -103,6 +102,7 @@ pub async fn register(
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),
+            outcome.tenant_id,
         ),
     )
     .await;
@@ -139,6 +139,7 @@ pub async fn login(
                     outcome.user.id,
                     Some(outcome.session_id),
                     Some(&outcome.user.username),
+                    outcome.tenant_id,
                 ),
             )
             .await;
@@ -156,7 +157,14 @@ pub async fn login(
                 &state.idm_outbox,
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
-                failure_data(&ctx, AuthChannel::Public, None, Some(&identifier), reason),
+                failure_data(
+                    &ctx,
+                    AuthChannel::Public,
+                    None,
+                    Some(&identifier),
+                    reason,
+                    None,
+                ),
             )
             .await;
             Err(idm_err.into())
@@ -191,6 +199,7 @@ pub async fn refresh(
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),
+            outcome.tenant_id,
         ),
     )
     .await;
@@ -220,6 +229,7 @@ pub async fn logout(
                     session.user_id,
                     Some(session.id),
                     None,
+                    session.tenant_id,
                 ),
             )
             .await;
@@ -248,6 +258,7 @@ pub async fn logout_all(
             user.0.id,
             None,
             Some(&user.0.username),
+            user.0.tenant_id,
         ),
     )
     .await;
@@ -319,6 +330,7 @@ pub async fn delete_me(
             user.0.id,
             None,
             Some(&user.0.username),
+            user.0.tenant_id,
         ),
     )
     .await;
@@ -352,10 +364,82 @@ pub async fn change_password(
             user.0.id,
             None,
             Some(&user.0.username),
+            user.0.tenant_id,
         ),
     )
     .await;
     Ok((StatusCode::NO_CONTENT, clear_auth_cookies(jar)))
+}
+
+// ── 租户:我的租户列表 / 切换当前租户(frontend 组,需登录)。 ──
+
+#[utoipa::path(
+    get, path = "/auth/tenants", tag = "me",
+    responses(
+        (status = 200, description = "当前账号有效的成员关系(租户 active + 成员 active),最近用过的在前;`current` 标出当前 token 所在租户", body = Vec<MyTenantView>),
+        (status = 401, body = ErrorBody),
+    )
+)]
+pub async fn list_my_tenants(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<Vec<MyTenantView>>, ApiError> {
+    let current = user.0.tenant_id;
+    let items = state
+        .auth
+        .my_tenants(user.0.id)
+        .await?
+        .into_iter()
+        .map(|m| MyTenantView::from_membership(m, current))
+        .collect();
+    Ok(Json(items))
+}
+
+#[utoipa::path(
+    post, path = "/auth/switch-tenant", tag = "me",
+    request_body = SwitchTenantRequest,
+    responses(
+        (status = 200, description = "已切换:旧会话吊销,带新租户的 token 写入 httponly cookie", body = UserResponse),
+        (status = 401, description = "未登录 / refresh cookie 无效 / refresh 会话不属于当前身份(原会话不动)", body = ErrorBody),
+        (status = 403, description = "不是该租户的有效成员(含平台管理员切进自己不是成员的租户),原会话不动", body = ErrorBody),
+        (status = 422, description = "校验失败", body = ErrorBody),
+    )
+)]
+pub async fn switch_tenant(
+    State(state): State<AppState>,
+    ctx: ClientContext,
+    jar: CookieJar,
+    user: CurrentUser, // frontend 组已闸登录;切哪个会话由 refresh cookie 定,但会话必须属于当前身份
+    Json(req): Json<SwitchTenantRequest>,
+) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
+    req.validate()?;
+    // 换租户 = 换会话:凭 refresh cookie(会话身份)切,不能只凭 access token。
+    let refresh = jar
+        .get(REFRESH_COOKIE)
+        .map(|c| c.value().to_owned())
+        .ok_or(AppError::Unauthorized)?;
+    // refresh 会话不属于当前身份(拿别人的 cookie 借道)→ 401,原会话不动(idm 校验)。
+    let outcome = state
+        .auth
+        .switch_tenant(&refresh, user.0.id, req.tenant_id)
+        .await?;
+    // 认证审计:记切换后的租户与新会话(失败 —— 不是成员 / refresh 无效 —— 不发事件,原会话不动)。
+    emit_auth_event(
+        &state.idm_outbox,
+        AuthEventType::TenantSwitched,
+        outcome.user.id,
+        success_data(
+            &ctx,
+            AuthChannel::Public,
+            outcome.user.id,
+            Some(outcome.session_id),
+            Some(&outcome.user.username),
+            outcome.tenant_id,
+        ),
+    )
+    .await;
+    let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
+    Ok((jar, Json(outcome.user.into())))
 }
 
 // ── admin 组(后台)。login 在组闸外(public 语义,验密后自查);me 在闸内。 ──
@@ -364,9 +448,9 @@ pub async fn change_password(
     post, path = "/auth/login", tag = "admin",
     request_body = LoginRequest,
     responses(
-        (status = 200, description = "后台登录成功,token 写入 httponly cookie", body = UserResponse),
+        (status = 200, description = "后台登录成功,token 写入 httponly cookie。进入的上下文:有效成员关系里按最近使用挑第一个有 admin:login 的租户;都没有而有平台级权限 → 平台上下文(无当前租户)", body = UserResponse),
         (status = 401, description = "用户名/邮箱或密码错误(同码同文案,防枚举)", body = ErrorBody),
-        (status = 403, description = "凭据正确但无后台准入(admin:login),不发 token 不设 cookie", body = ErrorBody),
+        (status = 403, description = "凭据正确但无后台准入,不发 token 不设 cookie:一个有效成员关系都没有、也没有平台级权限 → `tenant_required`;有成员关系但哪个租户里都没有 admin:login(也没有平台级权限)→ `forbidden`", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
@@ -378,46 +462,84 @@ pub async fn admin_login(
 ) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
     req.validate()?;
     let identifier = req.identifier.clone();
-    let outcome = match state.auth.login(req.into()).await {
+    // 验密后**挑进哪里**(`Policy::admin_login_entry`):有效成员关系按 last_used_at 倒序,第一个当前租户角色给了
+    // admin:login 的租户;都没有 → 有平台级权限进平台上下文;否则拒绝(没有成员关系 → tenant_required,
+    // 有 → forbidden)。拒绝时 idm **不建会话、不记 last_used_at**,不发 token 不设 cookie。
+    // 前台登录不走这里,仍进最近用过的租户。
+    let mut candidate: Option<Uuid> = None;
+    let mut denial: Option<AppError> = None;
+    let result = state
+        .auth
+        .login_with(req.into(), |c| {
+            candidate = Some(c.user_id);
+            let tenants = c
+                .memberships
+                .iter()
+                .map(|m| (m.tenant.id, m.roles.as_slice()));
+            match state.policy.admin_login_entry(c.platform_roles, tenants) {
+                Ok(Some(tenant)) => Some(idm::LoginEntry::Tenant(tenant)),
+                Ok(None) => Some(idm::LoginEntry::Platform),
+                Err(e) => {
+                    denial = Some(e);
+                    None
+                }
+            }
+        })
+        .await;
+    let outcome = match result {
         Ok(outcome) => outcome,
         // 凭据本身错(同 public login 的原因匹配);HTTP 仍统一 401,防枚举不变。
-        Err(idm_err) => {
-            let reason = match &idm_err {
-                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
-                _ => return Err(idm_err.into()),
-            };
+        Err(idm::IdmError::InvalidCredentials(f)) => {
             emit_auth_event(
                 &state.idm_outbox,
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
-                failure_data(&ctx, AuthChannel::Admin, None, Some(&identifier), reason),
+                failure_data(
+                    &ctx,
+                    AuthChannel::Admin,
+                    None,
+                    Some(&identifier),
+                    FailureReason::from(&f),
+                    None,
+                ),
             )
             .await;
-            return Err(idm_err.into());
+            return Err(idm::IdmError::InvalidCredentials(f).into());
         }
+        // 验过密但没有后台准入(或挑中的租户刚好被并发移出)。
+        Err(idm::IdmError::Forbidden) if candidate.is_some() => {
+            let user_id = candidate.unwrap_or_default();
+            emit_auth_event(
+                &state.idm_outbox,
+                AuthEventType::AdminAccessDenied,
+                user_id,
+                failure_data(
+                    &ctx,
+                    AuthChannel::Admin,
+                    Some(user_id),
+                    Some(&identifier),
+                    FailureReason::NoAdminPerm,
+                    None,
+                ),
+            )
+            .await;
+            return Err(denial.unwrap_or(AppError::Forbidden).into());
+        }
+        Err(e) => return Err(e.into()),
     };
-    // 验密后闸:无 admin:login(后台准入)→ 403,**不发 token 不设 cookie**(不然后台每接口 403,体验差)。
-    // login 已铸的 refresh 会话立即撤销,不留"验过密但没资格"的孤儿会话。
-    if !state
-        .policy
-        .perms_for(&outcome.user.roles)
-        .contains(&Perm::AdminLogin)
-    {
+    // 不变量护栏:挑选与 /admin 组闸(`Policy::require_admin_entry`)是同一准入口径,进来的 token 必然过组闸。
+    // 万一两边漂移:撤掉刚建的会话,403,不发 token(不然后台每接口 403)。
+    let entered = idm::AuthUser {
+        id: outcome.user.id,
+        username: outcome.user.username.clone(),
+        roles: outcome.user.roles.clone(),
+        tenant_id: outcome.tenant_id,
+        tenant_roles: outcome.tenant_roles.clone(),
+    };
+    if let Err(e) = state.policy.require_admin_entry(&entered, &[]) {
+        tracing::error!(user_id = %outcome.user.id, "后台登录挑出的上下文过不了后台组闸(准入口径漂移)");
         state.auth.logout(&outcome.refresh_token).await?;
-        emit_auth_event(
-            &state.idm_outbox,
-            AuthEventType::AdminAccessDenied,
-            outcome.user.id,
-            failure_data(
-                &ctx,
-                AuthChannel::Admin,
-                Some(outcome.user.id),
-                Some(&identifier),
-                FailureReason::NoAdminPerm,
-            ),
-        )
-        .await;
-        return Err(AppError::Forbidden.into());
+        return Err(e.into());
     }
     emit_auth_event(
         &state.idm_outbox,
@@ -429,6 +551,7 @@ pub async fn admin_login(
             outcome.user.id,
             Some(outcome.session_id),
             Some(&outcome.user.username),
+            outcome.tenant_id,
         ),
     )
     .await;

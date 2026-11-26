@@ -1,42 +1,197 @@
 //! WidgetRepo 契约一致性:**同一批断言对 InMemoryWidgetRepo 与 PgWidgetRepo 各跑一遍**,
-//! 钉死两实现的行为 parity —— 软删过滤 / 排序 / keyset / offset / with_total / 幂等 / 审计字段透传。
+//! 钉死两实现的行为 parity —— 软删过滤 / 排序 / keyset / offset / with_total / 幂等 / 审计字段透传 / **租户隔离**。
 //! "内存绿不保证 PG 绿"的漂移,全靠这一套契约抓。
 //!
 //! 内存入口:默认 `cargo test` 就跑(零 DB)。
-//! PG 入口:`cargo test --features pg-conformance`(需 DATABASE_URL 连 app role + 跑着的 pg),用 `just test-pg`。
+//! PG 入口:`cargo test --features pg-conformance`(DATABASE_URL 连 app_owner 建库迁移、仓储走运行时账号 app;用 `just test-pg`)。
 
 use baserust::features::widget::{WidgetRepo, WidgetSortField};
 use baserust::kernel::error::AppError;
 use baserust::kernel::pagination::{PageInfo, PageParams};
 use baserust::kernel::sort::SortOrder;
+use baserust::kernel::tenant::TenantId;
 use uuid::Uuid;
 
 /// 契约唯一真相源。内存与 PG 都调它 —— 加实现/加断言只改这一处。
 /// 只断言顺序·相对关系(updated_at >= created_at)·可见性,绝不断言绝对时间戳
 /// (PG `now()` ≠ memory `now_utc()`,断绝对值必假漂移)。
-async fn widget_repo_contract(repo: &dyn WidgetRepo) {
+/// 每个契约用自己的新租户:数据互不干扰,顺带证明「别的租户的行不进本租户的列表 / total」。
+fn fresh_tenant() -> TenantId {
+    TenantId::new(Uuid::now_v7()).unwrap()
+}
+
+fn offset_all() -> PageParams {
+    PageParams::Offset {
+        page: 1,
+        size: 100,
+        with_total: true,
+    }
+}
+
+/// **租户隔离契约**(spec §4.4 / §4.9):每个方法只在传入的租户里读写。内存实现靠这个参数过滤(唯一防线),
+/// PG 实现靠 `tenant_id = $1` + RLS(运行时账号跑,RLS 真生效)。两边同一份断言。
+async fn tenant_isolation(repo: &dyn WidgetRepo) {
+    let a = fresh_tenant();
+    let b = fresh_tenant();
+    let wa = repo
+        .create(a, "shared".into(), Some("ua".into()))
+        .await
+        .unwrap();
+
+    // ── 名字唯一只在租户内:别的租户可以同名;同租户重名仍 Conflict ──
+    let wb = repo
+        .create(b, "shared".into(), Some("ub".into()))
+        .await
+        .expect("别的租户里同名应可建");
+    assert!(matches!(
+        repo.create(b, "shared".into(), None).await,
+        Err(AppError::Conflict(_))
+    ));
+
+    // ── 按 id 取 / 改 / 删别的租户的行 → NotFound(不泄露存在),原行不动 ──
+    assert!(matches!(repo.get(b, wa.id).await, Err(AppError::NotFound)));
+    assert!(matches!(
+        repo.update(b, wa.id, "pwned".into(), None).await,
+        Err(AppError::NotFound)
+    ));
+    assert!(matches!(
+        repo.soft_delete(b, wa.id, None).await,
+        Err(AppError::NotFound)
+    ));
+    let still = repo.get(a, wa.id).await.unwrap();
+    assert_eq!(still.name, "shared");
+    assert_eq!(
+        still.updated_by.as_deref(),
+        Some("ua"),
+        "别的租户的写不该碰到它"
+    );
+
+    // ── 改名撞名也只看本租户:B 里有 only-b,A 的行改叫 only-b 不冲突 ──
+    repo.create(b, "only-b".into(), None).await.unwrap();
+    assert_eq!(
+        repo.update(a, wa.id, "only-b".into(), None)
+            .await
+            .expect("别的租户的名字不算撞名")
+            .name,
+        "only-b"
+    );
+
+    // ── 列表 / total 只含本租户(offset 与 cursor 都是)──
+    let la = repo
+        .list(
+            a,
+            &offset_all(),
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        la.items.iter().map(|w| w.id).collect::<Vec<_>>(),
+        vec![wa.id]
+    );
+    assert!(matches!(
+        la.page_info,
+        PageInfo::Offset { total: Some(1), .. }
+    ));
+    let lb = repo
+        .list(
+            b,
+            &offset_all(),
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lb.items.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
+        vec!["only-b", "shared"]
+    );
+    assert!(lb.items.iter().all(|w| w.id != wa.id));
+    let ca = repo
+        .list(
+            a,
+            &PageParams::Cursor {
+                after: None,
+                limit: 10,
+            },
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ca.items.iter().map(|w| w.id).collect::<Vec<_>>(),
+        vec![wa.id]
+    );
+    // owner 过滤叠在租户之上:B 里 ub 建的那行,在 A 里按 ub 过滤也是空
+    let by_ub = repo
+        .list(
+            a,
+            &offset_all(),
+            Some("ub"),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(by_ub.items.is_empty());
+
+    // ── cursor 锚点是别的租户的行 → BadRequest(不是本租户发出的 cursor,同伪造)──
+    assert!(matches!(
+        repo.list(
+            a,
+            &PageParams::Cursor {
+                after: Some(wb.id),
+                limit: 2
+            },
+            None,
+            WidgetSortField::Name,
+            SortOrder::Asc,
+        )
+        .await,
+        Err(AppError::BadRequest(_))
+    ));
+
+    // ── 父子事务:tag 跟父行同租户;别的租户读不到 tag;同名父行在别的租户照样能建 ──
+    let p = repo
+        .create_with_tags(a, "tagged".into(), vec!["x".into()], None)
+        .await
+        .unwrap();
+    assert_eq!(repo.tags_of(a, p.id).await.unwrap(), vec!["x".to_owned()]);
+    assert!(repo.tags_of(b, p.id).await.unwrap().is_empty());
+    repo.create_with_tags(b, "tagged".into(), vec!["x".into()], None)
+        .await
+        .expect("别的租户里同名父行 + 同 label 应可建");
+}
+
+async fn widget_repo_contract(repo: &dyn WidgetRepo, t: TenantId) {
     // ── create:审计字段透传(created_by = updated_by = by)──
     let a = repo
-        .create("alpha".into(), Some("tester".into()))
+        .create(t, "alpha".into(), Some("tester".into()))
         .await
         .unwrap();
     assert_eq!(a.created_by.as_deref(), Some("tester"));
     assert_eq!(a.updated_by.as_deref(), Some("tester"));
 
     // ── get 回环 + 不存在 → NotFound ──
-    assert_eq!(repo.get(a.id).await.unwrap().name, "alpha");
+    assert_eq!(repo.get(t, a.id).await.unwrap().name, "alpha");
     assert!(matches!(
-        repo.get(Uuid::now_v7()).await,
+        repo.get(t, Uuid::now_v7()).await,
         Err(AppError::NotFound)
     ));
 
     // 再造两行(uuid v7 单调递增:a.id < b.id < c.id)
-    let b = repo.create("bravo".into(), None).await.unwrap();
-    let c = repo.create("charlie".into(), None).await.unwrap();
+    let b = repo.create(t, "bravo".into(), None).await.unwrap();
+    let c = repo.create(t, "charlie".into(), None).await.unwrap();
 
     // ── offset:ORDER BY id DESC,with_total 计存活数 ──
     let p1 = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 2,
@@ -58,6 +213,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     ));
     let p2 = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 2,
                 size: 2,
@@ -77,6 +233,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // ── cursor keyset:首页 has_more,next_after 作锚点续翻 ──
     let cur1 = repo
         .list(
+            t,
             &PageParams::Cursor {
                 after: None,
                 limit: 2,
@@ -104,6 +261,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     };
     let cur2 = repo
         .list(
+            t,
             &PageParams::Cursor {
                 after: Some(next),
                 limit: 2,
@@ -129,6 +287,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // ── ownership 过滤:owner=Some 只列该 created_by 的行,total 也按 owner 算(memory↔PG parity)──
     let mine = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 50,
@@ -151,7 +310,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 
     // ── update:改名 + updated_by + updated_at 推进;软删行不可改 ──
     let upd = repo
-        .update(a.id, "alpha2".into(), Some("editor".into()))
+        .update(t, a.id, "alpha2".into(), Some("editor".into()))
         .await
         .unwrap();
     assert_eq!(upd.name, "alpha2");
@@ -159,18 +318,19 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     assert!(upd.updated_at >= upd.created_at); // 触发器 / now_utc() 都须满足
 
     // ── soft_delete 幂等 + 软删后不可见 ──
-    repo.soft_delete(a.id, None).await.unwrap();
-    assert!(matches!(repo.get(a.id).await, Err(AppError::NotFound)));
+    repo.soft_delete(t, a.id, None).await.unwrap();
+    assert!(matches!(repo.get(t, a.id).await, Err(AppError::NotFound)));
     assert!(matches!(
-        repo.soft_delete(a.id, None).await,
+        repo.soft_delete(t, a.id, None).await,
         Err(AppError::NotFound)
     )); // 二次删幂等
     assert!(matches!(
-        repo.update(a.id, "x".into(), None).await,
+        repo.update(t, a.id, "x".into(), None).await,
         Err(AppError::NotFound)
     )); // 改软删行
     let after = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 50,
@@ -192,20 +352,20 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // 此刻存活:b(bravo)、c(charlie);a(alpha2)已软删。
     assert!(
         matches!(
-            repo.create("bravo".into(), None).await,
+            repo.create(t, "bravo".into(), None).await,
             Err(AppError::Conflict(_))
         ),
         "重名 create 应 Conflict"
     );
     assert!(
         matches!(
-            repo.update(c.id, "bravo".into(), None).await,
+            repo.update(t, c.id, "bravo".into(), None).await,
             Err(AppError::Conflict(_))
         ),
         "改名撞已有存活名应 Conflict"
     );
     // a 此前叫 alpha2 且已软删 → 同名可被新行复用(部分唯一索引 WHERE deleted_at IS NULL)。
-    repo.create("alpha2".into(), None)
+    repo.create(t, "alpha2".into(), None)
         .await
         .expect("软删行的名字应可复用");
 
@@ -213,14 +373,14 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // (PG 靠 WHERE deleted_at IS NULL 不命中软删行;memory 须先判存活再判唯一 —— 此用例钉死该顺序。)
     assert!(
         matches!(
-            repo.update(a.id, "bravo".into(), None).await,
+            repo.update(t, a.id, "bravo".into(), None).await,
             Err(AppError::NotFound)
         ),
         "软删行 + 撞存活名应 NotFound(先判存活,再判唯一)"
     );
     // self-rename no-op:改成自己当前的名 → Ok 且名不变(唯一检查须排己 r.id != id,不误判 Conflict)。
     let same = repo
-        .update(c.id, "charlie".into(), None)
+        .update(t, c.id, "charlie".into(), None)
         .await
         .expect("改成自己当前的名应 Ok(no-op rename)");
     assert_eq!(same.name, "charlie");
@@ -229,6 +389,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // 成功:一笔里建 widget(父)+ 2 个 tag(子),回读 tag(label 升序)。
     let p = repo
         .create_with_tags(
+            t,
             "tx-ok".into(),
             vec!["red".into(), "blue".into()],
             Some("u".into()),
@@ -236,15 +397,16 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         .await
         .unwrap();
     assert_eq!(
-        repo.tags_of(p.id).await.unwrap(),
+        repo.tags_of(t, p.id).await.unwrap(),
         vec!["blue".to_owned(), "red".to_owned()]
     );
-    assert_eq!(repo.get(p.id).await.unwrap().name, "tx-ok");
+    assert_eq!(repo.get(t, p.id).await.unwrap().name, "tx-ok");
 
     // **原子性**:批内重复 label → 子表 (widget_id,label) 唯一违例 → 整笔回滚,**widget 父行也不该存在**。
     // PG:父先插、子失败 → ROLLBACK 撤掉父;memory:先校验后落盘 → 父根本没插。两者外部都是"全有或全无"。
     let before = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 50,
@@ -257,12 +419,18 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         .await
         .unwrap();
     assert!(matches!(
-        repo.create_with_tags("tx-rollback".into(), vec!["dup".into(), "dup".into()], None)
-            .await,
+        repo.create_with_tags(
+            t,
+            "tx-rollback".into(),
+            vec!["dup".into(), "dup".into()],
+            None
+        )
+        .await,
         Err(AppError::Conflict(_))
     ));
     let after = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 50,
@@ -282,10 +450,11 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 
     // ── name 排序 parity:大小写混排必须字节序(PG COLLATE "C" == 内存 str::cmp)。否则 locale
     //    collation(en_US.utf8 等)会把 "apple" 排到 "Banana" 前,内存↔PG 分叉。──
-    repo.create("Banana".into(), None).await.unwrap();
-    repo.create("apple".into(), None).await.unwrap();
+    repo.create(t, "Banana".into(), None).await.unwrap();
+    repo.create(t, "apple".into(), None).await.unwrap();
     let by_name = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 100,
@@ -310,6 +479,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // 期望序取自 offset 同 sort(它的 collation 口径刚在上面钉过)。
     let expected: Vec<String> = repo
         .list(
+            t,
             &PageParams::Offset {
                 page: 1,
                 size: 100,
@@ -334,6 +504,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     for _ in 0..expected.len() + 2 {
         let page = repo
             .list(
+                t,
                 &PageParams::Cursor { after, limit: 2 },
                 None,
                 WidgetSortField::Name,
@@ -366,6 +537,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // 方向跟随 `order`(不是恒 desc):desc 首条 = name 最大者。
     let desc1 = repo
         .list(
+            t,
             &PageParams::Cursor {
                 after: None,
                 limit: 1,
@@ -383,6 +555,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     assert!(
         matches!(
             repo.list(
+                t,
                 &PageParams::Cursor {
                     after: Some(Uuid::now_v7()),
                     limit: 2
@@ -400,6 +573,7 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
     // 锚点行在翻页途中被**软删**:后续页仍要翻得下去(锚点查询不过滤软删,软删行还在表里)。
     let first = repo
         .list(
+            t,
             &PageParams::Cursor {
                 after: None,
                 limit: 1,
@@ -417,9 +591,10 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
         } => c,
         _ => panic!("首页之后应还有下一页"),
     };
-    repo.soft_delete(first.items[0].id, None).await.unwrap();
+    repo.soft_delete(t, first.items[0].id, None).await.unwrap();
     let next = repo
         .list(
+            t,
             &PageParams::Cursor {
                 after: Some(anchor_cursor),
                 limit: 1,
@@ -440,10 +615,16 @@ async fn widget_repo_contract(repo: &dyn WidgetRepo) {
 #[tokio::test]
 async fn memory_satisfies_widget_contract() {
     use baserust::features::widget::InMemoryWidgetRepo;
-    widget_repo_contract(&InMemoryWidgetRepo::new()).await;
+    widget_repo_contract(&InMemoryWidgetRepo::new(), fresh_tenant()).await;
 }
 
-// ── 入口 2:PG(需 --features pg-conformance + DATABASE_URL 连 app role + 跑着的 pg)──
+#[tokio::test]
+async fn memory_tenant_isolation() {
+    use baserust::features::widget::InMemoryWidgetRepo;
+    tenant_isolation(&InMemoryWidgetRepo::new()).await;
+}
+
+// ── 入口 2:PG(需 --features pg-conformance + DATABASE_URL 连 app_owner + 跑着的 pg;仓储走运行时账号)──
 // support 提到顶层声明:#[path] 基目录是 tests/,正确指向 tests/support/mod.rs
 // (放进 mod pg 内会被推成 tests/pg/support/mod.rs)。
 #[cfg(feature = "pg-conformance")]
@@ -452,15 +633,122 @@ mod support;
 
 #[cfg(feature = "pg-conformance")]
 mod pg {
-    use super::{support, widget_repo_contract};
+    use super::{fresh_tenant, support, tenant_isolation, widget_repo_contract};
+    use baserust::features::widget::{PgWidgetRepo, WidgetRepo};
 
     #[sqlx::test(migrations = false)]
     async fn pg_satisfies_widget_contract(pool: sqlx::PgPool) -> sqlx::Result<()> {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let repo = baserust::features::widget::PgWidgetRepo::new(pool);
-        widget_repo_contract(&repo).await;
+        // 仓储走运行时账号(非 owner):生产形状,RLS 对它生效。
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        let repo = PgWidgetRepo::new(rt.clone());
+        widget_repo_contract(&repo, fresh_tenant()).await;
+        rt.close().await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pg_tenant_isolation(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        support::bootstrap_app_schema(&pool)
+            .await
+            .expect("bootstrap app schema + 跑 migrations/app");
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        tenant_isolation(&PgWidgetRepo::new(rt.clone())).await;
+        rt.close().await;
+        Ok(())
+    }
+
+    /// RLS 兜底(不经仓储,直接 SQL 打运行时账号):不设 `app.tenant_id` → 读不到任何行、写不进任何行;
+    /// 设了 A 也写不进 B 的行(WITH CHECK)、读不到 B 的行(USING)。仓储漏写条件时就靠这层。
+    #[sqlx::test(migrations = false)]
+    async fn pg_rls_without_tenant_sees_and_writes_nothing(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        support::bootstrap_app_schema(&pool)
+            .await
+            .expect("bootstrap app schema + 跑 migrations/app");
+        let rt = support::runtime_pool(&pool)
+            .await
+            .expect("运行时账号连临时库");
+        let repo = PgWidgetRepo::new(rt.clone());
+        let (a, b) = (fresh_tenant(), fresh_tenant());
+        let wa = repo
+            .create_with_tags(a, "a".into(), vec!["l".into()], None)
+            .await
+            .unwrap();
+        repo.create(b, "b".into(), None).await.unwrap();
+
+        // 1) 不设租户:两张表都 0 行(行确实在:owner 账号能看到)
+        for table in ["widgets", "widget_tags"] {
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("select count(*) from {table}")))
+                    .fetch_one(&rt)
+                    .await?;
+            assert_eq!(n, 0, "{table}:不设 app.tenant_id 应 0 行");
+        }
+        let owner_sees: i64 = sqlx::query_scalar("select count(*) from widgets")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            owner_sees, 2,
+            "owner 账号(BYPASSRLS)看得到全部,证明上面的 0 是 RLS 挡的"
+        );
+
+        // 2) 不设租户写:RLS 拒(42501)
+        let err = sqlx::query("insert into widgets (tenant_id, id, name) values ($1, $2, 'x')")
+            .bind(a.as_uuid())
+            .bind(uuid::Uuid::now_v7())
+            .execute(&rt)
+            .await
+            .expect_err("不设租户不该写得进");
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{err}"
+        );
+
+        // 3) 设了 A:看不到 B,写 B 的行被 WITH CHECK 拒;改 / 删 B 的行命中 0 行
+        let mut tx = baserust::infra::pg::tenant_tx(&rt, a).await?;
+        let seen: Vec<uuid::Uuid> = sqlx::query_scalar("select id from widgets")
+            .fetch_all(&mut *tx)
+            .await?;
+        assert_eq!(seen, vec![wa.id]);
+        let hit = sqlx::query("update widgets set name = 'pwned' where tenant_id = $1")
+            .bind(b.as_uuid())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        assert_eq!(hit, 0, "A 的事务里改不到 B 的行");
+        let err = sqlx::query("insert into widgets (tenant_id, id, name) values ($1, $2, 'x')")
+            .bind(b.as_uuid())
+            .bind(uuid::Uuid::now_v7())
+            .execute(&mut *tx)
+            .await
+            .expect_err("A 的事务里不该写得进 B 的行");
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{err}"
+        );
+        drop(tx);
+
+        // 4) nil 租户:CHECK 拒(owner 账号绕过 RLS 也拒)
+        let err = sqlx::query("insert into widgets (tenant_id, id, name) values ($1, $2, 'nil')")
+            .bind(uuid::Uuid::nil())
+            .bind(uuid::Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .expect_err("nil 租户不该写得进");
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("23514"),
+            "{err}"
+        );
+        rt.close().await;
         Ok(())
     }
 }

@@ -5,8 +5,8 @@
 //! 造数据口径:内存模式没有 projector(生产里它从 JetStream 投影落库再发 SSE),所以经**端口**造数据 ——
 //! `s.auth_events`(`AuthEventRepo::insert`)写行、`s.auth_bus.publish` 推帧,再经 HTTP 断言。
 //!
-//! 授权口径(seed 策略):`/api/v1/admin` 组闸要 `admin:login`(admin + superadmin 皆持),
-//! 四个端点内再 gate `users:admin`(仅 superadmin)。
+//! 授权口径(seed 策略):`/api/v1/admin` 组闸要后台准入(租户 `admin:login` 或任一平台级权限),
+//! 四个端点内再 gate `audit:read`(superadmin 独占;平台管理员有 users:admin 也不行)。
 //!
 //! covers: GET /api/v1/admin/auth/auth-events
 //! covers: GET /api/v1/admin/auth/auth-events/stats
@@ -18,6 +18,7 @@ mod http_support;
 use baserust::features::auth_audit::model::to_row;
 use baserust::features::auth_audit::{AuthEventRepo, NewAuthEvent};
 use baserust::kernel::authz::Perm;
+use http_support::DEFAULT_TENANT;
 use http_support::{
     expect, expect_error, expect_json, mint, next_sse_event, user_token, Client, TestServer, ADMIN,
     PASSWORD, SUPERADMIN,
@@ -40,7 +41,14 @@ fn user_events(id: impl std::fmt::Display) -> String {
 
 /// 满权 superadmin 令牌会话(无 scope 收窄)。
 fn superadmin(s: &TestServer) -> Client {
-    s.bearer(&mint(Uuid::now_v7(), SUPERADMIN, &["superadmin"], vec![]))
+    s.bearer(&mint(
+        Uuid::now_v7(),
+        SUPERADMIN,
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![],
+    ))
 }
 
 /// 一条默认事件:前台密码登录成功、当前时刻、无用户 / 无 IP。各测试按需改字段。
@@ -61,6 +69,7 @@ fn ev(seq: i64) -> NewAuthEvent {
         forwarded_chain: None,
         user_agent: None,
         request_id: None,
+        tenant_id: None,
         event_seq: seq,
     }
 }
@@ -181,25 +190,38 @@ async fn all_endpoints_require_login_401() {
     }
 }
 
-/// 权限矩阵:普通用户(无 admin:login)被组闸挡 403;admin 能进后台但无 users:admin → 403;
-/// 降权令牌(scope 不含 users:admin / 不含 admin:login)即便 role 是 superadmin 也 403。
+/// 权限矩阵:普通用户(无 admin:login)被组闸挡 403;admin 能进后台但无 audit:read → 403;
+/// 平台管理员(users:admin / tenants:admin 都有,但 audit:read 是 superadmin 独占)→ 403;
+/// 降权令牌(scope 不含 audit:read / 一个后台准入权限都不含)即便 role 是 superadmin 也 403。
 #[tokio::test]
-async fn all_endpoints_forbid_without_users_admin_403() {
+async fn all_endpoints_forbid_without_audit_read_403() {
     let s = TestServer::start().await;
     let user = s.bearer(&user_token().0);
     let admin = s.login_admin(ADMIN, PASSWORD).await;
-    let sa = Uuid::now_v7();
-    let scoped_no_users_admin = s.bearer(&mint(
-        sa,
-        SUPERADMIN,
-        &["superadmin"],
-        vec![Perm::AdminLogin],
+    let platform_admin = s.bearer(&mint(
+        Uuid::now_v7(),
+        "pa",
+        &["platform_admin"],
+        None,
+        &[],
+        vec![],
     ));
-    let scoped_no_admin_login = s.bearer(&mint(
+    let sa = Uuid::now_v7();
+    let scoped_no_audit_read = s.bearer(&mint(
         sa,
         SUPERADMIN,
         &["superadmin"],
-        vec![Perm::UsersAdmin],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![Perm::AdminLogin, Perm::UsersAdmin],
+    ));
+    let scoped_no_admin_entry = s.bearer(&mint(
+        sa,
+        SUPERADMIN,
+        &["superadmin"],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![Perm::WidgetRead],
     ));
     for path in [
         EV.to_owned(),
@@ -210,8 +232,9 @@ async fn all_endpoints_forbid_without_users_admin_403() {
         for (who, c) in [
             ("user", &user),
             ("admin", &admin),
-            ("scope 缺 users:admin", &scoped_no_users_admin),
-            ("scope 缺 admin:login", &scoped_no_admin_login),
+            ("平台管理员", &platform_admin),
+            ("scope 缺 audit:read", &scoped_no_audit_read),
+            ("scope 无后台准入", &scoped_no_admin_entry),
         ] {
             let resp = c.get(&path).await;
             assert_eq!(
@@ -224,7 +247,8 @@ async fn all_endpoints_forbid_without_users_admin_403() {
     }
 }
 
-/// superadmin:cookie 会话(后台登录)与 scope 恰含 admin:login + users:admin 的降权令牌都能读。
+/// superadmin:cookie 会话(后台登录)与 scope 只含 audit:read 的降权令牌都能读
+/// (audit:read 是平台级权限,本身就是后台准入)。
 #[tokio::test]
 async fn superadmin_cookie_session_and_exact_scope_can_read() {
     let s = TestServer::start().await;
@@ -233,7 +257,9 @@ async fn superadmin_cookie_session_and_exact_scope_can_read() {
         Uuid::now_v7(),
         SUPERADMIN,
         &["superadmin"],
-        vec![Perm::AdminLogin, Perm::UsersAdmin],
+        Some(DEFAULT_TENANT),
+        &[ADMIN],
+        vec![Perm::AuditRead],
     ));
     seed(&s, &[ev(1)]).await;
     for c in [&cookie, &scoped] {
@@ -1329,7 +1355,7 @@ async fn sse_no_replay_and_broadcasts_to_all_subscribers() {
 
 // ───────────────────────────── 后端未接线 ─────────────────────────────
 
-/// 审计后端未接线(非 idm 进程 / 无 search 库)→ 404 not_found;授权闸仍在前(无 users:admin 照样 403)。
+/// 审计后端未接线(非 idm 进程 / 无 search 库)→ 404 not_found;授权闸仍在前(无 audit:read 照样 403)。
 #[tokio::test]
 async fn no_audit_backend_is_404_after_authz() {
     let s = TestServer::start_with(|st| st.auth_audit = None).await;
