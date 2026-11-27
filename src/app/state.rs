@@ -339,7 +339,7 @@ impl AppState {
         // 门控见 `Config::seed_on_start`:非 prod 默认开(嵌入弱默认账号);prod 仅当挂了 `SEED_FILE`
         // (真密码)才开 —— 容器无 `just`/`cargo`,靠此在启动幂等建号,不再依赖外部 seed bin。
         if needs_idm && config.seed_on_start() {
-            super::seed::apply(
+            let seed_report = super::seed::apply(
                 idm_seed_repos,
                 &Argon2Hasher,
                 &seed,
@@ -354,6 +354,7 @@ impl AppState {
                     profile_repo.as_ref(),
                     idm_users.as_ref(),
                     &seed,
+                    &seed_report,
                     Some("system".to_owned()),
                 )
                 .await?;

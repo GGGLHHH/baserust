@@ -4,7 +4,11 @@
 //! 1. app / content / search 里**每张表**要么按租户隔离(ENABLE + FORCE ROW LEVEL SECURITY + 至少一条策略),
 //!    要么显式列在 [`GLOBAL_TABLES`](全局表白名单)里;两样都不是 → 测试失败。
 //!    下游项目同步底座后自己加的表也会被它拦下:加租户隔离,或进白名单(这是有意的提醒)。
-//! 2. 运行时账号(`<schema>`)不是任何表的 owner、没有 BYPASSRLS(否则 RLS 对它形同虚设);
+//!    隔离表上的**每条**策略(USING 与 WITH CHECK 都算)都得按 `app.tenant_id` 判;唯一允许的另一支是 content 的
+//!    个人内容(`tenant_id IS NULL` 且 `app.personal_scope`)—— 多一条 `USING (true)` 之类的宽松策略也会被拦下
+//!    (宽松策略之间是 OR,一条放水就全放水)。
+//! 2. 运行时账号(`<schema>`)不是任何表的 owner、没有 BYPASSRLS(否则 RLS 对它形同虚设),也不是
+//!    `<schema>_owner` / `<schema>_system` 的成员(`pg_auth_members`,含间接:成员能 SET ROLE 过去,等于拿到它的权);
 //!    `<schema>_owner` 拥有 schema 与表;`<schema>_system` 有 BYPASSRLS(后台任务 / 平台级读)。
 //!
 //! [`PENDING_TABLES`] 是**过渡清单**:还没改造成租户隔离的业务表。后续任务每改造一张就删一行,
@@ -182,6 +186,153 @@ async fn every_table_is_tenant_isolated_or_whitelisted() {
         }
     }
     assert!(errs.is_empty(), "RLS 审计不通过:\n  {}", errs.join("\n  "));
+}
+
+/// 一条 RLS 策略(`pg_policies`)。`qual` = USING,`with_check` = WITH CHECK(没写为 NULL)。
+#[derive(sqlx::FromRow)]
+struct Policy {
+    name: String,
+    policy: String,
+    permissive: String,
+    qual: Option<String>,
+    with_check: Option<String>,
+}
+
+async fn policies(pool: &PgPool) -> Vec<Policy> {
+    let schemas: Vec<String> = SCHEMAS.iter().map(|s| (*s).to_owned()).collect();
+    sqlx::query_as::<_, Policy>(
+        "select schemaname || '.' || tablename as name, policyname::text as policy, permissive,
+                qual, with_check
+           from pg_policies where schemaname = any($1) order by 1, 2",
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .expect("查 pg_policies")
+}
+
+/// 策略表达式(PG 反解析出来的文本)是否只按租户放行:
+/// - 必须有 `tenant_id = …current_setting('app.tenant_id'…` 这一支;
+/// - 不许有别的 OR 分支 —— 唯一例外是 content 的个人内容:`tenant_id IS NULL AND current_setting('app.personal_scope'…) = 'on'`。
+fn tenant_bound(schema: &str, expr: &str) -> Result<(), String> {
+    let e = expr.to_lowercase();
+    if !(e.contains("tenant_id =") && e.contains("current_setting('app.tenant_id'")) {
+        return Err("没按 app.tenant_id 判".into());
+    }
+    let ors = e.matches(" or ").count();
+    if ors == 0 {
+        return Ok(());
+    }
+    let personal = schema == "content"
+        && ors == 1
+        && e.contains("tenant_id is null")
+        && e.contains("current_setting('app.personal_scope'");
+    if personal {
+        Ok(())
+    } else {
+        Err("除了按租户判,还有别的放行分支".into())
+    }
+}
+
+#[tokio::test]
+async fn isolation_policies_are_bound_to_tenant_id() {
+    let pool = connect().await;
+    let global: BTreeSet<&str> = GLOBAL_TABLES.iter().copied().collect();
+    let all = policies(&pool).await;
+    let mut errs = Vec::new();
+    let mut checked = 0usize;
+    for t in tables(&pool).await {
+        if global.contains(t.name.as_str()) || !isolated(&t) {
+            continue; // 白名单表不审;没隔离的表由 every_table_is_tenant_isolated_or_whitelisted 报
+        }
+        let schema = t.name.split('.').next().unwrap_or_default();
+        for p in all.iter().filter(|p| p.name == t.name) {
+            let exprs: Vec<(&str, &str)> = [("USING", &p.qual), ("WITH CHECK", &p.with_check)]
+                .into_iter()
+                .filter_map(|(k, v)| v.as_deref().map(|v| (k, v)))
+                .collect();
+            if exprs.is_empty() {
+                errs.push(format!(
+                    "{} 的策略 {}:既没有 USING 也没有 WITH CHECK",
+                    t.name, p.policy
+                ));
+            }
+            for (kind, expr) in exprs {
+                checked += 1;
+                if let Err(why) = tenant_bound(schema, expr) {
+                    errs.push(format!(
+                        "{} 的策略 {}({}){kind} {why}:{expr}",
+                        t.name, p.policy, p.permissive
+                    ));
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "一条策略表达式都没审到:库没迁移?");
+    assert!(
+        errs.is_empty(),
+        "RLS 策略审计不通过:\n  {}",
+        errs.join("\n  ")
+    );
+}
+
+/// 判据自测(不连库):PG 反解析出的真实策略文本该过的过、该拦的拦。
+#[test]
+fn tenant_bound_accepts_tenant_policies_and_rejects_escapes() {
+    let tenant =
+        "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)";
+    let personal = "((tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid) OR ((tenant_id IS NULL) AND (current_setting('app.personal_scope'::text, true) = 'on'::text)))";
+    assert!(tenant_bound("app", tenant).is_ok());
+    assert!(tenant_bound("content", personal).is_ok());
+    assert!(
+        tenant_bound("app", personal).is_err(),
+        "个人分支只给 content"
+    );
+    assert!(tenant_bound("app", "true").is_err());
+    assert!(tenant_bound("app", &format!("({tenant} OR true)")).is_err());
+    assert!(tenant_bound("app", "(owner_id = current_user)").is_err());
+}
+
+/// `member` 是否(直接或间接)是 `role` 的成员 —— 递归查 `pg_auth_members`。
+async fn is_member_of(pool: &PgPool, member: &str, role: &str) -> bool {
+    sqlx::query_scalar(
+        "with recursive up(oid) as (
+             select roleid from pg_auth_members
+              where member = (select oid from pg_roles where rolname = $1)
+             union
+             select m.roleid from pg_auth_members m join up on m.member = up.oid
+         )
+         select exists (select 1 from up where oid = (select oid from pg_roles where rolname = $2))",
+    )
+    .bind(member)
+    .bind(role)
+    .fetch_one(pool)
+    .await
+    .expect("查 pg_auth_members")
+}
+
+/// 运行时账号不是 owner / system 账号的成员(否则 SET ROLE 过去就绕开了 RLS / 拿到 DDL);system 也不是 owner 的成员。
+#[tokio::test]
+async fn runtime_roles_are_not_members_of_owner_or_system() {
+    let pool = connect().await;
+    let mut errs = Vec::new();
+    for schema in SCHEMAS {
+        let r = roles_for(schema);
+        for (member, role) in [
+            (&r.runtime, &r.owner),
+            (&r.runtime, &r.system),
+            (&r.system, &r.owner),
+        ] {
+            if is_member_of(&pool, member, role).await {
+                errs.push(format!("{member} 是 {role} 的成员(pg_auth_members)"));
+            }
+        }
+    }
+    assert!(
+        errs.is_empty(),
+        "账号成员关系审计不通过:\n  {}",
+        errs.join("\n  ")
+    );
 }
 
 /// 账号属性:rolsuper / rolbypassrls。

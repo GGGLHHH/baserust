@@ -85,7 +85,7 @@ async fn register_duplicate_username_is_409_and_bad_input_422() {
     .await;
 }
 
-/// 登录:对 → 200 + 会话可用;错密码 / 不存在的用户 → 401(不区分,防枚举)。
+/// 登录:对 → 200 + 会话可用;错密码 / 不存在的用户 → 401 `invalid_credentials`(不区分,防枚举)。
 #[tokio::test]
 async fn login_ok_and_wrong_password_401() {
     let s = TestServer::start().await;
@@ -102,7 +102,7 @@ async fn login_ok_and_wrong_password_401() {
                 )
                 .await,
             StatusCode::UNAUTHORIZED,
-            "unauthorized",
+            "invalid_credentials",
         )
         .await;
     }
@@ -227,22 +227,34 @@ async fn update_me_full_replace() {
     .await;
 }
 
-/// 改密:旧密码错 → 4xx;对 → 204 + 清 cookie,新密码能登、旧密码不能。
+/// 改密:旧密码错 → 401 `invalid_credentials`(会话照旧可用);对 → 204 + 清 cookie,新密码能登、旧密码不能。
+/// 机器码和「没登录 / token 失效」的 `unauthorized` 分开:前端靠它区分「密码输错」和「会话过期」。
 #[tokio::test]
 async fn change_password_then_relogin() {
     let s = TestServer::start().await;
+    expect_error(
+        s.anon()
+            .post_json(
+                "/api/v1/frontend/auth/me/password",
+                &json!({ "current_password": PASSWORD, "new_password": "newpwd123" }),
+            )
+            .await,
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
     let c = s.login(USER, PASSWORD).await;
-    let wrong = c
-        .post_json(
+    expect_error(
+        c.post_json(
             "/api/v1/frontend/auth/me/password",
             &json!({ "current_password": "wrong", "new_password": "newpwd123" }),
         )
-        .await;
-    assert!(
-        wrong.status().is_client_error(),
-        "旧密码错应拒: {}",
-        wrong.status()
-    );
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "invalid_credentials",
+    )
+    .await;
+    expect(c.get(ME).await, StatusCode::OK).await;
 
     expect(
         c.post_json(
@@ -266,17 +278,49 @@ async fn change_password_then_relogin() {
     .await;
 }
 
-/// 注销账号:要密码确认;之后无法登录。
+/// superadmin 不能注销自己(不经任何接口撤销):密码对也 403,账号照旧能登录。
+#[tokio::test]
+async fn superadmin_cannot_delete_self() {
+    let s = TestServer::start().await;
+    let c = s.login(SUPERADMIN, PASSWORD).await;
+    expect_error(
+        c.delete_json(ME, &json!({ "password": PASSWORD })).await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+    expect(
+        s.anon()
+            .post_json(
+                "/api/v1/public/auth/login",
+                &json!({ "identifier": SUPERADMIN, "password": PASSWORD }),
+            )
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+}
+
+/// 注销账号:要密码确认(密码错 → 401 `invalid_credentials`,会话照旧可用;没登录 → `unauthorized`);之后无法登录。
 #[tokio::test]
 async fn delete_me_requires_password_then_account_gone() {
     let s = TestServer::start().await;
+    expect_error(
+        s.anon()
+            .delete_json(ME, &json!({ "password": PASSWORD }))
+            .await,
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
     let c = s.login(USER, PASSWORD).await;
-    let wrong = c.delete_json(ME, &json!({ "password": "wrong" })).await;
-    assert!(
-        wrong.status().is_client_error(),
-        "密码错应拒: {}",
-        wrong.status()
-    );
+    expect_error(
+        c.delete_json(ME, &json!({ "password": "wrong" })).await,
+        StatusCode::UNAUTHORIZED,
+        "invalid_credentials",
+    )
+    .await;
+    expect(c.get(ME).await, StatusCode::OK).await;
     expect(
         c.delete_json(ME, &json!({ "password": PASSWORD })).await,
         StatusCode::NO_CONTENT,

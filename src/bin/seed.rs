@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         PgTenantRepo::new(idm_pool.clone()),
         PgMemberRepo::new(idm_pool.clone()),
     );
-    apply(
+    let report = apply(
         IdmSeedRepos {
             users: &users,
             roles: &roles,
@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             &PgProfileRepo::new(app_pool.clone()),
             &PgUserRepo::new(idm_pool),
             &data,
+            &report,
             Some("system".to_owned()),
         )
         .await?;

@@ -1007,7 +1007,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 [[package]]
 name = "content"
 version = "0.4.0"
-source = "git+https://github.com/GGGLHHH/rust-content?rev=7f554b9#7f554b96a22c8864b14b27b55f295bae23b634cc"
+source = "git+https://github.com/GGGLHHH/rust-content?rev=fa3e600#fa3e6007c1ab294578e50ab2886a1e8a659ec790"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2178,7 +2178,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "idm"
 version = "0.6.0"
-source = "git+https://github.com/GGGLHHH/rust-idm?rev=9255b77#9255b77483cab4f6016942936d1a41d42144332b"
+source = "git+https://github.com/GGGLHHH/rust-idm?rev=00f4e4d#00f4e4ded6b5596852cb5c054d94aba0f4f95aca"
 dependencies = [
  "anyhow",
  "argon2",

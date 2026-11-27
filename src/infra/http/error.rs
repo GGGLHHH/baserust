@@ -29,7 +29,7 @@ impl HttpErrorExt for AppError {
             AppError::NotFound | AppError::AccountNotFound => StatusCode::NOT_FOUND,
             AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Forbidden | AppError::TenantRequired => StatusCode::FORBIDDEN,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -44,6 +44,7 @@ impl HttpErrorExt for AppError {
             AppError::Validation(_) => ErrorCode::Validation,
             AppError::BadRequest(_) => ErrorCode::BadRequest,
             AppError::Unauthorized => ErrorCode::Unauthorized,
+            AppError::InvalidCredentials => ErrorCode::InvalidCredentials,
             AppError::Conflict(_) => ErrorCode::Conflict,
             AppError::Forbidden => ErrorCode::Forbidden,
             AppError::TenantRequired => ErrorCode::TenantRequired,
@@ -52,14 +53,16 @@ impl HttpErrorExt for AppError {
     }
 
     /// 进响应 `error` 字段的消息 —— **永远安全、刻意写**,绝不含底层库的原始措辞。
-    /// Validation/Conflict 回传"具体内容"(本就写给用户);Unauthorized 刻意通用(防枚举)。
+    /// Validation/Conflict 回传"具体内容"(本就写给用户);Unauthorized / InvalidCredentials 刻意通用(防枚举)。
     fn client_message(&self) -> String {
         match self {
             AppError::NotFound => "Resource not found".to_owned(),
             AppError::AccountNotFound => "Account not found".to_owned(),
             AppError::Validation(msg) => format!("Invalid request: {msg}"),
             AppError::BadRequest(_) => "Malformed request".to_owned(),
-            AppError::Unauthorized => "Authentication failed".to_owned(),
+            AppError::Unauthorized | AppError::InvalidCredentials => {
+                "Authentication failed".to_owned()
+            }
             AppError::Conflict(msg) => msg.clone(),
             AppError::Forbidden => "Forbidden".to_owned(),
             AppError::TenantRequired => "A current tenant is required".to_owned(),
@@ -92,6 +95,7 @@ impl HttpErrorExt for AppError {
             AppError::NotFound
             | AppError::AccountNotFound
             | AppError::Unauthorized
+            | AppError::InvalidCredentials
             | AppError::Conflict(_)
             | AppError::Forbidden
             | AppError::TenantRequired => None,
@@ -106,7 +110,11 @@ pub enum ErrorCode {
     NotFound,
     Validation,
     BadRequest,
+    /// 401:没登录 / 会话失效(token 无效、过期、已撤销)。前端见此码走刷新 / 会话过期流程。
     Unauthorized,
+    /// 401:凭据错(登录密码错、改密旧密码错、注销密码确认错)。会话本身还有效,前端把错误交给调用方,
+    /// 不刷新、不跳登录页。文案与 `unauthorized` 一样通用(防枚举)。
+    InvalidCredentials,
     Conflict,
     Forbidden,
     /// 403:token 没有当前租户,却访问租户级接口(平台上下文 / 还没加入任何组织)。
@@ -129,11 +137,12 @@ impl ErrorCode {
     /// 的穷尽 match(编译不过),但它只让你**手写**一个 wire 串,不校验它等于 serde 的 rename。
     /// 后果:日志字段 `code`(as_str)与出参 `code`(serde)对新变体可能对不上。
     /// 要根治:声明宏单源展开 enum + `ALL` + `as_str`,让漏项不可表达。
-    pub const ALL: [ErrorCode; 11] = [
+    pub const ALL: [ErrorCode; 12] = [
         ErrorCode::NotFound,
         ErrorCode::Validation,
         ErrorCode::BadRequest,
         ErrorCode::Unauthorized,
+        ErrorCode::InvalidCredentials,
         ErrorCode::Conflict,
         ErrorCode::Forbidden,
         ErrorCode::TenantRequired,
@@ -150,6 +159,7 @@ impl ErrorCode {
             ErrorCode::Validation => "validation",
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::InvalidCredentials => "invalid_credentials",
             ErrorCode::Conflict => "conflict",
             ErrorCode::Forbidden => "forbidden",
             ErrorCode::TenantRequired => "tenant_required",
@@ -321,8 +331,13 @@ mod tests {
         let e = AppError::from(idm::IdmError::InvalidCredentials(
             idm::CredentialFailure::BadPassword,
         ));
-        assert!(matches!(e, AppError::Unauthorized));
+        assert!(matches!(e, AppError::InvalidCredentials));
         assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+        // 机器码与会话失效的 `unauthorized` 分开(前端据此不把「密码输错」当「会话过期」);
+        // 文案仍与 Unauthorized 一样通用,不区分「用户不存在 / 密码错」(防枚举)。
+        assert_eq!(e.code().as_str(), "invalid_credentials");
+        assert_eq!(e.client_message(), AppError::Unauthorized.client_message());
+        assert!(e.log_detail().is_none());
     }
 
     #[test]

@@ -113,7 +113,13 @@ fn test_app() -> (Router, content::ContentService, String, String, String) {
         policy: Arc::new(Policy::from_roles([
             (
                 "superadmin".to_owned(),
-                vec![Perm::ProfileRead, Perm::ProfileWrite, Perm::ProfileWriteAll],
+                // platform:roles:按 id 改**别人**的资料另要它(防接管,只有 superadmin 有)
+                vec![
+                    Perm::ProfileRead,
+                    Perm::ProfileWrite,
+                    Perm::ProfileWriteAll,
+                    Perm::PlatformRoles,
+                ],
             ),
             (
                 "admin".to_owned(),
@@ -274,7 +280,7 @@ async fn put_me_upsert_then_platform_admin_can_read() {
     assert_eq!(body_json(resp).await["phone"], "999");
 }
 
-/// 按 id 改别人:租户成员 → 403;平台管理员(write:all)→ 可建可改任何人。
+/// 按 id 改别人:租户成员 → 403;superadmin(write:all + platform:roles)→ 可建可改任何人。
 #[tokio::test]
 async fn ownership_gate_and_write_all() {
     let (app, _contents, admin, alice, _bob) = test_app();

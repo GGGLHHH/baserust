@@ -420,6 +420,140 @@ async fn ensure_sole_superadmin(
     Ok(())
 }
 
+/// 声明的 superadmin 条目**已过时**:库里恰好有一个存活的 superadmin,且不是声明的那个账号(`declared` = 按声明的
+/// 用户名查到的账号,查不到为 `None`)→ 返回现有 superadmin 的用户名。零个(首次 seed)/ 就是它 / 多于一个
+/// (启动期检查 [`ensure_single_superadmin`] 已拒)→ `None`。
+async fn stale_superadmin_declaration(
+    users: &dyn UserRepo,
+    declared: Option<Uuid>,
+) -> anyhow::Result<Option<String>> {
+    let holders = superadmin_holders(users).await?;
+    Ok(match holders.as_slice() {
+        [(id, name)] if Some(*id) != declared => Some(name.clone()),
+        _ => None,
+    })
+}
+
+/// [`apply`] 的结果:哪些已存在的账号因为**确认不了是运维建的**(密码和 seed 对不上)被跳过了补授。
+/// 跳过的账号 [`apply_profiles`] 也不给建初始资料(抢注者不该拿到 seed 里的显示名)。
+#[derive(Debug, Default)]
+pub struct SeedReport {
+    pub skipped: Vec<SkippedGrants>,
+}
+
+/// 一个被跳过补授的账号:账号 id + 用户名 + 它缺的、seed 本要补给它的东西(「平台角色 x」「组织 s 的角色 r」「组织 s 的成员关系」)。
+/// 判「跳没跳过」只看 `user_id`([`SeedReport::is_skipped`]):用户名是给人看的 —— seed 的用户名经 `find_by_identifier`
+/// 也可能命中邮箱等于它的另一个账号,那时两边的用户名对不上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedGrants {
+    pub user_id: Uuid,
+    pub username: String,
+    pub missing: Vec<String>,
+}
+
+impl SeedReport {
+    fn is_skipped(&self, user_id: Uuid) -> bool {
+        self.skipped.iter().any(|s| s.user_id == user_id)
+    }
+}
+
+/// seed 要给一个**已存在**的同名账号补授它还没有的东西(平台角色 / 成员关系 / 组织角色)时,先确认这个账号是运维建的:
+/// 用 seed 里的密码校验它的密码 hash。对不上 → 返回 `Some(缺的项)`,调用方**跳过这个账号的全部补授**(见
+/// [`skip_unverified`]:只警告,不中断启动)。否则公开注册抢注 seed 里的用户名(或 superadmin 自删后被人注册同名)
+/// 就能在下次启动时白拿平台角色 / 组织管理员;而报错又会让 idm 起不来(prod 每次启动都跑 seed,运维改过密码、
+/// 运行期撤过权都会撞上)。已经都有了 → 不校验(幂等重跑、运维改过密码都不受影响),返回 `None`。
+async fn verify_seed_owner(
+    repos: IdmSeedRepos<'_>,
+    hasher: &dyn PwHasher,
+    tenant_ids: &HashMap<String, Uuid>,
+    existing: &idm::UserWithHash,
+    seed: &UserSeed,
+    platform_roles: &[String],
+    memberships: &[MembershipSeed],
+) -> anyhow::Result<Option<SkippedGrants>> {
+    let user_id = existing.user.id;
+    let mut pending: Vec<String> = Vec::new();
+    let current = repos.roles.roles_for_user(user_id).await?;
+    for r in platform_roles.iter().filter(|r| !current.contains(r)) {
+        pending.push(format!("平台角色 {r}"));
+    }
+    for m in memberships {
+        let tenant_id = resolve_tenant(repos.tenants, tenant_ids, &m.slug).await?;
+        match repos.members.get(tenant_id, user_id).await? {
+            None => pending.push(format!("组织 {} 的成员关系", m.slug)),
+            Some(have) => {
+                for r in m.roles.iter().filter(|r| !have.roles.contains(r)) {
+                    pending.push(format!("组织 {} 的角色 {r}", m.slug));
+                }
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    // 库里的哈希串解析不了(坏串 / 不是本实现认得的格式)→ 同样确认不了是运维建的,按对不上处理(调用方走
+    // [`skip_unverified`]);报错会让 idm 起不来(prod 每次启动都跑 seed)。
+    let matches = match hasher.verify(&seed.password, &existing.password_hash) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                username = %existing.user.username,
+                "seed 校验账号 {name} 的密码时,库里存的密码哈希解析失败({e:?}):确认不了是运维建的账号,\
+                 按密码对不上处理(跳过补授,启动照常)。查 idm.user_password 里这个账号的 password_hash 是否被改坏",
+                name = existing.user.username,
+            );
+            false
+        }
+    };
+    Ok((!matches).then(|| SkippedGrants {
+        user_id,
+        username: existing.user.username.clone(),
+        missing: pending,
+    }))
+}
+
+/// 确认不了是运维建的账号([`verify_seed_owner`] 返回了缺的项):**不授任何东西**、记进报告、打一条警告说清
+/// 账号名 / 缺什么 / 为什么跳过 / 怎么处理,然后照常启动。声明的是 superadmin 且库里一个 superadmin 都没有时,
+/// 日志里另说明后果,并升为 **ERROR**(0 个 superadmin 不拦启动,同 [`ensure_single_superadmin`] 的「最多一个」;
+/// 所以只能靠这条 ERROR 让人去看容器日志)。
+async fn skip_unverified(
+    users: &dyn UserRepo,
+    report: &mut SeedReport,
+    skip: SkippedGrants,
+    declares_superadmin: bool,
+) -> anyhow::Result<()> {
+    let no_superadmin = declares_superadmin && superadmin_holders(users).await?.is_empty();
+    let consequence = if no_superadmin {
+        "库里现在没有 superadmin:系统监控、登录日志、任命平台管理员暂时没人能用。"
+    } else {
+        ""
+    };
+    // 同一条日志,级别按后果分:库里 0 个 superadmin(系统监控 / 登录日志 / 任命平台管理员没人能用)→ ERROR,
+    // 要运维去看容器日志;其余 → WARN。tracing 的级别必须是常量,所以用宏展开两份。
+    macro_rules! log_skip {
+        ($level:ident) => {
+            tracing::$level!(
+                username = %skip.username,
+                missing = %skip.missing.join("、"),
+                "seed 声明的账号 {name} 已存在,但缺 {missing};它的密码和 seed 里写的对不上,确认不了是运维建的账号\
+                 (可能是有人公开注册抢注了这个用户名,也可能是自己人运行期改过密码、之后又被撤掉了这些授予),\
+                 跳过这个账号的全部补授,启动照常。{consequence}处理:要补授 → 在后台手动授,或把 seed 里 {name} 的 \
+                 password 改成它现在的密码再启动;运行期是有意撤掉的 → 从 seed 去掉这些角色 / 成员关系即可消掉这条警告;\
+                 账号不是自己人 → 在 idm 库删掉 / 改名它(idm.users)再启动",
+                name = skip.username,
+                missing = skip.missing.join("、"),
+            )
+        };
+    }
+    if no_superadmin {
+        log_skip!(error);
+    } else {
+        log_skip!(warn);
+    }
+    report.skipped.push(skip);
+    Ok(())
+}
+
 /// 持 superadmin 的存活账号 (id, username),按建号先后。最多取 50 个(只用来判「多于一个」并列名字)。
 async fn superadmin_holders(users: &dyn UserRepo) -> anyhow::Result<Vec<(Uuid, String)>> {
     let filter = idm::UserListFilter {
@@ -477,13 +611,16 @@ async fn resolve_tenant(
 /// 幂等应用 seed:upsert role(按 `RoleName::scope()`)→ upsert 租户 → find-or-create 账号 →
 /// 补授平台角色 → 补齐成员关系与租户角色。`by` = 审计主体(seeder 用 "system")。
 /// **并发安全**:账号 / 租户 / 成员撞唯一约束(另一实例已建)→ 退回查已存在的,收敛不报错。
+/// **已存在的账号缺声明的东西、密码又和 seed 对不上**(抢注 / 运维改过密码后运行期撤了权)→ 警告并跳过它的补授,
+/// 不报错(见 [`verify_seed_owner`]);跳过了谁在返回的 [`SeedReport`] 里,把它交给 [`apply_profiles`]。
 pub async fn apply(
     repos: IdmSeedRepos<'_>,
     hasher: &dyn PwHasher,
     data: &SeedData,
     by: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SeedReport> {
     data.validate()?;
+    let mut report = SeedReport::default();
     // 1. 角色(幂等 upsert,作用域按代码闭集;已有库里迁移默认的 `tenant` 在这里收敛)。
     let mut role_ids: HashMap<&'static str, Uuid> = HashMap::new();
     for r in RoleName::ALL {
@@ -519,13 +656,45 @@ pub async fn apply(
             })
             .collect::<anyhow::Result<_>>()?;
 
+        let memberships_declared = a.effective_memberships();
         let existing = repos.users.find_by_identifier(&username).await?;
         if a.declares_superadmin() {
-            ensure_sole_superadmin(repos, existing.as_ref().map(|u| u.user.id), &username).await?;
+            let declared = existing.as_ref().map(|u| u.user.id);
+            // 库里已有唯一的 superadmin、却不是这个声明的账号:多半是 superadmin 经 PUT /frontend/auth/me 改了用户名
+            // (或旧用户名被人注册了)。这条声明已过时 —— 跳过(不建第二个、也不把 superadmin 授给占了旧名的账号),
+            // 不报错:prod 每次启动都跑 seed,报错 = idm 起不来。
+            if let Some(holder) = stale_superadmin_declaration(repos.users, declared).await? {
+                tracing::warn!(
+                    declared = %username,
+                    holder = %holder,
+                    "seed 声明的 superadmin 账号 {username} 不是库里现有的 superadmin({holder},可能改过用户名):\
+                     跳过这条声明(不建第二个 superadmin,也不动它的成员关系)。把 seed 里 superadmin 的 username 改成 {holder} \
+                     可消掉这条警告;真要换人,先按 scripts/prod/README.md 处理掉旧的"
+                );
+                continue;
+            }
+            ensure_sole_superadmin(repos, declared, &username).await?;
         }
         let user_id = match existing {
             // 已存在(幂等再跑):补齐平台角色 —— 走 set_roles(并集)而非 grant(见 ensure_roles_with_event)。
+            // 要补授它还没有的东西时,先确认这个同名账号是运维建的(见 verify_seed_owner);确认不了 → 警告、
+            // 跳过它的全部补授(平台角色 + 成员关系),不中断启动。
             Some(uwh) => {
+                if let Some(skip) = verify_seed_owner(
+                    repos,
+                    hasher,
+                    &tenant_ids,
+                    &uwh,
+                    a,
+                    &platform_roles,
+                    &memberships_declared,
+                )
+                .await?
+                {
+                    skip_unverified(repos.users, &mut report, skip, a.declares_superadmin())
+                        .await?;
+                    continue;
+                }
                 ensure_roles_with_event(repos.roles, uwh.user.id, &platform_roles, by.clone())
                     .await?;
                 uwh.user.id
@@ -548,12 +717,32 @@ pub async fn apply(
                     Ok(u) => u.id,
                     // 并发 seed:另一实例已抢先建 → 退回补齐角色(幂等收敛,同上走 set_roles)。
                     Err(IdmError::Conflict(_)) => {
-                        let user = repos
+                        let uwh = repos
                             .users
                             .find_by_identifier(&username)
                             .await?
-                            .context("并发 seed 冲突后仍查不到用户")?
-                            .user;
+                            .context("并发 seed 冲突后仍查不到用户")?;
+                        if let Some(skip) = verify_seed_owner(
+                            repos,
+                            hasher,
+                            &tenant_ids,
+                            &uwh,
+                            a,
+                            &platform_roles,
+                            &memberships_declared,
+                        )
+                        .await?
+                        {
+                            skip_unverified(
+                                repos.users,
+                                &mut report,
+                                skip,
+                                a.declares_superadmin(),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let user = uwh.user;
                         ensure_roles_with_event(repos.roles, user.id, &platform_roles, by.clone())
                             .await?;
                         user.id
@@ -564,7 +753,7 @@ pub async fn apply(
         };
 
         // 4. 成员关系 + 租户角色(并集)。
-        for m in a.effective_memberships() {
+        for m in memberships_declared {
             let tenant_id = resolve_tenant(repos.tenants, &tenant_ids, &m.slug).await?;
             ensure_membership(repos, tenant_id, user_id, &m.roles, by.clone())
                 .await
@@ -582,7 +771,7 @@ pub async fn apply(
         memberships,
         "idm seed 已应用(幂等)"
     );
-    Ok(())
+    Ok(report)
 }
 
 /// seed 账号的**初始 profile**(1:1 挂 user)。跟在 [`apply`] 之后跑 —— 那时账号已在,username 才解析得到。
@@ -598,20 +787,36 @@ pub async fn apply(
 /// 会把用户运行期改的 display_name/phone 清回 seed 值、连头像绑定一起解掉(每次重启资料重置)。
 /// 这与 `apply` 里账号"已存在则不动密码"、角色 / 成员关系写并集是同一条铁律:
 /// **seed 只负责把东西 bootstrap 出来,不负责把它按回初始值**。
+///
+/// `report` = 同一份 seed 的 [`apply`] 结果:被跳过补授的账号(密码对不上 seed)不建资料。
 pub async fn apply_profiles(
     profiles: &dyn ProfileRepo,
     users: &dyn UserRepo,
     data: &SeedData,
+    report: &SeedReport,
     by: Option<String>,
 ) -> anyhow::Result<()> {
     let mut created = 0usize;
     for a in &data.users {
         let username = a.username.trim().to_lowercase();
-        let user = users
-            .find_by_identifier(&username)
-            .await?
+        let found = users.find_by_identifier(&username).await?;
+        // 过时的 superadmin 声明(superadmin 改过用户名):`apply` 已跳过它,这里同样跳过 —— 不报错,
+        // 也不给占了旧名的别人建资料。
+        if a.declares_superadmin()
+            && stale_superadmin_declaration(users, found.as_ref().map(|u| u.user.id))
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+        let user = found
             .with_context(|| format!("seed profile 的账号 {username} 在 idm 不存在(apply 先跑)"))?
             .user;
+        // `apply` 因为确认不了是运维建的而跳过补授的账号(多半是抢注):同样不建 —— 不让它拿到 seed 里的显示名。
+        // 按 id 判(不按用户名:seed 的用户名可能经邮箱命中另一个账号,见 [`SkippedGrants`])。
+        if report.is_skipped(user.id) {
+            continue;
+        }
         if profiles.get(user.id).await?.is_some() {
             continue; // 幂等:已有资料 → 保持用户的现值,不按回 seed
         }
@@ -677,7 +882,7 @@ mod tests {
         }
 
         async fn apply(&self, data: &SeedData) {
-            apply(
+            let report = apply(
                 self.repos(),
                 &idm::FakeHasher,
                 data,
@@ -685,6 +890,7 @@ mod tests {
             )
             .await
             .unwrap();
+            assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         }
 
         async fn uid(&self, name: &str) -> Uuid {
@@ -813,17 +1019,21 @@ platform_roles = ["platform_admin"]"#,
         );
     }
 
-    /// 库里已有别的账号持 superadmin(如 seed 换了 superadmin 的用户名)→ apply 报错,不给出第二个;
-    /// 同一个账号重跑照常幂等。
-    #[tokio::test]
-    async fn seed_rejects_second_superadmin_in_store() {
-        let idm = Idm::new();
-        let first = parse(
-            r#"[[users]]
+    const ROOT_SEED: &str = r#"[[tenants]]
+slug = "default"
+name = "默认组织"
+[[users]]
 username = "root"
 password = "p"
-platform_roles = ["superadmin"]"#,
-        );
+platform_roles = ["superadmin"]
+tenants = [{ slug = "default", roles = ["admin"] }]"#;
+
+    /// 库里已有唯一的 superadmin、但 seed 声明的是另一个用户名(seed 换了名 / superadmin 自己改了名)→ 跳过这条
+    /// 声明,不报错、不建第二个;同一个账号重跑照常幂等。
+    #[tokio::test]
+    async fn seed_skips_superadmin_declared_under_another_name() {
+        let idm = Idm::new();
+        let first = parse(ROOT_SEED);
         idm.apply(&first).await;
         idm.apply(&first).await; // 同一账号:幂等
 
@@ -833,11 +1043,9 @@ username = "newroot"
 password = "p"
 platform_roles = ["superadmin"]"#,
         );
-        let err = apply(idm.repos(), &idm::FakeHasher, &renamed, None)
+        apply(idm.repos(), &idm::FakeHasher, &renamed, None)
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("superadmin 只能有一个"), "{err}");
+            .expect("声明过时应跳过而不是报错");
         assert!(
             idm.users
                 .find_by_identifier("newroot")
@@ -845,6 +1053,370 @@ platform_roles = ["superadmin"]"#,
                 .unwrap()
                 .is_none(),
             "没建出第二个 superadmin 账号"
+        );
+        assert_eq!(superadmin_holders(&idm.users).await.unwrap().len(), 1);
+    }
+
+    /// superadmin 经 `PUT /frontend/auth/me` 改了用户名 → 下次启动 seed 按旧名找不到它:不能报错(prod 每次启动都跑
+    /// seed,报错 = idm 起不来),也不能再建一个旧名的 superadmin。改名后的账号照旧是唯一的 superadmin。
+    #[tokio::test]
+    async fn seed_tolerates_renamed_superadmin() {
+        let idm = Idm::new();
+        let data = parse(ROOT_SEED);
+        idm.apply(&data).await;
+        let root = idm.uid("root").await;
+        idm.users.update(root, "boss", None, None).await.unwrap();
+
+        apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .expect("superadmin 改名后重跑 seed 不应报错");
+        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        apply_profiles(&profiles, &idm.users, &data, &SeedReport::default(), None)
+            .await
+            .expect("初始资料这一步同样跳过过时的声明");
+        assert!(
+            idm.users
+                .find_by_identifier("root")
+                .await
+                .unwrap()
+                .is_none(),
+            "不应按旧名再建账号"
+        );
+        let holders = superadmin_holders(&idm.users).await.unwrap();
+        assert_eq!(holders, vec![(root, "boss".to_owned())]);
+        ensure_single_superadmin(&idm.users).await.unwrap();
+
+        // 旧名随后被人公开注册了:同样跳过 —— 不授 superadmin、不加成员关系,也不因此起不来。
+        let squatter = idm
+            .users
+            .create_with_roles("root", None, "fake$attacker", &[], None)
+            .await
+            .unwrap();
+        apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .expect("旧名被占也不应让启动失败");
+        assert!(idm
+            .roles
+            .roles_for_user(squatter.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(idm
+            .members
+            .get(DEFAULT_TENANT_ID.as_uuid(), squatter.id)
+            .await
+            .unwrap()
+            .is_none());
+        apply_profiles(&profiles, &idm.users, &data, &SeedReport::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            profiles.get(squatter.id).await.unwrap().is_none(),
+            "不给占了旧名的账号建 seed 资料"
+        );
+    }
+
+    /// 同名账号已存在、seed 要给它补授它还没有的平台角色 / 组织角色 / 成员关系,密码对不上 seed(抢注)→ 不报错
+    /// (prod 每次启动都跑 seed,报错 = idm 起不来),跳过补授并记进报告:什么都不授、也不给它建 seed 资料;
+    /// 声明的 superadmin 被抢注 → 库里 0 个 superadmin,启动检查照常放行。对得上 → 照常补授。
+    #[tokio::test]
+    async fn seed_skips_grants_to_squatted_account() {
+        let idm = Idm::new();
+        // 空库上有人先注册了 seed 里的用户名(公开注册;密码不是 seed 里的)
+        let sa = idm
+            .users
+            .create_with_roles("root", None, "fake$attacker", &[], None)
+            .await
+            .unwrap();
+        let pa = idm
+            .users
+            .create_with_roles("ops", None, "fake$attacker", &[], None)
+            .await
+            .unwrap();
+        let admin = idm
+            .users
+            .create_with_roles("admin", None, "fake$attacker", &[], None)
+            .await
+            .unwrap();
+        let tenant = DEFAULT_TENANT_ID.as_uuid();
+        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        let cases = [
+            (sa.id, "root", ROOT_SEED, "平台角色 superadmin"),
+            (
+                pa.id,
+                "ops",
+                r#"[[users]]
+username = "ops"
+password = "p"
+display_name = "运维"
+platform_roles = ["platform_admin"]"#,
+                "平台角色 platform_admin",
+            ),
+            (
+                admin.id,
+                "admin",
+                r#"[[tenants]]
+slug = "default"
+name = "默认组织"
+[[users]]
+username = "admin"
+password = "p"
+display_name = "管理员"
+tenants = [{ slug = "default", roles = ["admin"] }]"#,
+                "组织 default 的成员关系",
+            ),
+        ];
+        for (id, name, seed, what) in cases {
+            let data = parse(seed);
+            let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+                .await
+                .expect("密码对不上应跳过而不是报错");
+            assert_eq!(report.skipped.len(), 1, "{what}");
+            assert_eq!(report.skipped[0].username, name);
+            assert!(
+                report.skipped[0].missing.iter().any(|m| m == what),
+                "{what}: {:?}",
+                report.skipped[0].missing
+            );
+            assert!(
+                idm.roles.roles_for_user(id).await.unwrap().is_empty(),
+                "{what}"
+            );
+            assert!(
+                idm.members.get(tenant, id).await.unwrap().is_none(),
+                "{what}"
+            );
+            apply_profiles(&profiles, &idm.users, &data, &report, None)
+                .await
+                .unwrap();
+            assert!(
+                profiles.get(id).await.unwrap().is_none(),
+                "不给抢注的账号建 seed 资料({what})"
+            );
+        }
+        // 声明的 superadmin 被抢注、被跳过 → 库里 0 个 superadmin:启动检查(≤ 1)照常放行
+        assert!(superadmin_holders(&idm.users).await.unwrap().is_empty());
+        ensure_single_superadmin(&idm.users).await.unwrap();
+
+        // 密码对得上 seed(运维先建的号)→ 照常补授,报告为空
+        let mine = parse(
+            r#"[[users]]
+username = "ops"
+password = "attacker"
+platform_roles = ["platform_admin"]"#,
+        );
+        let report = apply(idm.repos(), &idm::FakeHasher, &mine, None)
+            .await
+            .unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            idm.roles.roles_for_user(pa.id).await.unwrap(),
+            vec!["platform_admin".to_owned()]
+        );
+    }
+
+    /// 库里存的密码哈希串解析不了(坏串 / 非 PHC,如手工改库、换过哈希实现)→ 不让启动失败,
+    /// 按「确认不了是运维建的」处理:跳过这个账号的全部补授、记进报告,其余照常。
+    #[tokio::test]
+    async fn seed_skips_grants_when_stored_hash_unparseable() {
+        let idm = Idm::new();
+        let broken = idm
+            .users
+            .create_with_roles("ops", None, "not-a-phc-string", &[], None)
+            .await
+            .unwrap();
+        let data = parse(
+            r#"[[users]]
+username = "ops"
+password = "p"
+platform_roles = ["platform_admin"]"#,
+        );
+        // 真哈希实现:坏串在 PHC 解析这一步就 Err(FakeHasher 永不 Err,测不到)
+        let report = apply(idm.repos(), &idm::Argon2Hasher, &data, None)
+            .await
+            .expect("哈希串解析失败不应让启动失败");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].user_id, broken.id);
+        assert_eq!(report.skipped[0].username, "ops");
+        assert_eq!(report.skipped[0].missing, vec!["平台角色 platform_admin"]);
+        assert!(idm
+            .roles
+            .roles_for_user(broken.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 跳过判定按 user_id:seed 的用户名经 `find_by_identifier` 命中的是**另一个**账号(它的邮箱恰好等于这个用户名)、
+    /// 被跳过了补授 → `apply_profiles` 同样不给它建 seed 资料。按用户名比较时报告里记的是那个账号自己的用户名,
+    /// 和 seed 的对不上 → 漏判,抢注者拿到 seed 的显示名。
+    #[tokio::test]
+    async fn profiles_skip_is_keyed_by_user_id() {
+        let idm = Idm::new();
+        let eve = idm
+            .users
+            .create_with_roles("eve", Some("ops"), "fake$attacker", &[], None)
+            .await
+            .unwrap();
+        let data = parse(
+            r#"[[users]]
+username = "ops"
+password = "p"
+display_name = "运维"
+platform_roles = ["platform_admin"]"#,
+        );
+        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert_eq!(report.skipped[0].user_id, eve.id);
+        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        apply_profiles(&profiles, &idm.users, &data, &report, None)
+            .await
+            .unwrap();
+        assert!(
+            profiles.get(eve.id).await.unwrap().is_none(),
+            "被跳过的账号不该拿到 seed 资料"
+        );
+    }
+
+    /// 已经持有声明的角色 / 成员关系 → 不校验密码:运维运行期改过密码,重跑 seed 照常(幂等,不报错)。
+    #[tokio::test]
+    async fn seed_skips_password_check_when_nothing_to_grant() {
+        let idm = Idm::new();
+        let data = parse(ROOT_SEED);
+        idm.apply(&data).await;
+        let root = idm.uid("root").await;
+        idm.users
+            .update_password(root, "fake$rotated")
+            .await
+            .unwrap();
+        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .unwrap();
+        assert!(report.skipped.is_empty(), "什么都不缺 → 不校验、不跳过");
+        assert_eq!(
+            idm.roles.roles_for_user(root).await.unwrap(),
+            vec!["superadmin".to_owned()]
+        );
+
+        // 但改过密码后 seed 再多声明一个组织角色 → 要补授 → 密码对不上 → 跳过补授(不报错),报告里写明缺什么
+        let more = parse(
+            r#"[[tenants]]
+slug = "default"
+name = "默认组织"
+[[users]]
+username = "root"
+password = "p"
+platform_roles = ["superadmin"]
+tenants = [{ slug = "default", roles = ["admin", "user"] }]"#,
+        );
+        let report = apply(idm.repos(), &idm::FakeHasher, &more, None)
+            .await
+            .expect("改过密码不应让启动失败");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].username, "root");
+        assert_eq!(report.skipped[0].missing, vec!["组织 default 的角色 user"]);
+        let m = idm
+            .members
+            .get(DEFAULT_TENANT_ID.as_uuid(), root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.roles, vec!["admin".to_owned()], "没补授 user");
+    }
+
+    /// 运维改过密码、运行期又被撤掉了 seed 声明的东西(平台角色 / 组织角色 / 被移出组织)→ 重启 seed 不报错、
+    /// **不补授**(撤权在重启后仍然有效),报告里列出缺的项;库里的其他东西原样不动。
+    #[tokio::test]
+    async fn seed_does_not_regrant_runtime_revocations_after_password_change() {
+        let idm = Idm::new();
+        let data = parse(
+            r#"[[tenants]]
+slug = "default"
+name = "默认组织"
+[[tenants]]
+slug = "acme"
+name = "Acme"
+[[users]]
+username = "lead"
+password = "p"
+platform_roles = ["platform_admin"]
+tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["user"] }]"#,
+        );
+        idm.apply(&data).await;
+        let lead = idm.uid("lead").await;
+        let default = DEFAULT_TENANT_ID.as_uuid();
+        let acme = idm.tenants.get_by_slug("acme").await.unwrap().id;
+        idm.users
+            .update_password(lead, "fake$rotated")
+            .await
+            .unwrap();
+        // 运行期:superadmin 撤掉平台管理员、组织里把 admin 降成 user、从 acme 移出
+        idm.roles.set_roles(lead, &[], None).await.unwrap();
+        let user_role = role_ids_by_name(&idm.roles, ["user".to_owned()].iter())
+            .await
+            .unwrap();
+        idm.members
+            .set_roles(default, lead, &user_role, None)
+            .await
+            .unwrap();
+        idm.members.remove(acme, lead, None).await.unwrap();
+
+        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .expect("改过密码 + 运行期撤权,重启 seed 不应报错");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].username, "lead");
+        assert_eq!(
+            report.skipped[0].missing,
+            vec![
+                "平台角色 platform_admin",
+                "组织 default 的角色 admin",
+                "组织 acme 的成员关系",
+            ]
+        );
+        assert!(idm.roles.roles_for_user(lead).await.unwrap().is_empty());
+        assert_eq!(
+            idm.members.get(default, lead).await.unwrap().unwrap().roles,
+            vec!["user".to_owned()]
+        );
+        assert!(idm.members.get(acme, lead).await.unwrap().is_none());
+    }
+
+    /// 声明的 superadmin 改过密码、其 superadmin 授予又被删掉了(按 README 清理时删错 / 直接改库)→ 重启 seed 不报错、
+    /// 不补授:库里 0 个 superadmin,启动检查(≤ 1)照常放行;要恢复按警告里的办法(seed 填现在的密码再启动)。
+    #[tokio::test]
+    async fn seed_skips_superadmin_regrant_when_password_differs() {
+        let idm = Idm::new();
+        let data = parse(ROOT_SEED);
+        idm.apply(&data).await;
+        let root = idm.uid("root").await;
+        idm.users
+            .update_password(root, "fake$rotated")
+            .await
+            .unwrap();
+        idm.roles.set_roles(root, &[], None).await.unwrap();
+
+        ensure_single_superadmin(&idm.users).await.unwrap();
+        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+            .await
+            .expect("不应让 idm 起不来");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].missing, vec!["平台角色 superadmin"]);
+        assert!(idm.roles.roles_for_user(root).await.unwrap().is_empty());
+        assert!(superadmin_holders(&idm.users).await.unwrap().is_empty());
+        ensure_single_superadmin(&idm.users).await.unwrap();
+
+        // 按警告处理:seed 里填上它现在的密码 → 补授回来
+        let fixed = parse(&ROOT_SEED.replace(r#"password = "p""#, r#"password = "rotated""#));
+        let report = apply(idm.repos(), &idm::FakeHasher, &fixed, None)
+            .await
+            .unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            idm.roles.roles_for_user(root).await.unwrap(),
+            vec!["superadmin".to_owned()]
         );
     }
 
@@ -1119,9 +1691,15 @@ tenants = [{ slug = "default", roles = ["user"] }]"#,
         );
 
         idm.apply(&data).await;
-        apply_profiles(&profiles, &idm.users, &data, by.clone())
-            .await
-            .unwrap();
+        apply_profiles(
+            &profiles,
+            &idm.users,
+            &data,
+            &SeedReport::default(),
+            by.clone(),
+        )
+        .await
+        .unwrap();
         let uid = idm.uid("alice").await;
         let p = profiles
             .get(uid)
@@ -1146,7 +1724,7 @@ tenants = [{ slug = "default", roles = ["user"] }]"#,
             .unwrap();
 
         // 重跑(= 每次容器重启)
-        apply_profiles(&profiles, &idm.users, &data, by)
+        apply_profiles(&profiles, &idm.users, &data, &SeedReport::default(), by)
             .await
             .unwrap();
         let p = profiles.get(uid).await.unwrap().unwrap();

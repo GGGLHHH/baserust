@@ -43,6 +43,8 @@ oauth2 scopes = "which perm gates this op". Ownership is runtime/data-dependent 
 
 Doc `security` is **injected from `op_perms`** after `split_for_parts` — **never hand-write `security(("oauth2"=...))` in `#[utoipa::path]`**; `every_operation_classified` fail-closes on an unclassified op.
 
+条件闸(只在**请求本身**满足某条件时另要的权限,如 `put_profile` 改别人另要 `profiles:write:all` + `platform:roles`)security 表达不了:登记在 `op_perms.rs` 的 `OP_CONDITIONAL_PERMS`(条件是闭集 `Condition`),文档进 operation 的 `x-conditional-scopes` + description 一句,403 描述也要写明这些 scope;`openapi_authz_test::conditional_scopes_documented_and_enforced` 行为钉死。看**目标数据**的条件闸(防接管)仍只写在 403 描述里。
+
 ## Red flags
 - `if role == ...` / `roles.contains(...)` → gate a perm
 - 403 for "not yours" → should be 404

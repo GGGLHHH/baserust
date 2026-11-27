@@ -10,7 +10,7 @@ use utoipa::{Modify, OpenApi};
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::app::state::AppState;
-use crate::infra::op_perms::{op_authz, PermReq};
+use crate::infra::op_perms::{op_authz, op_conditional, PermReq};
 use crate::kernel::authz::Perm;
 use crate::kernel::error::AppError;
 
@@ -131,8 +131,51 @@ pub fn inject_operation_security(api: &mut utoipa::openapi::OpenApi) {
                     .map(|scopes| SecurityRequirement::new(OAUTH2_SCHEME, scopes))
                     .collect(),
             );
+            let id = id.to_owned();
+            inject_conditional_scopes(op, &id);
         }
     }
+}
+
+/// 条件权限([`crate::infra::op_perms::OP_CONDITIONAL_PERMS`])→ operation 的 `x-conditional-scopes` 扩展
+/// (`[{"when": …, "scopes": […]}]`,机读)+ description 末尾一句(人读)。security 是静态的,表达不了条件闸。
+fn inject_conditional_scopes(op: &mut utoipa::openapi::path::Operation, id: &str) {
+    let conds: Vec<_> = op_conditional(id).collect();
+    if conds.is_empty() {
+        return;
+    }
+    let machine: Vec<serde_json::Value> = conds
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "when": c.when.wire(),
+                "scopes": c.perms.iter().map(|&p| perm_wire(p)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    op.extensions
+        .get_or_insert_with(Default::default)
+        .insert("x-conditional-scopes".to_owned(), machine.into());
+    let note = conds
+        .iter()
+        .map(|c| {
+            let scopes: Vec<String> = c
+                .perms
+                .iter()
+                .map(|&p| format!("`{}`", perm_wire(p)))
+                .collect();
+            format!(
+                "条件权限:{}另需 {}(缺 → 403)。",
+                c.when.describe(),
+                scopes.join(" + ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    op.description = Some(match op.description.take() {
+        Some(d) if !d.is_empty() => format!("{d}\n\n{note}"),
+        _ => note,
+    });
 }
 
 /// admin 组闸(后台准入 = `admin:login` **或**任一平台级权限,见 `Policy::require_admin_entry`)并入文档:
@@ -337,6 +380,49 @@ mod tests {
                 ids.contains(e.operation_id),
                 "OP_PERMS 的 `{}` 在 spec 不存在(handler 改名/路径漂移?)",
                 e.operation_id
+            );
+        }
+    }
+
+    /// 防表腐:`OP_CONDITIONAL_PERMS` 每个 operationId 必在 spec 存在,且 operation 带着它的 `x-conditional-scopes`
+    /// 条目(`{when, scopes}` 与表一致)。条件权限只随 `OP_PERMS` 注入(不在 `OP_PERMS` = public → 不写),
+    /// 所以 handler 改名 / 路径漂移 / 漏登 `OP_PERMS` 都会让文档静默丢掉条件权限 → 这里红。
+    #[test]
+    fn op_conditional_perms_entries_documented_in_spec() {
+        let v = serde_json::to_value(crate::app::router::api_spec()).unwrap();
+        let ops: Vec<&serde_json::Value> = v["paths"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|item| item.as_object().unwrap().values())
+            .collect();
+        for c in crate::infra::op_perms::OP_CONDITIONAL_PERMS {
+            let op = ops
+                .iter()
+                .find(|op| op.get("operationId").and_then(|x| x.as_str()) == Some(c.operation_id))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "OP_CONDITIONAL_PERMS 的 `{}` 在 spec 不存在(handler 改名/路径漂移?)",
+                        c.operation_id
+                    )
+                });
+            let ext = op
+                .get("x-conditional-scopes")
+                .and_then(|x| x.as_array())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}` 在 spec 里没有 x-conditional-scopes(没登记进 OP_PERMS?条件权限只随它注入)",
+                        c.operation_id
+                    )
+                });
+            let want = serde_json::json!({
+                "when": c.when.wire(),
+                "scopes": c.perms.iter().map(|&p| perm_wire(p)).collect::<Vec<_>>(),
+            });
+            assert!(
+                ext.contains(&want),
+                "`{}` 的 x-conditional-scopes 缺条目 {want},got {ext:?}",
+                c.operation_id
             );
         }
     }

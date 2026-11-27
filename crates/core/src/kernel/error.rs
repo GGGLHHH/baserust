@@ -23,10 +23,16 @@ pub enum AppError {
     #[error("malformed request")]
     BadRequest(String),
 
-    /// 未认证 / 凭据无效(登录失败、token 无效或过期、改密旧密码错)→ 401。
-    /// `client_message` 刻意通用,**绝不区分"用户不存在"与"密码错误"**(防账号枚举)。
+    /// 未认证 / 会话失效(没带 token、token 无效或过期、refresh 失效、账号已不在)→ 401。
+    /// `client_message` 刻意通用。前端见此码走刷新 / 会话过期流程。
     #[error("authentication failed")]
     Unauthorized,
+
+    /// 凭据错(登录密码错 / 用户不存在、改密旧密码错、注销密码确认错)→ 401,机器码 `invalid_credentials`。
+    /// 与 `Unauthorized` 分开:会话本身还有效,前端**不能**当会话过期去刷新 / 跳登录页,而是把错误交给调用方。
+    /// `client_message` 与 `Unauthorized` 一样通用,**绝不区分"用户不存在"与"密码错误"**(防账号枚举)。
+    #[error("invalid credentials")]
+    InvalidCredentials,
 
     /// 资源冲突(注册时 email 已占用)→ 409。消息写给用户、可回传(不含内部措辞)。
     #[error("conflict: {0}")]
@@ -68,8 +74,9 @@ impl From<idm::IdmError> for AppError {
         match e {
             idm::IdmError::NotFound => AppError::NotFound,
             idm::IdmError::Unauthorized => AppError::Unauthorized,
-            // 失败原因只供审计(handler 发事件时读),HTTP 仍统一 401,防枚举不变。
-            idm::IdmError::InvalidCredentials(_) => AppError::Unauthorized,
+            // 失败原因只供审计(handler 发事件时读),HTTP 仍统一 401、文案通用,防枚举不变;
+            // 机器码与会话失效分开(invalid_credentials ≠ unauthorized)。
+            idm::IdmError::InvalidCredentials(_) => AppError::InvalidCredentials,
             idm::IdmError::Conflict(m) => AppError::Conflict(m),
             // 已认证但不是目标租户的有效成员(切换租户)→ 403。
             idm::IdmError::Forbidden => AppError::Forbidden,

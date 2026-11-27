@@ -265,6 +265,9 @@ impl TenantAdminService {
         roles: &[RoleName],
         by: Option<String>,
     ) -> Result<MemberView, AppError> {
+        // 先确认账号存活(不存在 / 已删 → 404),再写成员关系 —— 否则会给不存在的账号落一行成员关系,
+        // 最后取视图时才 404,而写已经生效了。
+        self.users.find_by_id(user_id).await?;
         let role_ids = self.tenant_role_ids(roles).await?;
         let t = tenant.as_uuid();
         let joined = match self.members.get(t, user_id).await? {
@@ -631,6 +634,33 @@ mod tests {
         async fn touch_last_used(&self, t: Uuid, u: Uuid) -> Result<(), idm::IdmError> {
             self.0.touch_last_used(t, u).await
         }
+    }
+
+    /// PUT 成员:账号不存在 / 已删 → 404,且**不落任何成员关系**(先查账号再写)。
+    #[tokio::test]
+    async fn put_member_unknown_or_deleted_account_is_404_without_writing() {
+        let e = env_with(None).await;
+        let t = tenant(&e, "acme").await;
+        let ghost = Uuid::now_v7();
+        assert!(matches!(
+            e.svc.put_member(t, ghost, &[RoleName::User], None).await,
+            Err(AppError::NotFound)
+        ));
+        assert!(
+            e.members.get(t.as_uuid(), ghost).await.unwrap().is_none(),
+            "不存在的账号不该落成员关系"
+        );
+
+        let dave = account(&e, "dave").await;
+        e.users.soft_delete(dave, None).await.unwrap();
+        assert!(matches!(
+            e.svc.put_member(t, dave, &[RoleName::User], None).await,
+            Err(AppError::NotFound)
+        ));
+        assert!(
+            e.members.get(t.as_uuid(), dave).await.unwrap().is_none(),
+            "已删的账号不该落成员关系"
+        );
     }
 
     /// PUT 成员幂等:加入时撞上「已是成员」(并发加入)→ 改走全量换角色,不报 409。

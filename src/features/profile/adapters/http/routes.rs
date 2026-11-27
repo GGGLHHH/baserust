@@ -6,6 +6,9 @@
 //! - 按 id 读 / 改任意人的资料用 `profiles:*`,它们是**平台级**权限(只有平台管理员有):租户管理员不能改
 //!   所有人的全局资料,租户成员也读不到别的租户的人的资料(含 phone)。PUT 的 ownership 用
 //!   `data_access(ProfileWriteAll)`,越权给 **403 而非 404**(持 `profiles:read` 的人本就可读,存在性不敏感)。
+//!   **按 id 改别人**另要 `platform:roles`(只有 superadmin):这个端点在 app 进程,app 里的 idm 仓储是内存占位,
+//!   查不到目标的平台角色,没法像后台那样按目标判防接管闸 —— 只好一律收紧。平台管理员改普通账号的资料走后台
+//!   `PUT /admin/auth/users/{id}/profile`(idm 进程,有 `guard_platform_account`)。
 //!
 //! **头像是个人内容**(`ContentScope::Personal`,spec §4.4):不属于任何租户,只有本人(或后台 `users:admin`)
 //! 能上传 / 替换;头像端点对所有已登录用户可读、跨租户可见。租户作用域的内容不能当头像(绑定 422)。
@@ -75,7 +78,8 @@ pub async fn get_my_profile(
     Ok(Json(state.profiles.get_or_empty(user.0.id).await?.into()))
 }
 
-/// 按 id 全量替换 upsert 资料(`profiles:write`,**平台级**);带 `profiles:write:all` 可替任何人。
+/// 按 id 全量替换 upsert 资料(`profiles:write`,**平台级**);改别人还要 `profiles:write:all` **和** `platform:roles`
+/// (只有 superadmin —— 防平台管理员改 superadmin 的资料;平台管理员改普通账号走后台 `PUT /admin/auth/users/{id}/profile`)。
 /// 未建 → 201,已有 → 200(PUT 即建即替,RFC 7231 本义;profile 无独立 POST)。本人改自己走 `PUT /profiles/me`。
 #[utoipa::path(
     put,
@@ -87,7 +91,7 @@ pub async fn get_my_profile(
         (status = 200, description = "已替换", body = ProfileResponse),
         (status = 201, description = "首次建立", body = ProfileResponse),
         (status = 401, description = "未认证", body = ErrorBody),
-        (status = 403, description = "无 profiles:write / 改别人无 write:all(平台级)", body = ErrorBody),
+        (status = 403, description = "无 profiles:write / 改别人缺 profiles:write:all 或 platform:roles(平台级;平台管理员改别人走后台资料接口)", body = ErrorBody),
         (status = 422, description = "校验失败(超长 / 头像不是目标本人的个人内容 / 未 confirm / 非栅格图)", body = ErrorBody)
     )
 )]
@@ -109,6 +113,13 @@ pub async fn put_profile(
         .allows(user_id)
     {
         return Err(AppError::Forbidden.into());
+    }
+    // 防接管:改别人的资料另要 platform:roles(只有 superadmin)。不按目标的平台角色判(后台那套
+    // guard_platform_account):本端点归 app 进程,app 里的 idm 仓储是内存占位,查不到目标 → 闸会放行。
+    if user_id != user.0.id {
+        state
+            .policy
+            .require_scoped(&user.0, &scope.0, Perm::PlatformRoles)?;
     }
     let (created, view) = state.profiles.put(user_id, input.into(), &ctx).await?;
     let status = if created {

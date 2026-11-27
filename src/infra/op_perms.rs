@@ -158,6 +158,8 @@ pub const OP_PERMS: &[OpAuthz] = &[
         operation_id: "get_my_permissions",
         perm: PermReq::LoginOnly,
     },
+    // 改别人另要 profiles:write:all + platform:roles:那是看请求数据(路径 user_id 是不是本人)的条件闸,
+    // security 表达不了 → 登记在下面的 OP_CONDITIONAL_PERMS(文档进 x-conditional-scopes)
     OpAuthz {
         operation_id: "put_profile",
         perm: PermReq::All(&[Perm::ProfileWrite]),
@@ -320,6 +322,63 @@ pub const OP_PERMS: &[OpAuthz] = &[
         perm: PermReq::All(&[Perm::AuditRead]),
     },
 ];
+
+/// 条件权限的触发条件(闭集)。每加一种,`tests/openapi_authz_test.rs` 的
+/// `conditional_scopes_documented_and_enforced` 要补对应的探测(不认识的条件那里直接报红)。
+#[derive(Clone, Copy, Debug)]
+pub enum Condition {
+    /// 路径里的 `{user_id}` 不是调用者本人(改别人的资源)。
+    OtherUser,
+}
+
+impl Condition {
+    /// 文档里的机读值(`x-conditional-scopes[].when`)。
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::OtherUser => "other_user",
+        }
+    }
+
+    /// 文档里的人读说明(拼进 operation 的 description)。
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::OtherUser => "路径里的 user_id 不是调用者本人(改别人)时",
+        }
+    }
+}
+
+/// 条件权限:在 [`OP_PERMS`] 的要求之外、**只在条件成立时** handler 另要的权限。
+#[derive(Clone, Copy, Debug)]
+pub struct OpConditional {
+    pub operation_id: &'static str,
+    pub when: Condition,
+    /// 条件成立时另需的全部权限(AND)。
+    pub perms: &'static [Perm],
+}
+
+/// **条件权限表**(文档侧)。OpenAPI 的 security 逐 operation 静态,表达不了「改别人才要」—— 写进 security 会谎称
+/// 改自己也要,不写又看不出来。所以单列在这:[`crate::infra::openapi::inject_operation_security`] 把它写进
+/// operation 的 `x-conditional-scopes` 扩展(`[{when, scopes}]`)并在 description 追加一句;与 handler 的一致性由
+/// `tests/openapi_authz_test.rs` 行为钉死(条件成立时逐个缺 → 403、全给 → 过;条件不成立只要 security 的)。
+///
+/// 只登记**看请求本身**就能判的条件。后台账号管理「目标持平台角色另要 `platform:roles`」要看目标账号的数据,
+/// 不在这里表达(见上表 users 段的注释)。
+pub const OP_CONDITIONAL_PERMS: &[OpConditional] = &[
+    // 按 id 改别人的资料:越权的 ownership(write:all)+ 防接管(platform:roles,只有 superadmin;
+    // 平台管理员改普通账号的资料走后台 PUT /admin/auth/users/{id}/profile)
+    OpConditional {
+        operation_id: "put_profile",
+        when: Condition::OtherUser,
+        perms: &[Perm::ProfileWriteAll, Perm::PlatformRoles],
+    },
+];
+
+/// 按 operationId 查条件权限(可多条)。
+pub fn op_conditional(id: &str) -> impl Iterator<Item = &'static OpConditional> + '_ {
+    OP_CONDITIONAL_PERMS
+        .iter()
+        .filter(move |o| o.operation_id == id)
+}
 
 /// 按 operationId 查授权目录。不在表 = public。
 pub fn op_authz(id: &str) -> Option<&'static OpAuthz> {

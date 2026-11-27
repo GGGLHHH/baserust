@@ -389,6 +389,119 @@ async fn by_id_access_is_platform_only() {
     assert_eq!(me["display_name"], "ByPlatformAgain");
 }
 
+/// 防接管:按 id 改**别人**的资料另要 `platform:roles`(只有 superadmin)。平台管理员(`platform_admin`,持
+/// `profiles:write:all` 但没有 `platform:roles`)改 superadmin / 普通账号的资料 → 403 且不落库;改自己(按 id)照常;
+/// 改普通账号走后台 `PUT /admin/auth/users/{id}/profile` 照常(那里按目标的平台角色判闸)。superadmin 改别人仍可。
+#[tokio::test]
+async fn platform_admin_cannot_put_others_profile_by_id() {
+    let s = TestServer::start().await;
+    let sa = s.login(SUPERADMIN, PASSWORD).await;
+    let sa_id = my_id(&sa).await;
+    let user_id = seed_id(&s, USER).await;
+    let pa_id = Uuid::now_v7();
+    let pa = s.bearer(&mint(pa_id, "pa", &["platform_admin"], None, &[], vec![]));
+
+    let before = expect_json(sa.get(ME).await, StatusCode::OK).await;
+    for target in [&sa_id, &user_id] {
+        expect_error(
+            pa.put_json(
+                &profile_path(target),
+                &json!({ "display_name": "pwned", "phone": "000" }),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )
+        .await;
+    }
+    let after = expect_json(sa.get(ME).await, StatusCode::OK).await;
+    assert_eq!(
+        after["display_name"], before["display_name"],
+        "被拒的写不应生效"
+    );
+    assert_eq!(after["phone"], before["phone"], "被拒的写不应生效");
+
+    // 改自己(按 id)不是"改别人",不要 platform:roles
+    let v = expect_json(
+        pa.put_json(
+            &profile_path(&pa_id.to_string()),
+            &json!({ "display_name": "Me" }),
+        )
+        .await,
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(v["display_name"], "Me");
+
+    // 平台管理员改普通账号的资料:走后台接口
+    let v = expect_json(
+        pa.put_json(
+            &admin_profile_path(&user_id),
+            &json!({ "display_name": "ByAdminRoute" }),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(v["display_name"], "ByAdminRoute");
+    // …但后台接口改 superadmin 照样 403(guard_platform_account)
+    expect_error(
+        pa.put_json(
+            &admin_profile_path(&sa_id),
+            &json!({ "display_name": "pwned" }),
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+
+    // superadmin 改别人仍可
+    let v = expect_json(
+        sa.put_json(
+            &profile_path(&user_id),
+            &json!({ "display_name": "BySuper" }),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(v["display_name"], "BySuper");
+}
+
+/// superadmin 的降权令牌:scope 里缺 `platform:roles` → 按 id 改别人 403(scope 只收窄不放大)。
+#[tokio::test]
+async fn put_others_profile_needs_platform_roles_in_scope() {
+    let s = TestServer::start().await;
+    let (_, target) = fresh_user(&s);
+    let narrowed = s.bearer(&superadmin_token(
+        Uuid::now_v7(),
+        vec![Perm::ProfileWrite, Perm::ProfileWriteAll],
+    ));
+    expect_error(
+        narrowed
+            .put_json(&profile_path(&target), &json!({ "display_name": "x" }))
+            .await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+    let full = s.bearer(&superadmin_token(
+        Uuid::now_v7(),
+        vec![
+            Perm::ProfileWrite,
+            Perm::ProfileWriteAll,
+            Perm::PlatformRoles,
+        ],
+    ));
+    expect(
+        full.put_json(&profile_path(&target), &json!({ "display_name": "x" }))
+            .await,
+        StatusCode::CREATED,
+    )
+    .await;
+}
+
 /// 读别人未建的资料 → 404(与 me 的"空资料"刻意不同)。
 #[tokio::test]
 async fn get_missing_profile_is_404() {

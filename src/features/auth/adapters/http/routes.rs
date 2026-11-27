@@ -22,6 +22,7 @@ use crate::infra::client_context::ClientContext;
 use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
+use crate::kernel::authz::RoleName;
 use crate::kernel::error::AppError;
 
 const ACCESS_COOKIE: &str = "access_token";
@@ -304,6 +305,7 @@ pub async fn update_me(
     responses(
         (status = 204, description = "已注销"),
         (status = 401, description = "密码错", body = ErrorBody),
+        (status = 403, description = "superadmin 不能注销自己(superadmin 不经任何接口撤销)", body = ErrorBody),
         (status = 422, description = "校验失败", body = ErrorBody),
     )
 )]
@@ -316,6 +318,15 @@ pub async fn delete_me(
     Json(req): Json<DeleteMeRequest>,
 ) -> Result<(StatusCode, CookieJar), ApiError> {
     req.validate()?;
+    // superadmin 只有一个、只由 seed 声明,任何接口都撤不掉 —— 注销自己也不行(删了之后同名注册 / 下次 seed 都会出事)。
+    // 看库里的原始平台角色(不信 token 里的 roles:降权令牌 / 闭集过滤都不该让它溜过去)。账号已不在 → 交给 delete_me 照旧回 401。
+    match state.user_admin.raw_role_names(user.0.id).await {
+        Ok(roles) if roles.iter().any(|r| r == RoleName::Superadmin.as_str()) => {
+            return Err(AppError::Forbidden.into());
+        }
+        Ok(_) | Err(AppError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
     state
         .auth
         .delete_me(user.0.id, req.password, audit.audit_id())

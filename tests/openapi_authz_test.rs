@@ -219,6 +219,114 @@ async fn spec_security_matches_real_enforcement() {
     );
 }
 
+/// **条件权限**(`op_perms::OP_CONDITIONAL_PERMS` → spec 的 `x-conditional-scopes` 扩展):OpenAPI 的 security 是逐
+/// operation 静态的,表达不了「改别人才要」这种看请求数据的闸(如 `put_profile` 改别人另要 `profiles:write:all` +
+/// `platform:roles`)。这类闸写进扩展,这里行为钉死文档 ⟷ handler:
+/// - 条件成立(路径 `{user_id}` 是**别人**):security 广告的 + 条件 scope 全给 → 穿过;逐个去掉条件 scope → 403。
+/// - 条件不成立(打自己):只给 security 广告的就能过(条件闸没有被无条件化)。
+/// - 403 的响应描述写明了每个条件 scope(读文档的人在 403 那里就能看到为什么)。
+#[tokio::test]
+async fn conditional_scopes_documented_and_enforced() {
+    let config = Config::default();
+    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
+    let app = build_router(state.clone(), &config, Mount::Both);
+    let su = state
+        .auth
+        .login(LoginInput {
+            identifier: "superadmin".to_owned(),
+            password: "pwd".to_owned(),
+        })
+        .await
+        .unwrap();
+    let signer = AppTokenSigner::dev();
+    let mint = |scope: Vec<Perm>| {
+        signer
+            .mint_scoped(
+                su.user.id,
+                &su.user.username,
+                su.user.roles.clone(),
+                Some(baserust::features::auth::ScopedTenant {
+                    id: su.tenant_id.expect("superadmin 登录应进默认租户"),
+                    roles: su.tenant_roles.clone(),
+                }),
+                scope,
+                900,
+            )
+            .unwrap()
+    };
+
+    let spec = serde_json::to_value(api_spec()).unwrap();
+    let mut checked: Vec<String> = Vec::new();
+    for (path, item) in spec["paths"].as_object().expect("paths").iter() {
+        for (method, op) in item.as_object().expect("path item").iter() {
+            let Some(conds) = op.get("x-conditional-scopes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            let op_id = op["operationId"].as_str().unwrap_or("");
+            // 条件闸之外的基本要求:取 security 的第一支(单支 = AND)
+            let base: Vec<Perm> = op["security"][0]["oauth2"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op_id} 有条件 scope 却没有 security"))
+                .iter()
+                .map(|s| str_to_perm(s.as_str().unwrap()))
+                .collect();
+            let forbidden_doc = op["responses"]["403"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{op_id} 有条件 scope,应文档化 403"));
+            for c in conds {
+                assert_eq!(
+                    c["when"], "other_user",
+                    "{op_id}:本测试只会探测 other_user 条件,新条件要在这里补探测"
+                );
+                let extra: Vec<Perm> = c["scopes"]
+                    .as_array()
+                    .expect("scopes")
+                    .iter()
+                    .map(|s| str_to_perm(s.as_str().unwrap()))
+                    .collect();
+                assert!(!extra.is_empty(), "{op_id} 条件 scope 不应为空");
+                for p in &extra {
+                    assert!(
+                        forbidden_doc.contains(&p.wire()),
+                        "{op_id} 的 403 描述应写明条件 scope {}:{forbidden_doc}",
+                        p.wire()
+                    );
+                }
+                let other = path.replace("{user_id}", &Uuid::now_v7().to_string());
+                let mine = path.replace("{user_id}", &su.user.id.to_string());
+                let full: Vec<Perm> = base.iter().chain(extra.iter()).copied().collect();
+                let s = hit(&app, method, &other, op_id, &mint(full.clone())).await;
+                assert!(
+                    s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+                    "{op_id} 改别人、scope={full:?} 不应被拒,got {s}"
+                );
+                for dropped in &extra {
+                    let rest: Vec<Perm> = full.iter().copied().filter(|p| p != dropped).collect();
+                    if rest.iter().any(|r| r.implies().contains(dropped)) {
+                        continue;
+                    }
+                    let s = hit(&app, method, &other, op_id, &mint(rest)).await;
+                    assert_eq!(
+                        s,
+                        StatusCode::FORBIDDEN,
+                        "{op_id} 改别人缺条件 scope {dropped:?} 应 403,got {s}"
+                    );
+                }
+                let s = hit(&app, method, &mine, op_id, &mint(base.clone())).await;
+                assert!(
+                    s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+                    "{op_id} 改自己只要 security 广告的 {base:?},got {s}"
+                );
+            }
+            checked.push(op_id.to_owned());
+        }
+    }
+    assert!(
+        checked.iter().any(|o| o == "put_profile"),
+        "put_profile 改别人要 platform:roles,应在 x-conditional-scopes 里文档化,实际查到:{checked:?}"
+    );
+}
+
 /// **`api_spec()` 必须与 `build_router` 实际装配的 spec 一致**。
 ///
 /// 两者是**手抄的两份**同一棵 merge/nest 树(router.rs 自称"同源",却把每个 `.merge(xxx::router())`
