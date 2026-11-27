@@ -62,8 +62,10 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("读目录 {}: {e}", dir.display())) {
+fn rs_files(directory: &Path, out: &mut Vec<PathBuf>) {
+    for entry in
+        fs::read_dir(directory).unwrap_or_else(|e| panic!("读目录 {}: {e}", directory.display()))
+    {
         let path = entry.unwrap().path();
         if path.is_dir() {
             rs_files(&path, out);
@@ -83,12 +85,12 @@ fn code_of(line: &str) -> &str {
 fn mentions_crate(text: &str, krate: &str) -> bool {
     let bytes = text.as_bytes();
     let mut from = 0;
-    while let Some(pos) = text[from..].find(krate) {
-        let start = from + pos;
+    while let Some(position) = text[from..].find(krate) {
+        let start = from + position;
         let end = start + krate.len();
         let before_ok = start == 0 || {
-            let c = bytes[start - 1] as char;
-            !(c.is_alphanumeric() || c == '_' || c == ':')
+            let character = bytes[start - 1] as char;
+            !(character.is_alphanumeric() || character == '_' || character == ':')
         };
         let rest = &text[end..];
         let after_ok = rest.starts_with("::")
@@ -104,9 +106,9 @@ fn mentions_crate(text: &str, krate: &str) -> bool {
 
 /// 一个核心源文件的违规清单(`文件:行: 原因`)。`module` = 所属业务模块名(kernel 为 None)。
 fn violations(path: &Path, module: Option<&str>) -> Vec<String> {
-    let src = fs::read_to_string(path).unwrap();
+    let source = fs::read_to_string(path).unwrap();
     let mut out = Vec::new();
-    for (i, raw) in src.lines().enumerate() {
+    for (i, raw) in source.lines().enumerate() {
         let line = code_of(raw);
         let at = || format!("{}:{}", path.display(), i + 1);
         for krate in FORBIDDEN_CRATES {
@@ -123,16 +125,16 @@ fn violations(path: &Path, module: Option<&str>) -> Vec<String> {
                 ));
             }
         }
-        if let Some(m) = module {
+        if let Some(own_module) = module {
             // crate::features::<x>:x 必须是本模块
             let mut rest = line;
-            while let Some(p) = rest.find("crate::features::") {
-                let tail = &rest[p + "crate::features::".len()..];
+            while let Some(position) = rest.find("crate::features::") {
+                let tail = &rest[position + "crate::features::".len()..];
                 let other: String = tail
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
-                if !other.is_empty() && other != m {
+                if !other.is_empty() && other != own_module {
                     out.push(format!(
                         "{}: 核心直接依赖了别的业务模块 `{other}`(应走端口)→ {}",
                         at(),
@@ -176,12 +178,12 @@ fn packages_in_section(toml: &str, section: &str) -> Vec<String> {
 #[test]
 fn core_crate_manifest_has_no_framework_dependencies() {
     let toml = fs::read_to_string(manifest_dir().join("crates/core/Cargo.toml")).unwrap();
-    let deps = packages_in_section(&toml, "[dependencies]");
+    let dependencies = packages_in_section(&toml, "[dependencies]");
     assert!(
-        deps.contains(&"serde".to_owned()),
-        "依赖段解析坏了?读到:{deps:?}"
+        dependencies.contains(&"serde".to_owned()),
+        "依赖段解析坏了?读到:{dependencies:?}"
     );
-    let bad: Vec<_> = deps
+    let bad: Vec<_> = dependencies
         .iter()
         .filter(|d| FORBIDDEN_PACKAGES.contains(&d.as_str()))
         .collect();
@@ -193,21 +195,21 @@ fn core_crate_manifest_has_no_framework_dependencies() {
 
 #[test]
 fn core_sources_respect_dependency_rules() {
-    let core_src = manifest_dir().join("crates/core/src");
+    let core_source = manifest_dir().join("crates/core/src");
     let mut files = Vec::new();
-    rs_files(&core_src, &mut files);
+    rs_files(&core_source, &mut files);
     let mut problems = Vec::new();
-    for f in &files {
+    for file in &files {
         // crates/core/src/features/<m>/… → 所属模块 m;kernel / lib.rs → None
-        let rel = f.strip_prefix(&core_src).unwrap();
-        let mut parts = rel
+        let relative = file.strip_prefix(&core_source).unwrap();
+        let mut parts = relative
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned());
         let module = match (parts.next().as_deref(), parts.next()) {
-            (Some("features"), Some(m)) if !m.ends_with(".rs") => Some(m),
+            (Some("features"), Some(name)) if !name.ends_with(".rs") => Some(name),
             _ => None,
         };
-        problems.extend(violations(f, module.as_deref()));
+        problems.extend(violations(file, module.as_deref()));
     }
     assert!(
         files.len() >= 30,
@@ -224,31 +226,65 @@ fn core_sources_respect_dependency_rules() {
 
 #[test]
 fn main_crate_holds_no_core_code() {
-    let src = manifest_dir().join("src");
+    let source_root = manifest_dir().join("src");
     assert!(
-        !src.join("kernel").exists(),
+        !source_root.join("kernel").exists(),
         "src/kernel/ 又出现了 —— 共享内核在 crates/core/src/kernel"
     );
     let mut misplaced = Vec::new();
-    for entry in fs::read_dir(src.join("features")).unwrap() {
-        let dir = entry.unwrap().path();
-        if !dir.is_dir() {
+    for entry in fs::read_dir(source_root.join("features")).unwrap() {
+        let directory = entry.unwrap().path();
+        if !directory.is_dir() {
             continue;
         }
         let mut files = Vec::new();
-        rs_files(&dir, &mut files);
-        for f in files {
-            let rel = f.strip_prefix(&dir).unwrap();
-            if rel.starts_with("adapters") || rel == Path::new("mod.rs") {
+        rs_files(&directory, &mut files);
+        for file in files {
+            let relative = file.strip_prefix(&directory).unwrap();
+            if relative.starts_with("adapters") || relative == Path::new("mod.rs") {
                 continue;
             }
-            misplaced.push(f.display().to_string());
+            misplaced.push(file.display().to_string());
         }
     }
     assert!(
         misplaced.is_empty(),
         "主 crate 的业务模块里只该有 mod.rs + adapters/;模型 / 端口 / 用例放 crates/core:\n{}",
         misplaced.join("\n")
+    );
+}
+
+/// 主 crate 的 `src/features/<m>/mod.rs` 按名重新导出核心,不用 glob:风格指南「Don't use glob imports」只允许
+/// `pub use submodule::*`(本模块的子模块),`baserust_core::features::<m>` 是另一个 crate 的模块。
+#[test]
+fn feature_modules_reexport_core_by_name() {
+    let features = manifest_dir().join("src/features");
+    let mut globbed = Vec::new();
+    let mut checked = 0;
+    for entry in fs::read_dir(&features).unwrap() {
+        let module = entry.unwrap().path().join("mod.rs");
+        if !module.exists() {
+            continue;
+        }
+        checked += 1;
+        let source = fs::read_to_string(&module).unwrap();
+        let mut statement = String::new();
+        for line in source.lines().map(code_of) {
+            statement.push_str(line);
+            if !line.trim_end().ends_with(';') {
+                continue;
+            }
+            if statement.trim_start().starts_with("pub use") && statement.contains('*') {
+                globbed.push(format!("{}: {}", module.display(), statement.trim()));
+            }
+            statement.clear();
+        }
+    }
+    assert!(checked >= 6, "只扫到 {checked} 个业务模块 —— 目录结构变了?");
+    assert!(
+        globbed.is_empty(),
+        "业务模块根不许 glob 重新导出:\n{}",
+        globbed.join("\n")
     );
 }
 

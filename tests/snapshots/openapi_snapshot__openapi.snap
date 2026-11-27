@@ -519,7 +519,7 @@ expression: spec
         "type": "object"
       },
       "ContentStatusView": {
-        "description": "内容生命周期状态闭集(镜像 `content::ContentStatus` 的 wire 串;库零 HTTP 不 derive\nToSchema,视图枚举归消费方 —— 见 closed-enums skill)。`From` 穷尽匹配:库加变体这里编译错。",
+        "description": "内容生命周期状态闭集(镜像 `content::ContentStatus` 的 wire 串;库零 HTTP 不 derive\nToSchema,视图枚举归消费方 —— 见 closed-enums skill)。库的枚举是 `#[non_exhaustive]`,转换用 `TryFrom`:\n已知变体逐个列出,库以后新加的变体 → 500(细节只进日志)。",
         "enum": [
           "created",
           "uploading",
@@ -2111,7 +2111,7 @@ expression: spec
         "type": "object"
       },
       "Perm": {
-        "description": "权限词表的**唯一真相**(封闭集)。handler 用变体 `Perm::WidgetWrite`,拼错=编译错。\nwire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。\n加权限 = 加一个变体 + `rename`,别处不动。",
+        "description": "权限词表的**唯一真相**(封闭集)。handler 用变体 `Permission::WidgetWrite`,拼错=编译错。\nwire 串(TOML / JWT scope)经 `rename` 映射;未知串 → 反序列化失败 → 启动期挡住(fail-fast)。\n加权限 = 加一个变体 + `rename`,别处不动。",
         "enum": [
           "widgets:read",
           "widgets:read:all",
@@ -8533,7 +8533,7 @@ expression: spec
             "oauth2": []
           }
         ],
-        "summary": "**仅登录**(authenticated):当前用户在**当前租户**里创建的 widget 数。要 `CurrentUser`、**无特定 perm**\n(`OP_PERMS` 标 `None` → 文档 `security:[{\"oauth2\":[]}]`)。演示\"只需登录\"形态。\n数的是租户数据,所以仍要当前租户(平台上下文 → 403 `tenant_required`)。",
+        "summary": "**仅登录**(authenticated):当前用户在**当前租户**里创建的 widget 数。要 `CurrentUser`、**无特定 perm**\n(`OPERATION_PERMISSIONS` 标 `LoginOnly` → 文档 `security:[{\"oauth2\":[]}]`)。演示\"只需登录\"形态。\n数的是租户数据,所以仍要当前租户(平台上下文 → 403 `tenant_required`)。",
         "tags": [
           "widgets"
         ]
@@ -8586,7 +8586,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "**多权限 OR 样板**:概览 —— 普通读权**或**本组织成员管理员(`members:admin`)任一即可。\n两支都是租户级权限:租户数据的接口不拿平台级权限(如 `users:admin`)当闸(spec §4.3)。\n`require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。",
+        "summary": "**多权限 OR 样板**:概览 —— 普通读权**或**本组织成员管理员(`members:admin`)任一即可。\n两支都是租户级权限:租户数据的接口不拿平台级权限(如 `users:admin`)当闸(spec §4.3)。\n`require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermissionRequirement::Any`)。",
         "tags": [
           "widgets"
         ]
@@ -8635,7 +8635,7 @@ expression: spec
             ]
           }
         ],
-        "summary": "**多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看\"可删多少\"。\n`require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OP_PERMS` 的 `PermReq::All`)。",
+        "summary": "**多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看\"可删多少\"。\n`require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OPERATION_PERMISSIONS` 的 `PermissionRequirement::All`)。",
         "tags": [
           "widgets"
         ]
@@ -8682,7 +8682,7 @@ expression: spec
             "oauth2": []
           }
         ],
-        "summary": "**仅登录**:当前租户的 widget 计数。要登录(frontend 组闸)+ 当前租户(`CurrentTenant`,缺 → 403\n`tenant_required`),**无特定 perm**(`OP_PERMS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。",
+        "summary": "**仅登录**:当前租户的 widget 计数。要登录(frontend 组闸)+ 当前租户(`CurrentTenant`,缺 → 403\n`tenant_required`),**无特定 perm**(`OPERATION_PERMISSIONS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。",
         "tags": [
           "widgets"
         ]
@@ -9119,7 +9119,7 @@ expression: spec
             "description": ""
           }
         },
-        "summary": "兼容别名 = livez,保留早期 `/health` 引用不破。",
+        "summary": "与 livez 相同(进程活着即 ok,不查依赖)。生产 nginx 对外只暴露这个探活入口\n(`location = /health`),外层负载均衡和部署脚本都探它。",
         "tags": [
           "health"
         ]

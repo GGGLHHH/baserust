@@ -1,12 +1,17 @@
+use std::fs;
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use figment::{providers::Env, Figment};
+use figment::providers::Env;
+use figment::Figment;
 use serde::Deserialize;
 
-/// 内嵌开发密钥对(keys/,**明文入库是刻意的**:零配置启动铁律)。prod 启动校验拒用(见 AppState::new)。
-pub const DEV_JWT_PRIVATE_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pem");
-pub const DEV_JWT_PUBLIC_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pub.pem");
+use crate::infra::percent;
+
+/// 内嵌开发密钥对(keys/,**明文入库是刻意的**:零配置启动铁律)。prod 启动校验拒用(见 AppState::try_new)。
+pub const DEVELOPMENT_JWT_PRIVATE_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pem");
+/// 与 [`DEVELOPMENT_JWT_PRIVATE_KEY_PEM`] 配对的内嵌开发公钥(同样只许非 prod 用)。
+pub const DEVELOPMENT_JWT_PUBLIC_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pub.pem");
 
 /// 运行环境。影响:日志格式(prod 走 JSON / 非 prod 走彩色)、是否暴露 /docs、CORS 策略。
 /// 环境变量 `APP_ENV`(dev/staging/prod),缺省 dev。
@@ -14,19 +19,23 @@ pub const DEV_JWT_PUBLIC_KEY_PEM: &str = include_str!("../../keys/dev-ed25519.pu
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
     #[default]
-    Dev,
+    #[serde(rename = "dev")]
+    Development,
     Staging,
-    Prod,
+    #[serde(rename = "prod")]
+    Production,
 }
 
 impl Profile {
-    pub fn is_prod(self) -> bool {
-        matches!(self, Profile::Prod)
+    #[must_use]
+    pub fn is_production(self) -> bool {
+        matches!(self, Profile::Production)
     }
 
     /// 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露 —— prod 收起以减少攻击面。
+    #[must_use]
     pub fn expose_docs(self) -> bool {
-        !self.is_prod()
+        !self.is_production()
     }
 }
 
@@ -38,11 +47,13 @@ impl Profile {
 pub struct Config {
     /// 监听地址,环境变量 `BIND_ADDR`,默认 `0.0.0.0:8080`。
     #[serde(default = "default_bind_addr")]
-    pub bind_addr: SocketAddr,
+    #[serde(rename = "bind_addr")]
+    pub bind_address: SocketAddr,
 
     /// 运行环境,`APP_ENV`(dev/staging/prod),默认 dev。决定日志格式 / 是否挂 /docs / CORS 策略。
     #[serde(default)]
-    pub app_env: Profile,
+    #[serde(rename = "app_env")]
+    pub app_environment: Profile,
 
     /// CORS 允许的源,`CORS_ALLOWED_ORIGINS`(逗号分隔)。**仅 prod 生效**:
     /// prod 用此白名单;dev/staging 走宽松策略(permissive),不读此项。
@@ -54,7 +65,8 @@ pub struct Config {
     pub rate_limit_enabled: bool,
     /// 每 IP 每秒补充令牌数,`RATE_LIMIT_PER_SEC`,默认 10。
     #[serde(default = "default_rate_limit_per_sec")]
-    pub rate_limit_per_sec: u32,
+    #[serde(rename = "rate_limit_per_sec")]
+    pub rate_limit_per_second: u32,
     /// 每 IP 突发上限,`RATE_LIMIT_BURST`,默认 20。
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
@@ -126,10 +138,12 @@ pub struct Config {
 
     /// access token 有效秒数,`IDM_ACCESS_TTL_SECS`,默认 900(15min)。
     #[serde(default = "default_access_ttl_secs")]
-    pub idm_access_ttl_secs: i64,
+    #[serde(rename = "idm_access_ttl_secs")]
+    pub idm_access_ttl_seconds: i64,
     /// refresh token 有效秒数,`IDM_REFRESH_TTL_SECS`,默认 604800(7天)。
     #[serde(default = "default_refresh_ttl_secs")]
-    pub idm_refresh_ttl_secs: i64,
+    #[serde(rename = "idm_refresh_ttl_secs")]
+    pub idm_refresh_ttl_seconds: i64,
 
     /// JWT 签发私钥 PEM(Ed25519)。默认内嵌 dev 私钥;生产 idm 进程经 JWT_PRIVATE_KEY_FILE 覆盖。
     #[serde(default = "default_jwt_private_key_pem")]
@@ -227,7 +241,7 @@ pub struct Config {
 
     /// NATS 地址,`NATS_URL`(如 `nats://localhost:2224`,本地 compose 主机端口)—— widget 事件总线选择链的**最高优先**:
     /// 设了 → NatsEventBus(多实例默认);没设但有 app pool → PgEventBus(LISTEN/NOTIFY 退路);
-    /// 都没有 → 内存(单实例,最终 fallback)。装配在组合根 `AppState::new`。
+    /// 都没有 → 内存(单实例,最终 fallback)。装配在组合根 `AppState::try_new`。
     #[serde(default)]
     pub nats_url: Option<String>,
 
@@ -293,10 +307,10 @@ fn default_refresh_ttl_secs() -> i64 {
     604_800
 }
 fn default_jwt_private_key_pem() -> String {
-    DEV_JWT_PRIVATE_KEY_PEM.into()
+    DEVELOPMENT_JWT_PRIVATE_KEY_PEM.into()
 }
 fn default_jwt_public_key_pem() -> String {
-    DEV_JWT_PUBLIC_KEY_PEM.into()
+    DEVELOPMENT_JWT_PUBLIC_KEY_PEM.into()
 }
 fn default_idm_db_user() -> String {
     "idm".into()
@@ -327,11 +341,11 @@ fn default_s3_region() -> String {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            bind_addr: default_bind_addr(),
-            app_env: Profile::default(),
+            bind_address: default_bind_addr(),
+            app_environment: Profile::default(),
             cors_allowed_origins: String::new(),
             rate_limit_enabled: false,
-            rate_limit_per_sec: default_rate_limit_per_sec(),
+            rate_limit_per_second: default_rate_limit_per_sec(),
             rate_limit_burst: default_rate_limit_burst(),
             metrics_enabled: false,
             log_format: None,
@@ -350,8 +364,8 @@ impl Default for Config {
             app_db_sslmode: default_db_sslmode(),
             app_db_system_user: None,
             app_db_system_password: default_db_password(),
-            idm_access_ttl_secs: default_access_ttl_secs(),
-            idm_refresh_ttl_secs: default_refresh_ttl_secs(),
+            idm_access_ttl_seconds: default_access_ttl_secs(),
+            idm_refresh_ttl_seconds: default_refresh_ttl_secs(),
             jwt_private_key_pem: default_jwt_private_key_pem(),
             jwt_public_key_pem: default_jwt_public_key_pem(),
             jwt_private_key_file: None,
@@ -396,16 +410,13 @@ impl Default for Config {
     }
 }
 
-/// 百分号编码连接串里的 user/password/database。生成的密码(如 `openssl rand -base64`)常含
+/// 拼 Postgres 连接串,user / password / database 百分号编码。
+///
+/// 生成的密码(如 `openssl rand -base64`)常含
 /// `/ + @ ? #` 等 URL 保留字符,直接插值进 `postgres://user:pass@host/db` 会破坏 authority 解析
 /// (`/` 提前结束 authority),或让形如 `%XX` 的子串被 sqlx 误 percent-decode 成别的密码 —— 都表现为
 /// opaque 的启动期连接失败。编码后 sqlx 连接时 percent-decode 还原。host 不编码(避免破坏 IPv6
 /// `[::1]` 的方括号/冒号)。机制收口在 [`crate::infra::percent`](super::percent)。
-fn enc(s: &str) -> String {
-    super::percent::encode(s)
-}
-
-/// 拼 Postgres 连接串(user / password / database 百分号编码,见 [`enc`])。
 fn pg_url(
     user: &str,
     password: &str,
@@ -415,20 +426,17 @@ fn pg_url(
     sslmode: &str,
 ) -> String {
     format!(
-        "postgres://{}:{}@{}:{}/{}?sslmode={}",
-        enc(user),
-        enc(password),
-        host,
-        port,
-        enc(database),
-        sslmode,
+        "postgres://{}:{}@{host}:{port}/{}?sslmode={sslmode}",
+        percent::encode(user),
+        percent::encode(password),
+        percent::encode(database),
     )
 }
 
 /// system 账号名:显式设了(非空)用它,否则 `<运行时账号>_system`(和建库脚本 10-tenancy-roles.sh 同一套缺省)。
 fn system_user(explicit: Option<&str>, runtime: &str) -> String {
     match explicit.filter(|s| !s.is_empty()) {
-        Some(s) => s.to_owned(),
+        Some(name) => name.to_owned(),
         None => format!("{runtime}_system"),
     }
 }
@@ -436,18 +444,18 @@ fn system_user(explicit: Option<&str>, runtime: &str) -> String {
 /// 把 figment 的解析错误**脱敏**成只含键路径的错误。
 ///
 /// **绝不能把出错的值带进消息**:figment 的 Display 会原样打出来(`invalid type: found unsigned
-/// int 755, expected a string for key "APP_DB_PASSWORD"`)—— 那个值就是密钥本身。而 `Config::load()`
+/// int 755, expected a string for key "APP_DB_PASSWORD"`)—— 那个值就是密钥本身。而 `Config::try_new()`
 /// 跑在 `init_tracing` **之前**(见 `app::runtime::run`),anyhow 链直接落**裸 stderr**,
 /// 等于把密钥打进控制台/容器日志 —— "原始细节只进日志"这条在这里是最粗暴的破法。
 ///
 /// 顺带给个能诊断的提示:figment 会把纯数字 / true / false **预解析**成数字/布尔,落到 String
 /// 字段就是类型错 —— 全数字的密码(如 minio 默认 `12345678`、`20240101` 这种)会让进程直接起不来,
 /// 而原始报错只说"期望字符串",完全没提这回事,排查时极易卡住。
-fn redact_config_error(e: figment::Error) -> anyhow::Error {
-    let key = if e.path.is_empty() {
+fn redact_config_error(error: figment::Error) -> anyhow::Error {
+    let key = if error.path.is_empty() {
         "(未知键)".to_owned()
     } else {
-        e.path.join(".")
+        error.path.join(".")
     };
     anyhow::anyhow!(
         "解析环境变量配置失败:`{key}` 的值类型不符。\
@@ -459,16 +467,17 @@ fn redact_config_error(e: figment::Error) -> anyhow::Error {
 impl Config {
     /// 从环境变量加载(调用方先 load 过 .env)。**全部环境变量的读取/默认值收口在本文件**:
     /// 加变量 = 加字段(figment 变量名转小写匹配),别在别处 `std::env::var`。
-    pub fn load() -> anyhow::Result<Self> {
-        let mut cfg: Config = Figment::new()
+    pub fn try_new() -> anyhow::Result<Self> {
+        let mut config: Config = Figment::new()
             .merge(Env::raw())
             .extract()
             .map_err(redact_config_error)?;
-        apply_jwt_key_file_overrides(&mut cfg)?;
-        Ok(cfg)
+        apply_jwt_key_file_overrides(&mut config)?;
+        Ok(config)
     }
 
     /// app schema 的连接串(运行时账号 app)。`None` = 没设 `APP_DB_HOST` → widget 走内存。
+    #[must_use]
     pub fn app_database_url(&self) -> Option<String> {
         self.app_db_host.as_ref().map(|host| {
             pg_url(
@@ -483,6 +492,7 @@ impl Config {
     }
 
     /// app schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `APP_DB_HOST`。
+    #[must_use]
     pub fn app_system_database_url(&self) -> Option<String> {
         self.app_db_host.as_ref().map(|host| {
             pg_url(
@@ -497,6 +507,7 @@ impl Config {
     }
 
     /// idm schema 的连接串(role=idm)。`None` = 没设 `IDM_DB_HOST` → idm 走内存。
+    #[must_use]
     pub fn idm_database_url(&self) -> Option<String> {
         self.idm_db_host.as_ref().map(|host| {
             pg_url(
@@ -511,6 +522,7 @@ impl Config {
     }
 
     /// content schema 的连接串(运行时账号 content)。`None` = 没设 `CONTENT_DB_HOST` → content 走内存。
+    #[must_use]
     pub fn content_database_url(&self) -> Option<String> {
         self.content_db_host.as_ref().map(|host| {
             pg_url(
@@ -525,6 +537,7 @@ impl Config {
     }
 
     /// content schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `CONTENT_DB_HOST`。
+    #[must_use]
     pub fn content_system_database_url(&self) -> Option<String> {
         self.content_db_host.as_ref().map(|host| {
             pg_url(
@@ -542,6 +555,7 @@ impl Config {
     }
 
     /// ops schema 的连接串(role=ops)。`None` = 没设 `OPS_DB_HOST` → 监控数据只在进程内存。
+    #[must_use]
     pub fn ops_database_url(&self) -> Option<String> {
         self.ops_db_host.as_ref().map(|host| {
             pg_url(
@@ -556,6 +570,7 @@ impl Config {
     }
 
     /// search schema 的连接串(运行时账号 search)。`None` = 没设 `SEARCH_DB_HOST` → 无投影 backend。
+    #[must_use]
     pub fn search_database_url(&self) -> Option<String> {
         self.search_db_host.as_ref().map(|host| {
             pg_url(
@@ -570,6 +585,7 @@ impl Config {
     }
 
     /// search schema 的 system 账号连接串(BYPASSRLS)。`None` = 没设 `SEARCH_DB_HOST`。
+    #[must_use]
     pub fn search_system_database_url(&self) -> Option<String> {
         self.search_db_host.as_ref().map(|host| {
             pg_url(
@@ -591,18 +607,20 @@ impl Config {
     /// (真密码,非仓库里的 `pwd` 弱默认)即在 idm 进程启动幂等建号。没给 SEED_FILE → 不 seed,
     /// 绝不用嵌入默认在 prod 建 superadmin/pwd(这才是原「避免启动期意外写库」真正针对的)。
     /// 幂等:账号已存在则跳过(`seed::apply`),重启不冲掉运维轮换过的密码。
+    #[must_use]
     pub fn seed_on_start(&self) -> bool {
         self.idm_seed_on_start
-            .unwrap_or(!self.app_env.is_prod() || self.seed_file.is_some())
+            .unwrap_or(!self.app_environment.is_production() || self.seed_file.is_some())
     }
 
     /// 日志过滤指令:`RUST_LOG` 优先;未设按环境缺省(prod=info、非 prod=debug)。
+    #[must_use]
     pub fn log_filter(&self) -> &str {
         // sqlx::query=warn:压掉 sqlx 每条 SQL 的 info/debug 刷屏,只留慢查询 WARN + 错误。
         // 要看 SQL 调试:显式设 RUST_LOG(如 `RUST_LOG=debug,sqlx::query=debug`)覆盖本默认。
         self.rust_log
             .as_deref()
-            .unwrap_or(if self.app_env.is_prod() {
+            .unwrap_or(if self.app_environment.is_production() {
                 "info,sqlx::query=warn"
             } else {
                 "debug,sqlx::query=warn"
@@ -610,6 +628,7 @@ impl Config {
     }
 
     /// prod CORS 白名单(解析逗号分隔、去空白、去空项)。
+    #[must_use]
     pub fn cors_origins(&self) -> Vec<String> {
         self.cors_allowed_origins
             .split(',')
@@ -622,46 +641,76 @@ impl Config {
 
 /// `JWT_*_KEY_FILE` 覆盖:设了则读文件内容覆盖对应 PEM 字段(镜像 SEED_FILE 范式)。抽成独立函数以便单测,
 /// 不依赖 figment/环境变量。
-fn apply_jwt_key_file_overrides(cfg: &mut Config) -> anyhow::Result<()> {
-    if let Some(p) = &cfg.jwt_private_key_file {
-        cfg.jwt_private_key_pem = std::fs::read_to_string(p)
-            .with_context(|| format!("读 JWT_PRIVATE_KEY_FILE {p} 失败"))?;
+fn apply_jwt_key_file_overrides(config: &mut Config) -> anyhow::Result<()> {
+    if let Some(path) = &config.jwt_private_key_file {
+        config.jwt_private_key_pem = fs::read_to_string(path)
+            .with_context(|| format!("读 JWT_PRIVATE_KEY_FILE {path} 失败"))?;
     }
-    if let Some(p) = &cfg.jwt_public_key_file {
-        cfg.jwt_public_key_pem = std::fs::read_to_string(p)
-            .with_context(|| format!("读 JWT_PUBLIC_KEY_FILE {p} 失败"))?;
+    if let Some(path) = &config.jwt_public_key_file {
+        config.jwt_public_key_pem = fs::read_to_string(path)
+            .with_context(|| format!("读 JWT_PUBLIC_KEY_FILE {path} 失败"))?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
+    use figment::providers::Serialized;
+    use sqlx::postgres::PgConnectOptions;
+
     use super::*;
 
-    /// **启动期报错绝不能带上出错的值** —— 它可能就是密钥,而 `Config::load()` 跑在
+    /// **启动期报错绝不能带上出错的值** —— 它可能就是密钥,而 `Config::try_new()` 跑在
     /// `init_tracing` 之前,错误直接落裸 stderr。figment 的原始 Display 会原样打出该值,
     /// 故必须脱敏成只留键路径。(用字面 provider 造错,不碰进程 env:那是全局状态、并行测试会打架。)
     #[test]
     fn config_parse_error_never_echoes_the_offending_value() {
         // 全数字密码:figment 预解析成数字 → 落到 String 字段即类型错(正是 minio `12345678` 那类)
         let secret = "12345678";
-        let err = Figment::new()
-            .merge(figment::providers::Serialized::default(
-                "app_db_password",
-                secret.parse::<u64>().unwrap(),
-            ))
+        let secret_as_number: u64 = secret.parse().unwrap();
+        let error = Figment::new()
+            .merge(Serialized::default("app_db_password", secret_as_number))
             .extract::<Config>()
             .map_err(redact_config_error)
             .expect_err("全数字密码落 String 字段应报错");
-        let msg = format!("{err:#}");
-        assert!(!msg.contains(secret), "报错里不能出现密钥本身: {msg}");
+        let message = format!("{error:#}");
         assert!(
-            msg.contains("app_db_password"),
-            "但要指明是哪个键,否则没法排查: {msg}"
+            !message.contains(secret),
+            "报错里不能出现密钥本身: {message}"
+        );
+        assert!(
+            message.contains("app_db_password"),
+            "但要指明是哪个键,否则没法排查: {message}"
         );
     }
 
-    fn cfg(host: Option<&str>) -> Config {
+    /// Rust 字段改成全称后,环境变量名(figment 转小写后的键)保持不变:`BIND_ADDR` / `APP_ENV` /
+    /// `RATE_LIMIT_PER_SEC` / `IDM_ACCESS_TTL_SECS` / `IDM_REFRESH_TTL_SECS` 照旧生效,枚举值照旧是 dev / prod。
+    #[test]
+    fn renamed_fields_keep_their_environment_variable_names() {
+        let config: Config = Figment::new()
+            .merge(Serialized::default("bind_addr", "127.0.0.1:9999"))
+            .merge(Serialized::default("app_env", "prod"))
+            .merge(Serialized::default("rate_limit_per_sec", 42))
+            .merge(Serialized::default("idm_access_ttl_secs", 61))
+            .merge(Serialized::default("idm_refresh_ttl_secs", 62))
+            .extract()
+            .expect("旧键名应能解析");
+        assert_eq!(config.bind_address.to_string(), "127.0.0.1:9999");
+        assert_eq!(config.app_environment, Profile::Production);
+        assert_eq!(config.rate_limit_per_second, 42);
+        assert_eq!(config.idm_access_ttl_seconds, 61);
+        assert_eq!(config.idm_refresh_ttl_seconds, 62);
+        let development: Config = Figment::new()
+            .merge(Serialized::default("app_env", "dev"))
+            .extract()
+            .expect("dev 应能解析");
+        assert_eq!(development.app_environment, Profile::Development);
+    }
+
+    fn config_with_host(host: Option<&str>) -> Config {
         Config {
             app_db_host: host.map(Into::into),
             app_db_port: 6000,
@@ -675,13 +724,13 @@ mod tests {
 
     #[test]
     fn no_host_means_memory() {
-        assert!(cfg(None).app_database_url().is_none());
+        assert!(config_with_host(None).app_database_url().is_none());
     }
 
     #[test]
     fn url_built_from_role_fields() {
         assert_eq!(
-            cfg(Some("h")).app_database_url().unwrap(),
+            config_with_host(Some("h")).app_database_url().unwrap(),
             "postgres://app:pw@h:6000/db?sslmode=require"
         );
     }
@@ -690,103 +739,105 @@ mod tests {
     fn url_percent_encodes_reserved_userinfo() {
         // 生成的密码常含 URL 保留字符;原样插值会在 '/' 处截断 authority → 连接失败。
         // 编码后 sqlx 的 URL 解析器应能正确解析(且 password 里不再有裸 '/')。
-        let mut c = cfg(Some("h"));
-        c.app_db_password = "p/w@x?y#z ".into();
-        let url = c.app_database_url().unwrap();
+        let mut config = config_with_host(Some("h"));
+        config.app_db_password = "p/w@x?y#z ".into();
+        let url = config.app_database_url().unwrap();
         assert!(!url.contains("p/w"), "保留字符必须被编码: {url}");
-        url.parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("编码后的连接串必须可解析");
+        let _options: PgConnectOptions = url.parse().expect("编码后的连接串必须可解析");
     }
 
     /// system 账号(BYPASSRLS 的单独连接池):跟运行时账号同 host/port/库,账号缺省 `<运行时>_system`,
     /// 可显式覆盖;没设 host → None(零配置内存模式没有 system 池)。
     #[test]
     fn system_urls_follow_runtime_host_and_default_to_suffixed_role() {
-        assert!(cfg(None).app_system_database_url().is_none());
+        assert!(config_with_host(None).app_system_database_url().is_none());
         assert!(Config::default().content_system_database_url().is_none());
         assert!(Config::default().search_system_database_url().is_none());
 
-        let mut c = cfg(Some("h"));
+        let mut config = config_with_host(Some("h"));
         assert_eq!(
-            c.app_system_database_url().unwrap(),
+            config.app_system_database_url().unwrap(),
             "postgres://app_system:pwd@h:6000/db?sslmode=require"
         );
-        c.app_db_system_user = Some("ops_bot".into());
-        c.app_db_system_password = "s/p".into();
-        let url = c.app_system_database_url().unwrap();
+        config.app_db_system_user = Some("ops_bot".into());
+        config.app_db_system_password = "s/p".into();
+        let url = config.app_system_database_url().unwrap();
         assert!(
             url.starts_with("postgres://ops_bot:s%2Fp@h:6000/db"),
             "{url}"
         );
         // 空串当没设(compose 里 `${X:-}` 会传空串进来)
-        c.app_db_system_user = Some(String::new());
-        assert!(c
+        config.app_db_system_user = Some(String::new());
+        assert!(config
             .app_system_database_url()
             .unwrap()
             .starts_with("postgres://app_system:"));
 
-        let c = Config {
+        let config = Config {
             content_db_host: Some("pg".into()),
             content_db_user: "media".into(),
             search_db_host: Some("pg".into()),
             ..Config::default()
         };
         assert_eq!(
-            c.content_system_database_url().unwrap(),
+            config.content_system_database_url().unwrap(),
             "postgres://media_system:pwd@pg:5432/baserust?sslmode=disable"
         );
         assert_eq!(
-            c.search_system_database_url().unwrap(),
+            config.search_system_database_url().unwrap(),
             "postgres://search_system:pwd@pg:5432/baserust?sslmode=disable"
         );
     }
 
     #[test]
     fn log_filter_prefers_rust_log_then_env_default() {
-        let mut c = Config::default();
-        assert_eq!(c.log_filter(), "debug,sqlx::query=warn");
-        c.app_env = Profile::Prod;
-        assert_eq!(c.log_filter(), "info,sqlx::query=warn");
-        c.rust_log = Some("warn".into());
-        assert_eq!(c.log_filter(), "warn");
+        let mut config = Config::default();
+        assert_eq!(config.log_filter(), "debug,sqlx::query=warn");
+        config.app_environment = Profile::Production;
+        assert_eq!(config.log_filter(), "info,sqlx::query=warn");
+        config.rust_log = Some("warn".into());
+        assert_eq!(config.log_filter(), "warn");
     }
 
     #[test]
     fn prod_only_hides_docs() {
-        assert!(Profile::Dev.expose_docs());
+        assert!(Profile::Development.expose_docs());
         assert!(Profile::Staging.expose_docs());
-        assert!(!Profile::Prod.expose_docs());
+        assert!(!Profile::Production.expose_docs());
     }
 
     /// JWT_*_KEY_FILE 覆盖:设了文件则读内容覆盖 PEM 字段;未设保持内嵌默认。
     #[test]
     fn jwt_key_file_overrides_pem_fields() {
-        let dir = std::env::temp_dir().join("jwt-key-override-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("k.pub.pem");
-        std::fs::write(
-            &p,
+        let directory = env::temp_dir().join("jwt-key-override-test");
+        fs::create_dir_all(&directory).unwrap();
+        let key_path = directory.join("k.pub.pem");
+        fs::write(
+            &key_path,
             "-----BEGIN PUBLIC KEY-----\nfake\n-----END PUBLIC KEY-----\n",
         )
         .unwrap();
-        let mut cfg = Config::default();
+        let mut config = Config::default();
         assert_eq!(
-            cfg.jwt_public_key_pem, DEV_JWT_PUBLIC_KEY_PEM,
+            config.jwt_public_key_pem, DEVELOPMENT_JWT_PUBLIC_KEY_PEM,
             "默认应是内嵌 dev"
         );
-        cfg.jwt_public_key_file = Some(p.to_string_lossy().into_owned());
-        apply_jwt_key_file_overrides(&mut cfg).unwrap();
-        assert!(cfg.jwt_public_key_pem.contains("fake"), "应被文件内容覆盖");
+        config.jwt_public_key_file = Some(key_path.to_string_lossy().into_owned());
+        apply_jwt_key_file_overrides(&mut config).unwrap();
+        assert!(
+            config.jwt_public_key_pem.contains("fake"),
+            "应被文件内容覆盖"
+        );
         // 指向不存在的文件 → 报错带路径
-        cfg.jwt_private_key_file = Some("/no/such/key.pem".to_owned());
-        assert!(apply_jwt_key_file_overrides(&mut cfg).is_err());
+        config.jwt_private_key_file = Some("/no/such/key.pem".to_owned());
+        assert!(apply_jwt_key_file_overrides(&mut config).is_err());
     }
 
     #[test]
     fn seed_on_start_prod_needs_seed_file() {
-        let seeds = |env: Profile, seed_file: Option<&str>, explicit: Option<bool>| {
+        let seeds = |profile: Profile, seed_file: Option<&str>, explicit: Option<bool>| {
             Config {
-                app_env: env,
+                app_environment: profile,
                 seed_file: seed_file.map(Into::into),
                 idm_seed_on_start: explicit,
                 ..Config::default()
@@ -794,13 +845,17 @@ mod tests {
             .seed_on_start()
         };
         // 非 prod:恒开(嵌入默认账号便利)。
-        assert!(seeds(Profile::Dev, None, None));
+        assert!(seeds(Profile::Development, None, None));
         // prod 无 SEED_FILE:关(绝不用嵌入的 pwd 弱默认建超管)。
-        assert!(!seeds(Profile::Prod, None, None));
+        assert!(!seeds(Profile::Production, None, None));
         // prod + SEED_FILE(运维给了真账号/密码):开(启动幂等建号,容器无外部命令)。
-        assert!(seeds(Profile::Prod, Some("seed.prod.toml"), None));
+        assert!(seeds(Profile::Production, Some("seed.prod.toml"), None));
         // 显式 IDM_SEED_ON_START 永远优先(prod 无 SEED_FILE 也能强开,反之强关)。
-        assert!(seeds(Profile::Prod, None, Some(true)));
-        assert!(!seeds(Profile::Prod, Some("seed.prod.toml"), Some(false)));
+        assert!(seeds(Profile::Production, None, Some(true)));
+        assert!(!seeds(
+            Profile::Production,
+            Some("seed.prod.toml"),
+            Some(false)
+        ));
     }
 }

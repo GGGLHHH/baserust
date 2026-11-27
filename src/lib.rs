@@ -4,8 +4,12 @@
 //! - `kernel` 共享内核:核心共用的纯件(错误/分页/排序/审计主体),不依赖框架、数据库、HTTP
 //! - `infra`  适配器侧横切件(config/HTTP 适配/openapi/鉴权/消息/对象存储/pg)
 //! - `app`    装配层(AppState + build_router),组合根
-//! - `features` 业务模块层(widget/ + 将来 user/order/...)
+//! - `features` 业务模块层的适配器(auth / auth_audit / content / profile / search / tenants / users / widget;
+//!   核心在 `baserust-core`,这里按名重新导出)
 //! - `health` 探针(单文件模块)
+
+// Google Rust 风格指南:必须 panic 时用 expect("原因") 说明不变量,不用 unwrap。
+#![warn(clippy::unwrap_used)]
 
 pub mod app;
 pub mod features;

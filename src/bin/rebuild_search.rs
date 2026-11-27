@@ -8,41 +8,48 @@
 //! app / search 用 **system 账号**(BYPASSRLS,spec §4.4:后台任务一律用 `_system`):成员索引按租户 RLS,
 //! 跨租户回填只有 system 账号写得进;app.outbox 的水位锁也用它。idm 不拆账号,用 idm 账号。
 
+// Google Rust 风格指南:必须 panic 时用 expect("原因") 说明不变量,不用 unwrap。
+#![warn(clippy::unwrap_used)]
+
+use std::sync::Arc;
+
 use anyhow::Context;
 use baserust::app::adapters::ProfileDisplayNames;
-use baserust::app::state::{connect_for_schema, connect_system_for_schema, Schema};
+use baserust::app::app_state::{self, Schema};
 use baserust::features::profile::PgProfileRepo;
-use baserust::features::search::{rebuild, IdmSources, PgSearchIndexRepo};
+use baserust::features::search::{self, IdmSources, PgSearchIndexRepo, Watermarks};
 use baserust::infra::config::Config;
 use idm::{PgMemberRepo, PgTenantRepo, PgUserRepo};
+use sqlx::PgPool;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::from_path(".env"); // 与 app/seed 同源:.env + 环境变量,读取/默认全在 Config
-    let config = Config::load()?;
+    let config = Config::try_new()?;
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(config.log_filter()))
+        .with_env_filter(EnvFilter::new(config.log_filter()))
         .init();
 
-    let idm_pool = connect_for_schema(&config, Schema::Idm)
+    let idm_pool = app_state::connect_for_schema(&config, Schema::Idm)
         .await?
         .context("需设 IDM_DB_HOST(重建读 idm.users 全量)")?;
-    let app_pool = connect_system_for_schema(&config, Schema::App)
+    let app_pool = app_state::connect_system_for_schema(&config, Schema::App)
         .await?
         .context("需设 APP_DB_HOST(重建读 app.profiles 全量)")?;
-    let search_pool = connect_system_for_schema(&config, Schema::Search)
+    let search_pool = app_state::connect_system_for_schema(&config, Schema::Search)
         .await?
         .context("需设 SEARCH_DB_HOST(重建写 account_index / admin_user_index)")?;
 
     // 快照水位:**先读 P、再读数据**(P 是回填时刻各 outbox 的水位,**下界**;之后 id>P 的新事件
     // 才会再覆写投影行,旧重投被 projector 的守卫挡住)。search_path 令 `outbox` 落各自 schema。
-    let p_idm = read_outbox_watermark(&idm_pool, "idm").await?;
-    let p_app = read_outbox_watermark(&app_pool, "app").await?;
+    let idm_watermark = read_outbox_watermark(&idm_pool, "idm").await?;
+    let app_watermark = read_outbox_watermark(&app_pool, "app").await?;
 
     let users = PgUserRepo::new(idm_pool.clone());
     let tenants = PgTenantRepo::new(idm_pool.clone());
     let members = PgMemberRepo::new(idm_pool);
-    let profiles = ProfileDisplayNames::new(std::sync::Arc::new(PgProfileRepo::new(app_pool)));
+    let profiles = ProfileDisplayNames::new(Arc::new(PgProfileRepo::new(app_pool)));
     let index = PgSearchIndexRepo::new(search_pool);
 
     let idm = IdmSources {
@@ -50,9 +57,18 @@ async fn main() -> anyhow::Result<()> {
         tenants: &tenants,
         members: &members,
     };
-    let counts = rebuild(idm, &profiles, &index, p_idm, p_app).await?;
+    let counts = search::rebuild(
+        idm,
+        &profiles,
+        &index,
+        Watermarks {
+            idm: idm_watermark,
+            app: app_watermark,
+        },
+    )
+    .await?;
     println!(
-        "✅ rebuild_search 完成:账号目录 {} 条、成员索引 {} 条(idm_seq={p_idm}, profile_seq={p_app})",
+        "✅ rebuild_search 完成:账号目录 {} 条、成员索引 {} 条(idm_seq={idm_watermark}, profile_seq={app_watermark})",
         counts.accounts, counts.members
     );
     Ok(())
@@ -78,17 +94,17 @@ async fn main() -> anyhow::Result<()> {
 /// 即:不设超时的话,本 CLI 会把该 schema 的写入整体拖停(emit_outbox 在每条业务写的事务里)。
 /// 故 `set local lock_timeout`:等不到就**快速失败**退出,让运维等阻塞事务散了再重跑,
 /// 而不是把生产写入拽下水。`set local` = 只作用本事务,提交即还原。
-async fn read_outbox_watermark(pool: &sqlx::PgPool, what: &str) -> anyhow::Result<i64> {
-    let mut tx = pool
+async fn read_outbox_watermark(pool: &PgPool, what: &str) -> anyhow::Result<i64> {
+    let mut transaction = pool
         .begin()
         .await
         .with_context(|| format!("开启 {what} 水位事务失败"))?;
     sqlx::query("set local lock_timeout = '5s'")
-        .execute(&mut *tx)
+        .execute(&mut *transaction)
         .await
         .with_context(|| format!("设 {what} lock_timeout 失败"))?;
     sqlx::query("lock table outbox in exclusive mode")
-        .execute(&mut *tx)
+        .execute(&mut *transaction)
         .await
         .with_context(|| {
             format!(
@@ -96,12 +112,13 @@ async fn read_outbox_watermark(pool: &sqlx::PgPool, what: &str) -> anyhow::Resul
                  有长事务占着 outbox,散了再重跑,别让本次重建拖停写入)"
             )
         })?;
-    let p: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
-        .fetch_one(&mut *tx)
+    let watermark: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from outbox")
+        .fetch_one(&mut *transaction)
         .await
         .with_context(|| format!("读 {what} outbox 水位失败"))?;
-    tx.commit()
+    transaction
+        .commit()
         .await
         .with_context(|| format!("提交 {what} 水位事务失败"))?;
-    Ok(p)
+    Ok(watermark)
 }

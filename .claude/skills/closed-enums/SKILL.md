@@ -5,7 +5,7 @@ description: Use when adding or changing an API-facing (ToSchema) field that onl
 
 # Closed enums (kill frontend type drift at the source)
 
-The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (core `crates/core/src/features/auth_audit/model.rs`, schema markers in `src/features/auth_audit/adapters/http/dto.rs`, PG parsing in `.../adapters/postgres.rs`).
+The non-obvious **judgment**: a field with a **known, finite** set of string values that is reachable through `#[derive(ToSchema)]` (i.e. anything that ends up in `src/generated/api-types.d.ts` on the frontend after `pnpm generate`) must be a Rust **enum**, never a bare `String`. Mechanics: copy `AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason` (core `crates/core/src/features/auth_audit/model.rs`, schema markers in `src/features/auth_audit/adapters/http/dto.rs`, PG parsing in `.../adapters/pg_auth_event_repo.rs`).
 
 ## bare `String` across the API boundary is not "flexible", it's a landmine
 
@@ -42,7 +42,7 @@ pub struct AuthEventFilter {
     pub outcome: Option<AuthOutcome>,
 }
 
-// adapters/postgres.rs — the row reads the column as String, TryFrom parses it via FromStr
+// adapters/pg_auth_event_repo.rs — the row reads the column as String, TryFrom parses it via FromStr
 outcome: r.outcome.parse().map_err(bad_closed_value)?,
 ```
 
@@ -59,6 +59,18 @@ Precedent: `NewAuthEvent` (write side, fed from an internal NATS/JSON message al
 ## frontend: import, never redeclare
 
 `types.ts` re-exports the generated union (`export type { AuthEventType } from '#/generated/api-types'`) as the single source of truth — no parallel hand-written local union. Any `Record<TheEnum, X>` (labels/icons/tone maps) then becomes **exhaustive**: adding a backend variant without updating the frontend map is a compile error, not a silent runtime `undefined`.
+
+## mapping a dependency's `#[non_exhaustive]` enum into a closed enum / error
+
+idm / content are separate crates and mark their public enums `#[non_exhaustive]` (`IdmError`, `ContentError`, `CredentialFailure`, …), so a `match` on them **must** have a wildcard arm — and that arm only ever fires after a library upgrade adds a variant. Google's rule "Don't omit patterns on `non_exhaustive` enums when matching" decides the shape:
+
+- **list every variant that exists today explicitly**, even ones that map to the same value as the wildcard — never let `_` silently absorb a known variant (adding a variant upstream must not change how today's variants are treated, and a reviewer must see the full current mapping in one place);
+- the **wildcard arm only covers future variants**, and says so in a comment citing the rule;
+- the wildcard must **not be silent**:
+  - error enums → map to the internal error (HTTP **500**, `ErrorBody` without details, original error only in the log). Precedent: `From<IdmError>` / `From<ContentError>` for `AppError` in `crates/core/src/kernel/app_error.rs`;
+  - closed value enums with no "other" variant (audit reason codes …) → map to the most generic existing value so the record still lands and the OpenAPI union stays unchanged, **and** `tracing::warn!` with the unknown value (WARN goes into `ops.log_record` via the monitor layer) so the next upgrade adds a proper value. Precedent: `From<&CredentialFailure> for FailureReason` in `crates/core/src/features/auth_audit/model.rs`;
+  - don't add an "unknown"/"other" variant to the API-facing enum just for this — that widens the generated frontend union for a case that should never reach production;
+- test every known variant's mapping (the wildcard itself can't be constructed in tests; it's guarded by review).
 
 ## Red flags
 

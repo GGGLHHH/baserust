@@ -1,10 +1,11 @@
 //! EventBus 契约:**一份契约,memory 与 PG 双实现各跑一遍**(镜像 widget_repo_conformance,防漂移)。
 //! PG 入口:`cargo test --features pg-conformance --test event_bus_conformance`(用 `just test-pg`)。
 
+use baserust::features::widget::EventSubscription;
 use std::time::Duration;
 
 use baserust::features::widget::{EventBus, MemoryEventBus, WidgetEvent};
-use baserust::kernel::tenant::{TenantId, DEFAULT_TENANT_ID};
+use baserust::kernel::tenant_id::{TenantId, DEFAULT_TENANT_ID};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -14,11 +15,8 @@ fn tenant() -> TenantId {
 }
 
 /// 5s 内必须收到一条事件,且是 `Deleted{expected}`(契约用 Deleted:payload 最小,断言只看 id)。
-async fn expect_deleted(
-    sub: &mut Box<dyn baserust::features::widget::EventSubscription>,
-    expected: Uuid,
-) {
-    let got = timeout(Duration::from_secs(5), sub.recv())
+async fn expect_deleted(subscription: &mut dyn EventSubscription, expected: Uuid) {
+    let got = timeout(Duration::from_secs(5), subscription.recv())
         .await
         .expect("5s 内应收到事件")
         .expect("总线不应关闭");
@@ -33,7 +31,7 @@ async fn expect_deleted(
 /// 本契约恰好 4 订阅,再加订阅会让 PG 入口卡在 acquire(内存侧照常绿)。加用例前先算这笔账。
 async fn event_bus_contract(bus: &dyn EventBus) {
     // 1. 订阅后发布 → 收到
-    let mut sub = bus.subscribe().await.expect("订阅应成功");
+    let mut subscription = bus.subscribe().await.expect("订阅应成功");
     let id1 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         tenant_id: tenant(),
@@ -41,11 +39,11 @@ async fn event_bus_contract(bus: &dyn EventBus) {
         created_by: None,
     })
     .await;
-    expect_deleted(&mut sub, id1).await;
+    expect_deleted(&mut *subscription, id1).await;
 
     // 2. 两个订阅各收一份(广播,非竞争消费)
-    let mut a = bus.subscribe().await.unwrap();
-    let mut b = bus.subscribe().await.unwrap();
+    let mut first = bus.subscribe().await.unwrap();
+    let mut second = bus.subscribe().await.unwrap();
     let id2 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         tenant_id: tenant(),
@@ -53,8 +51,8 @@ async fn event_bus_contract(bus: &dyn EventBus) {
         created_by: None,
     })
     .await;
-    expect_deleted(&mut a, id2).await;
-    expect_deleted(&mut b, id2).await;
+    expect_deleted(&mut *first, id2).await;
+    expect_deleted(&mut *second, id2).await;
 
     // 3. 无回放:晚订阅者收不到旧事件 —— 新订阅后发 id3,第一条即 id3(而非 id1/id2)
     let mut late = bus.subscribe().await.unwrap();
@@ -65,11 +63,11 @@ async fn event_bus_contract(bus: &dyn EventBus) {
         created_by: None,
     })
     .await;
-    expect_deleted(&mut late, id3).await;
+    expect_deleted(&mut *late, id3).await;
 
     // 4. 租户随负载往返(PG NOTIFY / NATS 要经 JSON 序列化):订阅侧拿到的 tenant_id 等于发布时的,
     //    SSE 才能按它先过滤租户。用一个非默认租户,防「反序列化时落到默认值」也能蒙混过关。
-    let other = TenantId::new(Uuid::now_v7()).unwrap();
+    let other = TenantId::try_new(Uuid::now_v7()).unwrap();
     let id4 = Uuid::now_v7();
     bus.publish(WidgetEvent::Deleted {
         tenant_id: other,
@@ -102,7 +100,7 @@ async fn memory_satisfies_event_bus_contract() {
 #[tokio::test]
 async fn memory_lagged_subscriber_skips_and_continues() {
     let bus = MemoryEventBus::new();
-    let mut sub = bus.subscribe().await.unwrap();
+    let mut subscription = bus.subscribe().await.unwrap();
     let last = Uuid::now_v7();
     for _ in 0..199 {
         bus.publish(WidgetEvent::Deleted {
@@ -121,7 +119,10 @@ async fn memory_lagged_subscriber_skips_and_continues() {
     // 前 136 条被挤掉;能一路读到最后一条 = 掉队后仍在流上
     let mut got_last = false;
     for _ in 0..64 {
-        match timeout(Duration::from_secs(5), sub.recv()).await.unwrap() {
+        match timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .unwrap()
+        {
             Some(WidgetEvent::Deleted { id, .. }) if id == last => {
                 got_last = true;
                 break;
@@ -138,11 +139,12 @@ async fn memory_lagged_subscriber_skips_and_continues() {
 mod pg {
     use super::*;
     use baserust::features::widget::PgEventBus;
+    use sqlx::PgPool;
 
     /// pg_notify 不碰任何表 → 免迁移;`#[sqlx::test]` 的临时库即可。LISTEN / NOTIFY 不需要表权限,
     /// owner / 运行时账号行为一样,这里直接用 sqlx::test 给的池(连接预算见文件头)。
     #[sqlx::test(migrations = false)]
-    async fn pg_satisfies_event_bus_contract(pool: sqlx::PgPool) {
+    async fn pg_satisfies_event_bus_contract(pool: PgPool) {
         event_bus_contract(&PgEventBus::new(pool)).await;
     }
 }
@@ -152,12 +154,13 @@ mod pg {
 mod nats {
     use super::*;
     use baserust::features::widget::NatsEventBus;
+    use std::env;
 
     /// core NATS 契约同一份;`NATS_URL` 可覆盖(默认本地 compose 的主机端口 2224)。
     #[tokio::test]
     async fn nats_satisfies_event_bus_contract() {
-        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:2224".to_owned());
-        let bus = NatsEventBus::connect(&url)
+        let url = env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:2224".to_owned());
+        let bus = NatsEventBus::try_new(&url)
             .await
             .expect("需要跑着的 NATS(先 just up)");
         event_bus_contract(&bus).await;

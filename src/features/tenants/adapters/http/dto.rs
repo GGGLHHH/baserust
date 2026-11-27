@@ -1,13 +1,14 @@
 //! tenants 的 **HTTP 线格式**:请求 / 响应 JSON、列表 query,与领域模型(`model`)互转。
 //! 类型名即 OpenAPI schema 名(对前端的契约)。闭集(租户状态 / 成员状态 / 角色名)经标记类型生成前端 union。
 
+use idm::RoleScope;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::features::tenants::model::{self, MemberStatus, TenantStatus};
-use crate::kernel::authz::RoleName;
+use crate::kernel::authorization::RoleName;
 
 crate::closed_enum_to_schema!(TenantStatusSchema => TenantStatus, TenantStatus::ALL, "租户状态闭集");
 crate::closed_enum_to_schema!(MemberStatusSchema => MemberStatus, MemberStatus::ALL, "成员状态闭集");
@@ -17,10 +18,11 @@ crate::closed_enum_to_schema!(MemberStatusSchema => MemberStatus, MemberStatus::
 /// 生成的前端 union 里不会出现平台角色(superadmin)。服务端仍会把平台角色拒成 422(兜底)。
 pub type TenantRoleName = RoleName;
 
+/// [`TenantRoleNameSchema`] 的取值:`RoleName::ALL` 里作用域为租户的那些。
 fn tenant_roles() -> Vec<RoleName> {
     RoleName::ALL
         .into_iter()
-        .filter(|r| r.scope() == idm::RoleScope::Tenant)
+        .filter(|r| r.scope() == RoleScope::Tenant)
         .collect()
 }
 
@@ -45,14 +47,14 @@ pub struct TenantView {
 }
 
 impl From<model::TenantView> for TenantView {
-    fn from(t: model::TenantView) -> Self {
+    fn from(tenant: model::TenantView) -> Self {
         Self {
-            id: t.id,
-            slug: t.slug,
-            name: t.name,
-            status: t.status,
-            created_at: t.created_at,
-            updated_at: t.updated_at,
+            id: tenant.id,
+            slug: tenant.slug,
+            name: tenant.name,
+            status: tenant.status,
+            created_at: tenant.created_at,
+            updated_at: tenant.updated_at,
         }
     }
 }
@@ -65,10 +67,10 @@ pub struct CreateTenantRequest {
 }
 
 impl From<CreateTenantRequest> for model::CreateTenant {
-    fn from(r: CreateTenantRequest) -> Self {
+    fn from(request: CreateTenantRequest) -> Self {
         Self {
-            slug: r.slug,
-            name: r.name,
+            slug: request.slug,
+            name: request.name,
         }
     }
 }
@@ -82,10 +84,10 @@ pub struct UpdateTenantRequest {
 }
 
 impl From<UpdateTenantRequest> for model::UpdateTenant {
-    fn from(r: UpdateTenantRequest) -> Self {
+    fn from(request: UpdateTenantRequest) -> Self {
         Self {
-            name: r.name,
-            status: r.status,
+            name: request.name,
+            status: request.status,
         }
     }
 }
@@ -112,16 +114,16 @@ pub struct MemberView {
 }
 
 impl From<model::MemberView> for MemberView {
-    fn from(m: model::MemberView) -> Self {
+    fn from(member: model::MemberView) -> Self {
         Self {
-            id: m.id,
-            username: m.username,
-            email: m.email,
-            display_name: m.display_name,
-            avatar_url: m.avatar_url,
-            roles: m.roles,
-            status: m.status,
-            holds_platform_role: m.holds_platform_role,
+            id: member.id,
+            username: member.username,
+            email: member.email,
+            display_name: member.display_name,
+            avatar_url: member.avatar_url,
+            roles: member.roles,
+            status: member.status,
+            holds_platform_role: member.holds_platform_role,
         }
     }
 }
@@ -136,10 +138,10 @@ pub struct AddMemberRequest {
 }
 
 impl From<AddMemberRequest> for model::AddMember {
-    fn from(r: AddMemberRequest) -> Self {
+    fn from(request: AddMemberRequest) -> Self {
         Self {
-            username: r.username,
-            roles: r.roles,
+            username: request.username,
+            roles: request.roles,
         }
     }
 }
@@ -157,11 +159,14 @@ pub struct MemberRolesRequest {
 #[into_params(parameter_in = Query)]
 pub struct ListMembersFilter {
     /// 用户名 + 显示名模糊搜索(仅接了 search 投影后端时可用;未接 → 422)。
-    pub q: Option<String>,
+    #[serde(rename = "q")]
+    pub query: Option<String>,
 }
 
 impl From<ListMembersFilter> for model::ListMembers {
-    fn from(f: ListMembersFilter) -> Self {
-        Self { q: f.q }
+    fn from(filter: ListMembersFilter) -> Self {
+        Self {
+            query: filter.query,
+        }
     }
 }

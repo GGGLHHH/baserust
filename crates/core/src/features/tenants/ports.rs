@@ -3,16 +3,16 @@
 //! - [`MemberProfiles`] 跨模块富化:按 user_id 批量取资料瘦快照(tenants 不 import profile)
 //!
 //! 租户 / 成员 / 会话 / 账号的写侧端口是 idm 领域库自己的 trait(`idm::TenantRepo` / `MemberRepo` /
-//! `SessionRepo` / `UserRepo` / `RoleRepo`)。测试替身 `StaticMemberProfiles` 在 `memory`。
+//! `SessionRepo` / `UserRepo` / `RoleRepo`)。测试替身 `StaticMemberProfiles` 在 `static_member_profiles`。
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
 use crate::kernel::pagination::PageParams;
-use crate::kernel::tenant::TenantId;
+use crate::kernel::tenant_id::TenantId;
 
 /// 资料瘦快照(成员列表要展示的两个富化字段)。
 #[derive(Clone, Debug, Default)]
@@ -53,7 +53,7 @@ pub trait MemberSearchIndex: Send + Sync {
     async fn query(
         &self,
         tenant: TenantId,
-        q: Option<&str>,
+        query: Option<&str>,
         page: &PageParams,
     ) -> Result<MemberSearchPage, AppError>;
 }

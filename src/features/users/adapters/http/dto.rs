@@ -8,9 +8,9 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::features::users::model;
-use crate::infra::authz::RoleNameSchema;
-use crate::infra::http::sort::SortOrder;
-use crate::kernel::authz::RoleName;
+use crate::infra::authorization::RoleNameSchema;
+use crate::infra::http::sort_order::SortOrder;
+use crate::kernel::authorization::RoleName;
 
 /// 后台用户视图:身份(idm.users)+ 角色(idm)+ 富化的资料(app.profiles;缺/分进程降级 → null)。
 #[derive(Debug, Serialize, ToSchema)]
@@ -31,16 +31,16 @@ pub struct AdminUserView {
 }
 
 impl From<model::AdminUserView> for AdminUserView {
-    fn from(v: model::AdminUserView) -> Self {
+    fn from(view: model::AdminUserView) -> Self {
         Self {
-            id: v.id,
-            username: v.username,
-            email: v.email,
-            email_verified: v.email_verified,
-            created_at: v.created_at,
-            roles: v.roles,
-            display_name: v.display_name,
-            avatar_url: v.avatar_url,
+            id: view.id,
+            username: view.username,
+            email: view.email,
+            email_verified: view.email_verified,
+            created_at: view.created_at,
+            roles: view.roles,
+            display_name: view.display_name,
+            avatar_url: view.avatar_url,
         }
     }
 }
@@ -57,11 +57,11 @@ pub struct RoleView {
 }
 
 impl From<model::Role> for RoleView {
-    fn from(r: model::Role) -> Self {
+    fn from(role: model::Role) -> Self {
         Self {
-            id: r.id,
-            name: r.name,
-            display_name: r.display_name,
+            id: role.id,
+            name: role.name,
+            display_name: role.display_name,
         }
     }
 }
@@ -77,12 +77,12 @@ pub struct CreateUserRequest {
 }
 
 impl From<CreateUserRequest> for model::CreateUser {
-    fn from(r: CreateUserRequest) -> Self {
+    fn from(request: CreateUserRequest) -> Self {
         Self {
-            username: r.username,
-            email: r.email,
-            password: r.password,
-            roles: r.roles,
+            username: request.username,
+            email: request.email,
+            password: request.password,
+            roles: request.roles,
         }
     }
 }
@@ -95,10 +95,10 @@ pub struct UpdateUserRequest {
 }
 
 impl From<UpdateUserRequest> for model::UpdateUser {
-    fn from(r: UpdateUserRequest) -> Self {
+    fn from(request: UpdateUserRequest) -> Self {
         Self {
-            username: r.username,
-            email: r.email,
+            username: request.username,
+            email: request.email,
         }
     }
 }
@@ -110,8 +110,10 @@ pub struct SetRolesRequest {
 }
 
 impl From<SetRolesRequest> for model::SetRoles {
-    fn from(r: SetRolesRequest) -> Self {
-        Self { roles: r.roles }
+    fn from(request: SetRolesRequest) -> Self {
+        Self {
+            roles: request.roles,
+        }
     }
 }
 
@@ -122,9 +124,9 @@ pub struct ResetPasswordRequest {
 }
 
 impl From<ResetPasswordRequest> for model::ResetPassword {
-    fn from(r: ResetPasswordRequest) -> Self {
+    fn from(request: ResetPasswordRequest) -> Self {
         Self {
-            new_password: r.new_password,
+            new_password: request.new_password,
         }
     }
 }
@@ -142,8 +144,8 @@ pub enum UserSortField {
 }
 
 impl From<UserSortField> for model::UserSortField {
-    fn from(f: UserSortField) -> Self {
-        match f {
+    fn from(field: UserSortField) -> Self {
+        match field {
             UserSortField::CreatedAt => Self::CreatedAt,
             UserSortField::Username => Self::Username,
             UserSortField::Email => Self::Email,
@@ -163,7 +165,8 @@ pub struct ListUsersFilter {
     /// 用户名模糊(ILIKE 子串)。
     pub username: Option<String>,
     /// 用户名 + 显示名模糊搜索(仅投影/search 后端支持;无后端 → 422)。
-    pub q: Option<String>,
+    #[serde(rename = "q")]
+    pub query: Option<String>,
     /// 正选:含任一角色(重复 key,如 `?role=admin&role=user`)。
     #[param(style = Form, explode, value_type = Vec<RoleNameSchema>)]
     pub role: Vec<RoleName>,
@@ -179,16 +182,16 @@ pub struct ListUsersFilter {
 }
 
 impl From<ListUsersFilter> for model::ListUsers {
-    fn from(f: ListUsersFilter) -> Self {
+    fn from(filter: ListUsersFilter) -> Self {
         Self {
-            username: f.username,
-            q: f.q,
-            role: f.role,
-            role_not: f.role_not,
-            created_from: f.created_from,
-            created_to: f.created_to,
-            sort_by: f.sort_by.into(),
-            order: f.order.into(),
+            username: filter.username,
+            query: filter.query,
+            role: filter.role,
+            role_not: filter.role_not,
+            created_from: filter.created_from,
+            created_to: filter.created_to,
+            sort_by: filter.sort_by.into(),
+            order: filter.order.into(),
         }
     }
 }

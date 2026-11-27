@@ -4,61 +4,78 @@
 //!
 //! 内存入口:默认 `cargo test`。PG 入口:`just test-pg`(--features pg-conformance)。
 
-use baserust::features::profile::{ProfileFields, ProfileRepo};
+use baserust::features::profile::{
+    InMemoryProfileRepo, ProfileFields, ProfileRepo, UpsertedProfile,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
 async fn profile_repo_contract(repo: &dyn ProfileRepo) {
-    let uid = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
     // 未建 → None
-    assert!(repo.get(uid).await.unwrap().is_none());
+    assert!(repo.get(user_id).await.unwrap().is_none());
 
     // 建:created=true,审计双落
     let avatar = Uuid::now_v7();
-    let f1 = ProfileFields {
+    let created_fields = ProfileFields {
         display_name: Some("A Z".into()),
         phone: Some("110".into()),
         avatar_content_id: Some(avatar),
     };
-    let (p1, created) = repo.upsert(uid, f1, Some("tester".into())).await.unwrap();
+    let UpsertedProfile {
+        profile: created_profile,
+        created,
+    } = repo
+        .upsert(user_id, created_fields, Some("tester".into()))
+        .await
+        .unwrap();
     assert!(created, "首次 upsert 应判别为建");
-    assert_eq!(p1.user_id, uid);
-    assert_eq!(p1.created_by.as_deref(), Some("tester"));
-    assert_eq!(p1.updated_by.as_deref(), Some("tester"));
-    assert_eq!(p1.avatar_content_id, Some(avatar));
+    assert_eq!(created_profile.user_id, user_id);
+    assert_eq!(created_profile.created_by.as_deref(), Some("tester"));
+    assert_eq!(created_profile.updated_by.as_deref(), Some("tester"));
+    assert_eq!(created_profile.avatar_content_id, Some(avatar));
 
     // 替:created=false;业务字段**全量覆盖**(未给=清空,含 avatar);created_* 保留;updated_* 推进
-    let f2 = ProfileFields {
+    let replacement_fields = ProfileFields {
         display_name: Some("M".into()),
         phone: None,
         avatar_content_id: None,
     };
-    let (p2, created) = repo.upsert(uid, f2, Some("other".into())).await.unwrap();
+    let UpsertedProfile {
+        profile: replaced_profile,
+        created,
+    } = repo
+        .upsert(user_id, replacement_fields, Some("other".into()))
+        .await
+        .unwrap();
     assert!(!created, "二次 upsert 应判别为替");
     assert_eq!(
-        p2.created_by.as_deref(),
+        replaced_profile.created_by.as_deref(),
         Some("tester"),
         "created_by 必须保留"
     );
-    assert_eq!(p2.created_at, p1.created_at, "created_at 必须保留");
-    assert_eq!(p2.updated_by.as_deref(), Some("other"));
-    assert!(p2.updated_at >= p1.updated_at);
-    assert!(p2.phone.is_none(), "全量替换:未给字段清空");
+    assert_eq!(
+        replaced_profile.created_at, created_profile.created_at,
+        "created_at 必须保留"
+    );
+    assert_eq!(replaced_profile.updated_by.as_deref(), Some("other"));
+    assert!(replaced_profile.updated_at >= created_profile.updated_at);
+    assert!(replaced_profile.phone.is_none(), "全量替换:未给字段清空");
     assert!(
-        p2.avatar_content_id.is_none(),
+        replaced_profile.avatar_content_id.is_none(),
         "avatar 同受全量替换管辖(null 即解绑)"
     );
-    assert_eq!(p2.display_name.as_deref(), Some("M"));
+    assert_eq!(replaced_profile.display_name.as_deref(), Some("M"));
 
     // get 回环
-    let g = repo.get(uid).await.unwrap().expect("已建应可读");
-    assert_eq!(g.display_name.as_deref(), Some("M"));
-    assert_eq!(g.created_by.as_deref(), Some("tester"));
+    let fetched = repo.get(user_id).await.unwrap().expect("已建应可读");
+    assert_eq!(fetched.display_name.as_deref(), Some("M"));
+    assert_eq!(fetched.created_by.as_deref(), Some("tester"));
 }
 
 #[tokio::test]
 async fn memory_satisfies_profile_contract() {
-    let repo = baserust::features::profile::InMemoryProfileRepo::new();
+    let repo = InMemoryProfileRepo::new();
     profile_repo_contract(&repo).await;
 }
 
@@ -70,33 +87,35 @@ async fn memory_profile_upsert_emits_profile_updated_outbox_event() {
     use baserust::features::profile::{InMemoryAppOutbox, InMemoryProfileRepo};
 
     let repo = InMemoryProfileRepo::new();
-    let outbox = InMemoryAppOutbox::sharing_with(&repo);
+    let outbox = InMemoryAppOutbox::new_shared_with(&repo);
     assert!(
         outbox.poll_unpublished(100).await.unwrap().is_empty(),
         "初始应无残留事件"
     );
 
     // ── 建(有头像):payload.avatar_url = 相对头像端点路径(按 user_id)──
-    let uid = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
     let avatar = Uuid::now_v7();
-    let f = ProfileFields {
+    let with_avatar = ProfileFields {
         display_name: Some("A Z".into()),
         phone: Some("110".into()),
         avatar_content_id: Some(avatar),
     };
-    repo.upsert(uid, f, Some("tester".into())).await.unwrap();
+    repo.upsert(user_id, with_avatar, Some("tester".into()))
+        .await
+        .unwrap();
     let rows = outbox.poll_unpublished(100).await.unwrap();
     assert_eq!(rows.len(), 1, "恰一条 profile.updated");
     assert_eq!(rows[0].event_type, "profile.updated");
-    assert_eq!(rows[0].aggregate_id, uid);
+    assert_eq!(rows[0].aggregate_id, user_id);
     assert_eq!(
         rows[0].payload["user_id"],
-        serde_json::to_value(uid).unwrap()
+        serde_json::to_value(user_id).unwrap()
     );
     assert_eq!(rows[0].payload["display_name"], "A Z");
     assert_eq!(
         rows[0].payload["avatar_url"],
-        format!("/api/v1/frontend/profiles/{uid}/avatar")
+        format!("/api/v1/frontend/profiles/{user_id}/avatar")
     );
     outbox.mark_published(&[rows[0].id]).await.unwrap();
     assert!(
@@ -105,16 +124,16 @@ async fn memory_profile_upsert_emits_profile_updated_outbox_event() {
     );
 
     // ── 建(无头像):payload.avatar_url 悬空 → null ──
-    let uid2 = Uuid::now_v7();
-    let f2 = ProfileFields {
+    let user_id2 = Uuid::now_v7();
+    let without_avatar = ProfileFields {
         display_name: None,
         phone: None,
         avatar_content_id: None,
     };
-    repo.upsert(uid2, f2, None).await.unwrap();
+    repo.upsert(user_id2, without_avatar, None).await.unwrap();
     let rows = outbox.poll_unpublished(100).await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].aggregate_id, uid2);
+    assert_eq!(rows[0].aggregate_id, user_id2);
     assert_eq!(rows[0].payload["display_name"], Value::Null);
     assert_eq!(rows[0].payload["avatar_url"], Value::Null);
     outbox.mark_published(&[rows[0].id]).await.unwrap();
@@ -135,21 +154,22 @@ mod support;
 mod pg {
     use super::{profile_repo_contract, support};
     use baserust::features::profile::{PgAppOutbox, PgProfileRepo, ProfileFields, ProfileRepo};
-    use baserust::kernel::error::AppError;
+    use baserust::kernel::app_error::AppError;
     use serde_json::Value;
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     #[sqlx::test(migrations = false)]
-    async fn pg_satisfies_profile_contract(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    async fn pg_satisfies_profile_contract(pool: PgPool) -> sqlx::Result<()> {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let rt = support::runtime_pool(&pool)
+        let runtime_pool = support::runtime_pool(&pool)
             .await
             .expect("运行时账号连临时库");
-        let repo = baserust::features::profile::PgProfileRepo::new(rt.clone());
+        let repo = PgProfileRepo::new(runtime_pool.clone());
         profile_repo_contract(&repo).await;
-        rt.close().await;
+        runtime_pool.close().await;
         Ok(())
     }
 
@@ -157,16 +177,16 @@ mod pg {
     /// 一遍(真实 upsert 驱动,含 avatar/无 avatar 两 case),钉内存↔PG parity。
     #[sqlx::test(migrations = false)]
     async fn pg_profile_upsert_emits_profile_updated_outbox_event(
-        pool: sqlx::PgPool,
+        pool: PgPool,
     ) -> sqlx::Result<()> {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
-        let rt = support::runtime_pool(&pool)
+        let runtime_pool = support::runtime_pool(&pool)
             .await
             .expect("运行时账号连临时库");
-        let repo = PgProfileRepo::new(rt.clone());
-        let outbox = PgAppOutbox::new(rt.clone());
+        let repo = PgProfileRepo::new(runtime_pool.clone());
+        let outbox = PgAppOutbox::new(runtime_pool.clone());
 
         assert!(
             outbox.poll_unpublished(100).await.unwrap().is_empty(),
@@ -174,26 +194,28 @@ mod pg {
         );
 
         // ── 建(有头像):payload.avatar_url = 相对头像端点路径(按 user_id)──
-        let uid = Uuid::now_v7();
+        let user_id = Uuid::now_v7();
         let avatar = Uuid::now_v7();
-        let f = ProfileFields {
+        let with_avatar = ProfileFields {
             display_name: Some("A Z".into()),
             phone: Some("110".into()),
             avatar_content_id: Some(avatar),
         };
-        repo.upsert(uid, f, Some("tester".into())).await.unwrap();
+        repo.upsert(user_id, with_avatar, Some("tester".into()))
+            .await
+            .unwrap();
         let rows = outbox.poll_unpublished(100).await.unwrap();
         assert_eq!(rows.len(), 1, "恰一条 profile.updated");
         assert_eq!(rows[0].event_type, "profile.updated");
-        assert_eq!(rows[0].aggregate_id, uid);
+        assert_eq!(rows[0].aggregate_id, user_id);
         assert_eq!(
             rows[0].payload["user_id"],
-            serde_json::to_value(uid).unwrap()
+            serde_json::to_value(user_id).unwrap()
         );
         assert_eq!(rows[0].payload["display_name"], "A Z");
         assert_eq!(
             rows[0].payload["avatar_url"],
-            format!("/api/v1/frontend/profiles/{uid}/avatar")
+            format!("/api/v1/frontend/profiles/{user_id}/avatar")
         );
         outbox.mark_published(&[rows[0].id]).await.unwrap();
         assert!(
@@ -202,21 +224,21 @@ mod pg {
         );
 
         // ── 建(无头像):payload.avatar_url 悬空 → null ──
-        let uid2 = Uuid::now_v7();
-        let f2 = ProfileFields {
+        let user_id2 = Uuid::now_v7();
+        let without_avatar = ProfileFields {
             display_name: None,
             phone: None,
             avatar_content_id: None,
         };
-        repo.upsert(uid2, f2, None).await.unwrap();
+        repo.upsert(user_id2, without_avatar, None).await.unwrap();
         let rows = outbox.poll_unpublished(100).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].aggregate_id, uid2);
+        assert_eq!(rows[0].aggregate_id, user_id2);
         assert_eq!(rows[0].payload["display_name"], Value::Null);
         assert_eq!(rows[0].payload["avatar_url"], Value::Null);
         outbox.mark_published(&[rows[0].id]).await.unwrap();
         assert!(outbox.poll_unpublished(100).await.unwrap().is_empty());
-        rt.close().await;
+        runtime_pool.close().await;
         Ok(())
     }
 
@@ -225,9 +247,7 @@ mod pg {
     /// tx-rollback 断言手法(那边靠业务唯一索引触发,这里 profiles 表本身无额外约束可借,故显式
     /// 造一条临时 CHECK 来触发同等的"写入中途失败"场景)。
     #[sqlx::test(migrations = false)]
-    async fn pg_profile_upsert_rollback_leaves_no_outbox_row(
-        pool: sqlx::PgPool,
-    ) -> sqlx::Result<()> {
+    async fn pg_profile_upsert_rollback_leaves_no_outbox_row(pool: PgPool) -> sqlx::Result<()> {
         support::bootstrap_app_schema(&pool)
             .await
             .expect("bootstrap app schema + 跑 migrations/app");
@@ -238,29 +258,29 @@ mod pg {
         .execute(&pool) // DDL 只有 owner 能做
         .await?;
 
-        let rt = support::runtime_pool(&pool)
+        let runtime_pool = support::runtime_pool(&pool)
             .await
             .expect("运行时账号连临时库");
-        let repo = PgProfileRepo::new(rt.clone());
-        let outbox = PgAppOutbox::new(rt.clone());
+        let repo = PgProfileRepo::new(runtime_pool.clone());
+        let outbox = PgAppOutbox::new(runtime_pool.clone());
 
-        let uid = Uuid::now_v7();
-        let f = ProfileFields {
+        let user_id = Uuid::now_v7();
+        let fields = ProfileFields {
             display_name: Some("__force_fail__".into()),
             phone: None,
             avatar_content_id: None,
         };
-        let err = repo.upsert(uid, f, None).await.unwrap_err();
-        assert!(matches!(err, AppError::Internal(_)));
+        let error = repo.upsert(user_id, fields, None).await.unwrap_err();
+        assert!(matches!(error, AppError::Internal(_)));
         assert!(
             outbox.poll_unpublished(100).await.unwrap().is_empty(),
             "失败的 upsert 不该留下 outbox 行"
         );
         assert!(
-            repo.get(uid).await.unwrap().is_none(),
+            repo.get(user_id).await.unwrap().is_none(),
             "失败的 upsert 也不该留下 profile 行(全有或全无)"
         );
-        rt.close().await;
+        runtime_pool.close().await;
         Ok(())
     }
 }

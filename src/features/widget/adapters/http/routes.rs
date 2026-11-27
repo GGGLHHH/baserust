@@ -7,28 +7,31 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::Stream;
+use futures_util::{stream, Stream};
+use serde::Deserialize;
+use utoipa::IntoParams;
 use uuid::Uuid;
 
 use super::dto::{
     CreateWidget, UpdateWidget, Widget, WidgetEvent, WidgetSortField, WidgetStats, WidgetView,
 };
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 use crate::features::widget::model;
-use crate::infra::authz::TokenScope;
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::{Audit, CurrentTenant, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::infra::http::sort::SortOrder;
-use crate::kernel::authz::Perm;
-use crate::kernel::error::AppError;
+use crate::infra::http::sort_order::SortOrder;
+use crate::infra::telemetry::SseConnectionGuard;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::{Permission, PermissionCheck};
 use crate::kernel::pagination::PageParams;
-use crate::kernel::tenant::TenantId;
+use crate::kernel::tenant_id::TenantId;
 
 /// 列表排序 query(**第二个 `Query` 提取器**,避免把 sort 塞进共享 `PageQuery`)。
 /// `#[serde(default)]`:两参都缺时回落默认(否则 serde_urlencoded 对必填字段缺失即 400)。
-#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 #[serde(default)]
 #[into_params(parameter_in = Query)]
 pub struct WidgetSort {
@@ -38,8 +41,8 @@ pub struct WidgetSort {
 
 /// cursor keyset 只支持 [`model::WidgetSortField::keyset_capable`] 的键(准入条件见那里);
 /// 不支持的键 + cursor → 422,**而非静默按别的键排**。两个方向(`order`)都支持。
-fn ensure_sort_pagination(params: &PageParams, sort: &WidgetSort) -> Result<(), AppError> {
-    if matches!(params, PageParams::Cursor { .. })
+fn ensure_sort_pagination(page_params: &PageParams, sort: &WidgetSort) -> Result<(), AppError> {
+    if matches!(page_params, PageParams::Cursor { .. })
         && !model::WidgetSortField::from(sort.sort_by).keyset_capable()
     {
         return Err(AppError::Validation(
@@ -77,25 +80,25 @@ pub async fn list_widgets(
 ) -> Result<Json<Page<WidgetView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetRead)?;
     // ownership:无 read:all → 只列自己创建的(过滤落查询层,分页正确)。
     let owner = state
         .policy
-        .data_access(&user.0, &scope.0, Perm::WidgetReadAll)
+        .data_access(&user.0, &scope.0, Permission::WidgetReadAll)
         .owner_filter();
-    let params = query.resolve()?;
-    ensure_sort_pagination(&params, &sort)?;
+    let page_params = query.resolve()?;
+    ensure_sort_pagination(&page_params, &sort)?;
     let page = state
         .widgets
         .list_enriched(
             tenant,
-            params,
+            page_params,
             owner,
             sort.sort_by.into(),
             sort.order.into(),
         )
         .await?;
-    Ok(Json(Page::from_core(page, WidgetView::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 创建一个 widget(需 `widgets:write`)。审计主体(created_by)= 当前登录用户,来自 `AuditContext`。
@@ -121,7 +124,7 @@ pub async fn create_widget(
 ) -> Result<(StatusCode, Json<Widget>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetWrite)?;
     let widget = state.widgets.create(tenant, input.into(), &ctx).await?;
     Ok((StatusCode::CREATED, Json(widget.into())))
 }
@@ -147,10 +150,10 @@ pub async fn get_widget(
 ) -> Result<Json<Widget>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetRead)?;
     let access = state
         .policy
-        .data_access(&user.0, &scope.0, Perm::WidgetReadAll);
+        .data_access(&user.0, &scope.0, Permission::WidgetReadAll);
     let widget = state.widgets.get(tenant, id).await?;
     if access.allows_created_by(widget.created_by.as_deref()) {
         Ok(Json(widget.into()))
@@ -185,7 +188,7 @@ pub async fn update_widget(
 ) -> Result<Json<Widget>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetWrite)?;
     ensure_may_write(&state, &user, &scope, tenant, id).await?;
     Ok(Json(
         state
@@ -214,9 +217,9 @@ async fn ensure_may_write(
 ) -> Result<(), AppError> {
     let access = state
         .policy
-        .data_access(&user.0, &scope.0, Perm::WidgetWriteAll);
-    let w = state.widgets.get(tenant, id).await?; // 不存在 / 别的租户 → 404(先于 ownership,口径同 get_widget)
-    if access.allows_created_by(w.created_by.as_deref()) {
+        .data_access(&user.0, &scope.0, Permission::WidgetWriteAll);
+    let widget = state.widgets.get(tenant, id).await?; // 不存在 / 别的租户 → 404(先于 ownership,口径同 get_widget)
+    if access.allows_created_by(widget.created_by.as_deref()) {
         Ok(())
     } else {
         Err(AppError::NotFound)
@@ -245,7 +248,7 @@ pub async fn delete_widget(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetDelete)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetDelete)?;
     ensure_may_write(&state, &user, &scope, tenant, id).await?;
     state.widgets.delete(tenant, id, &ctx).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -255,7 +258,7 @@ pub async fn delete_widget(
 // (平台级接口的样板见 users / monitoring:gate 平台级 `users:admin` / `ops:read`。)
 
 /// **仅登录**:当前租户的 widget 计数。要登录(frontend 组闸)+ 当前租户(`CurrentTenant`,缺 → 403
-/// `tenant_required`),**无特定 perm**(`OP_PERMS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。
+/// `tenant_required`),**无特定 perm**(`OPERATION_PERMISSIONS` 标 `LoginOnly`)。按租户计数走普通运行时池 + 租户事务。
 ///
 /// 曾是免登录的「全站计数」:多租户下匿名请求没有租户,跨租户汇总要绕过 RLS,违背「租户互相看不见」,
 /// 所以移到 frontend 组、只数当前租户。业务里要做公开数字,先想清楚它属于哪个租户。
@@ -279,7 +282,7 @@ pub async fn widget_stats(
 }
 
 /// **仅登录**(authenticated):当前用户在**当前租户**里创建的 widget 数。要 `CurrentUser`、**无特定 perm**
-/// (`OP_PERMS` 标 `None` → 文档 `security:[{"oauth2":[]}]`)。演示"只需登录"形态。
+/// (`OPERATION_PERMISSIONS` 标 `LoginOnly` → 文档 `security:[{"oauth2":[]}]`)。演示"只需登录"形态。
 /// 数的是租户数据,所以仍要当前租户(平台上下文 → 403 `tenant_required`)。
 #[utoipa::path(
     get,
@@ -302,7 +305,7 @@ pub async fn my_widget_count(
 }
 
 /// **多权限 AND 样板**:删除预检 —— 读得见**且**删得动才允许看"可删多少"。
-/// `require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OP_PERMS` 的 `PermReq::All`)。
+/// `require_all` 缺任一 perm 即 403;文档 = 单 requirement 多 scope(`OPERATION_PERMISSIONS` 的 `PermissionRequirement::All`)。
 #[utoipa::path(
     get,
     path = "/widgets/purge-preview",
@@ -319,9 +322,13 @@ pub async fn purge_preview(
     CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
 ) -> Result<Json<WidgetStats>, ApiError> {
-    state
-        .policy
-        .require_all(&user.0, &scope.0, &[Perm::WidgetRead, Perm::WidgetDelete])?;
+    state.policy.require_all(
+        &user.0,
+        PermissionCheck {
+            scope: &scope.0,
+            required: &[Permission::WidgetRead, Permission::WidgetDelete],
+        },
+    )?;
     Ok(Json(WidgetStats {
         total: state.widgets.count(tenant, Some(user.0.id)).await?,
     }))
@@ -329,7 +336,7 @@ pub async fn purge_preview(
 
 /// **多权限 OR 样板**:概览 —— 普通读权**或**本组织成员管理员(`members:admin`)任一即可。
 /// 两支都是租户级权限:租户数据的接口不拿平台级权限(如 `users:admin`)当闸(spec §4.3)。
-/// `require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermReq::Any`)。
+/// `require_any` 全败才 403;文档 = 多 requirement 各一 scope(`PermissionRequirement::Any`)。
 #[utoipa::path(
     get,
     path = "/widgets/overview",
@@ -346,9 +353,13 @@ pub async fn widget_overview(
     CurrentTenant(tenant): CurrentTenant,
     scope: TokenScope,
 ) -> Result<Json<WidgetStats>, ApiError> {
-    state
-        .policy
-        .require_any(&user.0, &scope.0, &[Perm::WidgetRead, Perm::MembersAdmin])?;
+    state.policy.require_any(
+        &user.0,
+        PermissionCheck {
+            scope: &scope.0,
+            required: &[Permission::WidgetRead, Permission::MembersAdmin],
+        },
+    )?;
     Ok(Json(WidgetStats {
         total: state.widgets.count(tenant, None).await?,
     }))
@@ -381,24 +392,24 @@ pub async fn admin_list_widgets(
 ) -> Result<Json<Page<WidgetView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetRead)?;
     let owner = state
         .policy
-        .data_access(&user.0, &scope.0, Perm::WidgetReadAll)
+        .data_access(&user.0, &scope.0, Permission::WidgetReadAll)
         .owner_filter();
-    let params = query.resolve()?;
-    ensure_sort_pagination(&params, &sort)?;
+    let page_params = query.resolve()?;
+    ensure_sort_pagination(&page_params, &sort)?;
     let page = state
         .widgets
         .list_enriched(
             tenant,
-            params,
+            page_params,
             owner,
             sort.sort_by.into(),
             sort.order.into(),
         )
         .await?;
-    Ok(Json(Page::from_core(page, WidgetView::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 订阅 widget 变更事件流(SSE)。需登录 + `widgets:read` —— 与列表同权:能看列表就能看变更。
@@ -431,21 +442,21 @@ pub async fn widget_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::WidgetRead)?;
     // ownership:无 read:all → 只收自己创建的那些 widget 的事件(与 list_widgets 同一判定)。
     let access = state
         .policy
-        .data_access(&user.0, &scope.0, Perm::WidgetReadAll);
-    let sub = state.widget_events.subscribe().await?;
+        .data_access(&user.0, &scope.0, Permission::WidgetReadAll);
+    let subscription = state.widget_events.subscribe().await?;
     // recv() → SSE 帧;None(总线关)→ 流结束。json_data 对我们的类型不会失败,失败即结束流(ok()?)。
     // 不在可见域内的帧:continue 跳过(丢帧 ≠ 断流 —— 广播里本就混着别人的事件)。
     // 在线连接数指标:守卫随流存活,客户端断开(流被丢弃)时自动 -1。
-    let guard = crate::infra::telemetry::SseConnectionGuard::new("widgets");
-    let stream = futures_util::stream::unfold(
-        (sub, access, guard),
-        move |(mut sub, access, guard)| async move {
+    let guard = SseConnectionGuard::new("widgets");
+    let frames = stream::unfold(
+        (subscription, access, guard),
+        move |(mut subscription, access, guard)| async move {
             loop {
-                let event = sub.recv().await?;
+                let event = subscription.recv().await?;
                 // 第一道:租户。别的租户的帧连 owner 都不必看。
                 if event.tenant_id() != tenant || !access.allows_created_by(event.owner()) {
                     continue;
@@ -454,9 +465,10 @@ pub async fn widget_events(
                     .event(event.name())
                     .json_data(WidgetEvent::from(event))
                     .ok()?;
-                return Some((Ok::<_, Infallible>(frame), (sub, access, guard)));
+                let item: Result<Event, Infallible> = Ok(frame);
+                return Some((item, (subscription, access, guard)));
             }
         },
     );
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    Ok(Sse::new(frames).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

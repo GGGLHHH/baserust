@@ -4,37 +4,50 @@
 //! 意义:黑盒测试是换 web 底座(或任何 HTTP 层重构)时的验收标准 —— 加了新接口却没写黑盒测试,
 //! 这道门就会红。清单是测试作者的声明(不是运行时统计),评审时看对应测试是否真的打到了它。
 
+use baserust::app::router;
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 
 const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
 
 fn spec_operations() -> BTreeSet<String> {
-    let spec = serde_json::to_value(baserust::app::router::api_spec()).unwrap();
-    let mut ops = BTreeSet::new();
+    let spec = serde_json::to_value(router::api_spec()).unwrap();
+    let mut operations = BTreeSet::new();
     for (path, item) in spec["paths"].as_object().unwrap() {
-        for m in METHODS {
-            if item.get(m).is_some() {
-                ops.insert(format!("{} {path}", m.to_uppercase()));
+        for method in METHODS {
+            if item.get(method).is_some() {
+                operations.insert(format!("{} {path}", method.to_uppercase()));
             }
         }
     }
-    ops
+    operations
 }
 
 /// 各 http_*.rs 声明的覆盖清单:(接口, 声明它的文件)。
-fn declared() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+/// 某个 `tests/http_*.rs` 文件头声明覆盖的一个接口。
+struct Declared {
+    /// `METHOD /path`。
+    operation: String,
+    /// 声明它的测试文件名。
+    file: String,
+}
+
+fn declared() -> Vec<Declared> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
+    for entry in fs::read_dir(&directory).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         if !(name.starts_with("http_") && name.ends_with(".rs")) || name == "http_coverage.rs" {
             continue;
         }
-        for line in std::fs::read_to_string(&path).unwrap().lines() {
-            if let Some(op) = line.trim().strip_prefix("//! covers:") {
-                out.push((op.trim().to_owned(), name.clone()));
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            if let Some(operation) = line.trim().strip_prefix("//! covers:") {
+                out.push(Declared {
+                    operation: operation.trim().to_owned(),
+                    file: name.clone(),
+                });
             }
         }
     }
@@ -45,13 +58,13 @@ fn declared() -> Vec<(String, String)> {
 fn every_operation_has_a_black_box_test() {
     let spec = spec_operations();
     let declared = declared();
-    let covered: BTreeSet<String> = declared.iter().map(|(op, _)| op.clone()).collect();
+    let covered: BTreeSet<String> = declared.iter().map(|d| d.operation.clone()).collect();
 
     let missing: Vec<_> = spec.difference(&covered).collect();
     let stale: Vec<_> = declared
         .iter()
-        .filter(|(op, _)| !spec.contains(op))
-        .map(|(op, f)| format!("{op}({f})"))
+        .filter(|d| !spec.contains(&d.operation))
+        .map(|d| format!("{}({})", d.operation, d.file))
         .collect();
 
     assert!(

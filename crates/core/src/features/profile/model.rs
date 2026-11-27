@@ -59,20 +59,24 @@ pub struct ProfileView {
 }
 
 impl ProfileView {
-    pub fn from_profile(p: Profile, avatar_url: Option<String>) -> Self {
+    /// 实体 + 富化好的头像路径 → 读模型(时间戳取真行的)。两个入参,不是值到值的转换,所以按
+    /// 「Naming initialization functions」叫 `new_with_profile`(不配 `From`)。
+    #[must_use]
+    pub fn new_with_profile(profile: Profile, avatar_url: Option<String>) -> Self {
         Self {
-            user_id: p.user_id,
-            display_name: p.display_name,
-            phone: p.phone,
-            avatar_content_id: p.avatar_content_id,
+            user_id: profile.user_id,
+            display_name: profile.display_name,
+            phone: profile.phone,
+            avatar_content_id: profile.avatar_content_id,
             avatar_url,
-            created_at: Some(p.created_at),
-            updated_at: Some(p.updated_at),
+            created_at: Some(profile.created_at),
+            updated_at: Some(profile.updated_at),
         }
     }
 
     /// 资料未建时的空壳(各段 None,`user_id` 是调用者本人 —— 前端据此 PUT 建资料)。
-    pub fn empty(user_id: Uuid) -> Self {
+    #[must_use]
+    pub fn new(user_id: Uuid) -> Self {
         Self {
             user_id,
             display_name: None,
@@ -89,9 +93,26 @@ impl ProfileView {
 /// SVG 是活动内容(可内联脚本);presign 后端把头像 307 直连存储出字节、**无 CSP sandbox**(只有代理
 /// 回退分支才加 sandbox),而头像端点任何登录用户跨用户可达 → 恶意 SVG 头像 = 存储型 XSS。收口在上传
 /// 边界(两处),从源头挡住,而非依赖出字节时的 `image/*` 前缀"双保险"(它并不排除 SVG)。
+#[must_use]
 pub fn is_allowed_avatar_mime(mime: &str) -> bool {
     matches!(
         mime,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     )
+}
+
+/// [`crate::features::profile::ports::ProfileRepo::upsert`] 的结果。
+#[derive(Debug, Clone)]
+pub struct UpsertedProfile {
+    pub profile: Profile,
+    /// 这次是新建(路由据此 201 / 200)。
+    pub created: bool,
+}
+
+/// [`crate::features::profile::ProfileService::put`] 的结果。
+#[derive(Debug, Clone)]
+pub struct PutProfileOutcome {
+    /// 这次是新建(路由据此 201 / 200)。
+    pub created: bool,
+    pub profile: ProfileView,
 }

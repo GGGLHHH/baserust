@@ -2,13 +2,16 @@
 //! (`AuthEventType` / `AuthChannel` / `AuthOutcome` / `FailureReason`)的 OpenAPI schema。
 //! 类型名即 schema 名(对前端的契约)。
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+// `model::AuthEventRow` / `model::AuthStats` 与本文件的同名 DTO 撞名,故这两个经 `model::` 限定。
 use crate::features::auth_audit::model::{
-    self, AuthChannel, AuthEventType, AuthOutcome, FailureReason,
+    self, AuthChannel, AuthEventQuery, AuthEventType, AuthOutcome, FailureReason,
 };
 
 crate::closed_enum_to_schema!(
@@ -61,25 +64,25 @@ pub struct AuthEventRow {
 }
 
 impl From<model::AuthEventRow> for AuthEventRow {
-    fn from(r: model::AuthEventRow) -> Self {
+    fn from(row: model::AuthEventRow) -> Self {
         Self {
-            id: r.id,
-            event_type: r.event_type,
-            occurred_at: r.occurred_at,
-            channel: r.channel,
-            user_id: r.user_id,
-            identifier_attempted: r.identifier_attempted,
-            session_id: r.session_id,
-            actor: r.actor,
-            outcome: r.outcome,
-            failure_reason: r.failure_reason,
-            ip: r.ip,
-            user_agent: r.user_agent,
-            country: r.country,
-            city: r.city,
-            os: r.os,
-            browser: r.browser,
-            tenant_id: r.tenant_id,
+            id: row.id,
+            event_type: row.event_type,
+            occurred_at: row.occurred_at,
+            channel: row.channel,
+            user_id: row.user_id,
+            identifier_attempted: row.identifier_attempted,
+            session_id: row.session_id,
+            actor: row.actor,
+            outcome: row.outcome,
+            failure_reason: row.failure_reason,
+            ip: row.ip,
+            user_agent: row.user_agent,
+            country: row.country,
+            city: row.city,
+            os: row.os,
+            browser: row.browser,
+            tenant_id: row.tenant_id,
         }
     }
 }
@@ -96,31 +99,30 @@ pub struct AuthEventFilter {
     pub outcome: Option<AuthOutcome>,
     /// 联合模糊搜:`actor`(展示用户名/标识)+ `identifier_attempted`(失败场景提交的用户名/邮箱)
     /// + `ip`(文本),大小写不敏感子串。**下推到库**(全历史检索),取代前端内存过滤。空 = 不搜。
-    pub q: Option<String>,
+    #[serde(rename = "q")]
+    pub query: Option<String>,
     /// 精确 IP 过滤(`ip = X`)。与 `q` 的子串搜互补;两者都给则 AND 组合。强类型 `IpAddr`:
     /// 非法值在 Query 提取器被拒 → 400(而非把裸串 cast 成 `::inet` 让 PG 抛 500;亦对齐内存侧规范化比较)。
     /// OpenAPI 里仍呈现为 string(utoipa 无 `IpAddr` schema)。
     #[param(value_type = String)]
-    pub ip: Option<std::net::IpAddr>,
+    pub ip: Option<IpAddr>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub from: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub to: Option<OffsetDateTime>,
 }
 
-impl From<AuthEventFilter> for model::AuthEventQuery {
-    /// `user_id` 由用例决定(单用户历史 `list_for_user` 覆盖,全局流为 None)。
-    fn from(f: AuthEventFilter) -> Self {
-        let user_id = None;
-        let s = f;
+impl From<AuthEventFilter> for AuthEventQuery {
+    fn from(filter: AuthEventFilter) -> Self {
         Self {
-            user_id,
-            event_type: s.event_type,
-            outcome: s.outcome,
-            q: s.q,
-            ip: s.ip,
-            from: s.from,
-            to: s.to,
+            // 由用例决定(单用户历史 `list_for_user` 覆盖,全局流为 None)。
+            user_id: None,
+            event_type: filter.event_type,
+            outcome: filter.outcome,
+            query: filter.query,
+            ip: filter.ip,
+            from: filter.from,
+            to: filter.to,
         }
     }
 }
@@ -137,11 +139,11 @@ pub struct StatsQuery {
 }
 
 /// 仪表盘统计(admin `/auth-events/stats`)。时间序列 + 各维度 group-by 计数。
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StatBucket {
     #[serde(with = "time::serde::rfc3339")]
-    pub t: OffsetDateTime,
+    #[serde(rename = "t")]
+    pub bucket_start: OffsetDateTime,
     pub success: i64,
     pub failure: i64,
 }
@@ -190,49 +192,49 @@ pub struct AuthStats {
 }
 
 impl From<model::AuthStats> for AuthStats {
-    fn from(s: model::AuthStats) -> Self {
+    fn from(stats: model::AuthStats) -> Self {
         Self {
-            activity: s
+            activity: stats
                 .activity
                 .into_iter()
-                .map(|b| StatBucket {
-                    t: b.t,
-                    success: b.success,
-                    failure: b.failure,
+                .map(|bucket| StatBucket {
+                    bucket_start: bucket.bucket_start,
+                    success: bucket.success,
+                    failure: bucket.failure,
                 })
                 .collect(),
-            reasons: s
+            reasons: stats
                 .reasons
                 .into_iter()
-                .map(|r| ReasonCount {
-                    key: r.key,
-                    count: r.count,
+                .map(|reason| ReasonCount {
+                    key: reason.key,
+                    count: reason.count,
                 })
                 .collect(),
-            types: s
+            types: stats
                 .types
                 .into_iter()
-                .map(|t| TypeCount {
-                    key: t.key,
-                    count: t.count,
+                .map(|type_count| TypeCount {
+                    key: type_count.key,
+                    count: type_count.count,
                 })
                 .collect(),
-            top_ips: s
+            top_ips: stats
                 .top_ips
                 .into_iter()
-                .map(|i| IpStat {
-                    ip: i.ip,
-                    failures: i.failures,
-                    total: i.total,
+                .map(|ip_stat| IpStat {
+                    ip: ip_stat.ip,
+                    failures: ip_stat.failures,
+                    total: ip_stat.total,
                 })
                 .collect(),
             kpi: AuthKpi {
-                total_events: s.kpi.total_events,
-                failed_count: s.kpi.failed_count,
-                unique_ips: s.kpi.unique_ips,
-                success_rate: s.kpi.success_rate,
-                total_delta: s.kpi.total_delta,
-                failed_delta: s.kpi.failed_delta,
+                total_events: stats.kpi.total_events,
+                failed_count: stats.kpi.failed_count,
+                unique_ips: stats.kpi.unique_ips,
+                success_rate: stats.kpi.success_rate,
+                total_delta: stats.kpi.total_delta,
+                failed_delta: stats.kpi.failed_delta,
             },
         }
     }

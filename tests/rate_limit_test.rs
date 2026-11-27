@@ -1,7 +1,16 @@
 //! 限流契约测试:opt-in 开启后,**同一 IP** 连发超 burst → 429 + 统一 `ErrorBody`。
 //! SmartIp 从 `X-Forwarded-For` 取 IP(oneshot 无 ConnectInfo,但带该 header 即可)。
 
+use axum::body;
+use baserust::app::{AppAuthService, AppContentService};
+use baserust::features::profile::{InMemoryProfileRepo, ProfileService, StaticAvatarProbe};
+use baserust::features::tenants::{StaticMemberProfiles, TenantAdminService};
+use baserust::features::users::{StaticProfileDirectory, UserAdminService};
+use baserust::features::widget::{EventBus, MemoryEventBus};
+use idm::{InMemoryMemberRepo, InMemoryTenantRepo};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -12,25 +21,24 @@ use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
 use baserust::infra::config::Config;
-use baserust::kernel::authz::Policy;
-use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
+use baserust::kernel::authorization::Policy;
+use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
-/// 内存 app + **限流开启**,配额由参数给(`per_sec` = 每秒补的令牌数,`burst` = 桶容量)。
-fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
-    let bus: Arc<dyn baserust::features::widget::EventBus> =
-        Arc::new(baserust::features::widget::MemoryEventBus::new());
+/// 内存 app + **限流开启**,配额由参数给(`per_second` = 每秒补的令牌数,`burst` = 桶容量)。
+fn rate_limited_app(per_second: u32, burst: u32) -> Router {
+    let bus: Arc<dyn EventBus> = Arc::new(MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
-            Arc::new(StaticUserDirectory::empty()),
+            Arc::new(StaticUserDirectory::new()),
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: baserust::features::profile::ProfileService::new(
-            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
+        profiles: ProfileService::new(
+            Arc::new(InMemoryProfileRepo::new()),
+            Arc::new(StaticAvatarProbe::new()),
         ),
-        contents: content::ContentService::new(
+        contents: AppContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
             Arc::new(content::InMemoryObjectStore::new()),
@@ -39,39 +47,42 @@ fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
         // 仅供 /health 用:此 fixture 的 AuthService 走 idm 默认 HS256 便捷构造,与 state 的
         // EdDSA token_verifier 算法不同 —— **不可扩展到登录/鉴权类断言**(HS256 签的 token 会被
         // EdDSA-only verifier 静默判空 scope 而非报错,假绿)。要打认证端点见 auth_api 的 fixture。
-        auth: AuthService::new(
-            Arc::new(InMemoryUserRepo::new()),
-            Arc::new(InMemorySessionRepo::new()),
-            Arc::new(InMemoryRoleRepo::new()),
-            Arc::new(idm::InMemoryMemberRepo::new()),
-            Arc::new(FakeHasher),
-            "test-secret",
-            900,
-            604_800,
+        auth: Arc::new(
+            AppAuthService::builder(
+                Arc::new(InMemoryUserRepo::new()),
+                Arc::new(InMemorySessionRepo::new()),
+                Arc::new(InMemoryRoleRepo::new()),
+                Arc::new(InMemoryMemberRepo::new()),
+            )
+            .hasher(FakeHasher)
+            .hs256_secret("test-secret")
+            .access_ttl(::time::Duration::seconds(900))
+            .refresh_ttl(::time::Duration::seconds(604_800))
+            .build(),
         ),
-        user_admin: baserust::features::users::UserAdminService::new(
+        user_admin: UserAdminService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemoryRoleRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
-            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            Arc::new(StaticProfileDirectory::new()),
             None,
         ),
-        tenant_admin: baserust::features::tenants::TenantAdminService::new(
-            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
-            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
-            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
-            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
-            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
-            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+        tenant_admin: TenantAdminService::new(
+            Arc::new(InMemoryTenantRepo::new()),
+            Arc::new(InMemoryMemberRepo::new()),
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(StaticMemberProfiles::new()),
             None,
         ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
         policy: Arc::new(Policy::default()),
-        token_signer: Some(Arc::new(AppTokenSigner::dev())),
-        token_verifier: Arc::new(AppTokenVerifier::dev()),
+        token_signer: Some(Arc::new(AppTokenSigner::new_with_development_key())),
+        token_verifier: Arc::new(AppTokenVerifier::new_with_development_key()),
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
@@ -81,7 +92,7 @@ fn rate_limited_app(per_sec: u32, burst: u32) -> Router {
     };
     let config = Config {
         rate_limit_enabled: true,
-        rate_limit_per_sec: per_sec,
+        rate_limit_per_second: per_second,
         rate_limit_burst: burst,
         ..Config::default()
     };
@@ -109,15 +120,15 @@ async fn over_burst_same_ip_gets_429_errorbody() {
     let mut body_429 = String::new();
     // burst=2、同 IP 连发 5 次 → 必触 429
     for _ in 0..5 {
-        let req = Request::get("/health")
+        let request = Request::get("/health")
             .header("x-forwarded-for", "1.2.3.4")
             .body(Body::empty())
             .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        last_status = resp.status();
+        let response = app.clone().oneshot(request).await.unwrap();
+        last_status = response.status();
         if last_status == StatusCode::TOO_MANY_REQUESTS {
             body_429 = String::from_utf8(
-                axum::body::to_bytes(resp.into_body(), usize::MAX)
+                body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap()
                     .to_vec(),
@@ -152,7 +163,7 @@ async fn per_sec_is_a_rate_not_an_interval() {
         "桶空,紧接着必 429"
     );
     // 300ms > 100ms 的补充间隔(留足余量抗抖动);若 period 被当成 10s,这里仍是 429 → 红。
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         hit(&app).await,
         StatusCode::OK,
@@ -165,30 +176,29 @@ async fn per_sec_is_a_rate_not_an_interval() {
 #[tokio::test]
 async fn zero_quota_does_not_panic_at_build() {
     let app = rate_limited_app(0, 0);
-    let s = hit(&app).await;
+    let status = hit(&app).await;
     assert!(
-        s == StatusCode::OK || s == StatusCode::TOO_MANY_REQUESTS,
-        "配 0 应能起且正常限流,得到 {s}"
+        status == StatusCode::OK || status == StatusCode::TOO_MANY_REQUESTS,
+        "配 0 应能起且正常限流,得到 {status}"
     );
 }
 
 #[tokio::test]
 async fn rate_limit_off_by_default_lets_all_through() {
     // Config::default() → rate_limit_enabled=false → 不挂限流,连发不 429。
-    let bus: Arc<dyn baserust::features::widget::EventBus> =
-        Arc::new(baserust::features::widget::MemoryEventBus::new());
+    let bus: Arc<dyn EventBus> = Arc::new(MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
-            Arc::new(StaticUserDirectory::empty()),
+            Arc::new(StaticUserDirectory::new()),
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: baserust::features::profile::ProfileService::new(
-            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
+        profiles: ProfileService::new(
+            Arc::new(InMemoryProfileRepo::new()),
+            Arc::new(StaticAvatarProbe::new()),
         ),
-        contents: content::ContentService::new(
+        contents: AppContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
             Arc::new(content::InMemoryObjectStore::new()),
@@ -197,39 +207,42 @@ async fn rate_limit_off_by_default_lets_all_through() {
         // 仅供 /health 用:此 fixture 的 AuthService 走 idm 默认 HS256 便捷构造,与 state 的
         // EdDSA token_verifier 算法不同 —— **不可扩展到登录/鉴权类断言**(HS256 签的 token 会被
         // EdDSA-only verifier 静默判空 scope 而非报错,假绿)。要打认证端点见 auth_api 的 fixture。
-        auth: AuthService::new(
-            Arc::new(InMemoryUserRepo::new()),
-            Arc::new(InMemorySessionRepo::new()),
-            Arc::new(InMemoryRoleRepo::new()),
-            Arc::new(idm::InMemoryMemberRepo::new()),
-            Arc::new(FakeHasher),
-            "test-secret",
-            900,
-            604_800,
+        auth: Arc::new(
+            AppAuthService::builder(
+                Arc::new(InMemoryUserRepo::new()),
+                Arc::new(InMemorySessionRepo::new()),
+                Arc::new(InMemoryRoleRepo::new()),
+                Arc::new(InMemoryMemberRepo::new()),
+            )
+            .hasher(FakeHasher)
+            .hs256_secret("test-secret")
+            .access_ttl(::time::Duration::seconds(900))
+            .refresh_ttl(::time::Duration::seconds(604_800))
+            .build(),
         ),
-        user_admin: baserust::features::users::UserAdminService::new(
+        user_admin: UserAdminService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemoryRoleRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
-            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            Arc::new(StaticProfileDirectory::new()),
             None,
         ),
-        tenant_admin: baserust::features::tenants::TenantAdminService::new(
-            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
-            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
-            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
-            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
-            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
-            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+        tenant_admin: TenantAdminService::new(
+            Arc::new(InMemoryTenantRepo::new()),
+            Arc::new(InMemoryMemberRepo::new()),
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(StaticMemberProfiles::new()),
             None,
         ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
         policy: Arc::new(Policy::default()),
-        token_signer: Some(Arc::new(AppTokenSigner::dev())),
-        token_verifier: Arc::new(AppTokenVerifier::dev()),
+        token_signer: Some(Arc::new(AppTokenSigner::new_with_development_key())),
+        token_verifier: Arc::new(AppTokenVerifier::new_with_development_key()),
         idm_outbox: None,
         auth_audit: None,
         auth_events_bus: None,
@@ -239,11 +252,11 @@ async fn rate_limit_off_by_default_lets_all_through() {
     };
     let app = build_router(state, &Config::default(), Mount::Both);
     for _ in 0..10 {
-        let resp = app
+        let response = app
             .clone()
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "默认关闭限流,不应 429");
+        assert_eq!(response.status(), StatusCode::OK, "默认关闭限流,不应 429");
     }
 }

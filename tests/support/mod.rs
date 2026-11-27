@@ -1,6 +1,6 @@
 //! conformance 测试的 PG 侧辅助:在 #[sqlx::test] 给的干净临时库里复刻 prod 的建库。
 //! (放 tests/support/ 子目录 → 不是独立 test target,由各 conformance `#[path]` 引入。)
-//! idm 的 conformance + bootstrap 已随 idm crate 迁出(见 crates/idm/tests),此处只剩 app 侧。
+//! idm 的 conformance + bootstrap 已随 idm 抽成独立库迁出(在 rust-idm 仓库的 `tests/`),此处只剩 app 侧。
 //!
 //! 账号拆分(spec §4.4)之后的形状:`#[sqlx::test]` 用 `DATABASE_URL` = **app_owner** 建临时库、跑迁移
 //! ([`bootstrap_app_schema`]);仓储用**运行时账号**(`APP_DB_USER`,非 owner、NOBYPASSRLS、只有 DML)
@@ -9,6 +9,7 @@
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, Executor, PgPool};
+use std::env;
 
 /// 编译期内嵌 migrations/app(相对 CARGO_MANIFEST_DIR)。唯一迁移真源,不复制 SQL。
 static APP_MIGRATOR: Migrator = sqlx::migrate!("migrations/app");
@@ -24,7 +25,7 @@ pub async fn bootstrap_app_schema(pool: &PgPool) -> anyhow::Result<()> {
 }
 
 fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
+    env::var(key)
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_owned())
@@ -38,23 +39,23 @@ fn env_or(key: &str, default: &str) -> String {
 pub async fn runtime_pool(owner: &PgPool) -> anyhow::Result<PgPool> {
     let user = env_or("APP_DB_USER", "app");
     let password = env_or("APP_DB_PASSWORD", "pwd");
-    let ident = format!("\"{}\"", user.replace('"', "\"\""));
+    let quoted_user = format!("\"{}\"", user.replace('"', "\"\""));
     owner
         .execute(AssertSqlSafe(format!(
-            "grant usage on schema app to {ident};
-             grant select, insert, update, delete on all tables in schema app to {ident};
-             grant usage, select on all sequences in schema app to {ident};"
+            "grant usage on schema app to {quoted_user};
+             grant select, insert, update, delete on all tables in schema app to {quoted_user};
+             grant usage, select on all sequences in schema app to {quoted_user};"
         )))
         .await?;
-    let opts = owner
+    let options = owner
         .connect_options()
         .as_ref()
         .clone()
         .username(&user)
         .password(&password);
-    let rt = PgPoolOptions::new()
+    let runtime_pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect_with(opts)
+        .connect_with(options)
         .await?;
     // 防呆:连上的必须是非 owner、不能绕过 RLS 的账号,否则这套 conformance 测的不是生产形状。
     let (is_owner, bypass): (bool, bool) = sqlx::query_as(
@@ -62,11 +63,11 @@ pub async fn runtime_pool(owner: &PgPool) -> anyhow::Result<PgPool> {
                          where n.nspname = 'app' and c.relowner = (select oid from pg_roles where rolname = current_user)),
                 (select rolbypassrls or rolsuper from pg_roles where rolname = current_user)",
     )
-    .fetch_one(&rt)
+    .fetch_one(&runtime_pool)
     .await?;
     anyhow::ensure!(
         !is_owner && !bypass,
         "运行时账号 {user} 不该拥有表 / 绕过 RLS(owner={is_owner} bypass={bypass})"
     );
-    Ok(rt)
+    Ok(runtime_pool)
 }

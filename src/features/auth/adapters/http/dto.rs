@@ -3,11 +3,13 @@
 //! idm 库零 HTTP、不认识这些 DTO —— 这里 `From<DTO> for idm::*Input` / `From<idm::UserView> for UserResponse` 做翻译。
 
 use garde::Validate;
+use idm::{ChangePasswordInput, LoginInput, Membership, RegisterInput, UpdateMeInput, UserView};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::kernel::authz::RoleName;
+use crate::infra::authorization::RoleNameSchema;
+use crate::kernel::authorization::RoleName;
 
 /// 注册请求(公开)。username 必填、唯一;email 可选;password 至少 3 位。
 #[derive(Debug, Deserialize, ToSchema, Validate)]
@@ -67,7 +69,7 @@ pub struct UserResponse {
     pub email: Option<String>,
     pub email_verified: bool,
     /// 角色名(闭集,生成前端 union)。
-    #[schema(value_type = Vec<crate::infra::authz::RoleNameSchema>)]
+    #[schema(value_type = Vec<RoleNameSchema>)]
     pub roles: Vec<RoleName>,
 }
 
@@ -85,71 +87,74 @@ pub struct MyTenantView {
     pub slug: String,
     pub name: String,
     /// 我在该租户内的角色(闭集,生成前端 union)。
-    #[schema(value_type = Vec<crate::infra::authz::RoleNameSchema>)]
+    #[schema(value_type = Vec<RoleNameSchema>)]
     pub roles: Vec<RoleName>,
     /// 是否是当前 token 所在的租户。
     pub current: bool,
 }
 
 impl MyTenantView {
-    pub fn from_membership(m: idm::Membership, current: Option<Uuid>) -> Self {
+    /// 把一条成员关系投影成列表元素;`current` 是当前 token 所在的租户(平台上下文为 `None`),
+    /// 用来标出 `current` 字段。闭集外的角色名被丢弃(`RoleName::parse_lossy`)。
+    #[must_use]
+    pub fn new_with_membership(membership: Membership, current: Option<Uuid>) -> Self {
         Self {
-            id: m.tenant.id,
-            slug: m.tenant.slug,
-            name: m.tenant.name,
-            roles: RoleName::parse_lossy(m.roles),
-            current: current == Some(m.tenant.id),
+            id: membership.tenant.id,
+            slug: membership.tenant.slug,
+            name: membership.tenant.name,
+            roles: RoleName::parse_lossy(membership.roles),
+            current: current == Some(membership.tenant.id),
         }
     }
 }
 
 // ── 边界转换:app DTO ↔ idm 领域类型 ──
 
-impl From<RegisterRequest> for idm::RegisterInput {
-    fn from(r: RegisterRequest) -> Self {
-        idm::RegisterInput {
-            username: r.username,
-            email: r.email,
-            password: r.password,
+impl From<RegisterRequest> for RegisterInput {
+    fn from(request: RegisterRequest) -> Self {
+        Self {
+            username: request.username,
+            email: request.email,
+            password: request.password,
         }
     }
 }
 
-impl From<LoginRequest> for idm::LoginInput {
-    fn from(r: LoginRequest) -> Self {
-        idm::LoginInput {
-            identifier: r.identifier,
-            password: r.password,
+impl From<LoginRequest> for LoginInput {
+    fn from(request: LoginRequest) -> Self {
+        Self {
+            identifier: request.identifier,
+            password: request.password,
         }
     }
 }
 
-impl From<UpdateMeRequest> for idm::UpdateMeInput {
-    fn from(r: UpdateMeRequest) -> Self {
-        idm::UpdateMeInput {
-            username: r.username,
-            email: r.email,
+impl From<UpdateMeRequest> for UpdateMeInput {
+    fn from(request: UpdateMeRequest) -> Self {
+        Self {
+            username: request.username,
+            email: request.email,
         }
     }
 }
 
-impl From<ChangePasswordRequest> for idm::ChangePasswordInput {
-    fn from(r: ChangePasswordRequest) -> Self {
-        idm::ChangePasswordInput {
-            current_password: r.current_password,
-            new_password: r.new_password,
+impl From<ChangePasswordRequest> for ChangePasswordInput {
+    fn from(request: ChangePasswordRequest) -> Self {
+        Self {
+            current_password: request.current_password,
+            new_password: request.new_password,
         }
     }
 }
 
-impl From<idm::UserView> for UserResponse {
-    fn from(u: idm::UserView) -> Self {
-        UserResponse {
-            id: u.id,
-            username: u.username,
-            email: u.email,
-            email_verified: u.email_verified,
-            roles: RoleName::parse_lossy(u.roles),
+impl From<UserView> for UserResponse {
+    fn from(view: UserView) -> Self {
+        Self {
+            id: view.id,
+            username: view.username,
+            email: view.email,
+            email_verified: view.email_verified,
+            roles: RoleName::parse_lossy(view.roles),
         }
     }
 }

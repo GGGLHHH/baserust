@@ -1,12 +1,15 @@
 //! tenants 的**领域模型**:租户读模型、成员读模型、命令(含校验规则)、闭集状态。
 //! 纯 Rust;请求 / 响应 JSON 形状在主 crate 的 `adapters::http::dto`。
 
+use std::str::FromStr;
+
 use garde::Validate;
+use idm::Tenant;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::kernel::authz::RoleName;
+use crate::kernel::authorization::RoleName;
 
 /// 租户状态(闭集)。`Suspended` = 停用:成员登录 / 切换 / refresh 都进不去(idm 判定)。
 /// wire 串与 idm 库里存的文本一致(`active` / `suspended`)。
@@ -19,8 +22,11 @@ pub enum TenantStatus {
 }
 
 impl TenantStatus {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
     pub const ALL: [TenantStatus; 2] = [TenantStatus::Active, TenantStatus::Suspended];
 
+    /// wire 串(== serde rename,也是 idm 库里存的文本)。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             TenantStatus::Active => "active",
@@ -29,19 +35,20 @@ impl TenantStatus {
     }
 }
 
-impl std::str::FromStr for TenantStatus {
+impl FromStr for TenantStatus {
     type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .into_iter()
-            .find(|v| v.as_str() == s)
-            .ok_or_else(|| format!("未知租户状态: {s}"))
+            .find(|v| v.as_str() == value)
+            .ok_or_else(|| format!("未知租户状态: {value}"))
     }
 }
 
 impl From<idm::TenantStatus> for TenantStatus {
-    fn from(s: idm::TenantStatus) -> Self {
-        match s {
+    fn from(status: idm::TenantStatus) -> Self {
+        match status {
             idm::TenantStatus::Active => TenantStatus::Active,
             idm::TenantStatus::Suspended => TenantStatus::Suspended,
         }
@@ -49,8 +56,8 @@ impl From<idm::TenantStatus> for TenantStatus {
 }
 
 impl From<TenantStatus> for idm::TenantStatus {
-    fn from(s: TenantStatus) -> Self {
-        match s {
+    fn from(status: TenantStatus) -> Self {
+        match status {
             TenantStatus::Active => idm::TenantStatus::Active,
             TenantStatus::Suspended => idm::TenantStatus::Suspended,
         }
@@ -67,8 +74,11 @@ pub enum MemberStatus {
 }
 
 impl MemberStatus {
+    /// 全部变体(FromStr 查表 / wire round-trip 测试用)。加变体必补这里。
     pub const ALL: [MemberStatus; 2] = [MemberStatus::Active, MemberStatus::Inactive];
 
+    /// wire 串(== serde rename,也是 idm 库里存的文本)。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             MemberStatus::Active => "active",
@@ -77,19 +87,20 @@ impl MemberStatus {
     }
 }
 
-impl std::str::FromStr for MemberStatus {
+impl FromStr for MemberStatus {
     type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .into_iter()
-            .find(|v| v.as_str() == s)
-            .ok_or_else(|| format!("未知成员状态: {s}"))
+            .find(|v| v.as_str() == value)
+            .ok_or_else(|| format!("未知成员状态: {value}"))
     }
 }
 
 impl From<idm::MemberStatus> for MemberStatus {
-    fn from(s: idm::MemberStatus) -> Self {
-        match s {
+    fn from(status: idm::MemberStatus) -> Self {
+        match status {
             idm::MemberStatus::Active => MemberStatus::Active,
             idm::MemberStatus::Inactive => MemberStatus::Inactive,
         }
@@ -107,15 +118,15 @@ pub struct TenantView {
     pub updated_at: OffsetDateTime,
 }
 
-impl From<idm::Tenant> for TenantView {
-    fn from(t: idm::Tenant) -> Self {
+impl From<Tenant> for TenantView {
+    fn from(tenant: Tenant) -> Self {
         Self {
-            id: t.id,
-            slug: t.slug,
-            name: t.name,
-            status: t.status.into(),
-            created_at: t.created_at,
-            updated_at: t.updated_at,
+            id: tenant.id,
+            slug: tenant.slug,
+            name: tenant.name,
+            status: tenant.status.into(),
+            created_at: tenant.created_at,
+            updated_at: tenant.updated_at,
         }
     }
 }
@@ -189,7 +200,7 @@ pub struct AddMember {
 /// 成员列表过滤。`q` = 用户名 / 显示名模糊搜索(仅投影 / search 后端支持;无后端 → 422)。
 #[derive(Debug, Clone, Default)]
 pub struct ListMembers {
-    pub q: Option<String>,
+    pub query: Option<String>,
 }
 
 #[cfg(test)]
@@ -198,27 +209,27 @@ mod tests {
 
     #[test]
     fn status_wire_round_trips() {
-        for s in TenantStatus::ALL {
-            let wire = serde_json::to_value(s).unwrap();
-            assert_eq!(wire.as_str(), Some(s.as_str()));
-            assert_eq!(s.as_str().parse::<TenantStatus>().unwrap(), s);
-            let idm: idm::TenantStatus = s.into();
-            assert_eq!(idm.as_str(), s.as_str(), "与 idm 存的文本一致");
-            assert_eq!(TenantStatus::from(idm), s);
+        for status in TenantStatus::ALL {
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire.as_str(), Some(status.as_str()));
+            assert_eq!(status.as_str().parse::<TenantStatus>().unwrap(), status);
+            let idm: idm::TenantStatus = status.into();
+            assert_eq!(idm.as_str(), status.as_str(), "与 idm 存的文本一致");
+            assert_eq!(TenantStatus::from(idm), status);
         }
-        for s in MemberStatus::ALL {
-            let wire = serde_json::to_value(s).unwrap();
-            assert_eq!(wire.as_str(), Some(s.as_str()));
-            assert_eq!(s.as_str().parse::<MemberStatus>().unwrap(), s);
+        for status in MemberStatus::ALL {
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire.as_str(), Some(status.as_str()));
+            assert_eq!(status.as_str().parse::<MemberStatus>().unwrap(), status);
         }
         assert!("deleted".parse::<TenantStatus>().is_err());
     }
 
     #[test]
     fn slug_rules() {
-        let ok = |s: &str| {
+        let ok = |slug: &str| {
             CreateTenant {
-                slug: s.into(),
+                slug: slug.into(),
                 name: "x".into(),
             }
             .validate()
@@ -232,4 +243,11 @@ mod tests {
             assert!(!ok(bad), "{bad}");
         }
     }
+}
+
+/// [`crate::features::tenants::TenantAdminService::resolve_add_member`] 的结果:要加进来的账号与它要拿的租户角色。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMember {
+    pub user_id: Uuid,
+    pub role_ids: Vec<Uuid>,
 }

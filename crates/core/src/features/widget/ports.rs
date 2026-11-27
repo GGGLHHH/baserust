@@ -1,7 +1,7 @@
 //! widget 的**端口**:核心对外要用的能力,定义成 trait,由适配器在外层实现、组合根注入。
-//! - [`WidgetRepo`] 仓储(实现:`adapters::memory` / `adapters::postgres`),**每个方法都带 `tenant`**
+//! - [`WidgetRepo`] 仓储(实现:`in_memory_widget_repo` / `adapters::pg_widget_repo`),**每个方法都带 `tenant`**
 //! - [`UserDirectory`] 跨模块富化要的用户目录(实现在组合根 `app/adapters/`,widget 不 import idm)
-//! - [`EventBus`] / [`EventSubscription`] 变更事件总线(实现:`adapters::memory` / `adapters::bus`)
+//! - [`EventBus`] / [`EventSubscription`] 变更事件总线(实现:`memory_event_bus` / `adapters::bus`)
 //!
 //! 端口归**消费方**:widget 只声明"我要什么",窄接口、typed 到自己的领域类型,不做通用总线。
 
@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::events::WidgetEvent;
 use super::model::{Widget, WidgetSortField};
-use crate::kernel::error::AppError;
+use super::widget_event::WidgetEvent;
+use crate::kernel::app_error::AppError;
 use crate::kernel::pagination::{Page, PageParams};
-use crate::kernel::sort::SortOrder;
-use crate::kernel::tenant::TenantId;
+use crate::kernel::sort_order::SortOrder;
+use crate::kernel::tenant_id::TenantId;
 
 /// 仓储端口。范式:trait 定义数据访问契约,service 依赖 trait 而非实现(内存 ↔ Postgres 可拔插)。
 /// 写操作的 `by` = 审计主体(created_by/updated_by),来自 `AuditContext`;时间由 DB default/触发器管。
@@ -24,7 +24,7 @@ use crate::kernel::tenant::TenantId;
 /// 读写都只落在这个租户里:别的租户的行一律当不存在(按 id 取 / 改 / 删 → `NotFound`,列表 / 计数不含,
 /// cursor 锚点 → `BadRequest`),名字唯一也只在租户内。
 /// - 内存实现没有 RLS,**这个参数是唯一防线**,每条路径都按它过滤;
-/// - PG 实现每个方法自己开 `infra::pg::tenant_tx`(事务级 `app.tenant_id`,RLS 兜底)并在 SQL 里**同时**写
+/// - PG 实现每个方法自己开 `infra::pg::tenant_transaction`(事务级 `app.tenant_id`,RLS 兜底)并在 SQL 里**同时**写
 ///   `tenant_id = $1`(走 `(tenant_id, …)` 索引)。
 #[async_trait]
 pub trait WidgetRepo: Send + Sync {
@@ -94,7 +94,7 @@ pub struct UserBrief {
 }
 
 /// widget 富化所需的用户目录端口:**一次**按 id 批量解析,防 N+1。
-/// 实现见 app/adapters(InProcess 进程内 / 将来 Http 分进程);测试用 `adapters::memory::StaticUserDirectory`。
+/// 实现见 app/adapters(InProcess 进程内 / 将来 Http 分进程);测试用 `static_user_directory::StaticUserDirectory`。
 #[async_trait]
 pub trait UserDirectory: Send + Sync {
     /// 批量解析 id→brief;查不到的 id **不在** map 里(交调用方降级)。

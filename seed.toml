@@ -1,8 +1,8 @@
 # idm 默认**租户 + 账号**(实例数据 + 密码)。`just seed` / 进程内 seed 读它幂等写进 idm。
 # `SEED_FILE` 可指外部文件覆盖(prod 换真账号/密码)。
 #
-# 角色集 / 权限集 / role→权限默认 **不在这里** —— 它们是代码闭集(crates/core/src/kernel/authz.rs 的
-# `RoleName` / `Perm`,不做动态 CRUD)。role→权限的运行期改动落 app schema 的 `role_permissions` 表。
+# 角色集 / 权限集 / role→权限默认 **不在这里** —— 它们是代码闭集(crates/core/src/kernel/authorization.rs 的
+# `RoleName` / `Permission`,不做动态 CRUD)。role→权限的运行期改动落 app schema 的 `role_permissions` 表。
 #
 # 角色分两类(`RoleName::scope()`):
 #   - 平台角色:写 `platform_roles`,跨租户。

@@ -9,13 +9,15 @@ use uuid::Uuid;
 
 use crate::features::profile::ProfileRepo;
 use crate::features::search::DisplayNameSource;
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
 
+/// search 重建 / 投影用的显示名来源:批量读 app 的 `ProfileRepo`。
 pub struct ProfileDisplayNames {
     repo: Arc<dyn ProfileRepo>,
 }
 
 impl ProfileDisplayNames {
+    #[must_use]
     pub fn new(repo: Arc<dyn ProfileRepo>) -> Self {
         Self { repo }
     }

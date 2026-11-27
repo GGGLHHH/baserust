@@ -9,6 +9,8 @@
 //! **连 search role**(`auth_event` 表在 search 库,跨运行共享)—— 每次运行用随机的远古时间窗(1990 年代)、
 //! 随机 event_seq / user_id / 搜索标记 / IP,与别的运行和真实数据互不干扰;结束时删掉本次造的行。
 
+use baserust::features::auth_audit::{AuthEventRow, InMemoryAuthEventRepo};
+use baserust::kernel::time_range::TimeRange;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -23,8 +25,8 @@ use uuid::Uuid;
 struct Fixture {
     /// 统计窗口起点(整点)。窗口 = [t, t+3h)。
     t: OffsetDateTime,
-    uid: Uuid,
-    uid2: Uuid,
+    user_id: Uuid,
+    other_user_id: Uuid,
     tag: String,
     ip_a: IpAddr,
     ip_b: IpAddr,
@@ -35,27 +37,37 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let n = Uuid::now_v7().as_u128();
+    let random_bits = Uuid::now_v7().as_u128();
     // 1990-01-01 起随机 0..~11 年的整点,作本次运行专属的远古时间窗。
-    let t = OffsetDateTime::from_unix_timestamp(631_152_000).unwrap()
-        + Duration::hours((n % 100_000) as i64);
-    let seq0 = (n % (i64::MAX as u128 / 2)) as i64;
-    let tag = format!("cf{:x}", n % 0xffff_ffff);
-    let ip_a = IpAddr::V4(Ipv4Addr::new(10, (n >> 8) as u8, (n >> 16) as u8, 1));
-    let ip_b = IpAddr::V4(Ipv4Addr::new(10, (n >> 8) as u8, (n >> 16) as u8, 2));
-    let uid = Uuid::now_v7();
-    let uid2 = Uuid::now_v7();
-    let mut seq = seq0;
-    let mut ev = |event_type: &str,
-                  channel: &str,
-                  at: OffsetDateTime,
-                  user: Option<Uuid>,
-                  outcome: &str,
-                  reason: Option<&str>,
-                  ip: IpAddr,
-                  actor: Option<String>,
-                  ident: Option<String>| {
-        seq += 1;
+    let window_start = OffsetDateTime::from_unix_timestamp(631_152_000).unwrap()
+        + Duration::hours((random_bits % 100_000) as i64);
+    let initial_sequence = (random_bits % (i64::MAX as u128 / 2)) as i64;
+    let tag = format!("cf{:x}", random_bits % 0xffff_ffff);
+    let ip_a = IpAddr::V4(Ipv4Addr::new(
+        10,
+        (random_bits >> 8) as u8,
+        (random_bits >> 16) as u8,
+        1,
+    ));
+    let ip_b = IpAddr::V4(Ipv4Addr::new(
+        10,
+        (random_bits >> 8) as u8,
+        (random_bits >> 16) as u8,
+        2,
+    ));
+    let user_id = Uuid::now_v7();
+    let other_user_id = Uuid::now_v7();
+    let mut sequence = initial_sequence;
+    let mut event = |event_type: &str,
+                     channel: &str,
+                     at: OffsetDateTime,
+                     user: Option<Uuid>,
+                     outcome: &str,
+                     reason: Option<&str>,
+                     ip: IpAddr,
+                     actor: Option<String>,
+                     identifier: Option<String>| {
+        sequence += 1;
         NewAuthEvent {
             id: Uuid::now_v7(),
             event_type: event_type.to_owned(),
@@ -63,7 +75,7 @@ fn fixture() -> Fixture {
             channel: channel.to_owned(),
             auth_method: "password".to_owned(),
             user_id: user,
-            identifier_attempted: ident,
+            identifier_attempted: identifier,
             session_id: None,
             actor,
             outcome: outcome.to_owned(),
@@ -73,49 +85,49 @@ fn fixture() -> Fixture {
             user_agent: Some("conformance".to_owned()),
             request_id: None,
             tenant_id: None,
-            event_seq: seq,
+            event_sequence: sequence,
         }
     };
-    let m = Duration::minutes;
+    let minutes = Duration::minutes;
     let mut events = vec![
         // 窗口外(一天前):保留期删除用
-        ev(
+        event(
             "auth.logged_out",
             "public",
-            t - Duration::days(1),
-            Some(uid),
+            window_start - Duration::days(1),
+            Some(user_id),
             "success",
             None,
             ip_a,
             None,
             None,
         ),
-        ev(
+        event(
             "auth.login_succeeded",
             "public",
-            t + m(10),
-            Some(uid),
+            window_start + minutes(10),
+            Some(user_id),
             "success",
             None,
             ip_a,
             Some(format!("alice-{tag}")),
             None,
         ),
-        ev(
+        event(
             "auth.login_failed",
             "public",
-            t + m(20),
-            Some(uid),
+            window_start + minutes(20),
+            Some(user_id),
             "failure",
             Some("bad_password"),
             ip_b,
             None,
             Some(format!("alice-{tag}")),
         ),
-        ev(
+        event(
             "auth.login_failed",
             "admin",
-            t + m(70),
+            window_start + minutes(70),
             None,
             "failure",
             Some("unknown_user"),
@@ -123,22 +135,22 @@ fn fixture() -> Fixture {
             None,
             Some(format!("ghost-{tag}")),
         ),
-        ev(
+        event(
             "auth.admin_access_denied",
             "admin",
-            t + m(80),
-            Some(uid2),
+            window_start + minutes(80),
+            Some(other_user_id),
             "failure",
             Some("no_admin_perm"),
             ip_a,
             Some(format!("bob-{tag}")),
             None,
         ),
-        ev(
+        event(
             "auth.refreshed",
             "public",
-            t + m(150),
-            Some(uid),
+            window_start + minutes(150),
+            Some(user_id),
             "success",
             None,
             ip_a,
@@ -151,9 +163,9 @@ fn fixture() -> Fixture {
     events[1].tenant_id = Some(tenant);
     events[5].tenant_id = Some(tenant);
     Fixture {
-        t,
-        uid,
-        uid2,
+        t: window_start,
+        user_id,
+        other_user_id,
         tag,
         ip_a,
         ip_b,
@@ -162,19 +174,19 @@ fn fixture() -> Fixture {
     }
 }
 
-fn ids(page: &Page<baserust::features::auth_audit::AuthEventRow>) -> Vec<Uuid> {
+fn ids(page: &Page<AuthEventRow>) -> Vec<Uuid> {
     page.items.iter().map(|r| r.id).collect()
 }
 
-fn total<T>(p: &Page<T>) -> Option<u64> {
-    match p.page_info {
+fn total<T>(page: &Page<T>) -> Option<u64> {
+    match page.page_info {
         PageInfo::Offset { total, .. } => total,
         PageInfo::Cursor { .. } => panic!("应是 offset 页"),
     }
 }
 
-fn next_after<T>(p: &Page<T>) -> Option<Uuid> {
-    match p.page_info {
+fn next_after<T>(page: &Page<T>) -> Option<Uuid> {
+    match page.page_info {
         PageInfo::Cursor { next_after, .. } => next_after,
         PageInfo::Offset { .. } => panic!("应是 cursor 页"),
     }
@@ -189,89 +201,93 @@ fn offset(size: u64) -> PageParams {
 }
 
 /// 多租户(spec §4.4 / §6.1):auth_event 记下事件所在的租户(读回来原样),没有租户的事件为 `None`。
-/// `page` = 按 `fx.uid` 列出的那一页(e5 / e2 / e1 / e0)。
-fn auth_event_records_tenant(
-    page: &Page<baserust::features::auth_audit::AuthEventRow>,
-    fx: &Fixture,
-) {
+/// `page` = 按 `fixture.user_id` 列出的那一页(e5 / e2 / e1 / e0)。
+fn auth_event_records_tenant(page: &Page<AuthEventRow>, fixture: &Fixture) {
     let by_id: HashMap<Uuid, Option<Uuid>> =
         page.items.iter().map(|r| (r.id, r.tenant_id)).collect();
-    let e = &fx.events;
-    assert_eq!(by_id[&e[1].id], Some(fx.tenant), "登录进租户的事件记租户");
-    assert_eq!(by_id[&e[5].id], Some(fx.tenant));
-    assert_eq!(by_id[&e[2].id], None, "登录失败没有租户");
-    assert_eq!(by_id[&e[0].id], None);
+    let events = &fixture.events;
+    assert_eq!(
+        by_id[&events[1].id],
+        Some(fixture.tenant),
+        "登录进租户的事件记租户"
+    );
+    assert_eq!(by_id[&events[5].id], Some(fixture.tenant));
+    assert_eq!(by_id[&events[2].id], None, "登录失败没有租户");
+    assert_eq!(by_id[&events[0].id], None);
 }
 
 /// 契约唯一真相源。返回窗口统计(PG 入口拿它与内存实现比对)。
-async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStats {
-    let e = &fx.events;
-    let id = |i: usize| e[i].id;
+async fn auth_event_contract(repo: &dyn AuthEventRepo, fixture: &Fixture) -> AuthStats {
+    let events = &fixture.events;
+    let id = |i: usize| events[i].id;
 
     // ── 1. 插入 + 幂等(同 event_seq 重投 → false,不重复) ──
-    for ev in e {
-        assert!(repo.insert(ev).await.unwrap(), "首次插入应为 true");
+    for event in events {
+        assert!(repo.insert(event).await.unwrap(), "首次插入应为 true");
     }
     assert!(
-        !repo.insert(&e[1]).await.unwrap(),
+        !repo.insert(&events[1]).await.unwrap(),
         "同 event_seq 重投应被幂等吞掉"
     );
 
     // ── 2. 按用户列:id 倒序 + total ──
-    let q = AuthEventQuery {
-        user_id: Some(fx.uid),
+    let query = AuthEventQuery {
+        user_id: Some(fixture.user_id),
         ..Default::default()
     };
-    let p = repo.list(&q, offset(10)).await.unwrap();
+    let page = repo.list(&query, offset(10)).await.unwrap();
     assert_eq!(
-        ids(&p),
+        ids(&page),
         vec![id(5), id(2), id(1), id(0)],
         "user 过滤 + id(v7,生成序)倒序"
     );
-    assert_eq!(total(&p), Some(4));
-    auth_event_records_tenant(&p, fx);
+    assert_eq!(total(&page), Some(4));
+    auth_event_records_tenant(&page, fixture);
 
     // ── 3. 类型过滤 ──
-    let q = AuthEventQuery {
-        user_id: Some(fx.uid),
+    let query = AuthEventQuery {
+        user_id: Some(fixture.user_id),
         event_type: Some(AuthEventType::LoginFailed),
         ..Default::default()
     };
-    assert_eq!(ids(&repo.list(&q, offset(10)).await.unwrap()), vec![id(2)]);
+    assert_eq!(
+        ids(&repo.list(&query, offset(10)).await.unwrap()),
+        vec![id(2)]
+    );
 
     // ── 4. 结果 + 联合模糊搜(大小写不敏感)+ 时间窗 ──
-    let q = AuthEventQuery {
+    let query = AuthEventQuery {
         outcome: Some(AuthOutcome::Failure),
-        q: Some(fx.tag.to_uppercase()),
-        from: Some(fx.t),
-        to: Some(fx.t + Duration::hours(3)),
+        query: Some(fixture.tag.to_uppercase()),
+        from: Some(fixture.t),
+        to: Some(fixture.t + Duration::hours(3)),
         ..Default::default()
     };
     assert_eq!(
-        ids(&repo.list(&q, offset(10)).await.unwrap()),
+        ids(&repo.list(&query, offset(10)).await.unwrap()),
         vec![id(4), id(3), id(2)]
     );
 
     // ── 5. IP 精确过滤(限定在本次窗口内) ──
-    let q = AuthEventQuery {
-        ip: Some(fx.ip_b),
-        from: Some(fx.t),
-        to: Some(fx.t + Duration::hours(3)),
+    let query = AuthEventQuery {
+        ip: Some(fixture.ip_b),
+        from: Some(fixture.t),
+        to: Some(fixture.t + Duration::hours(3)),
         ..Default::default()
     };
     assert_eq!(
-        ids(&repo.list(&q, offset(10)).await.unwrap()),
+        ids(&repo.list(&query, offset(10)).await.unwrap()),
         vec![id(3), id(2)]
     );
 
     // ── 6. keyset 分页(按 id 倒序翻,末页无 next) ──
-    let q = AuthEventQuery {
-        q: Some(fx.tag.clone()),
+    let query = AuthEventQuery {
+        query: Some(fixture.tag.clone()),
         ..Default::default()
     };
-    let p1 = repo
+    let first_page = repo
         .list(
-            &q,
+            &query,
             PageParams::Cursor {
                 after: None,
                 limit: 2,
@@ -279,11 +295,11 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
         )
         .await
         .unwrap();
-    assert_eq!(ids(&p1), vec![id(4), id(3)]);
-    let next = next_after(&p1).expect("还有下一页");
-    let p2 = repo
+    assert_eq!(ids(&first_page), vec![id(4), id(3)]);
+    let next = next_after(&first_page).expect("还有下一页");
+    let second_page = repo
         .list(
-            &q,
+            &query,
             PageParams::Cursor {
                 after: Some(next),
                 limit: 2,
@@ -291,11 +307,17 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
         )
         .await
         .unwrap();
-    assert_eq!(ids(&p2), vec![id(2), id(1)]);
-    assert_eq!(next_after(&p2), None, "末页不应有 next");
+    assert_eq!(ids(&second_page), vec![id(2), id(1)]);
+    assert_eq!(next_after(&second_page), None, "末页不应有 next");
 
     // ── 7. 仪表盘统计 [t, t+3h) ──
-    let stats = repo.stats(fx.t, fx.t + Duration::hours(3)).await.unwrap();
+    let stats = repo
+        .stats(TimeRange {
+            from: fixture.t,
+            to: fixture.t + Duration::hours(3),
+        })
+        .await
+        .unwrap();
     let buckets: Vec<(i64, i64)> = stats
         .activity
         .iter()
@@ -306,7 +328,7 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
         vec![(1, 1), (0, 2), (1, 0), (0, 0)],
         "小时桶零填充、两端含"
     );
-    assert_eq!(stats.activity[0].t, fx.t);
+    assert_eq!(stats.activity[0].bucket_start, fixture.t);
     let types: HashMap<String, i64> = stats
         .types
         .iter()
@@ -341,7 +363,10 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
         .collect();
     assert_eq!(
         ips,
-        vec![(fx.ip_b.to_string(), 2, 2), (fx.ip_a.to_string(), 1, 3)],
+        vec![
+            (fixture.ip_b.to_string(), 2, 2),
+            (fixture.ip_a.to_string(), 1, 3)
+        ],
         "失败多的 IP 在前"
     );
     assert_eq!(stats.kpi.total_events, 5);
@@ -350,28 +375,28 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
     assert_eq!(stats.kpi.total_delta, 0.0, "上个等长窗口为 0 → 记 0.0");
 
     // ── 8. 保留期删除:删 occurred_at < t 的行(本次的 e_old;共享库里更早的残留也可能一起删) ──
-    let deleted = repo.delete_older_than(fx.t).await.unwrap();
+    let deleted = repo.delete_older_than(fixture.t).await.unwrap();
     assert!(deleted >= 1, "至少删掉 e_old");
-    let q = AuthEventQuery {
-        user_id: Some(fx.uid),
+    let query = AuthEventQuery {
+        user_id: Some(fixture.user_id),
         ..Default::default()
     };
     assert_eq!(
-        ids(&repo.list(&q, offset(10)).await.unwrap()),
+        ids(&repo.list(&query, offset(10)).await.unwrap()),
         vec![id(5), id(2), id(1)]
     );
-    let q = AuthEventQuery {
-        user_id: Some(fx.uid2),
+    let query = AuthEventQuery {
+        user_id: Some(fixture.other_user_id),
         ..Default::default()
     };
     assert_eq!(
-        ids(&repo.list(&q, offset(10)).await.unwrap()),
+        ids(&repo.list(&query, offset(10)).await.unwrap()),
         vec![id(4)],
         "窗口内的行不受影响"
     );
 
     // 清场:本次的行都在 t+1 天之前(1990 年代),真实数据不会这么老
-    repo.delete_older_than(fx.t + Duration::days(1))
+    repo.delete_older_than(fixture.t + Duration::days(1))
         .await
         .unwrap();
     stats
@@ -379,7 +404,7 @@ async fn auth_event_contract(repo: &dyn AuthEventRepo, fx: &Fixture) -> AuthStat
 
 #[tokio::test]
 async fn memory_satisfies_auth_event_contract() {
-    let repo = baserust::features::auth_audit::InMemoryAuthEventRepo::new();
+    let repo = InMemoryAuthEventRepo::new();
     auth_event_contract(&repo, &fixture()).await;
 }
 
@@ -387,29 +412,31 @@ async fn memory_satisfies_auth_event_contract() {
 mod pg {
     use super::*;
     use baserust::features::auth_audit::{InMemoryAuthEventRepo, PgAuthEventRepo};
+    use sqlx::PgPool;
+    use std::env;
 
     /// 统计里 `ORDER BY count DESC` 的并列顺序未定义 → 比对前按 (count 降序, key) 归一。
-    fn normalized(mut s: AuthStats) -> AuthStats {
-        s.types.sort_by(|a, b| {
+    fn normalized(mut stats: AuthStats) -> AuthStats {
+        stats.types.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
                 .then(a.key.as_str().cmp(b.key.as_str()))
         });
-        s.reasons.sort_by(|a, b| {
+        stats.reasons.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
                 .then(a.key.as_str().cmp(b.key.as_str()))
         });
-        s
+        stats
     }
 
     /// 迁移用 owner(`SEARCH_OWNER_DATABASE_URL`,幂等),契约跑在 **system 账号**上
     /// (`SEARCH_SYSTEM_DATABASE_URL`:auth_event 是平台级表,读写都只走 search_system 池 —— 和生产一样)。
-    async fn connect() -> sqlx::PgPool {
-        let owner_url = std::env::var("SEARCH_OWNER_DATABASE_URL").unwrap_or_else(|_| {
+    async fn connect() -> PgPool {
+        let owner_url = env::var("SEARCH_OWNER_DATABASE_URL").unwrap_or_else(|_| {
             "postgres://search_owner:pwd@localhost:5821/baserust?sslmode=disable".into()
         });
-        let owner = sqlx::PgPool::connect(&owner_url).await.expect(
+        let owner = PgPool::connect(&owner_url).await.expect(
             "连 search_owner 失败(先 `just up` + `just db-ensure-roles` + `just migrate-search`)",
         );
         sqlx::migrate!("migrations/search")
@@ -417,23 +444,23 @@ mod pg {
             .await
             .expect("跑 migrations/search 失败(幂等,应可重复跑)");
         owner.close().await;
-        let url = std::env::var("SEARCH_SYSTEM_DATABASE_URL").unwrap_or_else(|_| {
+        let url = env::var("SEARCH_SYSTEM_DATABASE_URL").unwrap_or_else(|_| {
             "postgres://search_system:pwd@localhost:5821/baserust?sslmode=disable".into()
         });
-        sqlx::PgPool::connect(&url)
+        PgPool::connect(&url)
             .await
             .expect("连 search_system 账号失败(先 `just up` + `just db-ensure-roles`)")
     }
 
     #[tokio::test]
     async fn pg_satisfies_auth_event_contract_and_matches_memory_stats() {
-        let fx = fixture();
+        let fixture = fixture();
         let pg = PgAuthEventRepo::new(connect().await);
-        let pg_stats = auth_event_contract(&pg, &fx).await;
-        let mem_stats = auth_event_contract(&InMemoryAuthEventRepo::new(), &fx).await;
+        let pg_stats = auth_event_contract(&pg, &fixture).await;
+        let memory_stats = auth_event_contract(&InMemoryAuthEventRepo::new(), &fixture).await;
         assert_eq!(
             normalized(pg_stats),
-            normalized(mem_stats),
+            normalized(memory_stats),
             "内存与 PG 的统计口径应完全一致"
         );
     }

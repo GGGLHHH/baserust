@@ -732,7 +732,6 @@ name = "baserust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
  "async-nats",
  "async-trait",
  "aws-config",
@@ -753,15 +752,12 @@ dependencies = [
  "jsonwebtoken",
  "metrics",
  "metrics-process",
- "rand 0.8.6",
  "reqwest",
  "sea-query",
  "sea-query-sqlx",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sqlx",
- "thiserror 2.0.18",
  "time",
  "tokio",
  "toml",
@@ -1006,8 +1002,8 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "content"
-version = "0.4.0"
-source = "git+https://github.com/GGGLHHH/rust-content?rev=fa3e600#fa3e6007c1ab294578e50ab2886a1e8a659ec790"
+version = "0.5.0"
+source = "git+https://github.com/GGGLHHH/rust-content?rev=75f4e1b#75f4e1ba637f9569b0f6c62d3eecb06111e34c30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1018,7 +1014,6 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "time",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -2177,8 +2172,8 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm"
-version = "0.6.0"
-source = "git+https://github.com/GGGLHHH/rust-idm?rev=00f4e4d#00f4e4ded6b5596852cb5c054d94aba0f4f95aca"
+version = "0.7.0"
+source = "git+https://github.com/GGGLHHH/rust-idm?rev=7f5eaf4#7f5eaf410ab645b036ac8a92499e002954affb0f"
 dependencies = [
  "anyhow",
  "argon2",

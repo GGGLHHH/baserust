@@ -1,0 +1,368 @@
+//! auth_event 投影器(**驱动侧适配器**):消费 JetStream events.idm.auth.*,投影成 auth_event 读模型。
+//! 消息格式(envelope / data)只活在这个文件;解析后交给领域(`to_row` 闭集校验)与仓储端口。
+//! 骨架(Envelope/ApplyError/connect/run)镜像 features::search::projector;仅 apply_message 换成 auth 版。
+
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use anyhow::Context;
+use async_nats::jetstream;
+use async_nats::jetstream::consumer::{pull, AckPolicy, Consumer};
+use futures_util::StreamExt;
+use serde::Deserialize;
+use serde_json::Value;
+use time::OffsetDateTime;
+use tokio::sync::watch;
+// 别名:本文件还用着 `time` crate(`OffsetDateTime`、serde 的 `time::serde::rfc3339`)。
+use tokio::time as tokio_time;
+use uuid::Uuid;
+
+use crate::features::auth_audit::auth_event_bus::AuthEventBus;
+use crate::features::auth_audit::auth_event_repo::AuthEventRepo;
+use crate::features::auth_audit::model::{to_row, AuthEventRow, AuthEventType, NewAuthEvent};
+use crate::infra::jet_stream_publisher::{DurableConsumer, STREAM_NAME};
+use crate::infra::monitor::ProjectorOutcome;
+use crate::infra::telemetry;
+use crate::kernel::app_error::AppError;
+
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    r#type: String,
+    seq: i64,
+    /// 信封上的租户(`infra::outbox::build_outbox_item` 从 payload 抄出来的);老格式没有这个键 → None。
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
+    data: Value,
+}
+
+/// envelope.data 的形状(handler 发射时组装,见 Task 7)。缺省字段 = null。
+#[derive(Debug, Deserialize)]
+struct AuthEventData {
+    #[serde(with = "time::serde::rfc3339")]
+    occurred_at: OffsetDateTime,
+    channel: String,
+    outcome: String,
+    #[serde(default = "default_method")]
+    auth_method: String,
+    #[serde(default)]
+    user_id: Option<Uuid>,
+    #[serde(default)]
+    identifier_attempted: Option<String>,
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    failure_reason: Option<String>,
+    #[serde(default)]
+    ip: Option<IpAddr>,
+    #[serde(default)]
+    forwarded_chain: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    /// 事件所在的租户(emit 时写进 payload;信封上那份是它的拷贝)。没有 = 平台上下文 / 登录失败。
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
+}
+fn default_method() -> String {
+    "password".into()
+}
+
+/// `apply_message` 的失败分类 —— 决定 ack 与否(语义同 search projector)。
+#[derive(Debug)]
+enum ApplyError {
+    /// 永不可投(payload 损坏 / 闭集外取值):ack 跳过,重投只会死循环。
+    Poison(String),
+    /// 暂时故障(仓储写失败):不 ack,等重投。
+    Transient(AppError),
+}
+
+/// JetStream durable pull consumer + 投影仓储。持有装配好的 consumer 句柄,`run` 消费到停。
+pub struct AuthEventProjector {
+    /// durable 消费者名(指标 / 链路标签)。
+    name: String,
+    consumer: Consumer<pull::Config>,
+    repo: Arc<dyn AuthEventRepo>,
+    /// 落库成功后发布给 SSE 订阅者(`/admin/auth/auth-events/stream`)。`None` = 非 needs_idm 进程。
+    bus: Option<AuthEventBus>,
+}
+
+impl AuthEventProjector {
+    /// 连 NATS + 绑定/创建 durable pull consumer(ack 显式);只收 `events.idm.auth.>` 主题,
+    /// 与 search projector(无 filter,收全量)井水不犯河水。
+    pub async fn try_new(
+        consumer: DurableConsumer<'_>,
+        repo: Arc<dyn AuthEventRepo>,
+        bus: Option<AuthEventBus>,
+    ) -> anyhow::Result<Self> {
+        let DurableConsumer {
+            nats_url,
+            durable_name,
+        } = consumer;
+        let client = async_nats::connect(nats_url)
+            .await
+            .with_context(|| format!("连接 NATS 失败: {nats_url}"))?;
+        let jetstream_context = jetstream::new(client);
+        let stream = jetstream_context
+            .get_stream(STREAM_NAME)
+            .await
+            .with_context(|| format!("获取 JetStream 流 {STREAM_NAME} 失败"))?;
+        let consumer = stream
+            .get_or_create_consumer(
+                durable_name,
+                pull::Config {
+                    durable_name: Some(durable_name.to_owned()),
+                    ack_policy: AckPolicy::Explicit,
+                    filter_subject: "events.idm.auth.>".to_owned(), // 只收 auth 主题
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("创建/绑定 durable consumer {durable_name} 失败"))?;
+        Ok(Self {
+            name: durable_name.to_owned(),
+            consumer,
+            repo,
+            bus,
+        })
+    }
+
+    /// 后台循环:拉消息 → `apply_message` → 成功 ack,失败留待重投;`shutdown` 置位即退出。
+    /// **与 `search::projector::Projector::run` 的差异**:审计事件 append-only(`insert` 按
+    /// `event_seq` 幂等),无 per-user 水位覆盖问题,故这里**刻意不做**保序退避重试 / ack_wait
+    /// 续期(search 侧那套是为防"跳过本条→更大 seq 推高水位→本条重投被丢弃"的字段丢失)。
+    /// 慢 apply 触发的 ack_wait 重投由 `event_seq` 幂等吞掉(重复无害),无需续期。
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        use tracing::Instrument;
+
+        let mut messages = match self.consumer.messages().await {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::error!(error = %error, "projector 无法建立消息流,退出");
+                return;
+            }
+        };
+
+        let mut pending_tick = tokio_time::interval(telemetry::CONSUMER_INFO_INTERVAL);
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            tokio::select! {
+                _ = pending_tick.tick() => {
+                    telemetry::record_consumer_pending(&self.consumer, &self.name).await;
+                }
+                maybe = messages.next() => {
+                    let Some(received) = maybe else { break };
+                    let message = match received {
+                        Ok(message) => message,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "projector 拉取消息失败,跳过本条");
+                            continue;
+                        }
+                    };
+                    // 成功 / 毒消息 → ack(毒消息永不可投,重投无意义、只会死循环);暂时故障 → 不 ack、等重投。
+                    let span = telemetry::projector_span(&self.name);
+                    let mut outcome = ProjectorOutcome::Ok;
+                    let should_ack = match Self::apply_message(&*self.repo, &message.payload).instrument(span).await {
+                        Ok(row) => {
+                            // SSE 推送:发布失败(无订阅者)不影响落库结果,fire-and-forget。
+                            if let (Some(bus), Some(row)) = (&self.bus, row) {
+                                bus.publish(row);
+                            }
+                            true
+                        }
+                        Err(ApplyError::Poison(why)) => {
+                            tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
+                            outcome = ProjectorOutcome::Poison;
+                            true
+                        }
+                        Err(ApplyError::Transient(error)) => {
+                            tracing::warn!(error = %error, "projector apply 暂时失败,不 ack、等重投");
+                            outcome = ProjectorOutcome::Transient;
+                            false
+                        }
+                    };
+                    telemetry::record_projector_message(&self.name, outcome, &message);
+                    if should_ack {
+                        if let Err(error) = message.ack().await {
+                            tracing::warn!(error = %error, "projector ack 失败");
+                        }
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 纯路由逻辑(单测入口,不碰 NATS):解 envelope → 非 `auth.*` 忽略(前向兼容)→
+    /// 解 `data` → 组装 `NewAuthEvent` → `repo.insert`。成功落库 → `Some(row)`(供 `run()` 发布 SSE);
+    /// 非 auth.* 忽略 → `None`。
+    async fn apply_message(
+        repo: &dyn AuthEventRepo,
+        payload: &[u8],
+    ) -> Result<Option<AuthEventRow>, ApplyError> {
+        let envelope: Envelope = serde_json::from_slice(payload)
+            .map_err(|e| ApplyError::Poison(format!("envelope 反序列化: {e}")))?;
+        if !envelope.r#type.starts_with("auth.") {
+            return Ok(None); // 非 auth 事件,忽略(前向兼容)
+        }
+        // 未知 auth.* 子类型 ≠ 毒消息:多半是滚动升级窗口里新版本 emitter 发的合法新事件,
+        // 与"非 auth.* 忽略"同属前向兼容 —— warn + 跳过(该类型的投影缺口随 projector 升级补齐),
+        // 不标 Poison(那是 payload 损坏专用)。
+        let known_type: Result<AuthEventType, _> = envelope.r#type.parse();
+        if known_type.is_err() {
+            tracing::warn!(event_type = %envelope.r#type, "未知 auth.* 事件类型,前向兼容跳过(projector 落后于 emitter?)");
+            return Ok(None);
+        }
+        let data: AuthEventData = serde_json::from_value(envelope.data)
+            .map_err(|e| ApplyError::Poison(format!("{} data: {e}", envelope.r#type)))?;
+        let new = NewAuthEvent {
+            id: Uuid::now_v7(),
+            event_type: envelope.r#type,
+            occurred_at: data.occurred_at,
+            channel: data.channel,
+            auth_method: data.auth_method,
+            user_id: data.user_id,
+            identifier_attempted: data.identifier_attempted,
+            session_id: data.session_id,
+            actor: data.actor,
+            outcome: data.outcome,
+            failure_reason: data.failure_reason,
+            ip: data.ip,
+            forwarded_chain: data.forwarded_chain,
+            user_agent: data.user_agent,
+            request_id: data.request_id,
+            // payload 为准,信封兜底;nil 不是合法租户,当没有。
+            tenant_id: data
+                .tenant_id
+                .or(envelope.tenant_id)
+                .filter(|tenant| !tenant.is_nil()),
+            event_sequence: envelope.seq,
+        };
+        // 闭集校验在信任边界:to_row 是唯一解析权威,wire 串不在枚举内 → Poison
+        // (语义非法的 payload 不落库、不 panic)。
+        let row = to_row(&new).map_err(ApplyError::Poison)?;
+        let inserted = repo.insert(&new).await.map_err(ApplyError::Transient)?;
+        // 重投被幂等吞掉 → 不再 SSE 发布(row.id 是本次新造的,库里根本不存在)。
+        Ok(inserted.then_some(row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::features::auth_audit::InMemoryAuthEventRepo;
+
+    fn envelope(sequence: i64, event_type: &str, data: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "event_id": format!("idm-{sequence}"), "schema": "idm", "type": event_type,
+            "aggregate_id": "00000000-0000-0000-0000-000000000000", "seq": sequence, "data": data,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn projects_login_succeeded_and_is_idempotent() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        let user_id = Uuid::now_v7();
+        let payload = envelope(
+            7,
+            "auth.login_succeeded",
+            json!({
+                "occurred_at": "2026-07-08T10:00:00Z", "channel": "public", "outcome": "success",
+                "user_id": user_id, "session_id": Uuid::now_v7(), "identifier_attempted": null,
+                "failure_reason": null, "ip": null, "forwarded_chain": null, "user_agent": null, "request_id": null,
+            }),
+        );
+        AuthEventProjector::apply_message(repo.as_ref(), &payload)
+            .await
+            .unwrap();
+        AuthEventProjector::apply_message(repo.as_ref(), &payload)
+            .await
+            .unwrap(); // 同 seq 幂等
+        assert_eq!(repo.len(), 1);
+    }
+
+    /// 多租户:事件带 `tenant_id`(payload 里)→ 落行记下;没带 → None;`auth.tenant_switched` 是已知类型。
+    #[tokio::test]
+    async fn auth_event_records_tenant() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        let tenant = Uuid::now_v7();
+        let row = AuthEventProjector::apply_message(
+            repo.as_ref(),
+            &envelope(
+                1,
+                "auth.tenant_switched",
+                json!({
+                    "occurred_at": "2026-11-25T10:00:00Z", "channel": "public", "outcome": "success",
+                    "user_id": Uuid::now_v7(), "tenant_id": tenant,
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("已知类型应落库");
+        assert_eq!(row.event_type, AuthEventType::TenantSwitched);
+        assert_eq!(row.tenant_id, Some(tenant));
+
+        let row = AuthEventProjector::apply_message(
+            repo.as_ref(),
+            &envelope(
+                2,
+                "auth.login_failed",
+                json!({
+                    "occurred_at": "2026-11-25T10:00:00Z", "channel": "public", "outcome": "failure",
+                    "failure_reason": "bad_password",
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.tenant_id, None, "登录失败没有租户");
+    }
+
+    #[tokio::test]
+    async fn unknown_type_is_ignored_bad_payload_is_poison() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        // 非 auth.* → 忽略(Ok)
+        AuthEventProjector::apply_message(repo.as_ref(), &envelope(1, "user.created", json!({})))
+            .await
+            .unwrap();
+        // auth.* 但 data 坏 → Poison
+        let bad = envelope(2, "auth.login_succeeded", json!({"channel": 123}));
+        assert!(matches!(
+            AuthEventProjector::apply_message(repo.as_ref(), &bad).await,
+            Err(ApplyError::Poison(_))
+        ));
+        assert_eq!(repo.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn semantically_bad_enum_string_is_poison_not_panic() {
+        let repo = Arc::new(InMemoryAuthEventRepo::new());
+        // 类型上合法(String)但语义非法(不在闭集内)→ Poison,不落库、不 panic。
+        let payload = envelope(
+            99,
+            "auth.login_succeeded",
+            json!({
+                "occurred_at": "2026-07-08T10:00:00Z", "channel": "totally-bogus", "outcome": "success",
+                "user_id": null, "session_id": null, "identifier_attempted": null,
+                "failure_reason": null, "ip": null, "forwarded_chain": null, "user_agent": null, "request_id": null,
+            }),
+        );
+        let result = AuthEventProjector::apply_message(repo.as_ref(), &payload).await;
+        assert!(matches!(result, Err(ApplyError::Poison(_))));
+        assert_eq!(repo.len(), 0);
+    }
+}

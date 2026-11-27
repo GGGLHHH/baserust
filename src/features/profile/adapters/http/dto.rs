@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::features::profile::model;
+use crate::features::profile::model::{ProfileView, PutProfile};
 
 /// PUT 入参 —— **全量替换**:字段 null/缺省 = 清空(PUT 语义;不是 PATCH 的"跳过不改")。
 /// display_name / phone 最长 255;phone 只做长度不做 E.164。
@@ -18,19 +18,18 @@ pub struct PutProfileRequest {
     pub avatar_content_id: Option<Uuid>,
 }
 
-impl From<PutProfileRequest> for model::PutProfile {
-    fn from(r: PutProfileRequest) -> Self {
+impl From<PutProfileRequest> for PutProfile {
+    fn from(request: PutProfileRequest) -> Self {
         Self {
-            display_name: r.display_name,
-            phone: r.phone,
-            avatar_content_id: r.avatar_content_id,
+            display_name: request.display_name,
+            phone: request.phone,
+            avatar_content_id: request.avatar_content_id,
         }
     }
 }
 
 /// 传头像的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。
 #[derive(Debug, ToSchema)]
-#[allow(dead_code)] // 仅供 utoipa 生成 request_body schema,不实际反序列化
 pub struct AvatarForm {
     /// 图片本体(必填,带 filename + content-type,须 image/*)。
     #[schema(value_type = String, format = Binary)]
@@ -56,16 +55,16 @@ pub struct ProfileResponse {
     pub updated_at: Option<OffsetDateTime>,
 }
 
-impl From<model::ProfileView> for ProfileResponse {
-    fn from(v: model::ProfileView) -> Self {
+impl From<ProfileView> for ProfileResponse {
+    fn from(view: ProfileView) -> Self {
         Self {
-            user_id: v.user_id,
-            display_name: v.display_name,
-            phone: v.phone,
-            avatar_content_id: v.avatar_content_id,
-            avatar_url: v.avatar_url,
-            created_at: v.created_at,
-            updated_at: v.updated_at,
+            user_id: view.user_id,
+            display_name: view.display_name,
+            phone: view.phone,
+            avatar_content_id: view.avatar_content_id,
+            avatar_url: view.avatar_url,
+            created_at: view.created_at,
+            updated_at: view.updated_at,
         }
     }
 }

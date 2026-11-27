@@ -6,7 +6,7 @@ mod routes;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
 /// 平台级租户管理:admin 组下 nest `/platform`(组闸 = 后台准入;端点内再 gate `tenants:admin`)。
 pub fn platform_router() -> OpenApiRouter<AppState> {

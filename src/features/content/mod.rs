@@ -2,7 +2,7 @@
 //! 本模块只拥有它的**驱动侧适配器**:HTTP handler(`adapters::http::routes`)+ 线格式
 //! (`adapters::http::dto`,投影库的领域类型、入参校验)。
 //!
-//! 库的 service 在组合根 `app::state` 装配(注入内存/PG 仓储 + minio/内存 ObjectStore),经
+//! 库的 service 在组合根 `app::app_state` 装配(注入内存/PG 仓储 + minio/内存 ObjectStore),经
 //! `AppState.contents` 取用。
 
 pub mod adapters;

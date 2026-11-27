@@ -22,13 +22,14 @@
 
 mod http_support;
 
+use idm::RoleScope;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use baserust::kernel::authz::{Perm, Policy, RoleName};
-use http_support::DEFAULT_TENANT;
+use baserust::kernel::authorization::{Permission, Policy, RoleName};
 use http_support::{
-    expect, expect_error, expect_json, mint, Client, TestServer, ADMIN, PASSWORD, SUPERADMIN, USER,
+    expect, expect_error, expect_json, mint, Client, TestServer, ADMIN, DEFAULT_TENANT, PASSWORD,
+    SUPERADMIN, USER,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
@@ -48,22 +49,22 @@ const NIL: &str = "00000000-0000-0000-0000-000000000000";
 
 /// 起服务(seed 策略)+ 已登录后台的 superadmin 会话(cookie)。
 async fn start() -> (TestServer, Client) {
-    let s = TestServer::start().await;
-    let sa = s.login_admin(SUPERADMIN, PASSWORD).await;
-    (s, sa)
+    let server = TestServer::start().await;
+    let superadmin = server.login_admin(SUPERADMIN, PASSWORD).await;
+    (server, superadmin)
 }
 
 /// 角色名 → 角色 id(经 `GET /roles` 目录解析;角色按 id 提交)。
-async fn role_ids(c: &Client, names: &[&str]) -> Vec<String> {
-    let v = expect_json(c.get(ROLES).await, StatusCode::OK).await;
-    let items = v["items"].as_array().expect("items 应是数组");
+async fn role_ids(client: &Client, names: &[&str]) -> Vec<String> {
+    let catalog = expect_json(client.get(ROLES).await, StatusCode::OK).await;
+    let items = catalog["items"].as_array().expect("items 应是数组");
     names
         .iter()
-        .map(|n| {
+        .map(|name| {
             items
                 .iter()
-                .find(|r| r["name"] == *n)
-                .unwrap_or_else(|| panic!("角色目录缺 {n}: {v}"))["id"]
+                .find(|r| r["name"] == *name)
+                .unwrap_or_else(|| panic!("角色目录缺 {name}: {catalog}"))["id"]
                 .as_str()
                 .unwrap()
                 .to_owned()
@@ -73,15 +74,15 @@ async fn role_ids(c: &Client, names: &[&str]) -> Vec<String> {
 
 /// 建号(断言 201),返回响应体。`roles` 是角色**名**,内部解析成 id。
 async fn create(
-    c: &Client,
+    client: &Client,
     username: &str,
     email: Option<&str>,
     password: &str,
     roles: &[&str],
 ) -> Value {
-    let ids = role_ids(c, roles).await;
+    let ids = role_ids(client, roles).await;
     expect_json(
-        c.post_json(
+        client.post_json(
             USERS,
             &json!({ "username": username, "email": email, "password": password, "roles": ids }),
         )
@@ -92,55 +93,60 @@ async fn create(
 }
 
 /// 建号(无 email,密码 `password123`),返回新 id。
-async fn create_id(c: &Client, username: &str, roles: &[&str]) -> String {
-    let v = create(c, username, None, "password123", roles).await;
-    v["id"].as_str().unwrap().to_owned()
+async fn create_id(client: &Client, username: &str, roles: &[&str]) -> String {
+    let created = create(client, username, None, "password123", roles).await;
+    created["id"].as_str().unwrap().to_owned()
 }
 
 /// `GET /users?{query}` → 200 的 JSON。
-async fn list(c: &Client, query: &str) -> Value {
-    expect_json(c.get(&format!("{USERS}?{query}")).await, StatusCode::OK).await
+async fn list(client: &Client, query: &str) -> Value {
+    expect_json(
+        client.get(&format!("{USERS}?{query}")).await,
+        StatusCode::OK,
+    )
+    .await
 }
 
 /// 列表项的 username 序列(保序)。
-fn usernames(v: &Value) -> Vec<String> {
-    v["items"]
+fn usernames(page: &Value) -> Vec<String> {
+    page["items"]
         .as_array()
-        .unwrap_or_else(|| panic!("items 应是数组: {v}"))
+        .unwrap_or_else(|| panic!("items 应是数组: {page}"))
         .iter()
         .map(|i| i["username"].as_str().unwrap().to_owned())
         .collect()
 }
 
 /// 按**精确**用户名查 id(列表 username 过滤是子串,这里再精确匹配一遍)。
-async fn find_id(c: &Client, username: &str) -> String {
-    let v = list(c, &format!("username={username}&size=100")).await;
-    v["items"]
+async fn find_id(client: &Client, username: &str) -> String {
+    let page = list(client, &format!("username={username}&size=100")).await;
+    page["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|i| i["username"] == username)
-        .unwrap_or_else(|| panic!("列表里找不到 {username}: {v}"))["id"]
+        .unwrap_or_else(|| panic!("列表里找不到 {username}: {page}"))["id"]
         .as_str()
         .unwrap()
         .to_owned()
 }
 
 /// 响应体 roles 数组排序后(角色比较不看顺序)。
-fn sorted_roles(v: &Value) -> Vec<String> {
-    let mut r: Vec<String> = v["roles"]
+fn sorted_roles(user: &Value) -> Vec<String> {
+    let mut roles: Vec<String> = user["roles"]
         .as_array()
-        .unwrap_or_else(|| panic!("roles 应是数组: {v}"))
+        .unwrap_or_else(|| panic!("roles 应是数组: {user}"))
         .iter()
         .map(|x| x.as_str().unwrap().to_owned())
         .collect();
-    r.sort();
-    r
+    roles.sort();
+    roles
 }
 
 /// 前台登录的状态码(不断言,用来验「登不进去」)。
-async fn front_login_status(s: &TestServer, identifier: &str, password: &str) -> StatusCode {
-    s.anon()
+async fn front_login_status(server: &TestServer, identifier: &str, password: &str) -> StatusCode {
+    server
+        .anonymous()
         .post_json(
             LOGIN,
             &json!({ "identifier": identifier, "password": password }),
@@ -159,8 +165,8 @@ fn user_url(id: &str) -> String {
 /// 无 users:admin)→ 端点闸 403;都是统一错误体。请求体都合法,确保打到的是授权而非解析。
 #[tokio::test]
 async fn authz_matrix_all_endpoints() {
-    let (s, sa) = start().await;
-    let target = create_id(&sa, "matrix-target", &["platform_admin"]).await;
+    let (server, superadmin) = start().await;
+    let target = create_id(&superadmin, "matrix-target", &["platform_admin"]).await;
     let id_url = user_url(&target);
     let endpoints: Vec<(Method, String, Option<Value>)> = vec![
         (Method::GET, USERS.to_owned(), None),
@@ -189,35 +195,35 @@ async fn authz_matrix_all_endpoints() {
         (Method::GET, ROLES.to_owned(), None),
     ];
 
-    let anon = s.anon();
-    let user = s.login(USER, PASSWORD).await;
-    let admin = s.login_admin(ADMIN, PASSWORD).await;
-    for (c, status, code) in [
-        (&anon, StatusCode::UNAUTHORIZED, "unauthorized"),
+    let anonymous = server.anonymous();
+    let user = server.login(USER, PASSWORD).await;
+    let admin = server.login_admin(ADMIN, PASSWORD).await;
+    for (client, status, code) in [
+        (&anonymous, StatusCode::UNAUTHORIZED, "unauthorized"),
         (&user, StatusCode::FORBIDDEN, "forbidden"),
         (&admin, StatusCode::FORBIDDEN, "forbidden"),
     ] {
-        for (m, path, body) in &endpoints {
-            let mut req = c.req(m.clone(), path);
-            if let Some(b) = body {
-                req = req.json(b);
+        for (method, path, body) in &endpoints {
+            let mut request = client.request(method.clone(), path);
+            if let Some(payload) = body {
+                request = request.json(payload);
             }
-            expect_error(req.send().await.unwrap(), status, code).await;
+            expect_error(request.send().await.unwrap(), status, code).await;
         }
     }
 
     // 以上都被拒 → 目标毫发无损
-    let v = expect_json(sa.get(&id_url).await, StatusCode::OK).await;
-    assert_eq!(v["username"], "matrix-target");
-    assert_eq!(sorted_roles(&v), vec!["platform_admin"]);
+    let detail = expect_json(superadmin.get(&id_url).await, StatusCode::OK).await;
+    assert_eq!(detail["username"], "matrix-target");
+    assert_eq!(sorted_roles(&detail), vec!["platform_admin"]);
 }
 
 /// superadmin 能用;Bearer 令牌也行(不止 cookie)。
 #[tokio::test]
 async fn superadmin_cookie_and_bearer_both_work() {
-    let (s, sa) = start().await;
-    expect(sa.get(USERS).await, StatusCode::OK).await;
-    let bearer = s.bearer(&mint(
+    let (server, superadmin) = start().await;
+    expect(superadmin.get(USERS).await, StatusCode::OK).await;
+    let bearer = server.bearer(&mint(
         Uuid::now_v7(),
         SUPERADMIN,
         &[SUPERADMIN],
@@ -233,8 +239,8 @@ async fn superadmin_cookie_and_bearer_both_work() {
 /// (users:admin 本身就是平台级,单给它也能过组闸);两样都没有 → 组闸 403。
 #[tokio::test]
 async fn scoped_token_needs_users_admin_and_an_admin_entry() {
-    let s = TestServer::start().await;
-    let sa_token = |scope| {
+    let server = TestServer::start().await;
+    let superadmin_token = |scope| {
         mint(
             Uuid::now_v7(),
             SUPERADMIN,
@@ -244,7 +250,7 @@ async fn scoped_token_needs_users_admin_and_an_admin_entry() {
             scope,
         )
     };
-    let only_login = s.bearer(&sa_token(vec![Perm::AdminLogin]));
+    let only_login = server.bearer(&superadmin_token(vec![Permission::AdminLogin]));
     expect_error(
         only_login.get(USERS).await,
         StatusCode::FORBIDDEN,
@@ -258,12 +264,15 @@ async fn scoped_token_needs_users_admin_and_an_admin_entry() {
     )
     .await;
     // 平台管理员:users:admin 是平台级权限 → 自身即后台准入
-    let only_users = s.bearer(&sa_token(vec![Perm::UsersAdmin]));
+    let only_users = server.bearer(&superadmin_token(vec![Permission::UsersAdmin]));
     expect(only_users.get(USERS).await, StatusCode::OK).await;
     // 准入权限一个都不在 scope 里 → 组闸 403
-    let neither = s.bearer(&sa_token(vec![Perm::WidgetRead]));
+    let neither = server.bearer(&superadmin_token(vec![Permission::WidgetRead]));
     expect_error(neither.get(USERS).await, StatusCode::FORBIDDEN, "forbidden").await;
-    let both = s.bearer(&sa_token(vec![Perm::AdminLogin, Perm::UsersAdmin]));
+    let both = server.bearer(&superadmin_token(vec![
+        Permission::AdminLogin,
+        Permission::UsersAdmin,
+    ]));
     expect(both.get(USERS).await, StatusCode::OK).await;
 }
 
@@ -273,38 +282,45 @@ async fn scoped_token_needs_users_admin_and_an_admin_entry() {
 /// 租户角色(admin / user)经租户成员关系授予,不在账号管理的目录里;superadmin 只由 seed 声明,也不在。
 #[tokio::test]
 async fn list_roles_returns_platform_roles_single_page() {
-    let (_s, sa) = start().await;
-    let v = expect_json(sa.get(ROLES).await, StatusCode::OK).await;
-    let items = v["items"].as_array().unwrap();
+    let (_server, superadmin) = start().await;
+    let catalog = expect_json(superadmin.get(ROLES).await, StatusCode::OK).await;
+    let items = catalog["items"].as_array().unwrap();
     let platform: Vec<RoleName> = RoleName::ALL
         .into_iter()
-        .filter(|r| r.scope() == idm::RoleScope::Platform && *r != RoleName::Superadmin)
+        .filter(|r| r.scope() == RoleScope::Platform && *r != RoleName::Superadmin)
         .collect();
-    assert_eq!(items.len(), platform.len(), "{v}");
+    assert_eq!(items.len(), platform.len(), "{catalog}");
     assert!(
         !items
             .iter()
             .any(|i| i["name"] == "admin" || i["name"] == "user" || i["name"] == "superadmin"),
-        "租户角色 / superadmin 不进目录: {v}"
+        "租户角色 / superadmin 不进目录: {catalog}"
     );
-    for r in platform {
+    for role in platform {
         let item = items
             .iter()
-            .find(|i| i["name"] == r.as_str())
-            .unwrap_or_else(|| panic!("目录缺 {}: {v}", r.as_str()));
+            .find(|i| i["name"] == role.as_str())
+            .unwrap_or_else(|| panic!("目录缺 {}: {catalog}", role.as_str()));
         assert!(
             Uuid::parse_str(item["id"].as_str().unwrap()).is_ok(),
             "id 应是 uuid: {item}"
         );
-        assert_eq!(item["display_name"], r.display_name());
+        assert_eq!(item["display_name"], role.display_name());
     }
-    assert_eq!(v["page_info"]["mode"], "cursor");
-    assert_eq!(v["page_info"]["has_more"], false);
-    assert_eq!(v["page_info"]["next_cursor"], Value::Null);
+    assert_eq!(catalog["page_info"]["mode"], "cursor");
+    assert_eq!(catalog["page_info"]["has_more"], false);
+    assert_eq!(catalog["page_info"]["next_cursor"], Value::Null);
 
     // 带分页参数也照返全量(参数被接受但不真分页)
-    let v2 = expect_json(sa.get(&format!("{ROLES}?size=1")).await, StatusCode::OK).await;
-    assert_eq!(v2["items"].as_array().unwrap().len(), items.len());
+    let paged_catalog = expect_json(
+        superadmin.get(&format!("{ROLES}?size=1")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        paged_catalog["items"].as_array().unwrap().len(),
+        items.len()
+    );
 }
 
 // ───────────────────────────── 3. 建号 ─────────────────────────────
@@ -313,40 +329,41 @@ async fn list_roles_returns_platform_roles_single_page() {
 /// 之后 GET 详情一致,且能用这组凭据在**前台登录**(跨模块:管理员建号 → 认证)。
 #[tokio::test]
 async fn create_user_then_front_login_with_new_password() {
-    let (s, sa) = start().await;
-    let v = create(&sa, "neo", Some("neo@x.test"), "matrix123", &[]).await;
-    let id = v["id"].as_str().unwrap().to_owned();
-    assert!(Uuid::parse_str(&id).is_ok(), "{v}");
-    assert_eq!(v["username"], "neo");
-    assert_eq!(v["email"], "neo@x.test");
-    assert_eq!(v["email_verified"], false);
-    assert_eq!(v["roles"], json!([]));
-    assert_eq!(v["display_name"], Value::Null);
-    assert_eq!(v["avatar_url"], Value::Null);
-    assert!(v["created_at"].is_string(), "{v}");
+    let (server, superadmin) = start().await;
+    let created = create(&superadmin, "neo", Some("neo@x.test"), "matrix123", &[]).await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert!(Uuid::parse_str(&id).is_ok(), "{created}");
+    assert_eq!(created["username"], "neo");
+    assert_eq!(created["email"], "neo@x.test");
+    assert_eq!(created["email_verified"], false);
+    assert_eq!(created["roles"], json!([]));
+    assert_eq!(created["display_name"], Value::Null);
+    assert_eq!(created["avatar_url"], Value::Null);
+    assert!(created["created_at"].is_string(), "{created}");
     assert!(
-        v.get("password").is_none() && v.get("password_hash").is_none(),
-        "不应回显密码: {v}"
+        created.get("password").is_none() && created.get("password_hash").is_none(),
+        "不应回显密码: {created}"
     );
 
-    let got = expect_json(sa.get(&user_url(&id)).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&user_url(&id)).await, StatusCode::OK).await;
     assert_eq!(got["username"], "neo");
     assert_eq!(got["roles"], json!([]));
 
     // 前台登录:用户名 / 邮箱都行;错密码 401
-    let c = s.login("neo", "matrix123").await;
-    let me = expect_json(c.get(FRONT_ME).await, StatusCode::OK).await;
+    let client = server.login("neo", "matrix123").await;
+    let me = expect_json(client.get(FRONT_ME).await, StatusCode::OK).await;
     assert_eq!(me["username"], "neo");
     assert_eq!(me["roles"], json!([]));
-    s.login("neo@x.test", "matrix123").await;
+    server.login("neo@x.test", "matrix123").await;
     assert_eq!(
-        front_login_status(&s, "neo", "wrong-password").await,
+        front_login_status(&server, "neo", "wrong-password").await,
         StatusCode::UNAUTHORIZED
     );
     // 没有平台级权限、也不在任何租户里(管理员建的号不自动入租户)→ 后台登录 403 `tenant_required`
     // (前端据此显示「还没加入任何组织」)
     expect_error(
-        s.anon()
+        server
+            .anonymous()
             .post_json(
                 ADMIN_LOGIN,
                 &json!({ "identifier": "neo", "password": "matrix123" }),
@@ -362,9 +379,9 @@ async fn create_user_then_front_login_with_new_password() {
 /// 但够不到租户级接口(tenant_required);不带角色(roles=[])→ roles 为空、前台照常能登。
 #[tokio::test]
 async fn create_with_platform_role_can_login_admin_and_no_roles_is_empty() {
-    let (s, sa) = start().await;
-    create(&sa, "ops", None, "opspass", &["platform_admin"]).await;
-    let ops = s.login_admin("ops", "opspass").await;
+    let (server, superadmin) = start().await;
+    create(&superadmin, "ops", None, "opspass", &["platform_admin"]).await;
+    let ops = server.login_admin("ops", "opspass").await;
     let me = expect_json(ops.get("/api/v1/admin/auth/me").await, StatusCode::OK).await;
     assert_eq!(me["username"], "ops");
     expect(ops.get(USERS).await, StatusCode::OK).await;
@@ -375,11 +392,11 @@ async fn create_with_platform_role_can_login_admin_and_no_roles_is_empty() {
     )
     .await;
 
-    let v = create(&sa, "bare", None, "barepass", &[]).await;
-    assert_eq!(v["roles"], json!([]));
-    let c = s.login("bare", "barepass").await;
+    let created = create(&superadmin, "bare", None, "barepass", &[]).await;
+    assert_eq!(created["roles"], json!([]));
+    let client = server.login("bare", "barepass").await;
     assert_eq!(
-        expect_json(c.get(FRONT_ME).await, StatusCode::OK).await["roles"],
+        expect_json(client.get(FRONT_ME).await, StatusCode::OK).await["roles"],
         json!([])
     );
 }
@@ -387,10 +404,10 @@ async fn create_with_platform_role_can_login_admin_and_no_roles_is_empty() {
 /// 重复的角色 id 去重(响应与落库一致,不回显两份)。
 #[tokio::test]
 async fn create_dedups_repeated_role_ids() {
-    let (_s, sa) = start().await;
-    let ids = role_ids(&sa, &["platform_admin", "platform_admin"]).await;
-    let v = expect_json(
-        sa.post_json(
+    let (_server, superadmin) = start().await;
+    let ids = role_ids(&superadmin, &["platform_admin", "platform_admin"]).await;
+    let created = expect_json(
+        superadmin.post_json(
             USERS,
             &json!({ "username": "dup-roles", "email": null, "password": "secret1", "roles": ids }),
         )
@@ -398,9 +415,9 @@ async fn create_dedups_repeated_role_ids() {
         StatusCode::CREATED,
     )
     .await;
-    assert_eq!(sorted_roles(&v), vec!["platform_admin"], "{v}");
-    let id = v["id"].as_str().unwrap();
-    let got = expect_json(sa.get(&user_url(id)).await, StatusCode::OK).await;
+    assert_eq!(sorted_roles(&created), vec!["platform_admin"], "{created}");
+    let id = created["id"].as_str().unwrap();
+    let got = expect_json(superadmin.get(&user_url(id)).await, StatusCode::OK).await;
     assert_eq!(sorted_roles(&got), vec!["platform_admin"], "{got}");
 }
 
@@ -408,22 +425,24 @@ async fn create_dedups_repeated_role_ids() {
 /// 缺字段 / 非法 JSON 400 —— 全是统一错误体,且失败不留半态(不会建出号)。
 #[tokio::test]
 async fn create_user_error_cases() {
-    let (s, sa) = start().await;
+    let (server, superadmin) = start().await;
     let body = |username: &str, email: Value, password: &str, roles: Value| json!({ "username": username, "email": email, "password": password, "roles": roles });
     // 409:与 seed 账号撞名;与 seed superadmin 撞邮箱
     expect_error(
-        sa.post_json(USERS, &body(USER, Value::Null, "secret1", json!([])))
+        superadmin
+            .post_json(USERS, &body(USER, Value::Null, "secret1", json!([])))
             .await,
         StatusCode::CONFLICT,
         "conflict",
     )
     .await;
     expect_error(
-        sa.post_json(
-            USERS,
-            &body("fresh", json!("superadmin@local"), "secret1", json!([])),
-        )
-        .await,
+        superadmin
+            .post_json(
+                USERS,
+                &body("fresh", json!("superadmin@local"), "secret1", json!([])),
+            )
+            .await,
         StatusCode::CONFLICT,
         "conflict",
     )
@@ -438,19 +457,20 @@ async fn create_user_error_cases() {
         body("bad-mail", json!("not-an-email"), "secret1", json!([])),
         body("shortpw", Value::Null, "ab", json!([])),
     ];
-    for b in &cases {
+    for case in &cases {
         expect_error(
-            sa.post_json(USERS, b).await,
+            superadmin.post_json(USERS, case).await,
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation",
         )
         .await;
     }
     // 未知角色 id 夹在合法 id 中间也整单拒(原子)
-    let mut mixed = role_ids(&sa, &[]).await;
+    let mut mixed = role_ids(&superadmin, &[]).await;
     mixed.push(NIL.to_owned());
     expect_error(
-        sa.post_json(USERS, &body("half", Value::Null, "secret1", json!(mixed)))
+        superadmin
+            .post_json(USERS, &body("half", Value::Null, "secret1", json!(mixed)))
             .await,
         StatusCode::UNPROCESSABLE_ENTITY,
         "validation",
@@ -459,40 +479,45 @@ async fn create_user_error_cases() {
 
     // 400:缺 roles 字段、roles 里不是 uuid、非法 JSON
     expect_error(
-        sa.post_json(
-            USERS,
-            &json!({ "username": "noroles", "email": null, "password": "secret1" }),
-        )
-        .await,
+        superadmin
+            .post_json(
+                USERS,
+                &json!({ "username": "noroles", "email": null, "password": "secret1" }),
+            )
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     expect_error(
-        sa.post_json(
-            USERS,
-            &body("badid", Value::Null, "secret1", json!(["admin"])),
-        )
-        .await,
+        superadmin
+            .post_json(
+                USERS,
+                &body("badid", Value::Null, "secret1", json!(["admin"])),
+            )
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
-    let resp = sa
-        .req(Method::POST, USERS)
+    let response = superadmin
+        .request(Method::POST, USERS)
         .header("content-type", "application/json")
         .body("{not json")
         .send()
         .await
         .unwrap();
-    expect_error(resp, StatusCode::BAD_REQUEST, "bad_request").await;
+    expect_error(response, StatusCode::BAD_REQUEST, "bad_request").await;
 
     // 以上全部失败 → 只剩 seed 的 3 个号;失败的用户名也登不进
-    let v = list(&sa, "").await;
-    assert_eq!(v["page_info"]["total"], 3, "失败的建号不应留下数据: {v}");
+    let page = list(&superadmin, "").await;
+    assert_eq!(
+        page["page_info"]["total"], 3,
+        "失败的建号不应留下数据: {page}"
+    );
     for name in ["ghost", "half", "shortpw", "fresh"] {
         assert_eq!(
-            front_login_status(&s, name, "secret1").await,
+            front_login_status(&server, name, "secret1").await,
             StatusCode::UNAUTHORIZED,
             "{name} 不应被建出来"
         );
@@ -505,23 +530,21 @@ async fn create_user_error_cases() {
 /// 富化 display_name(seed 给 superadmin / admin 建了初始资料,user 没有 → null)。
 #[tokio::test]
 async fn list_default_offset_desc_and_enriched() {
-    let (_s, sa) = start().await;
-    let v = list(&sa, "").await;
-    assert_eq!(v["page_info"]["mode"], "offset");
-    assert_eq!(v["page_info"]["page"], 1);
-    assert_eq!(v["page_info"]["size"], 20);
-    assert_eq!(v["page_info"]["total"], 3);
-    assert_eq!(v["page_info"]["total_pages"], 1);
-    let names: HashSet<String> = usernames(&v).into_iter().collect();
-    assert_eq!(
-        names,
-        [SUPERADMIN, ADMIN, USER]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<HashSet<_>>()
-    );
+    let (_server, superadmin) = start().await;
+    let page = list(&superadmin, "").await;
+    assert_eq!(page["page_info"]["mode"], "offset");
+    assert_eq!(page["page_info"]["page"], 1);
+    assert_eq!(page["page_info"]["size"], 20);
+    assert_eq!(page["page_info"]["total"], 3);
+    assert_eq!(page["page_info"]["total_pages"], 1);
+    let names: HashSet<String> = usernames(&page).into_iter().collect();
+    let expected: HashSet<String> = [SUPERADMIN, ADMIN, USER]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(names, expected);
     let row = |name: &str| {
-        v["items"]
+        page["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -537,10 +560,10 @@ async fn list_default_offset_desc_and_enriched() {
     assert_eq!(row(USER)["email"], Value::Null);
 
     // 新建的号排最前(默认 created_at desc);order=asc 时排最后
-    create_id(&sa, "newest", &[]).await;
-    assert_eq!(usernames(&list(&sa, "").await)[0], "newest");
-    let asc = usernames(&list(&sa, "order=asc").await);
-    assert_eq!(asc.last().unwrap(), "newest");
+    create_id(&superadmin, "newest", &[]).await;
+    assert_eq!(usernames(&list(&superadmin, "").await)[0], "newest");
+    let ascending = usernames(&list(&superadmin, "order=asc").await);
+    assert_eq!(ascending.last().unwrap(), "newest");
 }
 
 /// username 过滤:子串 + 大小写不敏感;无命中 → 空页 total 0。
@@ -548,18 +571,18 @@ async fn list_default_offset_desc_and_enriched() {
 /// 不属于任何租户的账号也在里面;角色列是平台角色(租户角色不出现)。租户成员列表是另外的接口。
 #[tokio::test]
 async fn list_is_platform_account_list_including_accounts_in_no_tenant() {
-    let (_s, sa) = start().await;
-    let lonely = create_id(&sa, "lonely_acct", &[]).await;
+    let (_server, superadmin) = start().await;
+    let lonely = create_id(&superadmin, "lonely_acct", &[]).await;
 
-    let v = list(&sa, "size=100").await;
-    let names = usernames(&v);
+    let page = list(&superadmin, "size=100").await;
+    let names = usernames(&page);
     for expected in ["lonely_acct", SUPERADMIN, ADMIN, USER] {
         assert!(
             names.iter().any(|n| n == expected),
             "{expected} 应在平台账号列表里(不属于任何租户的账号也在): {names:?}"
         );
     }
-    let item = v["items"]
+    let item = page["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -567,7 +590,7 @@ async fn list_is_platform_account_list_including_accounts_in_no_tenant() {
         .expect("新账号在列表里");
     assert_eq!(item["roles"], json!([]), "不属于任何租户、没有平台角色");
     // seed 的 admin / user 是租户角色:平台账号列表的角色列不显示它们。
-    let admin = v["items"]
+    let admin = page["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -582,54 +605,63 @@ async fn list_is_platform_account_list_including_accounts_in_no_tenant() {
 
 #[tokio::test]
 async fn list_filter_username_substring_case_insensitive() {
-    let (_s, sa) = start().await;
-    for n in ["alice", "bob", "carol"] {
-        create_id(&sa, n, &[]).await;
+    let (_server, superadmin) = start().await;
+    for name in ["alice", "bob", "carol"] {
+        create_id(&superadmin, name, &[]).await;
     }
-    let v = list(&sa, "username=A&sort_by=username&order=asc").await;
-    assert_eq!(usernames(&v), vec!["admin", "alice", "carol", "superadmin"]);
-    assert_eq!(v["page_info"]["total"], 4);
-    let v = list(&sa, "username=ADMIN&sort_by=username&order=asc").await;
-    assert_eq!(usernames(&v), vec!["admin", "superadmin"]);
-    let v = list(&sa, "username=zzz").await;
-    assert_eq!(usernames(&v), Vec::<String>::new());
-    assert_eq!(v["page_info"]["total"], 0);
+    let page = list(&superadmin, "username=A&sort_by=username&order=asc").await;
+    assert_eq!(
+        usernames(&page),
+        vec!["admin", "alice", "carol", "superadmin"]
+    );
+    assert_eq!(page["page_info"]["total"], 4);
+    let page = list(&superadmin, "username=ADMIN&sort_by=username&order=asc").await;
+    assert_eq!(usernames(&page), vec!["admin", "superadmin"]);
+    let page = list(&superadmin, "username=zzz").await;
+    assert!(usernames(&page).is_empty(), "{page}");
+    assert_eq!(page["page_info"]["total"], 0);
 }
 
 /// 角色过滤:正选 role(重复 key = 任一)/ 反选 role_not / 二者组合 / 与 username 组合。
 #[tokio::test]
 async fn list_filter_roles_any_none_and_combined() {
-    let (_s, sa) = start().await;
+    let (_server, superadmin) = start().await;
     // 账号管理只授平台角色(经接口能授的只有 platform_admin;superadmin 只有 seed 的那一个);
     // seed 的 admin / user 只在默认租户里有租户角色,user_roles 里没有 → 按角色过滤时算「无角色」。
-    create_id(&sa, "alice", &["platform_admin"]).await;
-    create_id(&sa, "bob", &["platform_admin"]).await;
-    create_id(&sa, "nobody", &[]).await;
-    let q = |f: &str| format!("{f}&sort_by=username&order=asc");
+    create_id(&superadmin, "alice", &["platform_admin"]).await;
+    create_id(&superadmin, "bob", &["platform_admin"]).await;
+    create_id(&superadmin, "nobody", &[]).await;
+    let sorted = |filter: &str| format!("{filter}&sort_by=username&order=asc");
 
     assert_eq!(
-        usernames(&list(&sa, &q("role=platform_admin")).await),
+        usernames(&list(&superadmin, &sorted("role=platform_admin")).await),
         vec!["alice", "bob"]
     );
     assert_eq!(
-        usernames(&list(&sa, &q("role=platform_admin&role=superadmin")).await),
+        usernames(&list(&superadmin, &sorted("role=platform_admin&role=superadmin")).await),
         vec!["alice", "bob", "superadmin"],
         "重复 key = 任一"
     );
     assert_eq!(
-        usernames(&list(&sa, &q("role_not=platform_admin&role_not=superadmin")).await),
+        usernames(
+            &list(
+                &superadmin,
+                &sorted("role_not=platform_admin&role_not=superadmin")
+            )
+            .await
+        ),
         vec!["admin", "nobody", "user"]
     );
     assert_eq!(
-        usernames(&list(&sa, &q("role=platform_admin&username=o")).await),
+        usernames(&list(&superadmin, &sorted("role=platform_admin&username=o")).await),
         vec!["bob"]
     );
-    let v = list(&sa, "role=platform_admin").await;
-    assert_eq!(v["page_info"]["total"], 2);
+    let page = list(&superadmin, "role=platform_admin").await;
+    assert_eq!(page["page_info"]["total"], 2);
 
     // 不在闭集的角色名 → 400(query 反序列化失败,统一错误体)
     expect_error(
-        sa.get(&format!("{USERS}?role=editor")).await,
+        superadmin.get(&format!("{USERS}?role=editor")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -639,29 +671,31 @@ async fn list_filter_roles_any_none_and_combined() {
 /// 创建时间区间过滤(RFC3339,闭区间)。
 #[tokio::test]
 async fn list_filter_created_range() {
-    let (_s, sa) = start().await;
-    let v = list(&sa, "created_from=2000-01-01T00:00:00Z").await;
-    assert_eq!(v["page_info"]["total"], 3);
-    let v = list(&sa, "created_from=2999-01-01T00:00:00Z").await;
-    assert_eq!(v["page_info"]["total"], 0);
-    let v = list(&sa, "created_to=2000-01-01T00:00:00Z").await;
-    assert_eq!(v["page_info"]["total"], 0);
-    let v = list(
-        &sa,
+    let (_server, superadmin) = start().await;
+    let page = list(&superadmin, "created_from=2000-01-01T00:00:00Z").await;
+    assert_eq!(page["page_info"]["total"], 3);
+    let page = list(&superadmin, "created_from=2999-01-01T00:00:00Z").await;
+    assert_eq!(page["page_info"]["total"], 0);
+    let page = list(&superadmin, "created_to=2000-01-01T00:00:00Z").await;
+    assert_eq!(page["page_info"]["total"], 0);
+    let page = list(
+        &superadmin,
         "created_from=2000-01-01T00:00:00Z&created_to=2999-01-01T00:00:00Z",
     )
     .await;
-    assert_eq!(v["page_info"]["total"], 3);
+    assert_eq!(page["page_info"]["total"], 3);
 
     // 用某个号自己的 created_at 当两端 → 恰好命中它(闭区间)
-    let created = create(&sa, "pinpoint", None, "secret1", &[]).await;
+    let created = create(&superadmin, "pinpoint", None, "secret1", &[]).await;
     let at = created["created_at"].as_str().unwrap().replace('+', "%2B");
-    let v = list(&sa, &format!("created_from={at}&created_to={at}")).await;
-    assert_eq!(usernames(&v), vec!["pinpoint"], "{v}");
+    let page = list(&superadmin, &format!("created_from={at}&created_to={at}")).await;
+    assert_eq!(usernames(&page), vec!["pinpoint"], "{page}");
 
     // 非法时间 → 400
     expect_error(
-        sa.get(&format!("{USERS}?created_from=yesterday")).await,
+        superadmin
+            .get(&format!("{USERS}?created_from=yesterday"))
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -671,21 +705,21 @@ async fn list_filter_created_range() {
 /// 排序:username asc/desc、email asc(null 排在有值之后)、created_at;未知排序字段 → 400。
 #[tokio::test]
 async fn list_sort_by_username_email_created_at() {
-    let (_s, sa) = start().await;
-    create(&sa, "zed", Some("a@x.test"), "secret1", &[]).await;
-    create(&sa, "amy", Some("z@x.test"), "secret1", &[]).await;
+    let (_server, superadmin) = start().await;
+    create(&superadmin, "zed", Some("a@x.test"), "secret1", &[]).await;
+    create(&superadmin, "amy", Some("z@x.test"), "secret1", &[]).await;
 
     assert_eq!(
-        usernames(&list(&sa, "sort_by=username&order=asc").await),
+        usernames(&list(&superadmin, "sort_by=username&order=asc").await),
         vec!["admin", "amy", "superadmin", "user", "zed"]
     );
     assert_eq!(
-        usernames(&list(&sa, "sort_by=username&order=desc").await),
+        usernames(&list(&superadmin, "sort_by=username&order=desc").await),
         vec!["zed", "user", "superadmin", "amy", "admin"]
     );
 
-    let v = list(&sa, "sort_by=email&order=asc").await;
-    let emails: Vec<Value> = v["items"]
+    let page = list(&superadmin, "sort_by=email&order=asc").await;
+    let emails: Vec<Value> = page["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -698,25 +732,28 @@ async fn list_sort_by_username_email_created_at() {
             json!("superadmin@local"),
             json!("z@x.test")
         ],
-        "{v}"
+        "{page}"
     );
-    assert!(emails[3..].iter().all(Value::is_null), "无邮箱的排后: {v}");
-    let v = list(&sa, "sort_by=email&order=desc").await;
-    assert_eq!(v["items"][0]["email"], "z@x.test", "{v}");
+    assert!(
+        emails[3..].iter().all(Value::is_null),
+        "无邮箱的排后: {page}"
+    );
+    let page = list(&superadmin, "sort_by=email&order=desc").await;
+    assert_eq!(page["items"][0]["email"], "z@x.test", "{page}");
 
     // created_at 显式 asc:最早的是 seed 账号,最后建的 amy 在末尾
-    let asc = usernames(&list(&sa, "sort_by=created_at&order=asc").await);
-    assert_eq!(asc.last().unwrap(), "amy");
-    assert_eq!(asc[3], "zed");
+    let ascending = usernames(&list(&superadmin, "sort_by=created_at&order=asc").await);
+    assert_eq!(ascending.last().unwrap(), "amy");
+    assert_eq!(ascending[3], "zed");
 
     expect_error(
-        sa.get(&format!("{USERS}?sort_by=password")).await,
+        superadmin.get(&format!("{USERS}?sort_by=password")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     expect_error(
-        sa.get(&format!("{USERS}?order=sideways")).await,
+        superadmin.get(&format!("{USERS}?order=sideways")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -726,43 +763,46 @@ async fn list_sort_by_username_email_created_at() {
 /// offset 分页:page/size/total/total_pages;越界页空;with_total=false 不算 total;size 越界 clamp。
 #[tokio::test]
 async fn list_offset_pagination() {
-    let (_s, sa) = start().await;
-    for n in ["u1", "u2"] {
-        create_id(&sa, n, &[]).await;
+    let (_server, superadmin) = start().await;
+    for name in ["u1", "u2"] {
+        create_id(&superadmin, name, &[]).await;
     }
     // 共 5 个号,按 username 升序:admin, superadmin, u1, u2, user
-    let q = "sort_by=username&order=asc&size=2";
-    let p1 = list(&sa, &format!("{q}&page=1")).await;
-    assert_eq!(usernames(&p1), vec!["admin", "superadmin"]);
-    assert_eq!(p1["page_info"]["total"], 5);
-    assert_eq!(p1["page_info"]["total_pages"], 3);
-    assert_eq!(p1["page_info"]["size"], 2);
-    let p2 = list(&sa, &format!("{q}&page=2")).await;
-    assert_eq!(usernames(&p2), vec!["u1", "u2"]);
-    assert_eq!(p2["page_info"]["page"], 2);
-    let p3 = list(&sa, &format!("{q}&page=3")).await;
-    assert_eq!(usernames(&p3), vec!["user"]);
-    let p9 = list(&sa, &format!("{q}&page=9")).await;
-    assert_eq!(usernames(&p9), Vec::<String>::new());
-    assert_eq!(p9["page_info"]["total"], 5);
+    let query = "sort_by=username&order=asc&size=2";
+    let first_page = list(&superadmin, &format!("{query}&page=1")).await;
+    assert_eq!(usernames(&first_page), vec!["admin", "superadmin"]);
+    assert_eq!(first_page["page_info"]["total"], 5);
+    assert_eq!(first_page["page_info"]["total_pages"], 3);
+    assert_eq!(first_page["page_info"]["size"], 2);
+    let second_page = list(&superadmin, &format!("{query}&page=2")).await;
+    assert_eq!(usernames(&second_page), vec!["u1", "u2"]);
+    assert_eq!(second_page["page_info"]["page"], 2);
+    let third_page = list(&superadmin, &format!("{query}&page=3")).await;
+    assert_eq!(usernames(&third_page), vec!["user"]);
+    let out_of_range_page = list(&superadmin, &format!("{query}&page=9")).await;
+    assert!(
+        usernames(&out_of_range_page).is_empty(),
+        "{out_of_range_page}"
+    );
+    assert_eq!(out_of_range_page["page_info"]["total"], 5);
 
-    let no_total = list(&sa, &format!("{q}&page=1&with_total=false")).await;
+    let no_total = list(&superadmin, &format!("{query}&page=1&with_total=false")).await;
     assert_eq!(no_total["page_info"]["total"], Value::Null);
     assert_eq!(usernames(&no_total).len(), 2);
 
     // size clamp 到 [1,100];page=0 视为第 1 页
-    let v = list(&sa, "size=0").await;
-    assert_eq!(v["page_info"]["size"], 1);
-    assert_eq!(usernames(&v).len(), 1);
-    let v = list(&sa, "size=1000").await;
-    assert_eq!(v["page_info"]["size"], 100);
-    let v = list(&sa, "page=0&size=2&sort_by=username&order=asc").await;
-    assert_eq!(v["page_info"]["page"], 1);
-    assert_eq!(usernames(&v), vec!["admin", "superadmin"]);
+    let page = list(&superadmin, "size=0").await;
+    assert_eq!(page["page_info"]["size"], 1);
+    assert_eq!(usernames(&page).len(), 1);
+    let page = list(&superadmin, "size=1000").await;
+    assert_eq!(page["page_info"]["size"], 100);
+    let page = list(&superadmin, "page=0&size=2&sort_by=username&order=asc").await;
+    assert_eq!(page["page_info"]["page"], 1);
+    assert_eq!(usernames(&page), vec!["admin", "superadmin"]);
 
     // 类型不对 → 400
     expect_error(
-        sa.get(&format!("{USERS}?page=abc")).await,
+        superadmin.get(&format!("{USERS}?page=abc")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -772,55 +812,62 @@ async fn list_offset_pagination() {
 /// cursor 分页(默认排序):空 cursor = 首页;逐页走完覆盖全部、无重复、末页 has_more=false;可与过滤组合。
 #[tokio::test]
 async fn list_cursor_pagination_walks_all() {
-    let (_s, sa) = start().await;
-    for n in ["c1", "c2", "c3", "c4"] {
-        create_id(&sa, n, &["platform_admin"]).await;
+    let (_server, superadmin) = start().await;
+    for name in ["c1", "c2", "c3", "c4"] {
+        create_id(&superadmin, name, &["platform_admin"]).await;
     }
     let mut seen: Vec<String> = Vec::new();
     let mut cursor = String::new();
     let mut pages = 0;
     loop {
-        let v = list(&sa, &format!("cursor={cursor}&size=3")).await;
-        assert_eq!(v["page_info"]["mode"], "cursor", "{v}");
-        assert_eq!(v["page_info"]["limit"], 3);
+        let page = list(&superadmin, &format!("cursor={cursor}&size=3")).await;
+        assert_eq!(page["page_info"]["mode"], "cursor", "{page}");
+        assert_eq!(page["page_info"]["limit"], 3);
         assert!(
-            v["page_info"].get("total").is_none(),
-            "cursor 模式不带 total: {v}"
+            page["page_info"].get("total").is_none(),
+            "cursor 模式不带 total: {page}"
         );
-        seen.extend(usernames(&v));
+        seen.extend(usernames(&page));
         pages += 1;
-        if v["page_info"]["has_more"] == true {
-            cursor = v["page_info"]["next_cursor"].as_str().unwrap().to_owned();
+        if page["page_info"]["has_more"] == true {
+            cursor = page["page_info"]["next_cursor"]
+                .as_str()
+                .unwrap()
+                .to_owned();
         } else {
-            assert_eq!(v["page_info"]["next_cursor"], Value::Null);
+            assert_eq!(page["page_info"]["next_cursor"], Value::Null);
             break;
         }
         assert!(pages < 10, "cursor 翻页不收敛");
     }
     assert_eq!(pages, 3, "7 个号每页 3 → 3 页");
     assert_eq!(seen.len(), 7);
-    assert_eq!(
-        seen.iter().collect::<HashSet<_>>().len(),
-        7,
-        "不应重复: {seen:?}"
-    );
+    let unique: HashSet<_> = seen.iter().collect();
+    assert_eq!(unique.len(), 7, "不应重复: {seen:?}");
     assert_eq!(seen[0], "c4", "默认 created_at desc:最新的在首页首位");
 
     // 与过滤组合:role=platform_admin 共 4 个(c1..c4),size=3 → 首页 3 条且 has_more
-    let v = list(&sa, "cursor=&size=3&role=platform_admin").await;
-    assert_eq!(usernames(&v).len(), 3);
-    assert_eq!(v["page_info"]["has_more"], true);
-    let next = v["page_info"]["next_cursor"].as_str().unwrap().to_owned();
-    let v = list(&sa, &format!("cursor={next}&size=3&role=platform_admin")).await;
-    assert_eq!(usernames(&v).len(), 1);
-    assert_eq!(v["page_info"]["has_more"], false);
+    let page = list(&superadmin, "cursor=&size=3&role=platform_admin").await;
+    assert_eq!(usernames(&page).len(), 3);
+    assert_eq!(page["page_info"]["has_more"], true);
+    let next = page["page_info"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let page = list(
+        &superadmin,
+        &format!("cursor={next}&size=3&role=platform_admin"),
+    )
+    .await;
+    assert_eq!(usernames(&page).len(), 1);
+    assert_eq!(page["page_info"]["has_more"], false);
 }
 
 /// 分页参数冲突 / 非法:cursor + 非默认排序 → 422;page + cursor → 422;坏 cursor → 400。
 #[tokio::test]
 async fn list_pagination_param_errors() {
-    let (_s, sa) = start().await;
-    for q in [
+    let (_server, superadmin) = start().await;
+    for query in [
         "cursor=&sort_by=username",
         "cursor=&order=asc",
         "cursor=&sort_by=created_at&order=asc",
@@ -828,18 +875,18 @@ async fn list_pagination_param_errors() {
         "page=1&cursor=xxx",
     ] {
         expect_error(
-            sa.get(&format!("{USERS}?{q}")).await,
+            superadmin.get(&format!("{USERS}?{query}")).await,
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation",
         )
         .await;
     }
     // 显式写出默认排序(created_at desc)可以配 cursor
-    let v = list(&sa, "cursor=&sort_by=created_at&order=desc").await;
-    assert_eq!(v["page_info"]["mode"], "cursor");
+    let page = list(&superadmin, "cursor=&sort_by=created_at&order=desc").await;
+    assert_eq!(page["page_info"]["mode"], "cursor");
 
     expect_error(
-        sa.get(&format!("{USERS}?cursor=!!!bad")).await,
+        superadmin.get(&format!("{USERS}?cursor=!!!bad")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -849,19 +896,19 @@ async fn list_pagination_param_errors() {
 /// 内存模式无 search 投影后端:q(非空白)/ sort_by=display_name → 422;纯空白 q 视为未搜索 → 200。
 #[tokio::test]
 async fn list_without_search_backend_rejects_q_and_display_name_sort() {
-    let (_s, sa) = start().await;
-    for q in ["q=admin", "sort_by=display_name", "q=a&sort_by=username"] {
+    let (_server, superadmin) = start().await;
+    for query in ["q=admin", "sort_by=display_name", "q=a&sort_by=username"] {
         expect_error(
-            sa.get(&format!("{USERS}?{q}")).await,
+            superadmin.get(&format!("{USERS}?{query}")).await,
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation",
         )
         .await;
     }
-    let v = list(&sa, "q=%20%20").await;
-    assert_eq!(v["page_info"]["total"], 3);
-    let v = list(&sa, "q=").await;
-    assert_eq!(v["page_info"]["total"], 3);
+    let page = list(&superadmin, "q=%20%20").await;
+    assert_eq!(page["page_info"]["total"], 3);
+    let page = list(&superadmin, "q=").await;
+    assert_eq!(page["page_info"]["total"], 3);
 }
 
 // ───────────────────────────── 5. 详情 ─────────────────────────────
@@ -869,24 +916,24 @@ async fn list_without_search_backend_rejects_q_and_display_name_sort() {
 /// 详情:200 带富化;不存在 404;路径不是 uuid → 400。
 #[tokio::test]
 async fn get_user_found_missing_and_bad_id() {
-    let (_s, sa) = start().await;
-    let id = find_id(&sa, SUPERADMIN).await;
-    let v = expect_json(sa.get(&user_url(&id)).await, StatusCode::OK).await;
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(v["username"], SUPERADMIN);
-    assert_eq!(v["email"], "superadmin@local");
-    assert_eq!(v["roles"], json!(["superadmin"]));
-    assert_eq!(v["display_name"], "Super Admin");
-    assert!(v["created_at"].is_string());
+    let (_server, superadmin) = start().await;
+    let id = find_id(&superadmin, SUPERADMIN).await;
+    let user = expect_json(superadmin.get(&user_url(&id)).await, StatusCode::OK).await;
+    assert_eq!(user["id"], id.as_str());
+    assert_eq!(user["username"], SUPERADMIN);
+    assert_eq!(user["email"], "superadmin@local");
+    assert_eq!(user["roles"], json!(["superadmin"]));
+    assert_eq!(user["display_name"], "Super Admin");
+    assert!(user["created_at"].is_string());
 
     expect_error(
-        sa.get(&user_url(&Uuid::now_v7().to_string())).await,
+        superadmin.get(&user_url(&Uuid::now_v7().to_string())).await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.get(&user_url("not-a-uuid")).await,
+        superadmin.get(&user_url("not-a-uuid")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -898,41 +945,48 @@ async fn get_user_found_missing_and_bad_id() {
 /// PUT 全量:改名 + 邮箱 → 200 且持久;email=null 清空;改名后新名能登、旧名不能(会话凭据跟着变)。
 #[tokio::test]
 async fn update_user_full_replace_and_relogin_by_new_name() {
-    let (s, sa) = start().await;
-    let id = create_id(&sa, "gina", &["platform_admin"]).await;
+    let (server, superadmin) = start().await;
+    let id = create_id(&superadmin, "gina", &["platform_admin"]).await;
     let url = user_url(&id);
-    let v = expect_json(
-        sa.put_json(&url, &json!({ "username": "gina2", "email": "g@x.test" }))
+    let updated = expect_json(
+        superadmin
+            .put_json(&url, &json!({ "username": "gina2", "email": "g@x.test" }))
             .await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(v["username"], "gina2");
-    assert_eq!(v["email"], "g@x.test");
-    assert_eq!(v["email_verified"], false);
-    assert_eq!(v["roles"], json!(["platform_admin"]), "改身份不动角色");
-    let got = expect_json(sa.get(&url).await, StatusCode::OK).await;
+    assert_eq!(updated["id"], id.as_str());
+    assert_eq!(updated["username"], "gina2");
+    assert_eq!(updated["email"], "g@x.test");
+    assert_eq!(updated["email_verified"], false);
+    assert_eq!(
+        updated["roles"],
+        json!(["platform_admin"]),
+        "改身份不动角色"
+    );
+    let got = expect_json(superadmin.get(&url).await, StatusCode::OK).await;
     assert_eq!(got["username"], "gina2");
     assert_eq!(got["email"], "g@x.test");
 
-    s.login("gina2", "password123").await;
-    s.login("g@x.test", "password123").await;
+    server.login("gina2", "password123").await;
+    server.login("g@x.test", "password123").await;
     assert_eq!(
-        front_login_status(&s, "gina", "password123").await,
+        front_login_status(&server, "gina", "password123").await,
         StatusCode::UNAUTHORIZED
     );
 
     // email=null 清空;同名同邮箱(自己的)不算冲突
-    let v = expect_json(
-        sa.put_json(&url, &json!({ "username": "gina2", "email": null }))
+    let updated = expect_json(
+        superadmin
+            .put_json(&url, &json!({ "username": "gina2", "email": null }))
             .await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["email"], Value::Null);
+    assert_eq!(updated["email"], Value::Null);
     expect(
-        sa.put_json(&url, &json!({ "username": "gina2", "email": null }))
+        superadmin
+            .put_json(&url, &json!({ "username": "gina2", "email": null }))
             .await,
         StatusCode::OK,
     )
@@ -942,63 +996,67 @@ async fn update_user_full_replace_and_relogin_by_new_name() {
 /// 改身份错误分支:撞名 / 撞邮箱 409;空名 / 非法邮箱 422;缺字段 400;不存在 404;坏 id 400。
 #[tokio::test]
 async fn update_user_error_cases() {
-    let (_s, sa) = start().await;
-    let id = create_id(&sa, "hank", &[]).await;
+    let (_server, superadmin) = start().await;
+    let id = create_id(&superadmin, "hank", &[]).await;
     let url = user_url(&id);
     expect_error(
-        sa.put_json(&url, &json!({ "username": ADMIN, "email": null }))
+        superadmin
+            .put_json(&url, &json!({ "username": ADMIN, "email": null }))
             .await,
         StatusCode::CONFLICT,
         "conflict",
     )
     .await;
     expect_error(
-        sa.put_json(
-            &url,
-            &json!({ "username": "hank", "email": "superadmin@local" }),
-        )
-        .await,
+        superadmin
+            .put_json(
+                &url,
+                &json!({ "username": "hank", "email": "superadmin@local" }),
+            )
+            .await,
         StatusCode::CONFLICT,
         "conflict",
     )
     .await;
-    for b in [
+    for body in [
         json!({ "username": "", "email": null }),
         json!({ "username": "x".repeat(101), "email": null }),
         json!({ "username": "hank", "email": "nope" }),
     ] {
         expect_error(
-            sa.put_json(&url, &b).await,
+            superadmin.put_json(&url, &body).await,
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation",
         )
         .await;
     }
     expect_error(
-        sa.put_json(&url, &json!({ "email": null })).await,
+        superadmin.put_json(&url, &json!({ "email": null })).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     expect_error(
-        sa.put_json(
-            &user_url(&Uuid::now_v7().to_string()),
-            &json!({ "username": "ghost", "email": null }),
-        )
-        .await,
+        superadmin
+            .put_json(
+                &user_url(&Uuid::now_v7().to_string()),
+                &json!({ "username": "ghost", "email": null }),
+            )
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.put_json(&user_url("123"), &json!({ "username": "x", "email": null }))
+        superadmin
+            .put_json(&user_url("123"), &json!({ "username": "x", "email": null }))
             .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     // 全部失败 → 原样
-    let got = expect_json(sa.get(&url).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&url).await, StatusCode::OK).await;
     assert_eq!(got["username"], "hank");
     assert_eq!(got["email"], Value::Null);
 }
@@ -1009,97 +1067,106 @@ async fn update_user_error_cases() {
 /// 用户名释放(可再建同名号)。
 #[tokio::test]
 async fn delete_user_soft_deletes_and_kills_login() {
-    let (s, sa) = start().await;
-    let id = create_id(&sa, "doomed", &[]).await;
-    let session = s.login("doomed", "password123").await;
+    let (server, superadmin) = start().await;
+    let id = create_id(&superadmin, "doomed", &[]).await;
+    let session = server.login("doomed", "password123").await;
     expect(session.post_empty(REFRESH).await, StatusCode::OK).await;
 
-    let body = expect(sa.delete(&user_url(&id)).await, StatusCode::NO_CONTENT).await;
+    let body = expect(
+        superadmin.delete(&user_url(&id)).await,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
     assert!(body.is_empty(), "204 不应有 body: {body}");
 
     expect_error(
-        sa.get(&user_url(&id)).await,
+        superadmin.get(&user_url(&id)).await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.delete(&user_url(&id)).await,
+        superadmin.delete(&user_url(&id)).await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
-    let v = list(&sa, "").await;
-    assert!(!usernames(&v).contains(&"doomed".to_owned()), "{v}");
-    assert_eq!(v["page_info"]["total"], 3);
+    let page = list(&superadmin, "").await;
+    assert!(!usernames(&page).contains(&"doomed".to_owned()), "{page}");
+    assert_eq!(page["page_info"]["total"], 3);
 
     assert_eq!(
-        front_login_status(&s, "doomed", "password123").await,
+        front_login_status(&server, "doomed", "password123").await,
         StatusCode::UNAUTHORIZED
     );
     expect(session.post_empty(REFRESH).await, StatusCode::UNAUTHORIZED).await;
 
     // 已删号的其它写操作也是 404
     expect_error(
-        sa.put_json(
-            &user_url(&id),
-            &json!({ "username": "zombie", "email": null }),
-        )
-        .await,
-        StatusCode::NOT_FOUND,
-        "not_found",
-    )
-    .await;
-    expect_error(
-        sa.put_json(&format!("{}/roles", user_url(&id)), &json!({ "roles": [] }))
+        superadmin
+            .put_json(
+                &user_url(&id),
+                &json!({ "username": "zombie", "email": null }),
+            )
             .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.post_json(
-            &format!("{}/password", user_url(&id)),
-            &json!({ "new_password": "revive1" }),
-        )
-        .await,
+        superadmin
+            .put_json(&format!("{}/roles", user_url(&id)), &json!({ "roles": [] }))
+            .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    expect_error(
+        superadmin
+            .post_json(
+                &format!("{}/password", user_url(&id)),
+                &json!({ "new_password": "revive1" }),
+            )
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
 
     // 用户名释放:再建同名号是个新 id
-    let again = create_id(&sa, "doomed", &[]).await;
+    let again = create_id(&superadmin, "doomed", &[]).await;
     assert_ne!(again, id);
 }
 
 /// 删号错误分支:不存在 404;坏 id 400;**删自己** 409(自锁)。
 #[tokio::test]
 async fn delete_user_missing_bad_id_and_self_is_409() {
-    let (s, sa) = start().await;
+    let (server, superadmin) = start().await;
     expect_error(
-        sa.delete(&user_url(&Uuid::now_v7().to_string())).await,
+        superadmin
+            .delete(&user_url(&Uuid::now_v7().to_string()))
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.delete(&user_url("nope")).await,
+        superadmin.delete(&user_url("nope")).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
 
-    let me = find_id(&sa, SUPERADMIN).await;
+    let me = find_id(&superadmin, SUPERADMIN).await;
     expect_error(
-        sa.delete(&user_url(&me)).await,
+        superadmin.delete(&user_url(&me)).await,
         StatusCode::CONFLICT,
         "conflict",
     )
     .await;
     // 自己还在、还能登
-    expect(sa.get(&user_url(&me)).await, StatusCode::OK).await;
-    s.login_admin(SUPERADMIN, PASSWORD).await;
+    expect(superadmin.get(&user_url(&me)).await, StatusCode::OK).await;
+    server.login_admin(SUPERADMIN, PASSWORD).await;
 }
 
 // ───────────────────────────── 8. 设角色 ─────────────────────────────
@@ -1107,12 +1174,13 @@ async fn delete_user_missing_bad_id_and_self_is_409() {
 /// 全量替换角色:设 [platform_admin] → 200;再设 [] 清空;改动反映在后续登录(能否进后台)。
 #[tokio::test]
 async fn set_roles_full_replace_affects_next_login() {
-    let (s, sa) = start().await;
-    let id = create_id(&sa, "promo", &[]).await;
+    let (server, superadmin) = start().await;
+    let id = create_id(&superadmin, "promo", &[]).await;
     let url = format!("{}/roles", user_url(&id));
     // 还没平台角色(也不在任何租户里)→ 后台登录 403
     expect(
-        s.anon()
+        server
+            .anonymous()
             .post_json(
                 ADMIN_LOGIN,
                 &json!({ "identifier": "promo", "password": "password123" }),
@@ -1122,28 +1190,31 @@ async fn set_roles_full_replace_affects_next_login() {
     )
     .await;
 
-    let ids = role_ids(&sa, &["platform_admin"]).await;
-    let v = expect_json(
-        sa.put_json(&url, &json!({ "roles": ids })).await,
+    let ids = role_ids(&superadmin, &["platform_admin"]).await;
+    let updated = expect_json(
+        superadmin.put_json(&url, &json!({ "roles": ids })).await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["id"], id.as_str());
-    assert_eq!(sorted_roles(&v), vec!["platform_admin"]);
-    let got = expect_json(sa.get(&user_url(&id)).await, StatusCode::OK).await;
+    assert_eq!(updated["id"], id.as_str());
+    assert_eq!(sorted_roles(&updated), vec!["platform_admin"]);
+    let got = expect_json(superadmin.get(&user_url(&id)).await, StatusCode::OK).await;
     assert_eq!(sorted_roles(&got), vec!["platform_admin"]);
-    s.login_admin("promo", "password123").await;
-    assert!(usernames(&list(&sa, "role=platform_admin").await).contains(&"promo".to_owned()));
+    server.login_admin("promo", "password123").await;
+    assert!(
+        usernames(&list(&superadmin, "role=platform_admin").await).contains(&"promo".to_owned())
+    );
 
     // 全量替换(不是追加):清空
-    let v = expect_json(
-        sa.put_json(&url, &json!({ "roles": [] })).await,
+    let updated = expect_json(
+        superadmin.put_json(&url, &json!({ "roles": [] })).await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["roles"], json!([]));
+    assert_eq!(updated["roles"], json!([]));
     expect(
-        s.anon()
+        server
+            .anonymous()
             .post_json(
                 ADMIN_LOGIN,
                 &json!({ "identifier": "promo", "password": "password123" }),
@@ -1153,44 +1224,49 @@ async fn set_roles_full_replace_affects_next_login() {
     )
     .await;
     // 列表的角色过滤也跟着变
-    assert!(!usernames(&list(&sa, "role=platform_admin").await).contains(&"promo".to_owned()));
+    assert!(
+        !usernames(&list(&superadmin, "role=platform_admin").await).contains(&"promo".to_owned())
+    );
 }
 
 /// 设角色错误分支:未知角色 id 422(原子,不留半态);不存在 404;坏 body 400。
 #[tokio::test]
 async fn set_roles_error_cases() {
-    let (_s, sa) = start().await;
-    let id = create_id(&sa, "roleuser", &["platform_admin"]).await;
+    let (_server, superadmin) = start().await;
+    let id = create_id(&superadmin, "roleuser", &["platform_admin"]).await;
     let url = format!("{}/roles", user_url(&id));
-    let mut ids = role_ids(&sa, &["platform_admin"]).await;
+    let mut ids = role_ids(&superadmin, &["platform_admin"]).await;
     ids.push(NIL.to_owned());
     expect_error(
-        sa.put_json(&url, &json!({ "roles": ids })).await,
+        superadmin.put_json(&url, &json!({ "roles": ids })).await,
         StatusCode::UNPROCESSABLE_ENTITY,
         "validation",
     )
     .await;
-    let got = expect_json(sa.get(&user_url(&id)).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&user_url(&id)).await, StatusCode::OK).await;
     assert_eq!(got["roles"], json!(["platform_admin"]), "失败不应留半态");
 
     expect_error(
-        sa.put_json(
-            &format!("{}/roles", user_url(&Uuid::now_v7().to_string())),
-            &json!({ "roles": [] }),
-        )
-        .await,
+        superadmin
+            .put_json(
+                &format!("{}/roles", user_url(&Uuid::now_v7().to_string())),
+                &json!({ "roles": [] }),
+            )
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.put_json(&url, &json!({ "roles": "admin" })).await,
+        superadmin
+            .put_json(&url, &json!({ "roles": "admin" }))
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     expect_error(
-        sa.put_json(&url, &json!({})).await,
+        superadmin.put_json(&url, &json!({})).await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -1202,25 +1278,25 @@ async fn set_roles_error_cases() {
 /// 未知角色 id 先报 422(不被 403 / 409 抢先)。保留 superadmin 的改动见 `http_platform_admin.rs`。
 #[tokio::test]
 async fn set_own_roles_cannot_drop_superadmin() {
-    let (s, sa) = start().await;
-    let me = find_id(&sa, SUPERADMIN).await;
+    let (server, superadmin) = start().await;
+    let me = find_id(&superadmin, SUPERADMIN).await;
     let url = format!("{}/roles", user_url(&me));
     expect_error(
-        sa.put_json(&url, &json!({ "roles": [] })).await,
+        superadmin.put_json(&url, &json!({ "roles": [] })).await,
         StatusCode::FORBIDDEN,
         "forbidden",
     )
     .await;
     expect_error(
-        sa.put_json(&url, &json!({ "roles": [NIL] })).await,
+        superadmin.put_json(&url, &json!({ "roles": [NIL] })).await,
         StatusCode::UNPROCESSABLE_ENTITY,
         "validation",
     )
     .await;
-    let got = expect_json(sa.get(&user_url(&me)).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&user_url(&me)).await, StatusCode::OK).await;
     assert_eq!(got["roles"], json!(["superadmin"]), "被拒后角色不变");
     // 仍是超管
-    let again = s.login_admin(SUPERADMIN, PASSWORD).await;
+    let again = server.login_admin(SUPERADMIN, PASSWORD).await;
     expect(again.get(USERS).await, StatusCode::OK).await;
 }
 
@@ -1229,27 +1305,28 @@ async fn set_own_roles_cannot_drop_superadmin() {
 /// 重置密码 → 204;旧密码登不进、新密码能登;**既有会话被撤**(refresh 401)。
 #[tokio::test]
 async fn reset_password_switches_password_and_revokes_sessions() {
-    let (s, sa) = start().await;
-    let user_id = find_id(&sa, USER).await;
-    let old_session = s.login(USER, PASSWORD).await;
+    let (server, superadmin) = start().await;
+    let user_id = find_id(&superadmin, USER).await;
+    let old_session = server.login(USER, PASSWORD).await;
     expect(old_session.post_empty(REFRESH).await, StatusCode::OK).await;
 
     let body = expect(
-        sa.post_json(
-            &format!("{}/password", user_url(&user_id)),
-            &json!({ "new_password": "brand-new-1" }),
-        )
-        .await,
+        superadmin
+            .post_json(
+                &format!("{}/password", user_url(&user_id)),
+                &json!({ "new_password": "brand-new-1" }),
+            )
+            .await,
         StatusCode::NO_CONTENT,
     )
     .await;
     assert!(body.is_empty(), "204 不应有 body: {body}");
 
     assert_eq!(
-        front_login_status(&s, USER, PASSWORD).await,
+        front_login_status(&server, USER, PASSWORD).await,
         StatusCode::UNAUTHORIZED
     );
-    let fresh = s.login(USER, "brand-new-1").await;
+    let fresh = server.login(USER, "brand-new-1").await;
     assert_eq!(
         expect_json(fresh.get(FRONT_ME).await, StatusCode::OK).await["username"],
         USER
@@ -1267,20 +1344,21 @@ async fn reset_password_switches_password_and_revokes_sessions() {
 /// 管理员给**自己**重置密码也允许(无自锁);之后旧密码失效。
 #[tokio::test]
 async fn reset_own_password_is_allowed() {
-    let (s, sa) = start().await;
-    let me = find_id(&sa, SUPERADMIN).await;
+    let (server, superadmin) = start().await;
+    let me = find_id(&superadmin, SUPERADMIN).await;
     expect(
-        sa.post_json(
-            &format!("{}/password", user_url(&me)),
-            &json!({ "new_password": "rotated-1" }),
-        )
-        .await,
+        superadmin
+            .post_json(
+                &format!("{}/password", user_url(&me)),
+                &json!({ "new_password": "rotated-1" }),
+            )
+            .await,
         StatusCode::NO_CONTENT,
     )
     .await;
-    s.login_admin(SUPERADMIN, "rotated-1").await;
+    server.login_admin(SUPERADMIN, "rotated-1").await;
     assert_eq!(
-        front_login_status(&s, SUPERADMIN, PASSWORD).await,
+        front_login_status(&server, SUPERADMIN, PASSWORD).await,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -1288,39 +1366,45 @@ async fn reset_own_password_is_allowed() {
 /// 重置密码错误分支:短密码 422(且旧密码仍有效);不存在 404;缺字段 400;坏 id 400。
 #[tokio::test]
 async fn reset_password_error_cases() {
-    let (s, sa) = start().await;
-    let user_id = find_id(&sa, USER).await;
+    let (server, superadmin) = start().await;
+    let user_id = find_id(&superadmin, USER).await;
     let url = format!("{}/password", user_url(&user_id));
     expect_error(
-        sa.post_json(&url, &json!({ "new_password": "ab" })).await,
+        superadmin
+            .post_json(&url, &json!({ "new_password": "ab" }))
+            .await,
         StatusCode::UNPROCESSABLE_ENTITY,
         "validation",
     )
     .await;
-    s.login(USER, PASSWORD).await; // 没改成
+    server.login(USER, PASSWORD).await; // 没改成
 
     expect_error(
-        sa.post_json(
-            &format!("{}/password", user_url(&Uuid::now_v7().to_string())),
-            &json!({ "new_password": "secret1" }),
-        )
-        .await,
+        superadmin
+            .post_json(
+                &format!("{}/password", user_url(&Uuid::now_v7().to_string())),
+                &json!({ "new_password": "secret1" }),
+            )
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        sa.post_json(&url, &json!({ "password": "secret1" })).await,
+        superadmin
+            .post_json(&url, &json!({ "password": "secret1" }))
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
     .await;
     expect_error(
-        sa.post_json(
-            &format!("{}/password", user_url("zzz")),
-            &json!({ "new_password": "secret1" }),
-        )
-        .await,
+        superadmin
+            .post_json(
+                &format!("{}/password", user_url("zzz")),
+                &json!({ "new_password": "secret1" }),
+            )
+            .await,
         StatusCode::BAD_REQUEST,
         "bad_request",
     )
@@ -1332,22 +1416,30 @@ async fn reset_password_error_cases() {
 /// 带「中间管理员」的策略:`useradmin` 有 users:admin + admin:login 但非满权。
 /// user 角色不带权限 → 中间管理员够得着它(打「同级/更低权目标」照常放行)。
 fn escalation_policy() -> Policy {
-    Policy::from_roles([
-        ("superadmin".to_owned(), Perm::ALL.to_vec()),
-        ("admin".to_owned(), vec![Perm::AdminLogin]),
+    Policy::new([
+        ("superadmin".to_owned(), Permission::ALL.to_vec()),
+        ("admin".to_owned(), vec![Permission::AdminLogin]),
         ("user".to_owned(), vec![]),
         (
             "useradmin".to_owned(),
-            vec![Perm::AdminLogin, Perm::UsersAdmin],
+            vec![Permission::AdminLogin, Permission::UsersAdmin],
         ),
     ])
 }
 
-/// 起服务(中间管理员策略)→ (服务, superadmin 会话, 中间管理员会话)。
-async fn start_escalation() -> (TestServer, Client, Client) {
-    let s = TestServer::start_with(|st| st.policy = Arc::new(escalation_policy())).await;
-    let sa = s.login_admin(SUPERADMIN, PASSWORD).await;
-    let ua = s.bearer(&mint(
+/// 中间管理员策略下起好的服务和两个会话。
+struct EscalationSetup {
+    server: TestServer,
+    superadmin: Client,
+    /// 中间管理员(`useradmin`)会话。
+    user_admin: Client,
+}
+
+/// 起服务(中间管理员策略)并登好 superadmin 与中间管理员会话。
+async fn start_escalation() -> EscalationSetup {
+    let server = TestServer::start_with(|state| state.policy = Arc::new(escalation_policy())).await;
+    let superadmin = server.login_admin(SUPERADMIN, PASSWORD).await;
+    let user_admin = server.bearer(&mint(
         Uuid::now_v7(),
         "useradmin",
         &["useradmin"],
@@ -1355,96 +1447,123 @@ async fn start_escalation() -> (TestServer, Client, Client) {
         &["useradmin"],
         vec![],
     ));
-    (s, sa, ua)
+    EscalationSetup {
+        server,
+        superadmin,
+        user_admin,
+    }
 }
 
 /// 中间管理员能读(列表 / 详情 / 角色目录),但对 superadmin 的四个写操作全 403,
 /// 且 superadmin 毫发无损(原密码能登、名字/角色不变、没被删)。
 #[tokio::test]
 async fn intermediate_admin_cannot_touch_superadmin() {
-    let (s, sa, ua) = start_escalation().await;
-    expect(ua.get(USERS).await, StatusCode::OK).await;
-    expect(ua.get(ROLES).await, StatusCode::OK).await;
-    let victim = find_id(&ua, SUPERADMIN).await;
+    let EscalationSetup {
+        server,
+        superadmin,
+        user_admin,
+    } = start_escalation().await;
+    expect(user_admin.get(USERS).await, StatusCode::OK).await;
+    expect(user_admin.get(ROLES).await, StatusCode::OK).await;
+    let victim = find_id(&user_admin, SUPERADMIN).await;
     let url = user_url(&victim);
-    expect(ua.get(&url).await, StatusCode::OK).await;
+    expect(user_admin.get(&url).await, StatusCode::OK).await;
 
     expect_error(
-        ua.post_json(
-            &format!("{url}/password"),
-            &json!({ "new_password": "pwned123" }),
-        )
-        .await,
-        StatusCode::FORBIDDEN,
-        "forbidden",
-    )
-    .await;
-    expect_error(
-        ua.put_json(&url, &json!({ "username": "hijacked", "email": null }))
+        user_admin
+            .post_json(
+                &format!("{url}/password"),
+                &json!({ "new_password": "pwned123" }),
+            )
             .await,
         StatusCode::FORBIDDEN,
         "forbidden",
     )
     .await;
     expect_error(
-        ua.put_json(&format!("{url}/roles"), &json!({ "roles": [] }))
+        user_admin
+            .put_json(&url, &json!({ "username": "hijacked", "email": null }))
             .await,
         StatusCode::FORBIDDEN,
         "forbidden",
     )
     .await;
-    expect_error(ua.delete(&url).await, StatusCode::FORBIDDEN, "forbidden").await;
+    expect_error(
+        user_admin
+            .put_json(&format!("{url}/roles"), &json!({ "roles": [] }))
+            .await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+    expect_error(
+        user_admin.delete(&url).await,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
 
-    let got = expect_json(sa.get(&url).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&url).await, StatusCode::OK).await;
     assert_eq!(got["username"], SUPERADMIN);
     assert_eq!(got["roles"], json!(["superadmin"]));
-    s.login_admin(SUPERADMIN, PASSWORD).await;
+    server.login_admin(SUPERADMIN, PASSWORD).await;
 }
 
 /// 对同级/更低权目标,中间管理员四个写操作照常放行(闸别收成谁都改不了)。
 #[tokio::test]
 async fn intermediate_admin_can_manage_lower_users() {
-    let (s, sa, ua) = start_escalation().await;
-    let plain = create_id(&sa, "plain", &[]).await;
+    let EscalationSetup {
+        server,
+        superadmin,
+        user_admin,
+    } = start_escalation().await;
+    let plain = create_id(&superadmin, "plain", &[]).await;
     let url = user_url(&plain);
-    let v = expect_json(
-        ua.put_json(&url, &json!({ "username": "plain2", "email": null }))
+    let updated = expect_json(
+        user_admin
+            .put_json(&url, &json!({ "username": "plain2", "email": null }))
             .await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["username"], "plain2");
-    let v = expect_json(
-        ua.put_json(&format!("{url}/roles"), &json!({ "roles": [] }))
+    assert_eq!(updated["username"], "plain2");
+    let updated = expect_json(
+        user_admin
+            .put_json(&format!("{url}/roles"), &json!({ "roles": [] }))
             .await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(sorted_roles(&v), Vec::<String>::new());
+    assert!(sorted_roles(&updated).is_empty(), "{updated}");
     expect(
-        ua.post_json(
-            &format!("{url}/password"),
-            &json!({ "new_password": "reset-ok" }),
-        )
-        .await,
+        user_admin
+            .post_json(
+                &format!("{url}/password"),
+                &json!({ "new_password": "reset-ok" }),
+            )
+            .await,
         StatusCode::NO_CONTENT,
     )
     .await;
-    s.login("plain2", "reset-ok").await;
-    expect(ua.delete(&url).await, StatusCode::NO_CONTENT).await;
-    expect(sa.get(&url).await, StatusCode::NOT_FOUND).await;
+    server.login("plain2", "reset-ok").await;
+    expect(user_admin.delete(&url).await, StatusCode::NO_CONTENT).await;
+    expect(superadmin.get(&url).await, StatusCode::NOT_FOUND).await;
 }
 
 /// 授出去的角色也闸:中间管理员(无 platform:roles)不能建平台管理员号、不能把别人升成平台管理员(403,不落库);
 /// 目录里也看不到可授的平台角色(id 取自 superadmin 的目录)。superadmin 授出后,中间管理员反过来动不了那个号。
 #[tokio::test]
 async fn intermediate_admin_cannot_grant_platform_admin() {
-    let (_s, sa, ua) = start_escalation().await;
-    let v = expect_json(ua.get(ROLES).await, StatusCode::OK).await;
-    assert_eq!(v["items"], json!([]), "无 platform:roles → 目录为空");
-    let super_role = role_ids(&sa, &["platform_admin"]).await;
+    let EscalationSetup {
+        superadmin,
+        user_admin,
+        ..
+    } = start_escalation().await;
+    let catalog = expect_json(user_admin.get(ROLES).await, StatusCode::OK).await;
+    assert_eq!(catalog["items"], json!([]), "无 platform:roles → 目录为空");
+    let super_role = role_ids(&superadmin, &["platform_admin"]).await;
     expect_error(
-        ua.post_json(
+        user_admin.post_json(
             USERS,
             &json!({ "username": "sneaky", "email": null, "password": "secret1", "roles": super_role }),
         )
@@ -1454,39 +1573,41 @@ async fn intermediate_admin_cannot_grant_platform_admin() {
     )
     .await;
     assert!(
-        !usernames(&list(&sa, "username=sneaky").await).contains(&"sneaky".to_owned()),
+        !usernames(&list(&superadmin, "username=sneaky").await).contains(&"sneaky".to_owned()),
         "被拒的建号不应落库"
     );
 
-    let plain = create_id(&ua, "plain", &[]).await;
+    let plain = create_id(&user_admin, "plain", &[]).await;
     let with_super = super_role.clone();
     expect_error(
-        ua.put_json(
-            &format!("{}/roles", user_url(&plain)),
-            &json!({ "roles": with_super }),
-        )
-        .await,
+        user_admin
+            .put_json(
+                &format!("{}/roles", user_url(&plain)),
+                &json!({ "roles": with_super }),
+            )
+            .await,
         StatusCode::FORBIDDEN,
         "forbidden",
     )
     .await;
-    let got = expect_json(sa.get(&user_url(&plain)).await, StatusCode::OK).await;
+    let got = expect_json(superadmin.get(&user_url(&plain)).await, StatusCode::OK).await;
     assert_eq!(got["roles"], json!([]), "被拒后角色不变");
 
     // superadmin(持 platform:roles)授平台管理员照常
-    let v = expect_json(
-        sa.put_json(
-            &format!("{}/roles", user_url(&plain)),
-            &json!({ "roles": super_role }),
-        )
-        .await,
+    let updated = expect_json(
+        superadmin
+            .put_json(
+                &format!("{}/roles", user_url(&plain)),
+                &json!({ "roles": super_role }),
+            )
+            .await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["roles"], json!(["platform_admin"]));
+    assert_eq!(updated["roles"], json!(["platform_admin"]));
     // 现在 plain 是平台管理员了 → 中间管理员反过来动不了它
     expect_error(
-        ua.delete(&user_url(&plain)).await,
+        user_admin.delete(&user_url(&plain)).await,
         StatusCode::FORBIDDEN,
         "forbidden",
     )
@@ -1497,17 +1618,17 @@ async fn intermediate_admin_cannot_grant_platform_admin() {
 /// 不带权限的操作照常。验证闸看的是 role ∩ scope,而不只是 role。
 #[tokio::test]
 async fn scoped_superadmin_token_cannot_grant_or_touch_beyond_scope() {
-    let (s, sa) = start().await;
-    let narrow = s.bearer(&mint(
+    let (server, superadmin) = start().await;
+    let narrow = server.bearer(&mint(
         Uuid::now_v7(),
         SUPERADMIN,
         &[SUPERADMIN],
         Some(DEFAULT_TENANT),
         &[ADMIN],
-        vec![Perm::AdminLogin, Perm::UsersAdmin],
+        vec![Permission::AdminLogin, Permission::UsersAdmin],
     ));
     // scope 只给了 admin:login + users:admin,没给 platform:roles / tenants:admin
-    let super_role = role_ids(&sa, &["platform_admin"]).await;
+    let super_role = role_ids(&superadmin, &["platform_admin"]).await;
     // 授平台管理员(要 platform:roles,且含 tenants:admin,都在 scope 外)→ 403
     expect_error(
         narrow
@@ -1521,7 +1642,7 @@ async fn scoped_superadmin_token_cannot_grant_or_touch_beyond_scope() {
     )
     .await;
     // 不授角色 → 201
-    let v = expect_json(
+    let created = expect_json(
         narrow
             .post_json(
                 USERS,
@@ -1531,9 +1652,9 @@ async fn scoped_superadmin_token_cannot_grant_or_touch_beyond_scope() {
         StatusCode::CREATED,
     )
     .await;
-    let bare = v["id"].as_str().unwrap().to_owned();
+    let bare = created["id"].as_str().unwrap().to_owned();
     // 目标持平台角色(平台管理员,要 platform:roles,scope 外)→ 改密 403;无角色的号 → 204
-    let boss = create_id(&sa, "boss", &["platform_admin"]).await;
+    let boss = create_id(&superadmin, "boss", &["platform_admin"]).await;
     expect_error(
         narrow
             .post_json(
@@ -1545,7 +1666,7 @@ async fn scoped_superadmin_token_cannot_grant_or_touch_beyond_scope() {
         "forbidden",
     )
     .await;
-    s.login("boss", "password123").await; // 没被改
+    server.login("boss", "password123").await; // 没被改
     expect(
         narrow
             .post_json(
@@ -1562,10 +1683,10 @@ async fn scoped_superadmin_token_cannot_grant_or_touch_beyond_scope() {
 /// 但账号的列 / 建 / 查 / 改 / 删 / 设平台角色 / 重置密码 / 角色目录一律 403 —— 账号是全局的,可能也属于别的租户。
 #[tokio::test]
 async fn tenant_admin_cannot_manage_accounts() {
-    let (s, sa) = start().await;
-    let target = create_id(&sa, "victim", &[]).await;
-    let a = s.login_admin(ADMIN, PASSWORD).await;
-    let reqs: Vec<(Method, String, Option<Value>)> = vec![
+    let (server, superadmin) = start().await;
+    let target = create_id(&superadmin, "victim", &[]).await;
+    let admin = server.login_admin(ADMIN, PASSWORD).await;
+    let requests: Vec<(Method, String, Option<Value>)> = vec![
         (Method::GET, USERS.to_owned(), None),
         (
             Method::POST,
@@ -1591,15 +1712,24 @@ async fn tenant_admin_cannot_manage_accounts() {
         ),
         (Method::GET, ROLES.to_owned(), None),
     ];
-    for (method, path, body) in reqs {
-        let mut r = a.req(method.clone(), &path);
-        if let Some(b) = &body {
-            r = r.json(b);
+    for (method, path, body) in requests {
+        let mut request = admin.request(method.clone(), &path);
+        if let Some(payload) = &body {
+            request = request.json(payload);
         }
-        expect_error(r.send().await.unwrap(), StatusCode::FORBIDDEN, "forbidden").await;
+        expect_error(
+            request.send().await.unwrap(),
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )
+        .await;
     }
     // 账号原样:没被改名 / 删除 / 改密
-    let v = expect_json(sa.get(&format!("{USERS}/{target}")).await, StatusCode::OK).await;
-    assert_eq!(v["username"], "victim");
-    s.login("victim", "password123").await;
+    let user = expect_json(
+        superadmin.get(&format!("{USERS}/{target}")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(user["username"], "victim");
+    server.login("victim", "password123").await;
 }

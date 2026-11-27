@@ -3,17 +3,17 @@
 //! 成员列表的检索投影、资料富化是跨模块能力,走本模块自己的窄端口(实现在组合根 `app/adapters/`)。
 //! HTTP 适配器在主 crate。
 
-pub mod memory;
 pub mod model;
 pub mod ports;
-mod service;
+pub mod static_member_profiles;
+mod tenant_admin_service;
 
-pub use memory::StaticMemberProfiles;
 pub use model::{
-    AddMember, CreateTenant, ListMembers, MemberStatus, MemberView, TenantStatus, TenantView,
-    UpdateTenant,
+    AddMember, CreateTenant, ListMembers, MemberStatus, MemberView, ResolvedMember, TenantStatus,
+    TenantView, UpdateTenant,
 };
 pub use ports::{
     MemberProfile, MemberProfiles, MemberSearchIndex, MemberSearchPage, MemberSearchRow,
 };
-pub use service::TenantAdminService;
+pub use static_member_profiles::StaticMemberProfiles;
+pub use tenant_admin_service::TenantAdminService;

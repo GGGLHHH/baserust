@@ -14,72 +14,75 @@ use reqwest::{Method, StatusCode};
 
 #[tokio::test]
 async fn health_probes() {
-    let s = TestServer::start().await;
-    let c = s.anon();
+    let server = TestServer::start().await;
+    let client = server.anonymous();
     for path in ["/health", "/livez"] {
         assert_eq!(
-            expect(c.get(path).await, StatusCode::OK).await,
+            expect(client.get(path).await, StatusCode::OK).await,
             "ok",
             "{path}"
         );
     }
     // 内存模式无外部依赖 → 恒就绪,逐项检查结果为空
-    let v = expect_json(c.get("/readyz").await, StatusCode::OK).await;
-    assert_eq!(v["status"], "ok", "{v}");
-    assert_eq!(v["checks"], serde_json::json!({}), "{v}");
+    let readiness = expect_json(client.get("/readyz").await, StatusCode::OK).await;
+    assert_eq!(readiness["status"], "ok", "{readiness}");
+    assert_eq!(readiness["checks"], serde_json::json!({}), "{readiness}");
 }
 
 /// 当前令牌的有效权限:role 展开 ∩ scope;未登录 401。
 #[tokio::test]
 async fn permissions_me() {
-    let s = TestServer::start().await;
+    let server = TestServer::start().await;
     let path = "/api/v1/frontend/permissions/me";
-    expect(s.anon().get(path).await, StatusCode::UNAUTHORIZED).await;
+    expect(server.anonymous().get(path).await, StatusCode::UNAUTHORIZED).await;
 
-    let user = s.login(USER, PASSWORD).await;
-    let v = expect_json(user.get(path).await, StatusCode::OK).await;
+    let user = server.login(USER, PASSWORD).await;
+    let me = expect_json(user.get(path).await, StatusCode::OK).await;
     // user 没有平台角色;它的 user 角色是默认租户里的租户角色
-    assert_eq!(v["roles"], serde_json::json!([]));
-    assert_eq!(v["tenant_roles"], serde_json::json!(["user"]));
-    let perms: Vec<&str> = v["permissions"]
+    assert_eq!(me["roles"], serde_json::json!([]));
+    assert_eq!(me["tenant_roles"], serde_json::json!(["user"]));
+    let permissions: Vec<&str> = me["permissions"]
         .as_array()
         .unwrap()
         .iter()
         .map(|p| p.as_str().unwrap())
         .collect();
-    assert!(perms.contains(&"widgets:read"), "{v}");
+    assert!(permissions.contains(&"widgets:read"), "{me}");
     assert!(
-        !perms.contains(&"users:admin"),
-        "user 不应有 users:admin: {v}"
+        !permissions.contains(&"users:admin"),
+        "user 不应有 users:admin: {me}"
     );
-    let mut sorted = perms.clone();
+    let mut sorted = permissions.clone();
     sorted.sort();
-    assert_eq!(perms, sorted, "权限按 wire 串排序输出");
+    assert_eq!(permissions, sorted, "权限按 wire 串排序输出");
 
-    let admin = s.login(ADMIN, PASSWORD).await;
-    let v = expect_json(admin.get(path).await, StatusCode::OK).await;
+    let admin = server.login(ADMIN, PASSWORD).await;
+    let me = expect_json(admin.get(path).await, StatusCode::OK).await;
     assert!(
-        v["permissions"]
+        me["permissions"]
             .as_array()
             .unwrap()
             .iter()
             .any(|p| p == "admin:login"),
-        "{v}"
+        "{me}"
     );
 }
 
 /// 未知路径 → 404 **JSON 统一错误体**(不是框架默认的空 body / 纯文本)。
 #[tokio::test]
 async fn unknown_path_is_json_404() {
-    let s = TestServer::start().await;
+    let server = TestServer::start().await;
     expect_error(
-        s.anon().get("/api/v1/frontend/no-such-thing").await,
+        server
+            .anonymous()
+            .get("/api/v1/frontend/no-such-thing")
+            .await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
     .await;
     expect_error(
-        s.anon().get("/nope").await,
+        server.anonymous().get("/nope").await,
         StatusCode::NOT_FOUND,
         "not_found",
     )
@@ -89,71 +92,87 @@ async fn unknown_path_is_json_404() {
 /// 路径存在但方法不支持 → 405 + 统一错误体(机器码归 bad_request)+ `allow` 头。
 #[tokio::test]
 async fn wrong_method_is_json_405() {
-    let s = TestServer::start().await;
-    let resp = s
+    let server = TestServer::start().await;
+    let response = server
         .login(USER, PASSWORD)
         .await
-        .req(Method::PATCH, "/api/v1/frontend/widgets")
+        .request(Method::PATCH, "/api/v1/frontend/widgets")
         .send()
         .await
         .unwrap();
-    assert!(resp.headers().get("allow").is_some(), "405 应带 allow 头");
-    expect_error(resp, StatusCode::METHOD_NOT_ALLOWED, "bad_request").await;
+    assert!(
+        response.headers().get("allow").is_some(),
+        "405 应带 allow 头"
+    );
+    expect_error(response, StatusCode::METHOD_NOT_ALLOWED, "bad_request").await;
 }
 
 /// 每个响应(含错误响应)都带安全头 + request-id。
 #[tokio::test]
 async fn security_headers_and_request_id_on_every_response() {
-    let s = TestServer::start().await;
-    let c = s.anon();
+    let server = TestServer::start().await;
+    let client = server.anonymous();
     for path in ["/health", "/api/v1/frontend/widgets", "/nope"] {
-        let resp = c.get(path).await;
-        let h = resp.headers();
-        assert_eq!(h["x-content-type-options"], "nosniff", "{path}");
-        assert_eq!(h["x-frame-options"], "DENY", "{path}");
-        assert_eq!(h["referrer-policy"], "no-referrer", "{path}");
-        assert!(h.get("x-request-id").is_some(), "{path} 缺 x-request-id");
+        let response = client.get(path).await;
+        let headers = response.headers();
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
+        assert!(
+            headers.get("x-request-id").is_some(),
+            "{path} 缺 x-request-id"
+        );
     }
 }
 
 /// 客户端给的 request-id 原样回传(便于前后端日志关联)。
 #[tokio::test]
 async fn request_id_is_propagated() {
-    let s = TestServer::start().await;
-    let resp = s
-        .anon()
-        .req(Method::GET, "/health")
+    let server = TestServer::start().await;
+    let response = server
+        .anonymous()
+        .request(Method::GET, "/health")
         .header("x-request-id", "trace-me-123")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.headers()["x-request-id"], "trace-me-123");
+    assert_eq!(response.headers()["x-request-id"], "trace-me-123");
 }
 
 /// dev 配置下 CORS 放行任意源(预检 + 实际请求都带 CORS 头,错误响应也带)。
 #[tokio::test]
 async fn cors_dev_permissive() {
-    let s = TestServer::start().await;
-    let c = s.anon();
-    let pre = c
-        .req(Method::OPTIONS, "/api/v1/frontend/widgets")
+    let server = TestServer::start().await;
+    let client = server.anonymous();
+    let preflight = client
+        .request(Method::OPTIONS, "/api/v1/frontend/widgets")
         .header("origin", "http://example.test")
         .header("access-control-request-method", "GET")
         .send()
         .await
         .unwrap();
-    assert!(pre.status().is_success(), "预检应成功: {}", pre.status());
-    assert!(pre.headers().get("access-control-allow-origin").is_some());
+    assert!(
+        preflight.status().is_success(),
+        "预检应成功: {}",
+        preflight.status()
+    );
+    assert!(preflight
+        .headers()
+        .get("access-control-allow-origin")
+        .is_some());
 
-    let resp = c
-        .req(Method::GET, "/api/v1/frontend/widgets")
+    let response = client
+        .request(Method::GET, "/api/v1/frontend/widgets")
         .header("origin", "http://example.test")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(
-        resp.headers().get("access-control-allow-origin").is_some(),
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_some(),
         "错误响应也要带 CORS 头,否则浏览器读不到错误体"
     );
 }

@@ -10,17 +10,17 @@
 use async_trait::async_trait;
 
 use crate::features::profile::{AppOutboxRecord, InMemoryAppOutbox, PgAppOutbox};
-use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxSource};
-use crate::kernel::error::AppError;
+use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxRecordRef, OutboxSource};
+use crate::kernel::app_error::AppError;
 
-fn to_item(rec: AppOutboxRecord) -> OutboxItem {
-    build_outbox_item(
-        "app",
-        rec.id,
-        &rec.event_type,
-        rec.aggregate_id,
-        &rec.payload,
-    )
+fn to_item(record: AppOutboxRecord) -> OutboxItem {
+    build_outbox_item(OutboxRecordRef {
+        schema: "app",
+        id: record.id,
+        event_type: &record.event_type,
+        aggregate_id: record.aggregate_id,
+        payload: &record.payload,
+    })
 }
 
 #[async_trait]
@@ -65,7 +65,7 @@ mod tests {
     #[tokio::test]
     async fn maps_profile_updated_record_and_delegates_mark_published() {
         let profiles = InMemoryProfileRepo::new();
-        let outbox = InMemoryAppOutbox::sharing_with(&profiles);
+        let outbox = InMemoryAppOutbox::new_shared_with(&profiles);
         let user_id = Uuid::now_v7();
         profiles
             .upsert(

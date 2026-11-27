@@ -6,7 +6,7 @@ mod routes;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
 /// admin 组(组闸「admin:login」由 composition root 上;端点内再 gate「users:admin」)。
 pub fn admin_router() -> OpenApiRouter<AppState> {

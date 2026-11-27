@@ -1,8 +1,8 @@
-//! idm 默认数据 seed —— **进程内启动时**(`AppState::new`,见 [`crate::app::state`])或**显式 CLI**
+//! idm 默认数据 seed —— **进程内启动时**(`AppState::try_new`,见 [`crate::app::app_state`])或**显式 CLI**
 //! (`src/bin/seed.rs`)两条路共用此核心。幂等:role / 租户 upsert、账号 find-or-create、平台角色与成员关系取并集补齐,
 //! 可重复跑、可并发。
 //!
-//! 分工:**角色集 / 权限集 / role→权限默认**是代码闭集(`authz::{RoleName, Perm}`,不做动态 CRUD);
+//! 分工:**角色集 / 权限集 / role→权限默认**是代码闭集(`kernel::authorization::{RoleName, Permission}`,不做动态 CRUD);
 //! **租户与账号**(实例数据 + 密码)归 `seed.toml`(编译期 `include_str!` 嵌入,`SEED_FILE` 可覆盖)。
 //!
 //! 格式(spec §4.7):
@@ -21,15 +21,20 @@
 //! 租户角色进默认租户的成员关系。
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 
 use anyhow::Context;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::features::profile::{ProfileFields, ProfileRepo};
-use crate::kernel::authz::{Perm, Policy, RoleName};
-use crate::kernel::tenant::DEFAULT_TENANT_ID;
-use idm::{IdmError, MemberRepo, PwHasher, RoleRepo, RoleScope, TenantRepo, UserRepo};
+use crate::kernel::authorization::{Permission, Policy, RoleName};
+use crate::kernel::tenant_id::DEFAULT_TENANT_ID;
+use idm::{
+    IdmError, ListPage, MemberKey, MemberRepo, NewRole, NewTenant, NewUser, PasswordHasher,
+    RoleRepo, RoleScope, SortDirection, TenantRepo, UserListFilter, UserRepo, UserSortBy,
+    UserWithHash,
+};
 
 /// 编译期嵌入的默认 seed(仓库根 `seed.toml`)。`SEED_FILE` 设了则读外部文件覆盖。
 /// 注:Docker 构建需把 `seed.toml` 拷进 builder 上下文(见 Dockerfile),否则 `include_str!` 编译失败。
@@ -39,7 +44,7 @@ const EMBEDDED_SEED: &str = include_str!("../../seed.toml");
 pub const DEFAULT_TENANT_SLUG: &str = "default";
 
 /// 外置 seed:**租户 + 账号**(实例数据 + 密码,`SEED_FILE` 可覆盖)。角色集 / 权限集 / role→权限
-/// 默认全收进代码枚举(`RoleName` / `Perm`)—— 封闭集、不做动态 CRUD(角色**有哪些权限**才可
+/// 默认全收进代码枚举(`RoleName` / `Permission`)—— 封闭集、不做动态 CRUD(角色**有哪些权限**才可
 /// 运行时改,落 `role_permissions` 表)。
 #[derive(Deserialize, Default)]
 pub struct SeedData {
@@ -58,6 +63,7 @@ pub(crate) struct TenantSeed {
     name: String,
 }
 
+/// 一个账号(`[[users]]`,旧名 `[[accounts]]`):用户名 / 密码 + 平台角色 + 成员关系。
 #[derive(Deserialize, Clone)]
 pub(crate) struct UserSeed {
     username: String,
@@ -80,6 +86,7 @@ pub(crate) struct UserSeed {
     display_name: Option<String>,
 }
 
+/// 一条成员关系:租户 slug + 该租户里的角色。
 #[derive(Deserialize, Clone)]
 pub(crate) struct MembershipSeed {
     pub(crate) slug: String,
@@ -117,12 +124,14 @@ impl UserSeed {
             slug: DEFAULT_TENANT_SLUG.to_owned(),
             roles: legacy,
         });
-        for m in self.tenants.iter().cloned().chain(legacy) {
-            match out.iter_mut().find(|o| o.slug == m.slug) {
-                Some(o) => o.roles = dedup(o.roles.iter().chain(m.roles.iter())),
+        for membership in self.tenants.iter().cloned().chain(legacy) {
+            match out.iter_mut().find(|o| o.slug == membership.slug) {
+                Some(existing) => {
+                    existing.roles = dedup(existing.roles.iter().chain(membership.roles.iter()))
+                }
                 None => out.push(MembershipSeed {
-                    roles: dedup(m.roles.iter()),
-                    ..m
+                    roles: dedup(membership.roles.iter()),
+                    ..membership
                 }),
             }
         }
@@ -130,11 +139,11 @@ impl UserSeed {
     }
 }
 
-fn dedup<'a>(names: impl Iterator<Item = &'a String>) -> Vec<String> {
+fn dedup<'name>(names: impl Iterator<Item = &'name String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for n in names {
-        if !out.contains(n) {
-            out.push(n.clone());
+    for name in names {
+        if !out.contains(name) {
+            out.push(name.clone());
         }
     }
     out
@@ -142,15 +151,16 @@ fn dedup<'a>(names: impl Iterator<Item = &'a String>) -> Vec<String> {
 
 /// 闭集内角色的作用域;闭集外 → `None`。
 fn role_scope(name: &str) -> Option<RoleScope> {
-    name.parse::<RoleName>().ok().map(|r| r.scope())
+    let parsed: Result<RoleName, _> = name.parse();
+    parsed.ok().map(|r| r.scope())
 }
 
 /// 校验 seed 引用的角色:必须是闭集内角色,且作用域对得上(平台角色只能进 `platform_roles`、租户角色只能进成员关系)。
 fn check_role(username: &str, role: &str, expect: RoleScope) -> anyhow::Result<()> {
     match role_scope(role) {
         None => anyhow::bail!("账号 {username} 引用了未声明的角色 {role}"),
-        Some(s) if s != expect => anyhow::bail!(
-            "账号 {username} 把角色 {role}({s:?} 角色)写在了 {expect:?} 的位置:平台角色写 platform_roles,租户角色写 tenants.roles"
+        Some(scope) if scope != expect => anyhow::bail!(
+            "账号 {username} 把角色 {role}({scope:?} 角色)写在了 {expect:?} 的位置:平台角色写 platform_roles,租户角色写 tenants.roles"
         ),
         Some(_) => Ok(()),
     }
@@ -158,7 +168,7 @@ fn check_role(username: &str, role: &str, expect: RoleScope) -> anyhow::Result<(
 
 impl SeedData {
     /// 只有账号(没有租户声明)的 seed —— mock 的演示账号复用 [`apply`] 用(引用的租户须已存在)。
-    pub(crate) fn accounts(users: Vec<UserSeed>) -> Self {
+    pub(crate) fn new_with_users(users: Vec<UserSeed>) -> Self {
         Self {
             tenants: Vec::new(),
             users,
@@ -167,10 +177,11 @@ impl SeedData {
 
     /// 载入:`path`(来自 `Config.seed_file`,即 `SEED_FILE`)指定的外部文件优先,否则用编译期嵌入的默认。
     /// 角色引用 / 作用域 / 默认租户 id 在这里就校验,写错启动即挂。
-    pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
+    pub fn try_new(path: Option<&str>) -> anyhow::Result<Self> {
         let content = match path {
-            Some(path) => std::fs::read_to_string(path)
-                .with_context(|| format!("读 SEED_FILE {path} 失败"))?,
+            Some(path) => {
+                fs::read_to_string(path).with_context(|| format!("读 SEED_FILE {path} 失败"))?
+            }
             None => EMBEDDED_SEED.to_owned(),
         };
         let data: Self = toml::from_str(&content).context("解析 seed 数据失败")?;
@@ -178,9 +189,10 @@ impl SeedData {
         Ok(data)
     }
 
+    /// 校验租户 id、superadmin 唯一、角色引用与作用域(见 [`check_role`])。
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        for t in &self.tenants {
-            tenant_seed_id(t)?;
+        for tenant in &self.tenants {
+            tenant_seed_id(tenant)?;
         }
         // superadmin 只有一个(2026-11-26):只能由 seed 声明,且只能声明给一个账号。
         let roots: Vec<&str> = self
@@ -195,13 +207,13 @@ impl SeedData {
             roots.len(),
             roots.join(", ")
         );
-        for u in &self.users {
-            for r in u.effective_platform_roles() {
-                check_role(&u.username, &r, RoleScope::Platform)?;
+        for user in &self.users {
+            for role in user.effective_platform_roles() {
+                check_role(&user.username, &role, RoleScope::Platform)?;
             }
-            for m in u.effective_memberships() {
-                for r in &m.roles {
-                    check_role(&u.username, r, RoleScope::Tenant)?;
+            for membership in user.effective_memberships() {
+                for role in &membership.roles {
+                    check_role(&user.username, role, RoleScope::Tenant)?;
                 }
             }
         }
@@ -209,9 +221,10 @@ impl SeedData {
     }
 
     /// role→权限**默认**映射 → app 内存授权 `Policy`(无 `APP_DB_HOST` 时用)。默认来自 `RoleName` 代码;
-    /// `implies` 展开在 `Policy::from_roles`。**permissions 不写进 idm 库**。
+    /// `implies` 展开在 `Policy::new`。**permissions 不写进 idm 库**。
+    #[must_use]
     pub fn policy(&self) -> Policy {
-        Policy::from_roles(
+        Policy::new(
             RoleName::ALL
                 .iter()
                 .map(|r| (r.as_str().to_owned(), r.default_permissions())),
@@ -219,89 +232,118 @@ impl SeedData {
     }
 
     /// 账号引用到的角色名(平台 + 租户;供 `Policy::assert_roles_covered` 启动期校验:每个被授予的 role 都得有策略条目)。
+    #[must_use]
     pub fn granted_roles(&self) -> Vec<String> {
         let mut set = BTreeSet::new();
-        for u in &self.users {
-            set.extend(u.effective_platform_roles());
-            for m in u.effective_memberships() {
-                set.extend(m.roles);
+        for user in &self.users {
+            set.extend(user.effective_platform_roles());
+            for membership in user.effective_memberships() {
+                set.extend(membership.roles);
             }
         }
         set.into_iter().collect()
     }
 
-    /// 权限词表(key, description)—— 供 `policy_repo::seed_authz` upsert 进 `permissions` 表。源自 `Perm` 代码闭集。
-    pub fn permission_catalog(&self) -> impl Iterator<Item = (Perm, &'static str)> {
-        Perm::ALL.into_iter().map(|p| (p, p.description()))
+    /// 权限词表(权限 + 说明)—— 供 `policy_repo::seed_authorization` upsert 进 `permissions` 表。源自 `Permission` 代码闭集。
+    pub fn permission_catalog(&self) -> impl Iterator<Item = PermissionCatalogEntry> {
+        Permission::ALL
+            .into_iter()
+            .map(|permission| PermissionCatalogEntry {
+                permission,
+                description: permission.description(),
+            })
     }
 
-    /// role→权限**默认**映射(implies 未展开,展开在 `Policy::from_roles`)——
-    /// 供 `policy_repo::seed_authz` bootstrap `role_permissions` 表(`ON CONFLICT DO NOTHING`,不覆盖运行期改动)。
-    pub fn role_permission_mappings(&self) -> impl Iterator<Item = (&'static str, Vec<Perm>)> {
-        RoleName::ALL
-            .into_iter()
-            .map(|r| (r.as_str(), r.default_permissions()))
+    /// role→权限**默认**映射(implies 未展开,展开在 `Policy::new`)——
+    /// 供 `policy_repo::seed_authorization` bootstrap `role_permissions` 表(`ON CONFLICT DO NOTHING`,不覆盖运行期改动)。
+    pub fn role_permission_mappings(&self) -> impl Iterator<Item = RolePermissionMapping> {
+        RoleName::ALL.into_iter().map(|role| RolePermissionMapping {
+            role_name: role.as_str(),
+            permissions: role.default_permissions(),
+        })
     }
 }
 
-/// seed / mock 写 idm 要用的仓储(内存模式须 `sharing_with` 同一份存储,PG 模式同一个 idm 池)。
+/// [`SeedData::permission_catalog`] 的一项:权限与它的说明。
+#[derive(Clone, Copy, Debug)]
+pub struct PermissionCatalogEntry {
+    pub permission: Permission,
+    pub description: &'static str,
+}
+
+/// [`SeedData::role_permission_mappings`] 的一项:角色名与它的默认权限(implies 未展开)。
+#[derive(Clone, Debug)]
+pub struct RolePermissionMapping {
+    pub role_name: &'static str,
+    pub permissions: Vec<Permission>,
+}
+
+/// seed / mock 写 idm 要用的仓储(内存模式须 `new_shared_with` 同一份存储,PG 模式同一个 idm 池)。
 #[derive(Clone, Copy)]
-pub struct IdmSeedRepos<'a> {
-    pub users: &'a dyn UserRepo,
-    pub roles: &'a dyn RoleRepo,
-    pub tenants: &'a dyn TenantRepo,
-    pub members: &'a dyn MemberRepo,
+pub struct IdmSeedRepos<'repos> {
+    pub users: &'repos dyn UserRepo,
+    pub roles: &'repos dyn RoleRepo,
+    pub tenants: &'repos dyn TenantRepo,
+    pub members: &'repos dyn MemberRepo,
 }
 
 /// 租户声明的固定 id:`default` 恒为默认租户(写了别的 id → 错);其余用声明的(可无)。
-fn tenant_seed_id(t: &TenantSeed) -> anyhow::Result<Option<Uuid>> {
-    if t.slug == DEFAULT_TENANT_SLUG {
+fn tenant_seed_id(tenant: &TenantSeed) -> anyhow::Result<Option<Uuid>> {
+    if tenant.slug == DEFAULT_TENANT_SLUG {
         let default = DEFAULT_TENANT_ID.as_uuid();
         anyhow::ensure!(
-            t.id.is_none_or(|id| id == default),
+            tenant.id.is_none_or(|id| id == default),
             "slug = \"default\" 的租户 id 固定为 {default},不能改"
         );
         return Ok(Some(default));
     }
-    if let Some(id) = t.id {
-        anyhow::ensure!(!id.is_nil(), "租户 {} 的 id 不能是 nil UUID", t.slug);
+    if let Some(id) = tenant.id {
+        anyhow::ensure!(!id.is_nil(), "租户 {} 的 id 不能是 nil UUID", tenant.slug);
     }
-    Ok(t.id)
+    Ok(tenant.id)
 }
 
 /// 幂等确保一个租户存在,返回其 id。固定 id → `upsert_fixed`(已存在原样返回,不改名);
 /// 否则按 slug 找,找不到再建(并发另一实例抢先建 → 退回按 slug 取)。
 pub(crate) async fn ensure_tenant(
     tenants: &dyn TenantRepo,
-    t: &TenantSeed,
-    by: Option<String>,
+    tenant: &TenantSeed,
+    by: Option<&str>,
 ) -> anyhow::Result<Uuid> {
-    if let Some(id) = tenant_seed_id(t)? {
+    if let Some(id) = tenant_seed_id(tenant)? {
         let got = tenants
-            .upsert_fixed(id, &t.slug, &t.name, by)
+            .upsert_fixed(id, tenant_fields(tenant), by)
             .await
-            .with_context(|| format!("seed 租户 {} 失败", t.slug))?;
+            .with_context(|| format!("seed 租户 {} 失败", tenant.slug))?;
         return Ok(got.id);
     }
-    match tenants.get_by_slug(&t.slug).await {
+    match tenants.get_by_slug(&tenant.slug).await {
         Ok(found) => return Ok(found.id),
         Err(IdmError::NotFound) => {}
-        Err(e) => return Err(anyhow::anyhow!("查租户 {} 失败: {e:?}", t.slug)),
+        Err(error) => return Err(anyhow::anyhow!("查租户 {} 失败: {error:?}", tenant.slug)),
     }
-    match tenants.create(&t.slug, &t.name, by).await {
+    match tenants.create(tenant_fields(tenant), by).await {
         Ok(created) => Ok(created.id),
         // 并发 seed 抢先建了 → 取它;slug 被**已删除**租户占着(不复用)→ get_by_slug 也 NotFound → 报错
         Err(IdmError::Conflict(_)) => Ok(tenants
-            .get_by_slug(&t.slug)
+            .get_by_slug(&tenant.slug)
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 anyhow::anyhow!(
-                    "租户 slug {} 已被占用(可能是已删除的租户,slug 不复用): {e:?}",
-                    t.slug
+                    "租户 slug {} 已被占用(可能是已删除的租户,slug 不复用): {error:?}",
+                    tenant.slug
                 )
             })?
             .id),
-        Err(e) => Err(anyhow::anyhow!("seed 租户 {} 失败: {e:?}", t.slug)),
+        Err(error) => Err(anyhow::anyhow!("seed 租户 {} 失败: {error:?}", tenant.slug)),
+    }
+}
+
+/// seed 里的租户 → idm 建租户的字段。
+fn tenant_fields(tenant: &TenantSeed) -> NewTenant<'_> {
+    NewTenant {
+        slug: &tenant.slug,
+        name: &tenant.name,
     }
 }
 
@@ -323,7 +365,7 @@ async fn ensure_roles_with_event(
     roles: &dyn RoleRepo,
     user_id: Uuid,
     declared: &[String],
-    by: Option<String>,
+    by: Option<&str>,
 ) -> anyhow::Result<()> {
     let current = roles.roles_for_user(user_id).await?;
     if !declared.iter().any(|d| !current.contains(d)) {
@@ -337,9 +379,9 @@ async fn ensure_roles_with_event(
 /// 角色名 → id(去重保序)。走 `list()`(**不是**闭集):现有授予可能含闭集外的历史 / 手工角色,
 /// 映射不到就会被并集漏掉 —— 那等于把它清掉。存活角色恒在 `list()` 里;真映射不到说明目录与授予
 /// 不一致,宁可报错也不静默丢角色。
-async fn role_ids_by_name<'a>(
+async fn role_ids_by_name<'name>(
     roles: &dyn RoleRepo,
-    names: impl Iterator<Item = &'a String>,
+    names: impl Iterator<Item = &'name String>,
 ) -> anyhow::Result<Vec<Uuid>> {
     let by_name: HashMap<String, Uuid> = roles
         .list()
@@ -358,33 +400,42 @@ async fn role_ids_by_name<'a>(
     Ok(ids)
 }
 
+/// [`ensure_membership`] 要确保的一条成员关系。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Membership<'roles> {
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    /// 声明的租户角色名。
+    pub roles: &'roles [String],
+}
+
 /// 幂等确保成员关系 + 租户角色(取**并集**,同平台角色的理由:不清掉运行期授的租户角色)。
 /// 不是成员 → `add`(发 `tenant.member_added`);已是成员 → 声明的角色都在身就不动,否则 `set_roles`
 /// 写并集(发 `tenant.member_roles_set`)。**不改成员状态**:运行期被停用的成员,重跑 seed 不会被恢复。
 pub(crate) async fn ensure_membership(
     repos: IdmSeedRepos<'_>,
-    tenant_id: Uuid,
-    user_id: Uuid,
-    declared: &[String],
-    by: Option<String>,
+    membership: Membership<'_>,
+    by: Option<&str>,
 ) -> anyhow::Result<()> {
-    let existing = match repos.members.get(tenant_id, user_id).await? {
-        Some(m) => m,
+    let Membership {
+        tenant_id,
+        user_id,
+        roles: declared,
+    } = membership;
+    let key = MemberKey { tenant_id, user_id };
+    let existing = match repos.members.get(key).await? {
+        Some(found) => found,
         None => {
             let ids = role_ids_by_name(repos.roles, declared.iter()).await?;
-            match repos
-                .members
-                .add(tenant_id, user_id, &ids, by.clone())
-                .await
-            {
+            match repos.members.add(key, &ids, by).await {
                 Ok(_) => return Ok(()),
                 // 并发 seed 抢先加了 → 当已是成员走并集
                 Err(IdmError::Conflict(_)) => repos
                     .members
-                    .get(tenant_id, user_id)
+                    .get(key)
                     .await?
                     .context("并发 seed 冲突后仍查不到成员关系")?,
-                Err(e) => return Err(anyhow::anyhow!("加成员失败: {e:?}")),
+                Err(error) => return Err(anyhow::anyhow!("加成员失败: {error:?}")),
             }
         }
     };
@@ -392,10 +443,7 @@ pub(crate) async fn ensure_membership(
         return Ok(()); // 幂等:无写、无事件
     }
     let union = role_ids_by_name(repos.roles, existing.roles.iter().chain(declared.iter())).await?;
-    repos
-        .members
-        .set_roles(tenant_id, user_id, &union, by)
-        .await?;
+    repos.members.set_roles(key, &union, by).await?;
     Ok(())
 }
 
@@ -409,8 +457,8 @@ async fn ensure_sole_superadmin(
     let holders = superadmin_holders(repos.users).await?;
     let others: Vec<&str> = holders
         .iter()
-        .filter(|(id, _)| Some(*id) != declared_user)
-        .map(|(_, name)| name.as_str())
+        .filter(|h| Some(h.user_id) != declared_user)
+        .map(|h| h.username.as_str())
         .collect();
     anyhow::ensure!(
         others.is_empty(),
@@ -429,7 +477,7 @@ async fn stale_superadmin_declaration(
 ) -> anyhow::Result<Option<String>> {
     let holders = superadmin_holders(users).await?;
     Ok(match holders.as_slice() {
-        [(id, name)] if Some(*id) != declared => Some(name.clone()),
+        [only] if Some(only.user_id) != declared => Some(only.username.clone()),
         _ => None,
     })
 }
@@ -464,9 +512,9 @@ impl SeedReport {
 /// 运行期撤过权都会撞上)。已经都有了 → 不校验(幂等重跑、运维改过密码都不受影响),返回 `None`。
 async fn verify_seed_owner(
     repos: IdmSeedRepos<'_>,
-    hasher: &dyn PwHasher,
+    hasher: &dyn PasswordHasher,
     tenant_ids: &HashMap<String, Uuid>,
-    existing: &idm::UserWithHash,
+    existing: &UserWithHash,
     seed: &UserSeed,
     platform_roles: &[String],
     memberships: &[MembershipSeed],
@@ -474,16 +522,16 @@ async fn verify_seed_owner(
     let user_id = existing.user.id;
     let mut pending: Vec<String> = Vec::new();
     let current = repos.roles.roles_for_user(user_id).await?;
-    for r in platform_roles.iter().filter(|r| !current.contains(r)) {
-        pending.push(format!("平台角色 {r}"));
+    for role in platform_roles.iter().filter(|r| !current.contains(r)) {
+        pending.push(format!("平台角色 {role}"));
     }
-    for m in memberships {
-        let tenant_id = resolve_tenant(repos.tenants, tenant_ids, &m.slug).await?;
-        match repos.members.get(tenant_id, user_id).await? {
-            None => pending.push(format!("组织 {} 的成员关系", m.slug)),
+    for membership in memberships {
+        let tenant_id = resolve_tenant(repos.tenants, tenant_ids, &membership.slug).await?;
+        match repos.members.get(MemberKey { tenant_id, user_id }).await? {
+            None => pending.push(format!("组织 {} 的成员关系", membership.slug)),
             Some(have) => {
-                for r in m.roles.iter().filter(|r| !have.roles.contains(r)) {
-                    pending.push(format!("组织 {} 的角色 {r}", m.slug));
+                for role in membership.roles.iter().filter(|r| !have.roles.contains(r)) {
+                    pending.push(format!("组织 {} 的角色 {role}", membership.slug));
                 }
             }
         }
@@ -494,11 +542,11 @@ async fn verify_seed_owner(
     // 库里的哈希串解析不了(坏串 / 不是本实现认得的格式)→ 同样确认不了是运维建的,按对不上处理(调用方走
     // [`skip_unverified`]);报错会让 idm 起不来(prod 每次启动都跑 seed)。
     let matches = match hasher.verify(&seed.password, &existing.password_hash) {
-        Ok(m) => m,
-        Err(e) => {
+        Ok(matched) => matched,
+        Err(error) => {
             tracing::warn!(
                 username = %existing.user.username,
-                "seed 校验账号 {name} 的密码时,库里存的密码哈希解析失败({e:?}):确认不了是运维建的账号,\
+                "seed 校验账号 {name} 的密码时,库里存的密码哈希解析失败({error:?}):确认不了是运维建的账号,\
                  按密码对不上处理(跳过补授,启动照常)。查 idm.user_password 里这个账号的 password_hash 是否被改坏",
                 name = existing.user.username,
             );
@@ -554,25 +602,40 @@ async fn skip_unverified(
     Ok(())
 }
 
-/// 持 superadmin 的存活账号 (id, username),按建号先后。最多取 50 个(只用来判「多于一个」并列名字)。
-async fn superadmin_holders(users: &dyn UserRepo) -> anyhow::Result<Vec<(Uuid, String)>> {
-    let filter = idm::UserListFilter {
+/// 一个持 superadmin 的存活账号。
+#[derive(Debug, PartialEq, Eq)]
+struct SuperadminHolder {
+    user_id: Uuid,
+    username: String,
+}
+
+/// 持 superadmin 的存活账号,按建号先后。最多取 50 个(只用来判「多于一个」并列名字)。
+async fn superadmin_holders(users: &dyn UserRepo) -> anyhow::Result<Vec<SuperadminHolder>> {
+    let filter = UserListFilter {
         roles_any: vec![RoleName::Superadmin.as_str().to_owned()],
         ..Default::default()
     };
     let page = users
         .list(
             &filter,
-            idm::UserSortBy::CreatedAt,
-            idm::SortDir::Asc,
-            &idm::ListPage::Offset {
+            UserSortBy::CreatedAt,
+            SortDirection::Ascending,
+            &ListPage::Offset {
                 offset: 0,
                 limit: 50,
                 with_total: false,
             },
         )
         .await?;
-    Ok(page.rows.into_iter().map(|u| (u.id, u.username)).collect())
+    let holders: Vec<SuperadminHolder> = page
+        .rows
+        .into_iter()
+        .map(|user| SuperadminHolder {
+            user_id: user.id,
+            username: user.username,
+        })
+        .collect();
+    Ok(holders)
 }
 
 /// **启动期不变量**(装配了 idm 的进程每次启动都查,不受 `seed_on_start` 控制):持 superadmin 的存活账号最多一个。
@@ -580,16 +643,13 @@ async fn superadmin_holders(users: &dyn UserRepo) -> anyhow::Result<Vec<(Uuid, S
 /// 所以这里**拒绝启动**,列出这些账号,指向清理办法(`scripts/prod/README.md`「清理多余的 superadmin」)。
 pub async fn ensure_single_superadmin(users: &dyn UserRepo) -> anyhow::Result<()> {
     let holders = superadmin_holders(users).await?;
+    let names: Vec<&str> = holders.iter().map(|h| h.username.as_str()).collect();
     anyhow::ensure!(
         holders.len() <= 1,
         "superadmin 只能有一个,库里却有 {} 个账号持有:{}。接口撤不掉 superadmin —— 先决定保留哪一个,\
          按 scripts/prod/README.md「清理多余的 superadmin」在 idm 库删掉其余账号的 superadmin 授予(idm.user_roles),再启动",
         holders.len(),
-        holders
-            .iter()
-            .map(|(_, name)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        names.join(", ")
     );
     Ok(())
 }
@@ -603,9 +663,13 @@ async fn resolve_tenant(
     if let Some(id) = declared.get(slug) {
         return Ok(*id);
     }
-    tenants.get_by_slug(slug).await.map(|t| t.id).map_err(|e| {
-        anyhow::anyhow!("引用了不存在的租户 slug {slug}(先在 [[tenants]] 声明): {e:?}")
-    })
+    tenants
+        .get_by_slug(slug)
+        .await
+        .map(|t| t.id)
+        .map_err(|error| {
+            anyhow::anyhow!("引用了不存在的租户 slug {slug}(先在 [[tenants]] 声明): {error:?}")
+        })
 }
 
 /// 幂等应用 seed:upsert role(按 `RoleName::scope()`)→ upsert 租户 → find-or-create 账号 →
@@ -615,38 +679,45 @@ async fn resolve_tenant(
 /// 不报错(见 [`verify_seed_owner`]);跳过了谁在返回的 [`SeedReport`] 里,把它交给 [`apply_profiles`]。
 pub async fn apply(
     repos: IdmSeedRepos<'_>,
-    hasher: &dyn PwHasher,
+    hasher: &dyn PasswordHasher,
     data: &SeedData,
-    by: Option<String>,
+    by: Option<&str>,
 ) -> anyhow::Result<SeedReport> {
     data.validate()?;
     let mut report = SeedReport::default();
     // 1. 角色(幂等 upsert,作用域按代码闭集;已有库里迁移默认的 `tenant` 在这里收敛)。
     let mut role_ids: HashMap<&'static str, Uuid> = HashMap::new();
-    for r in RoleName::ALL {
+    for role in RoleName::ALL {
         let id = repos
             .roles
-            .upsert(r.as_str(), r.display_name(), r.scope(), by.clone())
+            .upsert(
+                NewRole {
+                    name: role.as_str(),
+                    display_name: role.display_name(),
+                    scope: role.scope(),
+                },
+                by,
+            )
             .await
-            .with_context(|| format!("seed role {} 失败", r.as_str()))?;
-        role_ids.insert(r.as_str(), id);
+            .with_context(|| format!("seed role {} 失败", role.as_str()))?;
+        role_ids.insert(role.as_str(), id);
     }
 
     // 2. 租户(默认租户固定 id)。
     let mut tenant_ids: HashMap<String, Uuid> = HashMap::new();
-    for t in &data.tenants {
-        let id = ensure_tenant(repos.tenants, t, by.clone()).await?;
-        tenant_ids.insert(t.slug.clone(), id);
+    for tenant in &data.tenants {
+        let id = ensure_tenant(repos.tenants, tenant, by).await?;
+        tenant_ids.insert(tenant.slug.clone(), id);
     }
 
     // 3. 账号(幂等:已存在则取,否则建)。新建走 **create_with_roles** —— 让 `user.created`
     //    事件**带上平台角色**,CQRS 投影据此落 `account_index.roles`。
     let mut memberships = 0usize;
-    for a in &data.users {
-        let username = a.username.trim().to_lowercase();
-        let email = a.email.as_deref().map(|e| e.trim().to_lowercase());
-        let platform_roles = a.effective_platform_roles();
-        let platform_role_ids: Vec<Uuid> = platform_roles
+    for user_seed in &data.users {
+        let username = user_seed.username.trim().to_lowercase();
+        let email = user_seed.email.as_deref().map(|e| e.trim().to_lowercase());
+        let platform_roles = user_seed.effective_platform_roles();
+        let resolved: anyhow::Result<Vec<Uuid>> = platform_roles
             .iter()
             .map(|name| {
                 role_ids
@@ -654,11 +725,12 @@ pub async fn apply(
                     .copied()
                     .with_context(|| format!("账号 {username} 引用了未声明的角色 {name}"))
             })
-            .collect::<anyhow::Result<_>>()?;
+            .collect();
+        let platform_role_ids = resolved?;
 
-        let memberships_declared = a.effective_memberships();
+        let memberships_declared = user_seed.effective_memberships();
         let existing = repos.users.find_by_identifier(&username).await?;
-        if a.declares_superadmin() {
+        if user_seed.declares_superadmin() {
             let declared = existing.as_ref().map(|u| u.user.id);
             // 库里已有唯一的 superadmin、却不是这个声明的账号:多半是 superadmin 经 PUT /frontend/auth/me 改了用户名
             // (或旧用户名被人注册了)。这条声明已过时 —— 跳过(不建第二个、也不把 superadmin 授给占了旧名的账号),
@@ -679,45 +751,52 @@ pub async fn apply(
             // 已存在(幂等再跑):补齐平台角色 —— 走 set_roles(并集)而非 grant(见 ensure_roles_with_event)。
             // 要补授它还没有的东西时,先确认这个同名账号是运维建的(见 verify_seed_owner);确认不了 → 警告、
             // 跳过它的全部补授(平台角色 + 成员关系),不中断启动。
-            Some(uwh) => {
+            Some(existing_user) => {
                 if let Some(skip) = verify_seed_owner(
                     repos,
                     hasher,
                     &tenant_ids,
-                    &uwh,
-                    a,
+                    &existing_user,
+                    user_seed,
                     &platform_roles,
                     &memberships_declared,
                 )
                 .await?
                 {
-                    skip_unverified(repos.users, &mut report, skip, a.declares_superadmin())
-                        .await?;
+                    skip_unverified(
+                        repos.users,
+                        &mut report,
+                        skip,
+                        user_seed.declares_superadmin(),
+                    )
+                    .await?;
                     continue;
                 }
-                ensure_roles_with_event(repos.roles, uwh.user.id, &platform_roles, by.clone())
+                ensure_roles_with_event(repos.roles, existing_user.user.id, &platform_roles, by)
                     .await?;
-                uwh.user.id
+                existing_user.user.id
             }
             None => {
                 let hash = hasher
-                    .hash(&a.password)
+                    .hash(&user_seed.password)
                     .map_err(|e| anyhow::anyhow!("argon2 hash 失败: {e:?}"))?;
                 match repos
                     .users
                     .create_with_roles(
-                        &username,
-                        email.as_deref(),
-                        &hash,
+                        NewUser {
+                            username: &username,
+                            email: email.as_deref(),
+                            password_hash: &hash,
+                        },
                         &platform_role_ids,
-                        by.clone(),
+                        by,
                     )
                     .await
                 {
-                    Ok(u) => u.id,
+                    Ok(created) => created.id,
                     // 并发 seed:另一实例已抢先建 → 退回补齐角色(幂等收敛,同上走 set_roles)。
                     Err(IdmError::Conflict(_)) => {
-                        let uwh = repos
+                        let existing_user = repos
                             .users
                             .find_by_identifier(&username)
                             .await?
@@ -726,8 +805,8 @@ pub async fn apply(
                             repos,
                             hasher,
                             &tenant_ids,
-                            &uwh,
-                            a,
+                            &existing_user,
+                            user_seed,
                             &platform_roles,
                             &memberships_declared,
                         )
@@ -737,28 +816,38 @@ pub async fn apply(
                                 repos.users,
                                 &mut report,
                                 skip,
-                                a.declares_superadmin(),
+                                user_seed.declares_superadmin(),
                             )
                             .await?;
                             continue;
                         }
-                        let user = uwh.user;
-                        ensure_roles_with_event(repos.roles, user.id, &platform_roles, by.clone())
-                            .await?;
+                        let user = existing_user.user;
+                        ensure_roles_with_event(repos.roles, user.id, &platform_roles, by).await?;
                         user.id
                     }
-                    Err(e) => return Err(anyhow::anyhow!("seed account {username} 失败: {e:?}")),
+                    Err(error) => {
+                        return Err(anyhow::anyhow!("seed account {username} 失败: {error:?}"))
+                    }
                 }
             }
         };
 
         // 4. 成员关系 + 租户角色(并集)。
-        for m in memberships_declared {
-            let tenant_id = resolve_tenant(repos.tenants, &tenant_ids, &m.slug).await?;
-            ensure_membership(repos, tenant_id, user_id, &m.roles, by.clone())
+        for membership_seed in memberships_declared {
+            let tenant_id =
+                resolve_tenant(repos.tenants, &tenant_ids, &membership_seed.slug).await?;
+            let membership = Membership {
+                tenant_id,
+                user_id,
+                roles: &membership_seed.roles,
+            };
+            ensure_membership(repos, membership, by)
                 .await
                 .with_context(|| {
-                    format!("seed 账号 {username} 在租户 {} 的成员关系失败", m.slug)
+                    format!(
+                        "seed 账号 {username} 在租户 {} 的成员关系失败",
+                        membership_seed.slug
+                    )
                 })?;
             memberships += 1;
         }
@@ -777,7 +866,7 @@ pub async fn apply(
 /// seed 账号的**初始 profile**(1:1 挂 user)。跟在 [`apply`] 之后跑 —— 那时账号已在,username 才解析得到。
 ///
 /// **跨模块、不跨 schema**:username → idm `UserRepo` 解析 user_id(标识引用),数据写 app `ProfileRepo`。
-/// 同 [`crate::app::mock::apply`] 的范式,组合根是唯一能同时握两边的地方。
+/// 同 [`crate::app::mock_data::apply`] 的范式,组合根是唯一能同时握两边的地方。
 ///
 /// **只在 app/idm 同进程(`Mount::Both`)调**:纯 idm 进程的 `profile_repo` 是内存占位
 /// (`app_pool=None`),写进去会静默丢、重启蒸发 —— 同 `router.rs` 不给纯 idm 进程挂后台资料端点的理由。
@@ -797,12 +886,12 @@ pub async fn apply_profiles(
     by: Option<String>,
 ) -> anyhow::Result<()> {
     let mut created = 0usize;
-    for a in &data.users {
-        let username = a.username.trim().to_lowercase();
+    for user_seed in &data.users {
+        let username = user_seed.username.trim().to_lowercase();
         let found = users.find_by_identifier(&username).await?;
         // 过时的 superadmin 声明(superadmin 改过用户名):`apply` 已跳过它,这里同样跳过 —— 不报错,
         // 也不给占了旧名的别人建资料。
-        if a.declares_superadmin()
+        if user_seed.declares_superadmin()
             && stale_superadmin_declaration(users, found.as_ref().map(|u| u.user.id))
                 .await?
                 .is_some()
@@ -824,7 +913,7 @@ pub async fn apply_profiles(
             .upsert(
                 user.id,
                 ProfileFields {
-                    display_name: a.display_name.clone(),
+                    display_name: user_seed.display_name.clone(),
                     ..Default::default()
                 },
                 by.clone(),
@@ -846,9 +935,11 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::features::profile::InMemoryProfileRepo;
+    use crate::kernel::authorization::{PermissionScope, RoleNames};
     use idm::{
-        InMemoryMemberRepo, InMemoryOutboxRepo, InMemoryRoleRepo, InMemoryTenantRepo,
-        InMemoryUserRepo, OutboxRepo,
+        Argon2Hasher, FakeHasher, InMemoryMemberRepo, InMemoryOutboxRepo, InMemoryRoleRepo,
+        InMemoryTenantRepo, InMemoryUserRepo, OutboxRepo, RoleGrant,
     };
 
     /// 共享存储的一套内存 idm 仓储(等价于 PG 共表)。
@@ -864,10 +955,10 @@ mod tests {
         fn new() -> Self {
             let users = InMemoryUserRepo::new();
             Self {
-                roles: InMemoryRoleRepo::sharing_with(&users),
-                tenants: InMemoryTenantRepo::sharing_with(&users),
-                members: InMemoryMemberRepo::sharing_with(&users),
-                outbox: InMemoryOutboxRepo::sharing_with(&users),
+                roles: InMemoryRoleRepo::new_shared_with(&users),
+                tenants: InMemoryTenantRepo::new_shared_with(&users),
+                members: InMemoryMemberRepo::new_shared_with(&users),
+                outbox: InMemoryOutboxRepo::new_shared_with(&users),
                 users,
             }
         }
@@ -882,18 +973,13 @@ mod tests {
         }
 
         async fn apply(&self, data: &SeedData) {
-            let report = apply(
-                self.repos(),
-                &idm::FakeHasher,
-                data,
-                Some("system".to_owned()),
-            )
-            .await
-            .unwrap();
+            let report = apply(self.repos(), &FakeHasher, data, Some("system"))
+                .await
+                .unwrap();
             assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         }
 
-        async fn uid(&self, name: &str) -> Uuid {
+        async fn user_id_of(&self, name: &str) -> Uuid {
             self.users
                 .find_by_identifier(name)
                 .await
@@ -903,13 +989,13 @@ mod tests {
                 .id
         }
 
-        async fn events(&self, ty: &str) -> usize {
+        async fn events(&self, event_type: &str) -> usize {
             self.outbox
                 .poll_unpublished(1000)
                 .await
                 .unwrap()
                 .iter()
-                .filter(|e| e.event_type == ty)
+                .filter(|e| e.event_type == event_type)
                 .count()
         }
     }
@@ -924,17 +1010,17 @@ mod tests {
     /// 声明了默认租户,每个账号都至少在一个租户里(内存模式登录也直接进默认租户)。
     #[test]
     fn embedded_seed_accounts_reference_known_roles() {
-        let data = SeedData::load(None).unwrap();
+        let data = SeedData::try_new(None).unwrap();
         let known: HashSet<&str> = RoleName::ALL.iter().map(|r| r.as_str()).collect();
         for role in data.granted_roles() {
             assert!(known.contains(role.as_str()), "账号引用了未知角色 `{role}`");
         }
         assert!(data.tenants.iter().any(|t| t.slug == DEFAULT_TENANT_SLUG));
-        for u in &data.users {
+        for user in &data.users {
             assert!(
-                !u.effective_memberships().is_empty(),
+                !user.effective_memberships().is_empty(),
                 "{} 应是某个租户的成员",
-                u.username
+                user.username
             );
         }
     }
@@ -944,22 +1030,32 @@ mod tests {
     #[test]
     fn default_policy_superadmin_has_all_platform_perms() {
         let policy = SeedData::default().policy();
-        let perms = policy.perms_for(&["superadmin".to_owned()], &[]);
-        for p in Perm::ALL {
-            let platform = p.scope() == crate::kernel::authz::PermScope::Platform;
-            assert_eq!(perms.contains(&p), platform, "{p:?}");
+        let permissions = policy.permissions_for(RoleNames {
+            platform: &["superadmin".to_owned()],
+            tenant: &[],
+        });
+        for permission in Permission::ALL {
+            let platform = permission.scope() == PermissionScope::Platform;
+            assert_eq!(
+                permissions.contains(&permission),
+                platform,
+                "{permission:?}"
+            );
         }
         assert!(policy
-            .perms_for(&[], &["admin".to_owned()])
-            .contains(&Perm::AdminLogin));
+            .permissions_for(RoleNames {
+                platform: &[],
+                tenant: &["admin".to_owned()],
+            })
+            .contains(&Permission::AdminLogin));
     }
 
     /// 作用域写错位置 / 未知角色 / 默认租户改 id → 校验报错(启动即挂)。
     #[test]
     fn validation_rejects_misplaced_roles() {
-        let bad = |s: &str| {
-            let data: SeedData = toml::from_str(s).unwrap();
-            assert!(data.validate().is_err(), "应拒:{s}");
+        let bad = |text: &str| {
+            let data: SeedData = toml::from_str(text).unwrap();
+            assert!(data.validate().is_err(), "应拒:{text}");
         };
         bad(r#"[[users]]
 username = "a"
@@ -998,9 +1094,12 @@ password = "p"
 roles = ["superadmin"]"#,
         )
         .unwrap();
-        let err = data.validate().unwrap_err().to_string();
-        assert!(err.contains("superadmin 只能有一个"), "{err}");
-        assert!(err.contains("root1") && err.contains("root2"), "{err}");
+        let error = data.validate().unwrap_err().to_string();
+        assert!(error.contains("superadmin 只能有一个"), "{error}");
+        assert!(
+            error.contains("root1") && error.contains("root2"),
+            "{error}"
+        );
 
         // 一个 superadmin + 多个平台管理员:合法
         parse(
@@ -1043,7 +1142,7 @@ username = "newroot"
 password = "p"
 platform_roles = ["superadmin"]"#,
         );
-        apply(idm.repos(), &idm::FakeHasher, &renamed, None)
+        apply(idm.repos(), &FakeHasher, &renamed, None)
             .await
             .expect("声明过时应跳过而不是报错");
         assert!(
@@ -1064,13 +1163,13 @@ platform_roles = ["superadmin"]"#,
         let idm = Idm::new();
         let data = parse(ROOT_SEED);
         idm.apply(&data).await;
-        let root = idm.uid("root").await;
+        let root = idm.user_id_of("root").await;
         idm.users.update(root, "boss", None, None).await.unwrap();
 
-        apply(idm.repos(), &idm::FakeHasher, &data, None)
+        apply(idm.repos(), &FakeHasher, &data, None)
             .await
             .expect("superadmin 改名后重跑 seed 不应报错");
-        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        let profiles = InMemoryProfileRepo::new();
         apply_profiles(&profiles, &idm.users, &data, &SeedReport::default(), None)
             .await
             .expect("初始资料这一步同样跳过过时的声明");
@@ -1083,16 +1182,30 @@ platform_roles = ["superadmin"]"#,
             "不应按旧名再建账号"
         );
         let holders = superadmin_holders(&idm.users).await.unwrap();
-        assert_eq!(holders, vec![(root, "boss".to_owned())]);
+        assert_eq!(
+            holders,
+            vec![SuperadminHolder {
+                user_id: root,
+                username: "boss".to_owned(),
+            }]
+        );
         ensure_single_superadmin(&idm.users).await.unwrap();
 
         // 旧名随后被人公开注册了:同样跳过 —— 不授 superadmin、不加成员关系,也不因此起不来。
         let squatter = idm
             .users
-            .create_with_roles("root", None, "fake$attacker", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "root",
+                    email: None,
+                    password_hash: "fake$attacker",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
-        apply(idm.repos(), &idm::FakeHasher, &data, None)
+        apply(idm.repos(), &FakeHasher, &data, None)
             .await
             .expect("旧名被占也不应让启动失败");
         assert!(idm
@@ -1103,7 +1216,10 @@ platform_roles = ["superadmin"]"#,
             .is_empty());
         assert!(idm
             .members
-            .get(DEFAULT_TENANT_ID.as_uuid(), squatter.id)
+            .get(MemberKey {
+                tenant_id: DEFAULT_TENANT_ID.as_uuid(),
+                user_id: squatter.id
+            })
             .await
             .unwrap()
             .is_none());
@@ -1123,27 +1239,51 @@ platform_roles = ["superadmin"]"#,
     async fn seed_skips_grants_to_squatted_account() {
         let idm = Idm::new();
         // 空库上有人先注册了 seed 里的用户名(公开注册;密码不是 seed 里的)
-        let sa = idm
+        let superadmin = idm
             .users
-            .create_with_roles("root", None, "fake$attacker", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "root",
+                    email: None,
+                    password_hash: "fake$attacker",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
-        let pa = idm
+        let platform_admin = idm
             .users
-            .create_with_roles("ops", None, "fake$attacker", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "ops",
+                    email: None,
+                    password_hash: "fake$attacker",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let admin = idm
             .users
-            .create_with_roles("admin", None, "fake$attacker", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "admin",
+                    email: None,
+                    password_hash: "fake$attacker",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let tenant = DEFAULT_TENANT_ID.as_uuid();
-        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        let profiles = InMemoryProfileRepo::new();
         let cases = [
-            (sa.id, "root", ROOT_SEED, "平台角色 superadmin"),
+            (superadmin.id, "root", ROOT_SEED, "平台角色 superadmin"),
             (
-                pa.id,
+                platform_admin.id,
                 "ops",
                 r#"[[users]]
 username = "ops"
@@ -1168,7 +1308,7 @@ tenants = [{ slug = "default", roles = ["admin"] }]"#,
         ];
         for (id, name, seed, what) in cases {
             let data = parse(seed);
-            let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+            let report = apply(idm.repos(), &FakeHasher, &data, None)
                 .await
                 .expect("密码对不上应跳过而不是报错");
             assert_eq!(report.skipped.len(), 1, "{what}");
@@ -1183,7 +1323,14 @@ tenants = [{ slug = "default", roles = ["admin"] }]"#,
                 "{what}"
             );
             assert!(
-                idm.members.get(tenant, id).await.unwrap().is_none(),
+                idm.members
+                    .get(MemberKey {
+                        tenant_id: tenant,
+                        user_id: id
+                    })
+                    .await
+                    .unwrap()
+                    .is_none(),
                 "{what}"
             );
             apply_profiles(&profiles, &idm.users, &data, &report, None)
@@ -1205,12 +1352,10 @@ username = "ops"
 password = "attacker"
 platform_roles = ["platform_admin"]"#,
         );
-        let report = apply(idm.repos(), &idm::FakeHasher, &mine, None)
-            .await
-            .unwrap();
+        let report = apply(idm.repos(), &FakeHasher, &mine, None).await.unwrap();
         assert!(report.skipped.is_empty());
         assert_eq!(
-            idm.roles.roles_for_user(pa.id).await.unwrap(),
+            idm.roles.roles_for_user(platform_admin.id).await.unwrap(),
             vec!["platform_admin".to_owned()]
         );
     }
@@ -1222,7 +1367,15 @@ platform_roles = ["platform_admin"]"#,
         let idm = Idm::new();
         let broken = idm
             .users
-            .create_with_roles("ops", None, "not-a-phc-string", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "ops",
+                    email: None,
+                    password_hash: "not-a-phc-string",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let data = parse(
@@ -1232,7 +1385,7 @@ password = "p"
 platform_roles = ["platform_admin"]"#,
         );
         // 真哈希实现:坏串在 PHC 解析这一步就 Err(FakeHasher 永不 Err,测不到)
-        let report = apply(idm.repos(), &idm::Argon2Hasher, &data, None)
+        let report = apply(idm.repos(), &Argon2Hasher, &data, None)
             .await
             .expect("哈希串解析失败不应让启动失败");
         assert_eq!(report.skipped.len(), 1);
@@ -1255,7 +1408,15 @@ platform_roles = ["platform_admin"]"#,
         let idm = Idm::new();
         let eve = idm
             .users
-            .create_with_roles("eve", Some("ops"), "fake$attacker", &[], None)
+            .create_with_roles(
+                NewUser {
+                    username: "eve",
+                    email: Some("ops"),
+                    password_hash: "fake$attacker",
+                },
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let data = parse(
@@ -1265,12 +1426,10 @@ password = "p"
 display_name = "运维"
 platform_roles = ["platform_admin"]"#,
         );
-        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
-            .await
-            .unwrap();
+        let report = apply(idm.repos(), &FakeHasher, &data, None).await.unwrap();
         assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
         assert_eq!(report.skipped[0].user_id, eve.id);
-        let profiles = crate::features::profile::InMemoryProfileRepo::new();
+        let profiles = InMemoryProfileRepo::new();
         apply_profiles(&profiles, &idm.users, &data, &report, None)
             .await
             .unwrap();
@@ -1286,14 +1445,12 @@ platform_roles = ["platform_admin"]"#,
         let idm = Idm::new();
         let data = parse(ROOT_SEED);
         idm.apply(&data).await;
-        let root = idm.uid("root").await;
+        let root = idm.user_id_of("root").await;
         idm.users
             .update_password(root, "fake$rotated")
             .await
             .unwrap();
-        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
-            .await
-            .unwrap();
+        let report = apply(idm.repos(), &FakeHasher, &data, None).await.unwrap();
         assert!(report.skipped.is_empty(), "什么都不缺 → 不校验、不跳过");
         assert_eq!(
             idm.roles.roles_for_user(root).await.unwrap(),
@@ -1311,19 +1468,22 @@ password = "p"
 platform_roles = ["superadmin"]
 tenants = [{ slug = "default", roles = ["admin", "user"] }]"#,
         );
-        let report = apply(idm.repos(), &idm::FakeHasher, &more, None)
+        let report = apply(idm.repos(), &FakeHasher, &more, None)
             .await
             .expect("改过密码不应让启动失败");
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].username, "root");
         assert_eq!(report.skipped[0].missing, vec!["组织 default 的角色 user"]);
-        let m = idm
+        let member = idm
             .members
-            .get(DEFAULT_TENANT_ID.as_uuid(), root)
+            .get(MemberKey {
+                tenant_id: DEFAULT_TENANT_ID.as_uuid(),
+                user_id: root,
+            })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(m.roles, vec!["admin".to_owned()], "没补授 user");
+        assert_eq!(member.roles, vec!["admin".to_owned()], "没补授 user");
     }
 
     /// 运维改过密码、运行期又被撤掉了 seed 声明的东西(平台角色 / 组织角色 / 被移出组织)→ 重启 seed 不报错、
@@ -1345,7 +1505,7 @@ platform_roles = ["platform_admin"]
 tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["user"] }]"#,
         );
         idm.apply(&data).await;
-        let lead = idm.uid("lead").await;
+        let lead = idm.user_id_of("lead").await;
         let default = DEFAULT_TENANT_ID.as_uuid();
         let acme = idm.tenants.get_by_slug("acme").await.unwrap().id;
         idm.users
@@ -1358,12 +1518,28 @@ tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["u
             .await
             .unwrap();
         idm.members
-            .set_roles(default, lead, &user_role, None)
+            .set_roles(
+                MemberKey {
+                    tenant_id: default,
+                    user_id: lead,
+                },
+                &user_role,
+                None,
+            )
             .await
             .unwrap();
-        idm.members.remove(acme, lead, None).await.unwrap();
+        idm.members
+            .remove(
+                MemberKey {
+                    tenant_id: acme,
+                    user_id: lead,
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
-        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+        let report = apply(idm.repos(), &FakeHasher, &data, None)
             .await
             .expect("改过密码 + 运行期撤权,重启 seed 不应报错");
         assert_eq!(report.skipped.len(), 1);
@@ -1378,10 +1554,26 @@ tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["u
         );
         assert!(idm.roles.roles_for_user(lead).await.unwrap().is_empty());
         assert_eq!(
-            idm.members.get(default, lead).await.unwrap().unwrap().roles,
+            idm.members
+                .get(MemberKey {
+                    tenant_id: default,
+                    user_id: lead
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .roles,
             vec!["user".to_owned()]
         );
-        assert!(idm.members.get(acme, lead).await.unwrap().is_none());
+        assert!(idm
+            .members
+            .get(MemberKey {
+                tenant_id: acme,
+                user_id: lead
+            })
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// 声明的 superadmin 改过密码、其 superadmin 授予又被删掉了(按 README 清理时删错 / 直接改库)→ 重启 seed 不报错、
@@ -1391,7 +1583,7 @@ tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["u
         let idm = Idm::new();
         let data = parse(ROOT_SEED);
         idm.apply(&data).await;
-        let root = idm.uid("root").await;
+        let root = idm.user_id_of("root").await;
         idm.users
             .update_password(root, "fake$rotated")
             .await
@@ -1399,7 +1591,7 @@ tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["u
         idm.roles.set_roles(root, &[], None).await.unwrap();
 
         ensure_single_superadmin(&idm.users).await.unwrap();
-        let report = apply(idm.repos(), &idm::FakeHasher, &data, None)
+        let report = apply(idm.repos(), &FakeHasher, &data, None)
             .await
             .expect("不应让 idm 起不来");
         assert_eq!(report.skipped.len(), 1);
@@ -1410,9 +1602,7 @@ tenants = [{ slug = "default", roles = ["admin"] }, { slug = "acme", roles = ["u
 
         // 按警告处理:seed 里填上它现在的密码 → 补授回来
         let fixed = parse(&ROOT_SEED.replace(r#"password = "p""#, r#"password = "rotated""#));
-        let report = apply(idm.repos(), &idm::FakeHasher, &fixed, None)
-            .await
-            .unwrap();
+        let report = apply(idm.repos(), &FakeHasher, &fixed, None).await.unwrap();
         assert!(report.skipped.is_empty());
         assert_eq!(
             idm.roles.roles_for_user(root).await.unwrap(),
@@ -1435,20 +1625,31 @@ platform_roles = ["superadmin"]"#,
         .await;
         ensure_single_superadmin(&idm.users).await.unwrap(); // 一个
                                                              // 模拟改动前经账号接口授出的第二个 superadmin(seed 现在不会这样做,直接写库)
-        let sa_role = role_ids_by_name(&idm.roles, ["superadmin".to_owned()].iter())
+        let superadmin_role = role_ids_by_name(&idm.roles, ["superadmin".to_owned()].iter())
             .await
             .unwrap();
         let second = idm
             .users
-            .create_with_roles("legacy-root", None, "h", &sa_role, None)
+            .create_with_roles(
+                NewUser {
+                    username: "legacy-root",
+                    email: None,
+                    password_hash: "h",
+                },
+                &superadmin_role,
+                None,
+            )
             .await
             .unwrap();
-        let err = ensure_single_superadmin(&idm.users)
+        let error = ensure_single_superadmin(&idm.users)
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("root") && err.contains("legacy-root"), "{err}");
-        assert!(err.contains("scripts/prod/README.md"), "{err}");
+        assert!(
+            error.contains("root") && error.contains("legacy-root"),
+            "{error}"
+        );
+        assert!(error.contains("scripts/prod/README.md"), "{error}");
         // 清理(删号)后恢复
         idm.users.soft_delete(second.id, None).await.unwrap();
         ensure_single_superadmin(&idm.users).await.unwrap();
@@ -1463,12 +1664,15 @@ username = "old"
 password = "p"
 roles = ["superadmin", "admin"]"#,
         );
-        let u = &data.users[0];
-        assert_eq!(u.effective_platform_roles(), vec!["superadmin".to_owned()]);
-        let ms = u.effective_memberships();
-        assert_eq!(ms.len(), 1);
-        assert_eq!(ms[0].slug, DEFAULT_TENANT_SLUG);
-        assert_eq!(ms[0].roles, vec!["admin".to_owned()]);
+        let user = &data.users[0];
+        assert_eq!(
+            user.effective_platform_roles(),
+            vec!["superadmin".to_owned()]
+        );
+        let memberships = user.effective_memberships();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].slug, DEFAULT_TENANT_SLUG);
+        assert_eq!(memberships[0].roles, vec!["admin".to_owned()]);
     }
 
     const TENANT_SEED: &str = r#"
@@ -1503,7 +1707,7 @@ tenants = [{ slug = "default", roles = ["user"] }, { slug = "acme", roles = ["ad
         // 租户:default 是固定 id(内存存储自带,不重复建),acme 只建一次
         let page = idm
             .tenants
-            .list(&idm::ListPage::Offset {
+            .list(&ListPage::Offset {
                 offset: 0,
                 limit: 100,
                 with_total: true,
@@ -1516,23 +1720,26 @@ tenants = [{ slug = "default", roles = ["user"] }, { slug = "acme", roles = ["ad
         assert_eq!(idm.events("tenant.created").await, 1, "只建一次 acme");
 
         // boss:平台角色 superadmin + 默认租户 admin
-        let boss = idm.uid("boss").await;
+        let boss = idm.user_id_of("boss").await;
         assert_eq!(
             idm.roles.roles_for_user(boss).await.unwrap(),
             vec!["superadmin".to_owned()]
         );
-        let m = idm
+        let member = idm
             .members
-            .get(DEFAULT_TENANT_ID.as_uuid(), boss)
+            .get(MemberKey {
+                tenant_id: DEFAULT_TENANT_ID.as_uuid(),
+                user_id: boss,
+            })
             .await
             .unwrap()
             .expect("boss 应是默认租户成员");
-        assert_eq!(m.roles, vec!["admin".to_owned()]);
+        assert_eq!(member.roles, vec!["admin".to_owned()]);
 
         // alice:两个租户,各自的角色;没有平台角色
-        let alice = idm.uid("alice").await;
+        let alice = idm.user_id_of("alice").await;
         assert!(idm.roles.roles_for_user(alice).await.unwrap().is_empty());
-        let mut ms: Vec<(String, Vec<String>)> = idm
+        let mut memberships: Vec<(String, Vec<String>)> = idm
             .members
             .memberships_for_user(alice)
             .await
@@ -1540,9 +1747,9 @@ tenants = [{ slug = "default", roles = ["user"] }, { slug = "acme", roles = ["ad
             .into_iter()
             .map(|m| (m.tenant.slug, m.roles))
             .collect();
-        ms.sort();
+        memberships.sort();
         assert_eq!(
-            ms,
+            memberships,
             vec![
                 ("acme".to_owned(), vec!["admin".to_owned()]),
                 ("default".to_owned(), vec!["user".to_owned()]),
@@ -1570,19 +1777,33 @@ password = "p"
 tenants = [{ slug = "default", roles = ["user"] }]"#,
         ))
         .await;
-        let alice = idm.uid("alice").await;
+        let alice = idm.user_id_of("alice").await;
         let tenant = DEFAULT_TENANT_ID.as_uuid();
         // 运行期:租户管理员给 alice 加了一个闭集外的租户角色 editor
         let editor = idm
             .roles
-            .upsert("editor", "编辑", RoleScope::Tenant, None)
+            .upsert(
+                NewRole {
+                    name: "editor",
+                    display_name: "编辑",
+                    scope: RoleScope::Tenant,
+                },
+                None,
+            )
             .await
             .unwrap();
         let user_role = role_ids_by_name(&idm.roles, ["user".to_owned()].iter())
             .await
             .unwrap();
         idm.members
-            .set_roles(tenant, alice, &[user_role[0], editor], None)
+            .set_roles(
+                MemberKey {
+                    tenant_id: tenant,
+                    user_id: alice,
+                },
+                &[user_role[0], editor],
+                None,
+            )
             .await
             .unwrap();
         let before = idm.events("tenant.member_roles_set").await;
@@ -1597,9 +1818,17 @@ password = "p"
 tenants = [{ slug = "default", roles = ["user", "admin"] }]"#,
         );
         idm.apply(&data).await;
-        let m = idm.members.get(tenant, alice).await.unwrap().unwrap();
+        let member = idm
+            .members
+            .get(MemberKey {
+                tenant_id: tenant,
+                user_id: alice,
+            })
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            m.roles,
+            member.roles,
             vec!["admin".to_owned(), "editor".to_owned(), "user".to_owned()],
             "并集:补上 admin,保留运行期的 editor"
         );
@@ -1622,14 +1851,30 @@ username = "alice"
 password = "p""#,
         );
         idm.apply(&first).await;
-        let alice = idm.uid("alice").await;
+        let alice = idm.user_id_of("alice").await;
         // 运行期授了一个闭集外的平台角色 auditor
         let auditor = idm
             .roles
-            .upsert("auditor", "审计员", RoleScope::Platform, None)
+            .upsert(
+                NewRole {
+                    name: "auditor",
+                    display_name: "审计员",
+                    scope: RoleScope::Platform,
+                },
+                None,
+            )
             .await
             .unwrap();
-        idm.roles.grant(alice, auditor, None).await.unwrap();
+        idm.roles
+            .grant(
+                RoleGrant {
+                    user_id: alice,
+                    role_id: auditor,
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         let data = parse(
             r#"[[users]]
@@ -1668,7 +1913,8 @@ platform_roles = ["superadmin"]"#,
         let idm = Idm::new();
         idm.apply(&SeedData::default()).await;
         for role in idm.roles.list().await.unwrap() {
-            let expect = role.name.parse::<RoleName>().unwrap().scope();
+            let parsed: RoleName = role.name.parse().unwrap();
+            let expect = parsed.scope();
             assert_eq!(role.scope, expect, "{}", role.name);
         }
     }
@@ -1677,8 +1923,6 @@ platform_roles = ["superadmin"]"#,
     /// 启动都跑,不先查就写会把用户改过的资料清回 seed 值、连头像一起解绑(每次重启资料重置)。
     #[tokio::test]
     async fn profiles_created_once_and_never_reset_on_rerun() {
-        use crate::features::profile::InMemoryProfileRepo;
-
         let idm = Idm::new();
         let profiles = InMemoryProfileRepo::new();
         let by = Some("system".to_owned());
@@ -1700,19 +1944,19 @@ tenants = [{ slug = "default", roles = ["user"] }]"#,
         )
         .await
         .unwrap();
-        let uid = idm.uid("alice").await;
-        let p = profiles
-            .get(uid)
+        let user_id = idm.user_id_of("alice").await;
+        let profile = profiles
+            .get(user_id)
             .await
             .unwrap()
             .expect("初始 profile 应已建");
-        assert_eq!(p.display_name.as_deref(), Some("Alice"));
+        assert_eq!(profile.display_name.as_deref(), Some("Alice"));
 
         // 用户运行期改名 + 绑头像
         let avatar = Uuid::now_v7();
         profiles
             .upsert(
-                uid,
+                user_id,
                 ProfileFields {
                     display_name: Some("Alice Liddell".to_owned()),
                     phone: Some("13800000000".to_owned()),
@@ -1727,12 +1971,16 @@ tenants = [{ slug = "default", roles = ["user"] }]"#,
         apply_profiles(&profiles, &idm.users, &data, &SeedReport::default(), by)
             .await
             .unwrap();
-        let p = profiles.get(uid).await.unwrap().unwrap();
+        let profile = profiles.get(user_id).await.unwrap().unwrap();
         assert_eq!(
-            p.display_name.as_deref(),
+            profile.display_name.as_deref(),
             Some("Alice Liddell"),
             "重跑不得把用户改的名按回 seed 值"
         );
-        assert_eq!(p.avatar_content_id, Some(avatar), "重跑不得解掉头像绑定");
+        assert_eq!(
+            profile.avatar_content_id,
+            Some(avatar),
+            "重跑不得解掉头像绑定"
+        );
     }
 }

@@ -2,6 +2,7 @@
 //! `ProfileDisplayNames` 一起装配(零 DB)。放在 tests/ 而非 rebuild.rs 的单测里 —— search 核心不许
 //! 依赖别的业务模块与组合根(见 `tests/architecture.rs`),装配多模块是集成测试的事。
 
+use idm::{MemberKey, NewRole, NewTenant, NewUser};
 use std::sync::Arc;
 
 use baserust::app::adapters::ProfileDisplayNames;
@@ -9,11 +10,11 @@ use baserust::features::profile::{InMemoryProfileRepo, ProfileFields, ProfileRep
 use baserust::features::search::rebuild::PAGE_LIMIT;
 use baserust::features::search::{
     rebuild, IdmSources, InMemorySearchIndexRepo, IndexQuery, IndexSort, RebuildCounts,
-    SearchIndexRepo,
+    SearchIndexRepo, Watermarks,
 };
 use baserust::kernel::pagination::PageParams;
-use baserust::kernel::sort::SortOrder;
-use baserust::kernel::tenant::TenantId;
+use baserust::kernel::sort_order::SortOrder;
+use baserust::kernel::tenant_id::TenantId;
 use idm::{
     InMemoryMemberRepo, InMemoryRoleRepo, InMemoryTenantRepo, InMemoryUserRepo, MemberRepo,
     RoleRepo, RoleScope, TenantRepo, UserRepo,
@@ -26,11 +27,17 @@ struct Idm {
     members: InMemoryMemberRepo,
 }
 
+impl Default for Idm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Idm {
     fn new() -> Self {
         let users = InMemoryUserRepo::new();
-        let tenants = InMemoryTenantRepo::sharing_with(&users);
-        let members = InMemoryMemberRepo::sharing_with(&users);
+        let tenants = InMemoryTenantRepo::new_shared_with(&users);
+        let members = InMemoryMemberRepo::new_shared_with(&users);
         Self {
             users,
             tenants,
@@ -55,17 +62,31 @@ async fn backfills_all_alive_users_with_profile_enrichment_and_watermarks() {
     let index = InMemorySearchIndexRepo::new();
 
     // 两个存活用户;u1 建了 profile(display_name),u2 没有 → 应回填为 None。
-    let u1 = users
-        .create("alice", Some("alice@x"), "hash", None)
+    let alice = users
+        .create(
+            NewUser {
+                username: "alice",
+                email: Some("alice@x"),
+                password_hash: "hash",
+            },
+            None,
+        )
         .await
         .unwrap();
-    let u2 = users
-        .create("bob", Some("bob@x"), "hash", None)
+    let bob = users
+        .create(
+            NewUser {
+                username: "bob",
+                email: Some("bob@x"),
+                password_hash: "hash",
+            },
+            None,
+        )
         .await
         .unwrap();
     profiles
         .upsert(
-            u1.id,
+            alice.id,
             ProfileFields {
                 display_name: Some("Alice Disp".to_owned()),
                 ..Default::default()
@@ -79,8 +100,7 @@ async fn backfills_all_alive_users_with_profile_enrichment_and_watermarks() {
         idm.sources(),
         &ProfileDisplayNames::new(profiles),
         &index,
-        100,
-        200,
+        Watermarks { idm: 100, app: 200 },
     )
     .await
     .unwrap();
@@ -93,26 +113,26 @@ async fn backfills_all_alive_users_with_profile_enrichment_and_watermarks() {
     );
 
     let row1 = index
-        .get_account(u1.id)
+        .get_account(alice.id)
         .await
         .unwrap()
         .expect("u1 应已回填");
     assert_eq!(row1.username.as_deref(), Some("alice"));
-    assert_eq!(row1.roles, Vec::<String>::new());
+    assert!(row1.roles.is_empty(), "{:?}", row1.roles);
     assert_eq!(row1.display_name.as_deref(), Some("Alice Disp"));
-    assert_eq!(row1.idm_seq, Some(100));
-    assert_eq!(row1.profile_seq, Some(200));
+    assert_eq!(row1.idm_sequence, Some(100));
+    assert_eq!(row1.profile_sequence, Some(200));
     assert!(!row1.deleted);
 
     let row2 = index
-        .get_account(u2.id)
+        .get_account(bob.id)
         .await
         .unwrap()
         .expect("u2 应已回填");
     assert_eq!(row2.username.as_deref(), Some("bob"));
     assert_eq!(row2.display_name, None, "无 profile 的用户应回填 None");
-    assert_eq!(row2.idm_seq, Some(100));
-    assert_eq!(row2.profile_seq, Some(200));
+    assert_eq!(row2.idm_sequence, Some(100));
+    assert_eq!(row2.profile_sequence, Some(200));
 }
 
 /// **翻页必须收全**:超过一页时,keyset 要把每一页都走到,`alive` 才完整 —— 漏掉任何一个
@@ -125,12 +145,19 @@ async fn multi_page_backfill_keeps_every_alive_user() {
     let profiles = Arc::new(InMemoryProfileRepo::new());
     let index = InMemorySearchIndexRepo::new();
 
-    let n = PAGE_LIMIT as usize + 3; // 跨页:一整页 + 零头
-    let mut ids = Vec::with_capacity(n);
-    for i in 0..n {
+    let user_count = PAGE_LIMIT as usize + 3; // 跨页:一整页 + 零头
+    let mut ids = Vec::with_capacity(user_count);
+    for i in 0..user_count {
         ids.push(
             users
-                .create(&format!("u{i}"), None, "hash", None)
+                .create(
+                    NewUser {
+                        username: &format!("u{i}"),
+                        email: None,
+                        password_hash: "hash",
+                    },
+                    None,
+                )
                 .await
                 .unwrap()
                 .id,
@@ -141,13 +168,12 @@ async fn multi_page_backfill_keeps_every_alive_user() {
         idm.sources(),
         &ProfileDisplayNames::new(profiles),
         &index,
-        100,
-        200,
+        Watermarks { idm: 100, app: 200 },
     )
     .await
     .unwrap();
     assert_eq!(
-        written.accounts, n,
+        written.accounts, user_count,
         "每一页的用户都该回填(翻页漏人 = 后面被扫成已删)"
     );
     for id in ids {
@@ -170,8 +196,7 @@ async fn no_alive_users_backfills_zero() {
         idm.sources(),
         &ProfileDisplayNames::new(profiles),
         &index,
-        1,
-        1,
+        Watermarks { idm: 1, app: 1 },
     )
     .await
     .unwrap();
@@ -189,36 +214,134 @@ async fn no_alive_users_backfills_zero() {
 #[tokio::test]
 async fn rebuild_fills_one_member_row_per_membership() {
     let idm = Idm::new();
-    let roles = InMemoryRoleRepo::sharing_with(&idm.users);
+    let roles = InMemoryRoleRepo::new_shared_with(&idm.users);
     let admin = roles
-        .upsert("admin", "Admin", RoleScope::Tenant, None)
+        .upsert(
+            NewRole {
+                name: "admin",
+                display_name: "Admin",
+                scope: RoleScope::Tenant,
+            },
+            None,
+        )
         .await
         .unwrap();
     let user_role = roles
-        .upsert("user", "User", RoleScope::Tenant, None)
+        .upsert(
+            NewRole {
+                name: "user",
+                display_name: "User",
+                scope: RoleScope::Tenant,
+            },
+            None,
+        )
         .await
         .unwrap();
     let profiles = Arc::new(InMemoryProfileRepo::new());
     let index = InMemorySearchIndexRepo::new();
 
-    let a = idm.tenants.create("ta", "Tenant A", None).await.unwrap();
-    let b = idm.tenants.create("tb", "Tenant B", None).await.unwrap();
-    let alice = idm.users.create("alice", None, "hash", None).await.unwrap();
-    let bob = idm.users.create("bob", None, "hash", None).await.unwrap();
-    let gone = idm.users.create("gone", None, "hash", None).await.unwrap();
-    idm.members
-        .add(a.id, alice.id, &[admin], None)
+    let tenant_a = idm
+        .tenants
+        .create(
+            NewTenant {
+                slug: "ta",
+                name: "Tenant A",
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let tenant_b = idm
+        .tenants
+        .create(
+            NewTenant {
+                slug: "tb",
+                name: "Tenant B",
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let alice = idm
+        .users
+        .create(
+            NewUser {
+                username: "alice",
+                email: None,
+                password_hash: "hash",
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let bob = idm
+        .users
+        .create(
+            NewUser {
+                username: "bob",
+                email: None,
+                password_hash: "hash",
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let gone = idm
+        .users
+        .create(
+            NewUser {
+                username: "gone",
+                email: None,
+                password_hash: "hash",
+            },
+            None,
+        )
         .await
         .unwrap();
     idm.members
-        .add(b.id, alice.id, &[user_role], None)
+        .add(
+            MemberKey {
+                tenant_id: tenant_a.id,
+                user_id: alice.id,
+            },
+            &[admin],
+            None,
+        )
         .await
         .unwrap();
     idm.members
-        .add(a.id, bob.id, &[user_role], None)
+        .add(
+            MemberKey {
+                tenant_id: tenant_b.id,
+                user_id: alice.id,
+            },
+            &[user_role],
+            None,
+        )
         .await
         .unwrap();
-    idm.members.add(a.id, gone.id, &[], None).await.unwrap();
+    idm.members
+        .add(
+            MemberKey {
+                tenant_id: tenant_a.id,
+                user_id: bob.id,
+            },
+            &[user_role],
+            None,
+        )
+        .await
+        .unwrap();
+    idm.members
+        .add(
+            MemberKey {
+                tenant_id: tenant_a.id,
+                user_id: gone.id,
+            },
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
     idm.users.soft_delete(gone.id, None).await.unwrap();
     profiles
         .upsert(
@@ -236,8 +359,7 @@ async fn rebuild_fills_one_member_row_per_membership() {
         idm.sources(),
         &ProfileDisplayNames::new(profiles),
         &index,
-        100,
-        200,
+        Watermarks { idm: 100, app: 200 },
     )
     .await
     .unwrap();
@@ -250,9 +372,13 @@ async fn rebuild_fills_one_member_row_per_membership() {
         "存活账号 2 个;成员关系 4 条,其中 gone 的账号已删不回填"
     );
 
-    let ta = TenantId::new(a.id).unwrap();
-    let tb = TenantId::new(b.id).unwrap();
-    let alice_a = index.get_member(ta, alice.id).await.unwrap().unwrap();
+    let tenant_a_id = TenantId::try_new(tenant_a.id).unwrap();
+    let tenant_b_id = TenantId::try_new(tenant_b.id).unwrap();
+    let alice_a = index
+        .get_member(tenant_a_id, alice.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(alice_a.username.as_deref(), Some("alice"));
     assert_eq!(alice_a.roles, vec!["admin".to_owned()]);
     assert_eq!(alice_a.status.as_deref(), Some("active"));
@@ -261,17 +387,29 @@ async fn rebuild_fills_one_member_row_per_membership() {
         Some("Alice Disp"),
         "显示名来自全局资料"
     );
-    assert_eq!(alice_a.idm_seq, Some(100));
-    assert_eq!(alice_a.member_seq, Some(100));
-    assert_eq!(alice_a.profile_seq, Some(200));
-    let alice_b = index.get_member(tb, alice.id).await.unwrap().unwrap();
+    assert_eq!(alice_a.idm_sequence, Some(100));
+    assert_eq!(alice_a.member_sequence, Some(100));
+    assert_eq!(alice_a.profile_sequence, Some(200));
+    let alice_b = index
+        .get_member(tenant_b_id, alice.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         alice_b.roles,
         vec!["user".to_owned()],
         "各租户的租户角色各自独立"
     );
-    assert!(index.get_member(tb, bob.id).await.unwrap().is_none());
-    assert!(index.get_member(ta, gone.id).await.unwrap().is_none());
+    assert!(index
+        .get_member(tenant_b_id, bob.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(index
+        .get_member(tenant_a_id, gone.id)
+        .await
+        .unwrap()
+        .is_none());
 
     let page = PageParams::Offset {
         page: 1,
@@ -280,7 +418,7 @@ async fn rebuild_fills_one_member_row_per_membership() {
     };
     let in_a = index
         .query(
-            ta,
+            tenant_a_id,
             &IndexQuery::default(),
             IndexSort::Username,
             SortOrder::Asc,
@@ -294,7 +432,7 @@ async fn rebuild_fills_one_member_row_per_membership() {
     );
     let in_b = index
         .query(
-            tb,
+            tenant_b_id,
             &IndexQuery::default(),
             IndexSort::Username,
             SortOrder::Asc,

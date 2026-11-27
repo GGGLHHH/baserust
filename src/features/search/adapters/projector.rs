@@ -4,34 +4,31 @@
 //!
 //! [`Projector::apply_message`] 是纯路由逻辑,不碰 NATS —— 单测入口;`connect`/`run` 是唯一接 NATS 的地方。
 
+use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Context;
-use async_nats::jetstream::{
-    self,
-    consumer::{pull, AckPolicy},
-};
-use futures_util::StreamExt;
+use async_nats::jetstream::consumer::{pull, AckPolicy, Consumer};
+use async_nats::jetstream::{self, AckKind, Message};
 use serde::Deserialize;
 use time::OffsetDateTime;
+use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::features::search::ports::SearchIndexRepo;
-use crate::infra::jetstream::STREAM_NAME;
-use crate::kernel::error::AppError;
-use crate::kernel::tenant::TenantId;
+use crate::features::search::model::{AccountCreated, AccountUpdated};
+use crate::features::search::search_index_repo::SearchIndexRepo;
+use crate::infra::jet_stream_publisher::{DurableConsumer, STREAM_NAME};
+use crate::infra::monitor::ProjectorOutcome;
+use crate::kernel::app_error::AppError;
+use crate::kernel::tenant_id::TenantId;
 
-/// P1 envelope 的 wire 形状(见 `infra::outbox::build_outbox_item`)。`data` 按 `r#type` 分支再解。
+/// P1 envelope 的 wire 形状(见 `infra::outbox::build_outbox_item`),只声明本投影器读的字段(`event_id` /
+/// `schema` / `aggregate_id` 等由 serde 忽略)。`data` 按 `r#type` 分支再解。
 /// `tenant_id`(多租户)只有租户事件带;`user.*` / `profile.*` 没有,本投影器也不依赖它 —— 成员事件
 /// 用 `data.tenant_id`(payload 是权威,信封上那份是它的拷贝)。
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    #[allow(dead_code)] // 路由只按 r#type 分支,schema 暂无消费者用得上,留字段保 envelope 形状完整
-    schema: String,
     r#type: String,
-    #[allow(dead_code)]
-    // data 里的 user_id 与之相等,路由用 data 里的那份;留字段保 envelope 形状完整
-    aggregate_id: Uuid,
     seq: i64,
     data: serde_json::Value,
 }
@@ -100,7 +97,7 @@ const DEFAULT_MEMBER_STATUS: &str = "active";
 pub struct Projector {
     /// durable 消费者名(指标 / 链路标签)。
     name: String,
-    consumer: jetstream::consumer::Consumer<pull::Config>,
+    consumer: Consumer<pull::Config>,
     repo: Arc<dyn SearchIndexRepo>,
 }
 
@@ -118,17 +115,23 @@ enum ApplyError {
 
 impl Projector {
     /// 连 NATS + 绑定/创建 durable pull consumer(ack 显式)。`get_or_create_consumer` 幂等
-    /// ——durable 已存在则直接绑定,不比对/不覆盖配置(与 `JetStreamPublisher::connect` 同哲学)。
-    pub async fn connect(
-        nats_url: &str,
+    /// ——durable 已存在则直接绑定,不比对/不覆盖配置(与 `JetStreamPublisher::try_new` 同哲学)。
+    pub async fn try_new(
+        consumer: DurableConsumer<'_>,
         repo: Arc<dyn SearchIndexRepo>,
-        durable_name: &str,
     ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+
+        let DurableConsumer {
+            nats_url,
+            durable_name,
+        } = consumer;
+
         let client = async_nats::connect(nats_url)
             .await
             .with_context(|| format!("连接 NATS 失败: {nats_url}"))?;
-        let js = jetstream::new(client);
-        let stream = js
+        let jetstream_context = jetstream::new(client);
+        let stream = jetstream_context
             .get_stream(STREAM_NAME)
             .await
             .with_context(|| format!("获取 JetStream 流 {STREAM_NAME} 失败"))?;
@@ -139,7 +142,7 @@ impl Projector {
             filter_subjects: FILTER_SUBJECTS.iter().map(|s| (*s).to_owned()).collect(),
             // 盖过 run() 退避梯子的单次最长 sleep(512s)。存量 durable 的配置见下方的更新兜底;
             // run() 的退避另切 ≤15s 片、每片发 AckKind::Progress 续期。
-            ack_wait: std::time::Duration::from_secs(600),
+            ack_wait: Duration::from_secs(600),
             ..Default::default()
         };
         let mut consumer = stream
@@ -160,8 +163,8 @@ impl Projector {
                     );
                     consumer = updated;
                 }
-                Err(err) => tracing::warn!(
-                    error = %err,
+                Err(error) => tracing::warn!(
+                    error = %error,
                     durable = durable_name,
                     "更新 projector durable 的过滤主题失败:收不到 tenant.* 事件,成员索引要靠 rebuild_search 回填"
                 ),
@@ -175,18 +178,22 @@ impl Projector {
     }
 
     /// 后台循环:拉消息 → `apply_message` → 成功 ack,失败留待重投;`shutdown` 置位即退出。
-    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        use futures_util::StreamExt;
+        use tokio::time;
+        use tracing::Instrument;
+
+        use crate::infra::telemetry;
+
         let mut messages = match self.consumer.messages().await {
             Ok(messages) => messages,
-            Err(err) => {
-                tracing::error!(error = %err, "projector 无法建立消息流,退出");
+            Err(error) => {
+                tracing::error!(error = %error, "projector 无法建立消息流,退出");
                 return;
             }
         };
 
-        use crate::infra::telemetry;
-        use tracing::Instrument;
-        let mut pending_tick = tokio::time::interval(telemetry::CONSUMER_INFO_INTERVAL);
+        let mut pending_tick = time::interval(telemetry::CONSUMER_INFO_INTERVAL);
         loop {
             if *shutdown.borrow() {
                 break;
@@ -198,10 +205,10 @@ impl Projector {
                 }
                 maybe = messages.next() => {
                     let Some(received) = maybe else { break };
-                    let msg = match received {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "projector 拉取消息失败,跳过本条");
+                    let message = match received {
+                        Ok(message) => message,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "projector 拉取消息失败,跳过本条");
                             continue;
                         }
                     };
@@ -214,42 +221,39 @@ impl Projector {
                     // (共 ~17min,盖住常规 DB 抖动/故障切换),仍失败按毒消息跳过 + error 级告警
                     // (数据可经 bin/rebuild_search 回填)。
                     let mut attempt = 0u32;
-                    let mut result = "ok";
+                    let mut outcome = ProjectorOutcome::Ok;
                     let span = telemetry::projector_span(&self.name);
                     let should_ack = 'retry: loop {
-                        match Self::apply_with_progress(&*self.repo, &msg).instrument(span.clone()).await {
+                        match Self::apply_with_progress(&*self.repo, &message).instrument(span.clone()).await {
                             Ok(()) => break 'retry true,
                             Err(ApplyError::Poison(why)) => {
                                 tracing::warn!(poison = %why, "projector 跳过不可投的毒消息(ack,不重投)");
-                                result = "poison";
+                                outcome = ProjectorOutcome::Poison;
                                 break 'retry true;
                             }
-                            Err(ApplyError::Transient(err)) if attempt >= 10 => {
-                                tracing::error!(error = %err, attempt, "projector 重试超限,按毒消息跳过(投影缺口需 rebuild_search 回填)");
-                                result = "dropped";
+                            Err(ApplyError::Transient(error)) if attempt >= 10 => {
+                                tracing::error!(error = %error, attempt, "projector 重试超限,按毒消息跳过(投影缺口需 rebuild_search 回填)");
+                                outcome = ProjectorOutcome::Dropped;
                                 break 'retry true;
                             }
-                            Err(ApplyError::Transient(err)) => {
-                                let backoff = std::time::Duration::from_secs(1 << attempt.min(9));
+                            Err(ApplyError::Transient(error)) => {
+                                let backoff = Duration::from_secs(1 << attempt.min(9));
                                 attempt += 1;
-                                tracing::warn!(error = %err, attempt, ?backoff, "projector apply 暂时失败,退避后原地重试(保序)");
+                                tracing::warn!(error = %error, attempt, ?backoff, "projector apply 暂时失败,退避后原地重试(保序)");
                                 // 退避切成 ≤15s 片、每片先发 AckKind::Progress 续期(WIP):
                                 // 不依赖服务端 ack_wait —— 存量 durable 的配置 get_or_create
                                 // 不会更新,仍是默认 30s,整段长 sleep 会被判超时重投副本。
                                 let mut remaining = backoff;
                                 while !remaining.is_zero() {
-                                    let slice =
-                                        remaining.min(std::time::Duration::from_secs(15));
-                                    if let Err(e) =
-                                        msg.ack_with(jetstream::AckKind::Progress).await
-                                    {
-                                        tracing::warn!(error = %e, "ack Progress 续期失败(重投风险,幂等守卫兜底)");
+                                    let slice = remaining.min(Duration::from_secs(15));
+                                    if let Err(error) = message.ack_with(AckKind::Progress).await {
+                                        tracing::warn!(error = %error, "ack Progress 续期失败(重投风险,幂等守卫兜底)");
                                     }
                                     tokio::select! {
-                                        _ = tokio::time::sleep(slice) => {}
+                                        _ = time::sleep(slice) => {}
                                         changed = shutdown.changed() => {
                                             if changed.is_err() || *shutdown.borrow() {
-                                                result = "shutdown";
+                                                outcome = ProjectorOutcome::Shutdown;
                                                 break 'retry false; // 关停:不 ack,留待重投
                                             }
                                         }
@@ -259,10 +263,10 @@ impl Projector {
                             }
                         }
                     };
-                    telemetry::record_projector_message(&self.name, result, &msg);
+                    telemetry::record_projector_message(&self.name, outcome, &message);
                     if should_ack {
-                        if let Err(err) = msg.ack().await {
-                            tracing::warn!(error = %err, "projector ack 失败");
+                        if let Err(error) = message.ack().await {
+                            tracing::warn!(error = %error, "projector ack 失败");
                         }
                     }
                 }
@@ -281,15 +285,17 @@ impl Projector {
     /// 段的续期同源防御,补上 apply 段这段窗口(见 review round-4)。
     async fn apply_with_progress(
         repo: &dyn SearchIndexRepo,
-        msg: &jetstream::Message,
+        message: &Message,
     ) -> Result<(), ApplyError> {
-        let mut apply = std::pin::pin!(Self::apply_message(repo, &msg.payload));
+        use tokio::time;
+
+        let mut apply = pin!(Self::apply_message(repo, &message.payload));
         loop {
             tokio::select! {
-                r = &mut apply => return r,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-                    if let Err(e) = msg.ack_with(jetstream::AckKind::Progress).await {
-                        tracing::warn!(error = %e, "ack Progress 续期失败(apply 期间,重投风险)");
+                result = &mut apply => return result,
+                _ = time::sleep(Duration::from_secs(15)) => {
+                    if let Err(error) = message.ack_with(AckKind::Progress).await {
+                        tracing::warn!(error = %error, "ack Progress 续期失败(apply 期间,重投风险)");
                     }
                 }
             }
@@ -301,107 +307,115 @@ impl Projector {
     /// 反序列化失败(envelope 或 data)= [`ApplyError::Poison`](调用方 ack 跳过,永不可投);
     /// repo 写失败 = [`ApplyError::Transient`](调用方不 ack、等重投);未知 type 前向兼容忽略(`Ok`)。
     async fn apply_message(repo: &dyn SearchIndexRepo, payload: &[u8]) -> Result<(), ApplyError> {
-        let env: Envelope = serde_json::from_slice(payload)
+        let envelope: Envelope = serde_json::from_slice(payload)
             .map_err(|e| ApplyError::Poison(format!("envelope 反序列化: {e}")))?;
 
         // auth.* 是 auth_audit projector 的域(同一 stream,它按 events.idm.auth.> 过滤消费)。
         // 本(user-search)projector 只管 user.*/profile.*;存量 durable 没设 filter_subjects
         // 时会一并收到 auth.* —— 显式静默跳过(ack),不当"未知类型"刷 debug。
-        if env.r#type.starts_with("auth.") {
+        if envelope.r#type.starts_with("auth.") {
             return Ok(());
         }
 
-        match env.r#type.as_str() {
+        match envelope.r#type.as_str() {
             "user.created" => {
-                let d: UserCreatedData = serde_json::from_value(env.data)
+                let data: UserCreatedData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("user.created data: {e}")))?;
                 repo.apply_user_created(
-                    d.user_id,
-                    &d.username,
-                    d.email.as_deref(),
-                    d.email_verified,
-                    &d.roles,
-                    d.created_at,
-                    env.seq,
+                    AccountCreated {
+                        user_id: data.user_id,
+                        username: &data.username,
+                        email: data.email.as_deref(),
+                        email_verified: data.email_verified,
+                        roles: &data.roles,
+                        created_at: data.created_at,
+                    },
+                    envelope.seq,
                 )
                 .await
                 .map_err(ApplyError::Transient)?;
             }
             "user.updated" => {
-                let d: UserUpdatedData = serde_json::from_value(env.data)
+                let data: UserUpdatedData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("user.updated data: {e}")))?;
                 repo.apply_user_updated(
-                    d.user_id,
-                    &d.username,
-                    d.email.as_deref(),
-                    d.email_verified,
-                    env.seq,
+                    AccountUpdated {
+                        user_id: data.user_id,
+                        username: &data.username,
+                        email: data.email.as_deref(),
+                        email_verified: data.email_verified,
+                    },
+                    envelope.seq,
                 )
                 .await
                 .map_err(ApplyError::Transient)?;
             }
             "user.roles_set" => {
-                let d: RolesSetData = serde_json::from_value(env.data)
+                let data: RolesSetData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("user.roles_set data: {e}")))?;
-                repo.apply_roles_set(d.user_id, &d.roles, env.seq)
+                repo.apply_roles_set(data.user_id, &data.roles, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
             "user.deleted" => {
-                let d: DeletedData = serde_json::from_value(env.data)
+                let data: DeletedData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("user.deleted data: {e}")))?;
-                repo.apply_user_deleted(d.user_id, env.seq)
+                repo.apply_user_deleted(data.user_id, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
             "profile.updated" => {
-                let d: ProfileUpdatedData = serde_json::from_value(env.data)
+                let data: ProfileUpdatedData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("profile.updated data: {e}")))?;
-                repo.apply_profile_updated(d.user_id, d.display_name.as_deref(), env.seq)
-                    .await
-                    .map_err(ApplyError::Transient)?;
+                repo.apply_profile_updated(
+                    data.user_id,
+                    data.display_name.as_deref(),
+                    envelope.seq,
+                )
+                .await
+                .map_err(ApplyError::Transient)?;
             }
             // ── 租户成员(多租户):成员索引一行 = 一个成员关系 ──
             "tenant.member_added" => {
-                let d = member_data(env.data, "tenant.member_added")?;
+                let data = member_data(envelope.data, "tenant.member_added")?;
                 repo.apply_member_added(
-                    d.tenant_id,
-                    d.user_id,
-                    d.status.as_deref().unwrap_or(DEFAULT_MEMBER_STATUS),
-                    &d.roles.unwrap_or_default(),
-                    env.seq,
+                    data.tenant_id,
+                    data.user_id,
+                    data.status.as_deref().unwrap_or(DEFAULT_MEMBER_STATUS),
+                    &data.roles.unwrap_or_default(),
+                    envelope.seq,
                 )
                 .await
                 .map_err(ApplyError::Transient)?;
             }
             "tenant.member_updated" => {
-                let d = member_data(env.data, "tenant.member_updated")?;
-                let status = d.status.ok_or_else(|| {
+                let data = member_data(envelope.data, "tenant.member_updated")?;
+                let status = data.status.ok_or_else(|| {
                     ApplyError::Poison("tenant.member_updated data: 缺 status".to_owned())
                 })?;
-                repo.apply_member_updated(d.tenant_id, d.user_id, &status, env.seq)
+                repo.apply_member_updated(data.tenant_id, data.user_id, &status, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
             "tenant.member_roles_set" => {
-                let d = member_data(env.data, "tenant.member_roles_set")?;
-                let roles = d.roles.ok_or_else(|| {
+                let data = member_data(envelope.data, "tenant.member_roles_set")?;
+                let roles = data.roles.ok_or_else(|| {
                     ApplyError::Poison("tenant.member_roles_set data: 缺 roles".to_owned())
                 })?;
-                repo.apply_member_roles_set(d.tenant_id, d.user_id, &roles, env.seq)
+                repo.apply_member_roles_set(data.tenant_id, data.user_id, &roles, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
             "tenant.member_removed" => {
-                let d = member_data(env.data, "tenant.member_removed")?;
-                repo.apply_member_removed(d.tenant_id, d.user_id, env.seq)
+                let data = member_data(envelope.data, "tenant.member_removed")?;
+                repo.apply_member_removed(data.tenant_id, data.user_id, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
             "tenant.deleted" => {
-                let d: TenantData = serde_json::from_value(env.data)
+                let data: TenantData = serde_json::from_value(envelope.data)
                     .map_err(|e| ApplyError::Poison(format!("tenant.deleted data: {e}")))?;
-                repo.apply_tenant_deleted(d.tenant_id, env.seq)
+                repo.apply_tenant_deleted(data.tenant_id, envelope.seq)
                     .await
                     .map_err(ApplyError::Transient)?;
             }
@@ -460,7 +474,7 @@ mod tests {
 
         let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.username.as_deref(), Some("alice"));
-        assert_eq!(row.idm_seq, Some(5));
+        assert_eq!(row.idm_sequence, Some(5));
         assert!(!row.deleted);
     }
 
@@ -482,7 +496,7 @@ mod tests {
 
         let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.display_name.as_deref(), Some("D"));
-        assert_eq!(row.profile_seq, Some(2));
+        assert_eq!(row.profile_sequence, Some(2));
     }
 
     #[tokio::test]
@@ -606,7 +620,7 @@ mod tests {
 
         let row = repo.get_account(user_id).await.unwrap().expect("行已写入");
         assert_eq!(row.username.as_deref(), Some("alice"));
-        assert_eq!(row.idm_seq, Some(5));
+        assert_eq!(row.idm_sequence, Some(5));
     }
 
     #[tokio::test]
@@ -640,12 +654,17 @@ mod tests {
         );
     }
 
-    fn env(seq: i64, schema: &str, ty: &str, data: serde_json::Value) -> Vec<u8> {
+    fn envelope_bytes(
+        sequence: i64,
+        schema: &str,
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "schema": schema,
-            "type": ty,
+            "type": event_type,
             "aggregate_id": Uuid::now_v7(),
-            "seq": seq,
+            "seq": sequence,
             "data": data,
         }))
         .unwrap()
@@ -656,44 +675,48 @@ mod tests {
     #[tokio::test]
     async fn projector_handles_member_events() {
         let repo = InMemorySearchIndexRepo::new();
-        let a = TenantId::new(Uuid::now_v7()).unwrap();
-        let b = TenantId::new(Uuid::now_v7()).unwrap();
-        let u = Uuid::now_v7();
+        let tenant_a = TenantId::try_new(Uuid::now_v7()).unwrap();
+        let tenant_b = TenantId::try_new(Uuid::now_v7()).unwrap();
+        let user_id = Uuid::now_v7();
         let apply = |bytes: Vec<u8>| {
             let repo = &repo;
             async move { Projector::apply_message(repo, &bytes).await.unwrap() }
         };
 
-        apply(env(
+        apply(envelope_bytes(
             1,
             "idm",
             "user.created",
             json!({
-                "user_id": u, "username": "alice", "email": null, "email_verified": false,
+                "user_id": user_id, "username": "alice", "email": null, "email_verified": false,
                 "roles": ["superadmin"], "created_at": created_at_fixture(),
             }),
         ))
         .await;
         // 成员事件的 aggregate_id 是租户 id;信封上也带 tenant_id(投影器用 data 里那份)。
-        apply(env(
+        apply(envelope_bytes(
             2,
             "idm",
             "tenant.member_added",
             json!({
-                "tenant_id": a, "user_id": u, "status": "active", "roles": ["admin"],
+                "tenant_id": tenant_a, "user_id": user_id, "status": "active", "roles": ["admin"],
             }),
         ))
         .await;
-        apply(env(
+        apply(envelope_bytes(
             3,
             "idm",
             "tenant.member_added",
             json!({
-                "tenant_id": b, "user_id": u, "status": "active", "roles": ["user"],
+                "tenant_id": tenant_b, "user_id": user_id, "status": "active", "roles": ["user"],
             }),
         ))
         .await;
-        let row = repo.get_member(a, u).await.unwrap().expect("a 的成员行");
+        let row = repo
+            .get_member(tenant_a, user_id)
+            .await
+            .unwrap()
+            .expect("a 的成员行");
         assert_eq!(row.username.as_deref(), Some("alice"), "账号列从账号目录抄");
         assert_eq!(
             row.roles,
@@ -701,62 +724,74 @@ mod tests {
             "roles 是租户角色,不是平台角色"
         );
         assert_eq!(row.status.as_deref(), Some("active"));
-        assert_eq!(row.member_seq, Some(2));
+        assert_eq!(row.member_sequence, Some(2));
 
-        apply(env(
+        apply(envelope_bytes(
             4,
             "idm",
             "tenant.member_roles_set",
             json!({
-                "tenant_id": a, "user_id": u, "roles": ["user"],
+                "tenant_id": tenant_a, "user_id": user_id, "roles": ["user"],
             }),
         ))
         .await;
-        apply(env(
+        apply(envelope_bytes(
             5,
             "idm",
             "tenant.member_updated",
             json!({
-                "tenant_id": a, "user_id": u, "status": "inactive",
+                "tenant_id": tenant_a, "user_id": user_id, "status": "inactive",
             }),
         ))
         .await;
-        let row = repo.get_member(a, u).await.unwrap().unwrap();
+        let row = repo.get_member(tenant_a, user_id).await.unwrap().unwrap();
         assert_eq!(row.roles, vec!["user".to_owned()]);
         assert_eq!(row.status.as_deref(), Some("inactive"));
 
         // 资料全局:一个 profile.updated 刷新两个租户的行。
-        apply(env(
+        apply(envelope_bytes(
             1,
             "app",
             "profile.updated",
-            json!({ "user_id": u, "display_name": "Alice" }),
+            json!({ "user_id": user_id, "display_name": "Alice" }),
         ))
         .await;
-        for t in [a, b] {
-            let row = repo.get_member(t, u).await.unwrap().unwrap();
+        for tenant in [tenant_a, tenant_b] {
+            let row = repo.get_member(tenant, user_id).await.unwrap().unwrap();
             assert_eq!(row.display_name.as_deref(), Some("Alice"));
         }
 
-        apply(env(
+        apply(envelope_bytes(
             6,
             "idm",
             "tenant.member_removed",
-            json!({ "tenant_id": b, "user_id": u }),
+            json!({ "tenant_id": tenant_b, "user_id": user_id }),
         ))
         .await;
-        assert!(repo.get_member(b, u).await.unwrap().unwrap().removed);
-        apply(env(
+        assert!(
+            repo.get_member(tenant_b, user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .removed
+        );
+        apply(envelope_bytes(
             7,
             "idm",
             "tenant.deleted",
-            json!({ "tenant_id": a, "slug": "a" }),
+            json!({ "tenant_id": tenant_a, "slug": "a" }),
         ))
         .await;
-        assert!(repo.get_member(a, u).await.unwrap().unwrap().removed);
+        assert!(
+            repo.get_member(tenant_a, user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .removed
+        );
 
         // 租户建 / 改名:成员索引不存租户信息 → 无操作、不报错。
-        apply(env(
+        apply(envelope_bytes(
             8,
             "idm",
             "tenant.created",
@@ -771,26 +806,27 @@ mod tests {
     #[tokio::test]
     async fn bad_member_events_are_poison() {
         let repo = InMemorySearchIndexRepo::new();
-        let u = Uuid::now_v7();
-        for (ty, data) in [
+        let user_id = Uuid::now_v7();
+        for (event_type, data) in [
             (
                 "tenant.member_added",
-                json!({ "tenant_id": Uuid::nil(), "user_id": u }),
+                json!({ "tenant_id": Uuid::nil(), "user_id": user_id }),
             ),
             (
                 "tenant.member_updated",
-                json!({ "tenant_id": Uuid::now_v7(), "user_id": u }),
+                json!({ "tenant_id": Uuid::now_v7(), "user_id": user_id }),
             ),
             (
                 "tenant.member_roles_set",
-                json!({ "tenant_id": Uuid::now_v7(), "user_id": u }),
+                json!({ "tenant_id": Uuid::now_v7(), "user_id": user_id }),
             ),
-            ("tenant.member_removed", json!({ "user_id": u })),
+            ("tenant.member_removed", json!({ "user_id": user_id })),
         ] {
-            let r = Projector::apply_message(&repo, &env(1, "idm", ty, data)).await;
+            let result =
+                Projector::apply_message(&repo, &envelope_bytes(1, "idm", event_type, data)).await;
             assert!(
-                matches!(r, Err(ApplyError::Poison(_))),
-                "{ty} 坏 data 应判毒消息"
+                matches!(result, Err(ApplyError::Poison(_))),
+                "{event_type} 坏 data 应判毒消息"
             );
         }
     }

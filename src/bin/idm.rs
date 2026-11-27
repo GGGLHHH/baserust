@@ -2,9 +2,12 @@
 //! nginx 按 `/api/v1/{public,frontend,admin}/auth` 与 `/api/v1/admin/platform`(平台租户管理)前缀分流到此。
 //! 本地开发用 app 进程(Both 已含 idm)即可,不必单跑它。对应 Go 的 cmd/realestate-login。
 
-use baserust::app::{run, Mount};
+// Google Rust 风格指南:必须 panic 时用 expect("原因") 说明不变量,不用 unwrap。
+#![warn(clippy::unwrap_used)]
+
+use baserust::app::{self, Mount};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run(|_| Mount::Idm).await
+    app::run(|_| Mount::Idm).await
 }

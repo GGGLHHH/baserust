@@ -1,67 +1,75 @@
 //! RBAC + scope 授权**契约测试** —— 用同一套 seed 数据(admin/user/superadmin,见 `seed.toml`)。
 //!
-//! 范式演示:授权归 app。这里把几个 **mock 端点** gate 在 `Perm` 上(`state.policy.require_scoped`),
-//! 过**真实** `authenticate` 中间件 + 真实 `AppState::new`(进程内 seed,内存仓储,无 DB):
+//! 范式演示:授权归 app。这里把几个 **mock 端点** gate 在 `Permission` 上(`state.policy.require_scoped`),
+//! 过**真实** `authenticate` 中间件 + 真实 `AppState::try_new`(进程内 seed,内存仓储,无 DB):
 //! - **RBAC**:role→权限来自 seed.toml;admin 能写、user 只读、users:admin 仅 superadmin。
 //! - **scope**:`mint_scoped` 签的降权令牌即便 role 够,scope 没给也拒(有效权限 = role 权限 ∩ scope)。
 //!
 //! 401(没认证)vs 403(认证了但无权限)严格区分。
 
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::from_fn_with_state;
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{body, Router};
+use baserust::features::auth::ScopedTenant;
+use baserust::kernel::tenant_id::DEFAULT_TENANT_ID;
+use serde_json::Value;
 use tower::ServiceExt; // oneshot
 use uuid::Uuid;
 
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{authenticate, AppTokenSigner};
-use baserust::infra::authz::TokenScope;
+use baserust::infra::authorization::TokenScope;
 use baserust::infra::config::Config;
 use baserust::infra::http::audit::CurrentUser;
 use baserust::infra::http::error::ApiError;
-use baserust::kernel::authz::Perm;
+use baserust::kernel::authorization::Permission;
 use baserust::kernel::pagination::PageParams;
 use idm::{AuthOutcome, LoginInput};
 
-// ── mock 端点:每个 gate 在一个 Perm 上(范式:require_scoped 同时管 RBAC 与 scope)──
+// ── mock 端点:每个 gate 在一个 Permission 上(范式:require_scoped 同时管 RBAC 与 scope)──
 
 async fn demo_read(
-    axum::extract::State(s): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
 ) -> Result<StatusCode, ApiError> {
-    s.policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetRead)?;
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Permission::WidgetRead)?;
     Ok(StatusCode::OK)
 }
 
 async fn demo_write(
-    axum::extract::State(s): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
 ) -> Result<StatusCode, ApiError> {
-    s.policy
-        .require_scoped(&user.0, &scope.0, Perm::WidgetWrite)?;
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Permission::WidgetWrite)?;
     Ok(StatusCode::OK)
 }
 
 async fn demo_admin(
-    axum::extract::State(s): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
 ) -> Result<StatusCode, ApiError> {
-    s.policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+    state
+        .policy
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// 真实 AppState(内存,进程内 seed 出 admin/user/superadmin)+ mock 端点 + 真实鉴权中间件。
 async fn setup() -> (AppState, Router) {
-    let (state, _bg) = AppState::new(&Config::default(), Mount::Both)
+    let state = AppState::try_new(&Config::default(), Mount::Both)
         .await
-        .expect("内存模式 AppState 应可建(含进程内 seed)");
+        .expect("内存模式 AppState 应可建(含进程内 seed)")
+        .state;
     let app = Router::new()
         .route("/demo/read", get(demo_read))
         .route("/demo/write", post(demo_write))
@@ -82,17 +90,17 @@ async fn login(state: &AppState, who: &str) -> AuthOutcome {
         .unwrap_or_else(|_| panic!("seed 用户 {who}:pwd 应能登录"))
 }
 
-fn req(method: &str, uri: &str, bearer: Option<&str>) -> Request<Body> {
-    let mut b = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        b = b.header("authorization", format!("Bearer {t}"));
+fn request(method: &str, uri: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    b.body(Body::empty()).unwrap()
+    builder.body(Body::empty()).unwrap()
 }
 
 async fn status(app: &Router, method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
     app.clone()
-        .oneshot(req(method, uri, bearer))
+        .oneshot(request(method, uri, bearer))
         .await
         .unwrap()
         .status()
@@ -162,17 +170,17 @@ async fn scope_downscopes_below_role_grant() {
 
     // 给 admin 签一个**只含 widgets:read** 的降权令牌(模拟 PAT / 第三方授权)
     // state 的 verifier 用内嵌默认 dev 公钥,故本地 dev 私钥签的令牌它也认。
-    let signer = AppTokenSigner::dev();
+    let signer = AppTokenSigner::new_with_development_key();
     let scoped = signer
         .mint_scoped(
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
-            Some(baserust::features::auth::ScopedTenant {
+            Some(ScopedTenant {
                 id: admin.tenant_id.expect("admin 登录应进默认租户"),
                 roles: admin.tenant_roles.clone(),
             }),
-            vec![Perm::WidgetRead],
+            vec![Permission::WidgetRead],
             900,
         )
         .unwrap();
@@ -212,8 +220,12 @@ fn real_app(state: &AppState) -> Router {
 }
 
 async fn body_of(app: &Router, method: &str, uri: &str, bearer: Option<&str>) -> String {
-    let resp = app.clone().oneshot(req(method, uri, bearer)).await.unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let response = app
+        .clone()
+        .oneshot(request(method, uri, bearer))
+        .await
+        .unwrap();
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -223,11 +235,7 @@ async fn body_of(app: &Router, method: &str, uri: &str, bearer: Option<&str>) ->
 async fn widget_id(state: &AppState, name: &str) -> Uuid {
     state
         .widgets
-        .list(
-            baserust::kernel::tenant::DEFAULT_TENANT_ID,
-            page_query(),
-            None,
-        )
+        .list(DEFAULT_TENANT_ID, page_query(), None)
         .await
         .unwrap()
         .items
@@ -239,7 +247,7 @@ async fn widget_id(state: &AppState, name: &str) -> Uuid {
 
 #[tokio::test]
 async fn ownership_user_sees_own_others_see_all() {
-    // AppState::new 已从 mock.toml 幂等 seed:admin 拥 admin-w1/w2,user 拥 user-w1。
+    // AppState::try_new 已从 mock.toml 幂等 seed:admin 拥 admin-w1/w2,user 拥 user-w1。
     let (state, _) = setup().await;
     let app = real_app(&state);
     let admin = login(&state, "admin").await.access_token;
@@ -247,23 +255,28 @@ async fn ownership_user_sees_own_others_see_all() {
     let superadmin = login(&state, "superadmin").await.access_token;
 
     // user(无 read:all)→ /widgets 只列自己的 user-w1
-    let u = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&user)).await;
-    assert!(u.contains("user-w1"), "user 应见自己的: {u}");
+    let user_body = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&user)).await;
     assert!(
-        !u.contains("admin-w1") && !u.contains("admin-w2"),
-        "user 不该见别人的: {u}"
+        user_body.contains("user-w1"),
+        "user 应见自己的: {user_body}"
+    );
+    assert!(
+        !user_body.contains("admin-w1") && !user_body.contains("admin-w2"),
+        "user 不该见别人的: {user_body}"
     );
     // admin(read:all)→ 见全部三个
-    let a = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&admin)).await;
+    let admin_body = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&admin)).await;
     assert!(
-        a.contains("admin-w1") && a.contains("admin-w2") && a.contains("user-w1"),
-        "admin 应见全部: {a}"
+        admin_body.contains("admin-w1")
+            && admin_body.contains("admin-w2")
+            && admin_body.contains("user-w1"),
+        "admin 应见全部: {admin_body}"
     );
     // superadmin(read:all)→ 见全部
-    let s = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&superadmin)).await;
+    let superadmin_body = body_of(&app, "GET", "/api/v1/frontend/widgets", Some(&superadmin)).await;
     assert!(
-        s.contains("admin-w1") && s.contains("user-w1"),
-        "superadmin 应见全部: {s}"
+        superadmin_body.contains("admin-w1") && superadmin_body.contains("user-w1"),
+        "superadmin 应见全部: {superadmin_body}"
     );
 }
 
@@ -396,16 +409,16 @@ async fn scope_without_read_all_narrows_admin_to_own() {
     assert!(full.contains("user-w1"), "满权应见全部: {full}");
 
     // admin 降权令牌:scope=[widgets:read],**不含 read:all** → 跌回 Own → 只见自己的
-    let scoped = AppTokenSigner::dev()
+    let scoped = AppTokenSigner::new_with_development_key()
         .mint_scoped(
             admin.user.id,
             &admin.user.username,
             admin.user.roles.clone(),
-            Some(baserust::features::auth::ScopedTenant {
+            Some(ScopedTenant {
                 id: admin.tenant_id.expect("admin 登录应进默认租户"),
                 roles: admin.tenant_roles.clone(),
             }),
-            vec![Perm::WidgetRead],
+            vec![Permission::WidgetRead],
             900,
         )
         .unwrap();
@@ -422,7 +435,7 @@ async fn scope_without_read_all_narrows_admin_to_own() {
 #[tokio::test]
 async fn my_permissions_reflect_role_and_scope() {
     let config = Config::default();
-    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
+    let state = AppState::try_new(&config, Mount::Both).await.unwrap().state;
     let app = build_router(state.clone(), &config, Mount::Both);
     let admin = state
         .auth
@@ -432,16 +445,16 @@ async fn my_permissions_reflect_role_and_scope() {
         })
         .await
         .unwrap();
-    let signer = AppTokenSigner::dev();
+    let signer = AppTokenSigner::new_with_development_key();
     // roles = 默认租户里的租户角色(admin 的权限都是租户级)
-    let mint = |roles: Vec<String>, scope: Vec<Perm>| {
+    let mint = |roles: Vec<String>, scope: Vec<Permission>| {
         signer
             .mint_scoped(
                 admin.user.id,
                 "probe",
                 vec![],
-                Some(baserust::features::auth::ScopedTenant {
-                    id: baserust::kernel::tenant::DEFAULT_TENANT_ID.as_uuid(),
+                Some(ScopedTenant {
+                    id: DEFAULT_TENANT_ID.as_uuid(),
                     roles,
                 }),
                 scope,
@@ -452,7 +465,7 @@ async fn my_permissions_reflect_role_and_scope() {
     let fetch = |token: String| {
         let app = app.clone();
         async move {
-            let resp = app
+            let response = app
                 .oneshot(
                     Request::get("/api/v1/frontend/permissions/me")
                         .header("authorization", format!("Bearer {token}"))
@@ -461,59 +474,61 @@ async fn my_permissions_reflect_role_and_scope() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            let permissions: Value = serde_json::from_slice(&bytes).unwrap();
+            permissions
         }
     };
 
     // 满权令牌:admin 全部 13 权(含 admin:login 后台准入、members:read / members:admin 成员管理,
     // **无** users:admin、无 profiles:* —— 那些是平台级),
     // 含 implies 展开;排序稳定
-    let v = fetch(admin.access_token.clone()).await;
-    assert_eq!(v["roles"], serde_json::json!([]), "admin 没有平台角色");
-    assert_eq!(v["tenant_roles"], serde_json::json!(["admin"]));
-    assert_eq!(
-        v["tenant"]["id"],
-        baserust::kernel::tenant::DEFAULT_TENANT_ID.to_string()
-    );
-    let perms: Vec<&str> = v["permissions"]
+    let me = fetch(admin.access_token.clone()).await;
+    assert_eq!(me["roles"], serde_json::json!([]), "admin 没有平台角色");
+    assert_eq!(me["tenant_roles"], serde_json::json!(["admin"]));
+    assert_eq!(me["tenant"]["id"], DEFAULT_TENANT_ID.to_string());
+    let permissions: Vec<&str> = me["permissions"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s.as_str().unwrap())
         .collect();
-    assert_eq!(perms.len(), 13, "admin 应 13 权,got {perms:?}");
-    assert!(perms.contains(&"members:read") && perms.contains(&"members:admin"));
+    assert_eq!(permissions.len(), 13, "admin 应 13 权,got {permissions:?}");
+    assert!(permissions.contains(&"members:read") && permissions.contains(&"members:admin"));
     assert!(
-        perms.iter().all(|p| !p.starts_with("profiles:")),
+        permissions.iter().all(|p| !p.starts_with("profiles:")),
         "资料全局一份:租户管理员没有 profiles:*"
     );
-    assert!(perms.contains(&"widgets:read:all"));
+    assert!(permissions.contains(&"widgets:read:all"));
     assert!(
-        perms.contains(&"widgets:write:all"),
+        permissions.contains(&"widgets:write:all"),
         "admin 跨用户改/删 widget(镜像 contents:write:all)"
     );
-    assert!(perms.contains(&"admin:login"), "admin 应有后台准入");
+    assert!(permissions.contains(&"admin:login"), "admin 应有后台准入");
     assert!(
-        !perms.contains(&"users:admin"),
+        !permissions.contains(&"users:admin"),
         "admin 无 users:admin(superadmin 专属)"
     );
-    let mut sorted = perms.clone();
+    let mut sorted = permissions.clone();
     sorted.sort_unstable();
-    assert_eq!(perms, sorted, "应已排序");
+    assert_eq!(permissions, sorted, "应已排序");
 
     // 降权令牌 scope=[widgets:read:all]:implies 展开 → 恰好 read + read:all
-    let v = fetch(mint(vec!["admin".to_owned()], vec![Perm::WidgetReadAll])).await;
+    let me = fetch(mint(
+        vec!["admin".to_owned()],
+        vec![Permission::WidgetReadAll],
+    ))
+    .await;
     assert_eq!(
-        v["permissions"],
+        me["permissions"],
         serde_json::json!(["widgets:read", "widgets:read:all"]),
         "scope 收窄集应精确"
     );
 
     // 零权限令牌(roles+scope 皆空):可达(仅登录),集合为空
-    let v = fetch(mint(vec![], vec![])).await;
-    assert_eq!(v["permissions"], serde_json::json!([]));
+    let me = fetch(mint(vec![], vec![])).await;
+    assert_eq!(me["permissions"], serde_json::json!([]));
 }

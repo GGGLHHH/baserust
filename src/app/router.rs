@@ -7,30 +7,39 @@
 //! (粗过滤、防御纵深第一层;端点内 role/scope/字段级三轴照旧)。
 //! 文档端点仅非 prod 暴露。
 
+use std::any::Any;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, MatchedPath, Request};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use idm::AuthUser;
+use tokio::time;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::{GovernorError, GovernorLayer};
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{self, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+use tracing::{field, Span};
+use utoipa::openapi::OpenApi as OpenApiSpec;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::app::AppState;
+use crate::app::{client_errors, monitoring, AppState};
 use crate::features::{auth, auth_audit, content, profile, tenants, users, widget};
 use crate::health;
+use crate::infra::client_context::{self, TrustedHops};
 use crate::infra::config::Config;
 use crate::infra::http::error::{ErrorBody, ErrorCode};
-use crate::infra::openapi;
+use crate::infra::openapi::{self, ApiDoc};
+use crate::infra::{authorization, monitor};
 
 /// 请求处理超时上限,超过返回 408 + 统一错误契约。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,28 +59,34 @@ pub enum Mount {
 /// 组装路由。按 `mount` 决定挂哪些模块;业务模块(含 auth)按 public(无闸)/ frontend(需登录)/
 /// admin(admin:login 准入)三组分别 merge,各组统一 nest 到 /api/v1 下再上组闸。
 /// 两次 nest 同前缀会 panic,故**先 merge 再 nest 一次**。
+///
+/// # Panics
+///
+/// 限流配置非法时 panic。`period` / `burst` 已用 `max(1)` 兜成非零,实际不会发生。
+///
+/// 路由冲突时 `nest` / `merge` 也会 panic(同一路径 + 方法注册两次、同一前缀 nest 两次等)。
+/// 路由表是写死的,冲突属于编程错误,任何一次启动或路由测试都会立刻暴露。
 pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     let needs_app = matches!(mount, Mount::App | Mount::Both);
     let needs_idm = matches!(mount, Mount::Idm | Mount::Both);
 
     // health 在根(/livez 等不带 /api/v1);业务模块按 mount 装配进三组,统一 nest /api/v1。
-    let mut api_router =
-        OpenApiRouter::with_openapi(openapi::ApiDoc::openapi()).merge(health::router());
+    let mut api_router = OpenApiRouter::with_openapi(ApiDoc::openapi()).merge(health::router());
     let mut public = OpenApiRouter::new();
     let mut frontend = OpenApiRouter::new();
     let mut admin = OpenApiRouter::new();
     let mut admin_open = OpenApiRouter::new(); // admin 组闸外(admin_login)
     if needs_app {
-        public = public.merge(crate::app::client_errors::public_router());
+        public = public.merge(client_errors::public_router());
         frontend = frontend
             .merge(widget::router())
             .merge(content::router())
             .merge(profile::router())
             // permissions/me:app 侧回答"能干什么"(policy 权威;idm 的 /auth/me 只给身份事实)
-            .merge(crate::infra::authz::router());
+            .merge(authorization::router());
         admin = admin
             .merge(widget::admin_router())
-            .merge(crate::app::monitoring::admin_router());
+            .merge(monitoring::admin_router());
     }
     if needs_idm {
         public = public.merge(auth::public_router());
@@ -96,11 +111,11 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         admin_open = admin_open.merge(auth::admin_login_router());
     }
     // 组闸(粗过滤,防御纵深第一层;端点内三轴照旧)。layer 只包**调用时已有**的路由。
-    let frontend = frontend.layer(middleware::from_fn(crate::infra::authz::require_login));
+    let frontend = frontend.layer(middleware::from_fn(authorization::require_login));
     let admin = admin
         .layer(middleware::from_fn_with_state(
             state.policy.clone(),
-            crate::infra::authz::require_admin_login,
+            authorization::require_admin_login,
         ))
         .merge(admin_open); // 闸后 merge:layer 只包已有路由,login 免闸
     let features = OpenApiRouter::new()
@@ -113,7 +128,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
     openapi::inject_operation_security(&mut api);
     // 纯 idm 进程:给 app 汇总监控用的内部端点(不进 OpenAPI;nginx 不转发 /internal,外部到不了)。
     let router = if matches!(mount, Mount::Idm) {
-        router.merge(crate::app::monitoring::internal_router())
+        router.merge(monitoring::internal_router())
     } else {
         router
     };
@@ -144,11 +159,13 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         //
         // timeout:超时也走 ErrorBody JSON(tower-http TimeoutLayer 只给空体,故自己包一层)
         .layer(middleware::from_fn(timeout_middleware))
-        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)
+        // panic:兜底为 500 + ErrorBody JSON(原始 panic 信息只进日志,绝不泄露给客户端)。
+        // 风格指南「Don't call `panic::catch_unwind`」的 defense in depth 例外:不依赖它保证任何性质
+        // (没有它 panic 的请求只是断连,同样不泄露);产品代码已禁 unwrap、expect 都写 `# Panics`。
         .layer(CatchPanicLayer::custom(handle_panic))
         // 请求统计(后台监控页):包在 panic 兜底之外,panic 转成的 500 也记得到;
         // 作为路由层中间件,读得到 MatchedPath(按路由模板聚合,不按带 id 的真实路径)。
-        .layer(middleware::from_fn(crate::infra::monitor::track_requests))
+        .layer(middleware::from_fn(monitor::track_requests))
         // Trace 必须在 panic/timeout **之外**:span 在它们之内才进得去。
         // 放最内(旧接法)时,`handle_panic` 的 error! 是在 unwind 过 Trace 之后才打的、
         // `timeout_or_408` 的 warn! 同理 —— 两条日志都不带 method/path/request_id,
@@ -161,9 +178,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
                 .on_response(on_http_response),
         )
         // 可信反代跳数(TRUSTED_PROXY_HOPS)注入 extension,供 ClientContext 提取器解析真实客户端 IP
-        .layer(axum::Extension(crate::infra::client_context::TrustedHops(
-            config.trusted_proxy_hops,
-        )))
+        .layer(Extension(TrustedHops(config.trusted_proxy_hops)))
         // 鉴权:best-effort 解析 token(cookie 优先/Bearer 兜底),验过塞 AuthUser 进 extensions(无/非法不报错,下游决定)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -181,16 +196,16 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         // 与 `RATE_LIMIT_PER_SEC`("每秒补 n 个")正好互为倒数:直接喂会慢 n² 倍(默认 10 → 0.1 req/s)。
         // 故取倒数 `1s / n`。`max(1)`:period/burst 为零时 `finish()` 返 None → 启动 panic;
         // 配 0 应退化成"最严但能跑",不是炸进程。
-        let per_sec = config.rate_limit_per_sec.max(1);
-        let gov = GovernorConfigBuilder::default()
-            .period(Duration::from_secs(1) / per_sec)
+        let per_second = config.rate_limit_per_second.max(1);
+        let governor_config = GovernorConfigBuilder::default()
+            .period(Duration::from_secs(1) / per_second)
             .burst_size(config.rate_limit_burst.max(1))
             .key_extractor(TrustedIpKeyExtractor {
                 trusted_hops: config.trusted_proxy_hops,
             })
             .finish()
             .expect("限流配置应合法");
-        router.layer(GovernorLayer::new(gov).error_handler(rate_limit_response))
+        router.layer(GovernorLayer::new(governor_config).error_handler(rate_limit_response))
     } else {
         router
     };
@@ -213,7 +228,7 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
         .layer(cors_layer(config));
 
     // 文档端点(/docs、/api-docs/*)只在**非 prod** 暴露,prod 收起减少攻击面。
-    let router = if config.app_env.expose_docs() {
+    let router = if config.app_environment.expose_docs() {
         router.merge(openapi::doc_routes(api))
     } else {
         router
@@ -224,8 +239,9 @@ pub fn build_router(state: AppState, config: &Config, mount: Mount) -> Router {
 
 /// 合并后的 OpenAPI 规范(`Both` 全量)。运行时 doc 端点与契约测试**同源**复用此装配
 /// (镜像 `build_router` 的 `Mount::Both` 分支)—— 避免测试复制装配逻辑而与运行时漂移。
-pub fn api_spec() -> utoipa::openapi::OpenApi {
-    let mut api = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
+#[must_use]
+pub fn api_spec() -> OpenApiSpec {
+    let (_router, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(health::router())
         .nest(
             "/api/v1",
@@ -233,7 +249,7 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                 .nest(
                     "/public",
                     OpenApiRouter::new()
-                        .merge(crate::app::client_errors::public_router())
+                        .merge(client_errors::public_router())
                         .merge(auth::public_router()),
                 )
                 .nest(
@@ -242,14 +258,14 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                         .merge(widget::router())
                         .merge(content::router())
                         .merge(profile::router())
-                        .merge(crate::infra::authz::router())
+                        .merge(authorization::router())
                         .merge(auth::me_router()),
                 )
                 .nest(
                     "/admin",
                     OpenApiRouter::new()
                         .merge(widget::admin_router())
-                        .merge(crate::app::monitoring::admin_router())
+                        .merge(monitoring::admin_router())
                         .merge(auth::admin_router())
                         .nest(
                             "/auth",
@@ -263,15 +279,14 @@ pub fn api_spec() -> utoipa::openapi::OpenApi {
                         .merge(auth::admin_login_router()),
                 ),
         )
-        .split_for_parts()
-        .1;
+        .split_for_parts();
     openapi::inject_operation_security(&mut api); // 与 build_router 同源:doc 端点与契约测试都经此注入
     api
 }
 
 /// CORS 层:prod 用配置白名单(空则等于不放行任何跨源);dev/staging 走 permissive(任意源,便于联调)。
 fn cors_layer(config: &Config) -> CorsLayer {
-    if config.app_env.is_prod() {
+    if config.app_environment.is_production() {
         let origins: Vec<HeaderValue> = config
             .cors_origins()
             .iter()
@@ -279,28 +294,28 @@ fn cors_layer(config: &Config) -> CorsLayer {
             .collect();
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_methods(cors::Any)
+            .allow_headers(cors::Any)
     } else {
         CorsLayer::permissive()
     }
 }
 
 /// 请求超时中间件:超过 `REQUEST_TIMEOUT` 返回 408 + 统一 `ErrorBody`(非 tower-http 默认空体)。
-async fn timeout_middleware(req: Request, next: Next) -> Response {
-    timeout_or_408(REQUEST_TIMEOUT, next.run(req)).await
+async fn timeout_middleware(request: Request, next: Next) -> Response {
+    timeout_or_408(REQUEST_TIMEOUT, next.run(request)).await
 }
 
 /// 把响应 future 套超时:超时 → 408 + 统一 `ErrorBody`(非 tower-http 默认空体)。
 /// 抽出 `Duration` 形参 → 可用极短超时单测,逻辑零重复(避免测试复刻一份超时逻辑)。
 async fn timeout_or_408(
-    dur: Duration,
-    fut: impl std::future::Future<Output = Response>,
+    duration: Duration,
+    response_future: impl Future<Output = Response>,
 ) -> Response {
-    match tokio::time::timeout(dur, fut).await {
-        Ok(resp) => resp,
+    match time::timeout(duration, response_future).await {
+        Ok(response) => response,
         Err(_) => {
-            tracing::warn!(timeout_secs = dur.as_secs(), "request timed out");
+            tracing::warn!(timeout_secs = duration.as_secs(), "request timed out");
             error_response(
                 StatusCode::REQUEST_TIMEOUT,
                 ErrorCode::Timeout,
@@ -311,11 +326,11 @@ async fn timeout_or_408(
 }
 
 /// panic 兜底:原始 panic 信息进**日志**,响应给统一的 500 `ErrorBody`(不泄露内部措辞)。
-fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
-    let detail = err
+fn handle_panic(payload: Box<dyn Any + Send + 'static>) -> Response {
+    let detail = payload
         .downcast_ref::<String>()
         .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "unknown panic".to_owned());
     tracing::error!(detail, "request panicked, fell back to 500");
     error_response(
@@ -326,10 +341,10 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
 }
 
 /// 构造与 `AppError` 同形的 `{code,error}` 响应,供 panic/timeout 这类绕过 AppError 的路径复用。
-fn error_response(status: StatusCode, code: ErrorCode, msg: &str) -> Response {
+fn error_response(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     let body = ErrorBody {
         code,
-        error: msg.to_owned(),
+        error: message.to_owned(),
     };
     (status, Json(body)).into_response()
 }
@@ -342,31 +357,31 @@ struct TrustedIpKeyExtractor {
 }
 
 impl KeyExtractor for TrustedIpKeyExtractor {
-    type Key = std::net::IpAddr;
+    type Key = IpAddr;
 
-    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
-        let peer = req
+    fn extract<B>(&self, request: &Request<B>) -> Result<Self::Key, GovernorError> {
+        let peer = request
             .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .get::<ConnectInfo<SocketAddr>>()
             .map(|ci| ci.0.ip());
-        crate::infra::client_context::client_ip_from_headers(req.headers(), peer, self.trusted_hops)
+        client_context::client_ip_from_headers(request.headers(), peer, self.trusted_hops)
             .ok_or(GovernorError::UnableToExtractKey)
     }
 }
 
 /// 限流超限 → 统一 `ErrorBody`,透传 governor 的 retry-after 等 header(错误契约也覆盖限流)。
-fn rate_limit_response(err: GovernorError) -> Response {
-    match err {
+fn rate_limit_response(error: GovernorError) -> Response {
+    match error {
         GovernorError::TooManyRequests { headers, .. } => {
-            let mut resp = error_response(
+            let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::RateLimited,
                 "Too many requests, please try again later",
             );
-            if let Some(h) = headers {
-                resp.headers_mut().extend(h);
+            if let Some(governor_headers) = headers {
+                response.headers_mut().extend(governor_headers);
             }
-            resp
+            response
         }
         GovernorError::UnableToExtractKey => error_response(
             StatusCode::BAD_REQUEST,
@@ -374,11 +389,11 @@ fn rate_limit_response(err: GovernorError) -> Response {
             "Could not identify request source",
         ),
         GovernorError::Other { code, headers, .. } => {
-            let mut resp = error_response(code, ErrorCode::Internal, "Rate limit error");
-            if let Some(h) = headers {
-                resp.headers_mut().extend(h);
+            let mut response = error_response(code, ErrorCode::Internal, "Rate limit error");
+            if let Some(governor_headers) = headers {
+                response.headers_mut().extend(governor_headers);
             }
-            resp
+            response
         }
     }
 }
@@ -393,51 +408,51 @@ const QUIET_PATHS: [&str; 5] = [
 ];
 
 /// 给每个请求建带 method/path/route/request_id 的 tracing span,日志即可按 request_id 关联。
-fn make_http_span(req: &Request) -> tracing::Span {
-    if QUIET_PATHS.contains(&req.uri().path()) {
-        return tracing::Span::none();
+fn make_http_span(request: &Request) -> Span {
+    if QUIET_PATHS.contains(&request.uri().path()) {
+        return Span::none();
     }
-    let request_id = req
+    let request_id = request
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
     // 路由模板(如 /api/v1/frontend/widgets/{id}):按接口筛日志用,不必从带 id 的真实路径反推。
-    let route = req
+    let route = request
         .extensions()
-        .get::<axum::extract::MatchedPath>()
+        .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default();
     // 鉴权中间件在 Trace 层之外先跑,验过的身份已在 extensions:user_id / tenant_id 进根 span,
     // 该请求的每条日志都带上它们(未认证 / 平台上下文的字段留空)。
-    let user = req.extensions().get::<idm::AuthUser>();
+    let user = request.extensions().get::<AuthUser>();
     let span = tracing::info_span!(
         "http",
-        method = %req.method(),
-        path = %req.uri().path(),
+        method = %request.method(),
+        path = %request.uri().path(),
         route = %route,
         request_id = %request_id,
-        user_id = tracing::field::Empty,
-        tenant_id = tracing::field::Empty,
-        status = tracing::field::Empty,
+        user_id = field::Empty,
+        tenant_id = field::Empty,
+        status = field::Empty,
     );
-    if let Some(u) = user {
-        span.record("user_id", tracing::field::display(u.id));
-        if let Some(t) = u.tenant_id {
-            span.record("tenant_id", tracing::field::display(t));
+    if let Some(auth_user) = user {
+        span.record("user_id", field::display(auth_user.id));
+        if let Some(tenant_id) = auth_user.tenant_id {
+            span.record("tenant_id", field::display(tenant_id));
         }
     }
     span
 }
 
 /// 请求完成日志(探针路径没有 span,跳过)。字段同 tower-http 的 DefaultOnResponse。
-fn on_http_response(res: &Response, latency: std::time::Duration, span: &tracing::Span) {
+fn on_http_response(response: &Response, latency: Duration, span: &Span) {
     if span.is_disabled() {
         return;
     }
-    span.record("status", res.status().as_u16());
+    span.record("status", response.status().as_u16());
     tracing::info!(
-        status = res.status().as_u16(),
+        status = response.status().as_u16(),
         latency_ms = latency.as_millis() as u64,
         "finished processing request"
     );
@@ -446,7 +461,7 @@ fn on_http_response(res: &Response, latency: std::time::Duration, span: &tracing
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{self, Body};
     use axum::routing::get;
     use tower::ServiceExt;
 
@@ -460,72 +475,68 @@ mod tests {
         let app = Router::new()
             .route("/boom", get(boom))
             .layer(CatchPanicLayer::custom(handle_panic));
-        let resp = app
+        let response = app
             .oneshot(Request::get("/boom").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            s.contains("\"code\":\"internal\""),
-            "应是 ErrorBody JSON: {s}"
+            text.contains("\"code\":\"internal\""),
+            "应是 ErrorBody JSON: {text}"
         );
-        assert!(s.contains("Internal server error"));
-        assert!(!s.contains("boom-secret"), "原始 panic 信息不可泄露: {s}");
+        assert!(text.contains("Internal server error"));
+        assert!(
+            !text.contains("boom-secret"),
+            "原始 panic 信息不可泄露: {text}"
+        );
     }
 
     /// 鉴权身份进 http 根 span:user_id / tenant_id 字段有值(日志按租户、按人筛)。
     #[test]
     fn http_span_records_user_and_tenant() {
+        use std::fmt::Debug;
         use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{subscriber, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+        use uuid::Uuid;
 
         /// 收集 span 上记录的字段(name=value)。
         struct Fields(Arc<Mutex<Vec<String>>>);
-        struct Visit<'a>(&'a mut Vec<String>);
-        impl tracing::field::Visit for Visit<'_> {
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                self.0.push(format!("{}={v:?}", f.name()));
+        struct FieldCollector<'fields>(&'fields mut Vec<String>);
+        impl Visit for FieldCollector<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
             }
         }
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
-            fn on_new_span(
-                &self,
-                attrs: &tracing::span::Attributes<'_>,
-                _: &tracing::span::Id,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                attrs.record(&mut Visit(&mut self.0.lock().unwrap()));
+        impl<S: Subscriber> Layer<S> for Fields {
+            fn on_new_span(&self, attributes: &Attributes<'_>, _: &Id, _: Context<'_, S>) {
+                attributes.record(&mut FieldCollector(&mut self.0.lock().unwrap()));
             }
-            fn on_record(
-                &self,
-                _: &tracing::span::Id,
-                values: &tracing::span::Record<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                values.record(&mut Visit(&mut self.0.lock().unwrap()));
+            fn on_record(&self, _: &Id, values: &Record<'_>, _: Context<'_, S>) {
+                values.record(&mut FieldCollector(&mut self.0.lock().unwrap()));
             }
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Fields(seen.clone()));
-        let user = uuid::Uuid::from_u128(7);
-        let tenant = uuid::Uuid::from_u128(1);
-        tracing::subscriber::with_default(subscriber, || {
-            let mut req = Request::get("/api/v1/frontend/widgets")
+        let registry = tracing_subscriber::registry().with(Fields(seen.clone()));
+        let user = Uuid::from_u128(7);
+        let tenant = Uuid::from_u128(1);
+        subscriber::with_default(registry, || {
+            let mut request = Request::get("/api/v1/frontend/widgets")
                 .body(Body::empty())
                 .unwrap();
-            req.extensions_mut().insert(idm::AuthUser {
-                id: user,
-                username: "u".into(),
-                roles: vec![],
-                tenant_id: Some(tenant),
-                tenant_roles: vec![],
-            });
-            let _span = make_http_span(&req);
+            request
+                .extensions_mut()
+                .insert(AuthUser::new(user, "u".into(), vec![]).in_tenant(tenant, vec![]));
+            let _span = make_http_span(&request);
         });
         let seen = seen.lock().unwrap().join(" ");
         assert!(seen.contains(&format!("user_id={user}")), "{seen}");
@@ -536,19 +547,19 @@ mod tests {
     /// 直测抽出的 `timeout_or_408`(极短超时 + 永不返回的慢 future),不必等真实 30s。
     #[tokio::test]
     async fn timeout_yields_408_errorbody() {
-        let resp = timeout_or_408(Duration::from_millis(5), async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+        let response = timeout_or_408(Duration::from_millis(5), async {
+            time::sleep(Duration::from_secs(30)).await;
             StatusCode::OK.into_response()
         })
         .await;
-        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            s.contains("\"code\":\"timeout\""),
-            "应是统一 ErrorBody: {s}"
+            text.contains("\"code\":\"timeout\""),
+            "应是统一 ErrorBody: {text}"
         );
     }
 }

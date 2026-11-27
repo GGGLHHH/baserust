@@ -11,13 +11,15 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use idm::{ListPage, MemberRepo, SortDir, TenantRepo, UserListFilter, UserRepo, UserSortBy};
+use idm::{
+    ListPage, MemberRepo, SortDirection, TenantRepo, User, UserListFilter, UserRepo, UserSortBy,
+};
 use uuid::Uuid;
 
 use super::model::{AccountIndexRow, AdminUserIndexRow};
-use super::ports::SearchIndexRepo;
-use crate::kernel::error::AppError;
-use crate::kernel::tenant::TenantId;
+use super::search_index_repo::SearchIndexRepo;
+use crate::kernel::app_error::AppError;
+use crate::kernel::tenant_id::TenantId;
 
 /// rebuild 的窄端口(端口归消费方,见 cross-module-enrichment skill):只要
 /// "user_id → display_name" 批量映射,不吃 profile 模块的整个仓储 trait。
@@ -34,10 +36,19 @@ pub trait DisplayNameSource: Send + Sync {
 pub const PAGE_LIMIT: u64 = 500;
 
 /// rebuild 读的 idm 源(账号 / 租户 / 成员关系)。打包传参,省得签名越加越长。
-pub struct IdmSources<'a> {
-    pub users: &'a dyn UserRepo,
-    pub tenants: &'a dyn TenantRepo,
-    pub members: &'a dyn MemberRepo,
+pub struct IdmSources<'repo> {
+    pub users: &'repo dyn UserRepo,
+    pub tenants: &'repo dyn TenantRepo,
+    pub members: &'repo dyn MemberRepo,
+}
+
+/// 回填时刻两个 outbox 的水位(各自的 max id):回填行的 `*_seq` 就设成它们。两个 `i64` 按名字区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Watermarks {
+    /// idm.outbox 的水位(账号事件、成员事件共用这一条序列)。
+    pub idm: i64,
+    /// app.outbox 的水位(资料事件)。
+    pub app: i64,
 }
 
 /// 回填了多少行。
@@ -49,13 +60,14 @@ pub struct RebuildCounts {
     pub members: usize,
 }
 
-/// 全量回填投影(bootstrap + 漂移恢复)。水位设为快照 `p_idm`/`p_app`(= 回填时各 outbox 的 max id):
+/// 全量回填投影(bootstrap + 漂移恢复)。水位设为快照 `watermarks.idm` / `watermarks.app`(= 回填时 idm / app
+/// 两个 outbox 各自的 max id,下称 P):
 /// 之后 id>P 的新事件才会再覆写,旧重投被 projector 的守卫挡住。**先读 P、再读数据**(P 是下界,
 /// 数据集只会比快照时刻更新,保守收敛不会漏)。
 ///
 /// 只回填**存活**用户(`UserRepo::list` 本就只返存活行);成员索引只回填存活租户(`TenantRepo::list`)
 /// 里、账号也存活(`find_by_ids` 查得到)的成员关系,任何状态都写(停用的成员也在成员列表里)。
-/// 成员行的 `member_seq` 也设为 `p_idm`(成员事件和账号事件同在 idm.outbox,同一个水位序列)。
+/// 成员行的 `member_seq` 也设为 `watermarks.idm`(成员事件和账号事件同在 idm.outbox,同一个水位序列)。
 ///
 /// **不做"扫掉快照外残留行"那一刀**,尽管模块头注的"漂移恢复"因此对删除只是半程:
 /// 要扫,前提是这份存活快照**完整**;而上游分页给不了这个保证 —— idm 的 cursor 谓词恒是
@@ -74,11 +86,10 @@ pub async fn rebuild(
     idm: IdmSources<'_>,
     profiles: &dyn DisplayNameSource,
     index: &dyn SearchIndexRepo,
-    p_idm: i64,
-    p_app: i64,
+    watermarks: Watermarks,
 ) -> Result<RebuildCounts, AppError> {
-    let accounts = rebuild_accounts(idm.users, profiles, index, p_idm, p_app).await?;
-    let members = rebuild_members(&idm, profiles, index, p_idm, p_app).await?;
+    let accounts = rebuild_accounts(idm.users, profiles, index, watermarks).await?;
+    let members = rebuild_members(&idm, profiles, index, watermarks).await?;
     tracing::info!(accounts, members, "rebuild_search 回填完成");
     Ok(RebuildCounts { accounts, members })
 }
@@ -88,8 +99,7 @@ async fn rebuild_accounts(
     users: &dyn UserRepo,
     profiles: &dyn DisplayNameSource,
     index: &dyn SearchIndexRepo,
-    p_idm: i64,
-    p_app: i64,
+    watermarks: Watermarks,
 ) -> Result<usize, AppError> {
     let mut written = 0usize;
     let mut after: Option<Uuid> = None;
@@ -100,7 +110,7 @@ async fn rebuild_accounts(
             .list(
                 &UserListFilter::default(),
                 UserSortBy::CreatedAt,
-                SortDir::Asc,
+                SortDirection::Ascending,
                 &ListPage::Cursor {
                     after,
                     limit: PAGE_LIMIT,
@@ -128,8 +138,8 @@ async fn rebuild_accounts(
                     roles: row.roles,
                     created_at: Some(row.created_at),
                     deleted: false,
-                    idm_seq: Some(p_idm),
-                    profile_seq: Some(p_app),
+                    idm_sequence: Some(watermarks.idm),
+                    profile_sequence: Some(watermarks.app),
                 })
                 .await?;
             written += 1;
@@ -152,8 +162,7 @@ async fn rebuild_members(
     idm: &IdmSources<'_>,
     profiles: &dyn DisplayNameSource,
     index: &dyn SearchIndexRepo,
-    p_idm: i64,
-    p_app: i64,
+    watermarks: Watermarks,
 ) -> Result<usize, AppError> {
     let mut written = 0usize;
     let mut tenant_after: Option<Uuid> = None;
@@ -166,7 +175,7 @@ async fn rebuild_members(
             })
             .await?;
         for tenant in &tenants.rows {
-            let tenant_id = TenantId::new(tenant.id)?;
+            let tenant_id = TenantId::try_new(tenant.id)?;
             let mut member_after: Option<Uuid> = None;
             loop {
                 let page = idm
@@ -180,7 +189,7 @@ async fn rebuild_members(
                     )
                     .await?;
                 let ids: Vec<Uuid> = page.rows.iter().map(|m| m.user_id).collect();
-                let users: HashMap<Uuid, idm::User> = idm
+                let users: HashMap<Uuid, User> = idm
                     .users
                     .find_by_ids(&ids)
                     .await?
@@ -188,26 +197,26 @@ async fn rebuild_members(
                     .map(|u| (u.id, u))
                     .collect();
                 let display_names = profiles.display_names_by_ids(&ids).await?;
-                for m in page.rows {
-                    let Some(user) = users.get(&m.user_id) else {
+                for membership in page.rows {
+                    let Some(user) = users.get(&membership.user_id) else {
                         continue; // 账号已删:不进成员列表
                     };
                     index
                         .rebuild_member(AdminUserIndexRow {
                             tenant_id,
-                            user_id: m.user_id,
+                            user_id: membership.user_id,
                             username: Some(user.username.clone()),
                             email: user.email.clone(),
                             email_verified: user.email_verified,
-                            display_name: display_names.get(&m.user_id).cloned().flatten(),
+                            display_name: display_names.get(&membership.user_id).cloned().flatten(),
                             created_at: Some(user.created_at),
                             deleted: false,
-                            idm_seq: Some(p_idm),
-                            profile_seq: Some(p_app),
-                            roles: m.roles,
-                            status: Some(m.status.as_str().to_owned()),
+                            idm_sequence: Some(watermarks.idm),
+                            profile_sequence: Some(watermarks.app),
+                            roles: membership.roles,
+                            status: Some(membership.status.as_str().to_owned()),
                             removed: false,
-                            member_seq: Some(p_idm),
+                            member_sequence: Some(watermarks.idm),
                         })
                         .await?;
                     written += 1;

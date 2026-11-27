@@ -9,21 +9,24 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use garde::Validate;
+use idm::{AuthOutcome, AuthUser, IdmError, LoginEntry, MemberKey};
 use uuid::Uuid;
 
 use super::dto::{
     ChangePasswordRequest, DeleteMeRequest, LoginRequest, MyTenantView, RegisterRequest,
     SwitchTenantRequest, UpdateMeRequest, UserResponse,
 };
-use crate::app::state::AppState;
-use crate::features::auth::adapters::emit::{emit_auth_event, failure_data, success_data};
+use crate::app::app_state::AppState;
+use crate::features::auth::adapters::emit::{
+    emit_auth_event, failure_data, success_data, FailureEventData, SuccessEventData,
+};
 use crate::features::auth_audit::{AuthChannel, AuthEventType, FailureReason};
 use crate::infra::client_context::ClientContext;
 use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
-use crate::kernel::authz::RoleName;
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::RoleName;
 
 const ACCESS_COOKIE: &str = "access_token";
 const REFRESH_COOKIE: &str = "refresh_token";
@@ -32,7 +35,7 @@ const REFRESH_COOKIE: &str = "refresh_token";
 fn auth_cookie(
     name: &'static str,
     value: String,
-    max_age_secs: i64,
+    max_age: time::Duration,
     secure: bool,
 ) -> Cookie<'static> {
     Cookie::build((name, value))
@@ -40,22 +43,22 @@ fn auth_cookie(
         .same_site(SameSite::Lax)
         .secure(secure)
         .path("/")
-        .max_age(time::Duration::seconds(max_age_secs))
+        .max_age(max_age)
         .build()
 }
 
 /// 把 access/refresh 写进 cookie(发会话)。
-fn set_auth_cookies(jar: CookieJar, outcome: &idm::AuthOutcome, secure: bool) -> CookieJar {
+fn set_auth_cookies(jar: CookieJar, outcome: &AuthOutcome, secure: bool) -> CookieJar {
     jar.add(auth_cookie(
         ACCESS_COOKIE,
         outcome.access_token.clone(),
-        outcome.access_max_age_secs,
+        outcome.access_max_age,
         secure,
     ))
     .add(auth_cookie(
         REFRESH_COOKIE,
         outcome.refresh_token.clone(),
-        outcome.refresh_max_age_secs,
+        outcome.refresh_max_age,
         secure,
     ))
 }
@@ -89,21 +92,26 @@ pub async fn register(
     jar: CookieJar,
     ctx: ClientContext,
     Audit(audit): Audit,
-    Json(req): Json<RegisterRequest>,
+    Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, CookieJar, Json<UserResponse>), ApiError> {
-    req.validate()?;
-    let outcome = state.auth.register(req.into(), audit.audit_id()).await?;
+    request.validate()?;
+    let outcome = state
+        .auth
+        .register(request.into(), audit.audit_id().as_deref())
+        .await?;
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::Registered,
         outcome.user.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            outcome.user.id,
-            Some(outcome.session_id),
-            Some(&outcome.user.username),
-            outcome.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: outcome.user.id,
+                session_id: Some(outcome.session_id),
+                actor: Some(&outcome.user.username),
+                tenant_id: outcome.tenant_id,
+            },
         ),
     )
     .await;
@@ -124,51 +132,55 @@ pub async fn login(
     State(state): State<AppState>,
     ctx: ClientContext,
     jar: CookieJar,
-    Json(req): Json<LoginRequest>,
+    Json(request): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
-    req.validate()?;
-    let identifier = req.identifier.clone();
-    match state.auth.login(req.into()).await {
+    request.validate()?;
+    let identifier = request.identifier.clone();
+    match state.auth.login(request.into()).await {
         Ok(outcome) => {
             emit_auth_event(
-                &state.idm_outbox,
+                state.idm_outbox.as_deref(),
                 AuthEventType::LoginSucceeded,
                 outcome.user.id,
                 success_data(
                     &ctx,
-                    AuthChannel::Public,
-                    outcome.user.id,
-                    Some(outcome.session_id),
-                    Some(&outcome.user.username),
-                    outcome.tenant_id,
+                    SuccessEventData {
+                        channel: AuthChannel::Public,
+                        user_id: outcome.user.id,
+                        session_id: Some(outcome.session_id),
+                        actor: Some(&outcome.user.username),
+                        tenant_id: outcome.tenant_id,
+                    },
                 ),
             )
             .await;
             let jar = set_auth_cookies(jar, &outcome, state.cookie_secure);
             Ok((jar, Json(outcome.user.into())))
         }
-        // 失败原因(仅供审计)必须在 `idm::IdmError` → `AppError` 的 `From` 转换**之前**读出
+        // 失败原因(仅供审计)必须在 `IdmError` → `AppError` 的 `From` 转换**之前**读出
         // (转换后统一收口 401,原因丢失);HTTP 仍统一 401,防枚举不变。
-        Err(idm_err) => {
-            let reason = match &idm_err {
-                idm::IdmError::InvalidCredentials(f) => FailureReason::from(f),
-                _ => return Err(idm_err.into()),
+        Err(idm_error) => {
+            let reason = match &idm_error {
+                IdmError::InvalidCredentials(failure) => FailureReason::from(failure),
+                _ => return Err(idm_error.into()),
             };
             emit_auth_event(
-                &state.idm_outbox,
+                state.idm_outbox.as_deref(),
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
                 failure_data(
                     &ctx,
-                    AuthChannel::Public,
-                    None,
-                    Some(&identifier),
-                    reason,
-                    None,
+                    FailureEventData {
+                        channel: AuthChannel::Public,
+                        user_id: None,
+                        identifier: Some(&identifier),
+                        reason,
+                        tenant_id: None,
+                    },
                 ),
             )
             .await;
-            Err(idm_err.into())
+            Err(idm_error.into())
         }
     }
 }
@@ -187,20 +199,22 @@ pub async fn refresh(
 ) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
     let refresh = jar
         .get(REFRESH_COOKIE)
-        .map(|c| c.value().to_owned())
+        .map(|cookie| cookie.value().to_owned())
         .ok_or(AppError::Unauthorized)?;
     let outcome = state.auth.refresh(&refresh).await?;
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::Refreshed,
         outcome.user.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            outcome.user.id,
-            Some(outcome.session_id),
-            Some(&outcome.user.username),
-            outcome.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: outcome.user.id,
+                session_id: Some(outcome.session_id),
+                actor: Some(&outcome.user.username),
+                tenant_id: outcome.tenant_id,
+            },
         ),
     )
     .await;
@@ -218,19 +232,21 @@ pub async fn logout(
     jar: CookieJar,
 ) -> Result<(StatusCode, CookieJar), ApiError> {
     // 撤销服务端 session(若 cookie 带了 refresh)+ 清 cookie。幂等 —— 没找到活跃会话不发事件。
-    if let Some(c) = jar.get(REFRESH_COOKIE) {
-        if let Some(session) = state.auth.logout(c.value()).await? {
+    if let Some(cookie) = jar.get(REFRESH_COOKIE) {
+        if let Some(session) = state.auth.logout(cookie.value()).await? {
             emit_auth_event(
-                &state.idm_outbox,
+                state.idm_outbox.as_deref(),
                 AuthEventType::LoggedOut,
                 session.user_id,
                 success_data(
                     &ctx,
-                    AuthChannel::Public,
-                    session.user_id,
-                    Some(session.id),
-                    None,
-                    session.tenant_id,
+                    SuccessEventData {
+                        channel: AuthChannel::Public,
+                        user_id: session.user_id,
+                        session_id: Some(session.id),
+                        actor: None,
+                        tenant_id: session.tenant_id,
+                    },
                 ),
             )
             .await;
@@ -250,16 +266,18 @@ pub async fn logout_all(
 ) -> Result<(StatusCode, CookieJar), ApiError> {
     state.auth.logout_all(user.0.id).await?;
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::LogoutAll,
         user.0.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            user.0.id,
-            None,
-            Some(&user.0.username),
-            user.0.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: user.0.id,
+                session_id: None,
+                actor: Some(&user.0.username),
+                tenant_id: user.0.tenant_id,
+            },
         ),
     )
     .await;
@@ -290,12 +308,12 @@ pub async fn update_me(
     State(state): State<AppState>,
     Audit(ctx): Audit,
     user: CurrentUser,
-    Json(req): Json<UpdateMeRequest>,
+    Json(request): Json<UpdateMeRequest>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    req.validate()?;
+    request.validate()?;
     let view = state
         .auth
-        .update_me(user.0.id, req.into(), ctx.audit_id())
+        .update_me(user.0.id, request.into(), ctx.audit_id().as_deref())
         .await?;
     Ok(Json(view.into()))
 }
@@ -315,33 +333,39 @@ pub async fn delete_me(
     Audit(audit): Audit,
     user: CurrentUser,
     jar: CookieJar,
-    Json(req): Json<DeleteMeRequest>,
+    Json(request): Json<DeleteMeRequest>,
 ) -> Result<(StatusCode, CookieJar), ApiError> {
-    req.validate()?;
+    request.validate()?;
     // superadmin 只有一个、只由 seed 声明,任何接口都撤不掉 —— 注销自己也不行(删了之后同名注册 / 下次 seed 都会出事)。
     // 看库里的原始平台角色(不信 token 里的 roles:降权令牌 / 闭集过滤都不该让它溜过去)。账号已不在 → 交给 delete_me 照旧回 401。
     match state.user_admin.raw_role_names(user.0.id).await {
-        Ok(roles) if roles.iter().any(|r| r == RoleName::Superadmin.as_str()) => {
+        Ok(roles)
+            if roles
+                .iter()
+                .any(|role| role == RoleName::Superadmin.as_str()) =>
+        {
             return Err(AppError::Forbidden.into());
         }
         Ok(_) | Err(AppError::NotFound) => {}
-        Err(e) => return Err(e.into()),
+        Err(error) => return Err(error.into()),
     }
     state
         .auth
-        .delete_me(user.0.id, req.password, audit.audit_id())
+        .delete_me(user.0.id, request.password, audit.audit_id().as_deref())
         .await?;
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::AccountDeleted,
         user.0.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            user.0.id,
-            None,
-            Some(&user.0.username),
-            user.0.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: user.0.id,
+                session_id: None,
+                actor: Some(&user.0.username),
+                tenant_id: user.0.tenant_id,
+            },
         ),
     )
     .await;
@@ -361,21 +385,26 @@ pub async fn change_password(
     ctx: ClientContext,
     user: CurrentUser,
     jar: CookieJar,
-    Json(req): Json<ChangePasswordRequest>,
+    Json(request): Json<ChangePasswordRequest>,
 ) -> Result<(StatusCode, CookieJar), ApiError> {
-    req.validate()?;
-    state.auth.change_password(user.0.id, req.into()).await?;
+    request.validate()?;
+    state
+        .auth
+        .change_password(user.0.id, request.into())
+        .await?;
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::PasswordChanged,
         user.0.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            user.0.id,
-            None,
-            Some(&user.0.username),
-            user.0.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: user.0.id,
+                session_id: None,
+                actor: Some(&user.0.username),
+                tenant_id: user.0.tenant_id,
+            },
         ),
     )
     .await;
@@ -396,12 +425,10 @@ pub async fn list_my_tenants(
     user: CurrentUser,
 ) -> Result<Json<Vec<MyTenantView>>, ApiError> {
     let current = user.0.tenant_id;
-    let items = state
-        .auth
-        .my_tenants(user.0.id)
-        .await?
+    let memberships = state.auth.my_tenants(user.0.id).await?;
+    let items: Vec<MyTenantView> = memberships
         .into_iter()
-        .map(|m| MyTenantView::from_membership(m, current))
+        .map(|membership| MyTenantView::new_with_membership(membership, current))
         .collect();
     Ok(Json(items))
 }
@@ -421,31 +448,39 @@ pub async fn switch_tenant(
     ctx: ClientContext,
     jar: CookieJar,
     user: CurrentUser, // frontend 组已闸登录;切哪个会话由 refresh cookie 定,但会话必须属于当前身份
-    Json(req): Json<SwitchTenantRequest>,
+    Json(request): Json<SwitchTenantRequest>,
 ) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
-    req.validate()?;
+    request.validate()?;
     // 换租户 = 换会话:凭 refresh cookie(会话身份)切,不能只凭 access token。
     let refresh = jar
         .get(REFRESH_COOKIE)
-        .map(|c| c.value().to_owned())
+        .map(|cookie| cookie.value().to_owned())
         .ok_or(AppError::Unauthorized)?;
     // refresh 会话不属于当前身份(拿别人的 cookie 借道)→ 401,原会话不动(idm 校验)。
     let outcome = state
         .auth
-        .switch_tenant(&refresh, user.0.id, req.tenant_id)
+        .switch_tenant(
+            &refresh,
+            MemberKey {
+                tenant_id: request.tenant_id,
+                user_id: user.0.id,
+            },
+        )
         .await?;
     // 认证审计:记切换后的租户与新会话(失败 —— 不是成员 / refresh 无效 —— 不发事件,原会话不动)。
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::TenantSwitched,
         outcome.user.id,
         success_data(
             &ctx,
-            AuthChannel::Public,
-            outcome.user.id,
-            Some(outcome.session_id),
-            Some(&outcome.user.username),
-            outcome.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id: outcome.user.id,
+                session_id: Some(outcome.session_id),
+                actor: Some(&outcome.user.username),
+                tenant_id: outcome.tenant_id,
+            },
         ),
     )
     .await;
@@ -469,10 +504,10 @@ pub async fn admin_login(
     State(state): State<AppState>,
     ctx: ClientContext,
     jar: CookieJar,
-    Json(req): Json<LoginRequest>,
+    Json(request): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<UserResponse>), ApiError> {
-    req.validate()?;
-    let identifier = req.identifier.clone();
+    request.validate()?;
+    let identifier = request.identifier.clone();
     // 验密后**挑进哪里**(`Policy::admin_login_entry`):有效成员关系按 last_used_at 倒序,第一个当前租户角色给了
     // admin:login 的租户;都没有 → 有平台级权限进平台上下文;否则拒绝(没有成员关系 → tenant_required,
     // 有 → forbidden)。拒绝时 idm **不建会话、不记 last_used_at**,不发 token 不设 cookie。
@@ -481,88 +516,96 @@ pub async fn admin_login(
     let mut denial: Option<AppError> = None;
     let result = state
         .auth
-        .login_with(req.into(), |c| {
-            candidate = Some(c.user_id);
-            let tenants = c
+        .login_with(request.into(), |checked| {
+            candidate = Some(checked.user_id);
+            let tenants = checked
                 .memberships
                 .iter()
-                .map(|m| (m.tenant.id, m.roles.as_slice()));
-            match state.policy.admin_login_entry(c.platform_roles, tenants) {
-                Ok(Some(tenant)) => Some(idm::LoginEntry::Tenant(tenant)),
-                Ok(None) => Some(idm::LoginEntry::Platform),
-                Err(e) => {
-                    denial = Some(e);
+                .map(|membership| (membership.tenant.id, membership.roles.as_slice()));
+            match state
+                .policy
+                .admin_login_entry(checked.platform_roles, tenants)
+            {
+                Ok(Some(tenant)) => Some(LoginEntry::Tenant(tenant)),
+                Ok(None) => Some(LoginEntry::Platform),
+                Err(error) => {
+                    denial = Some(error);
                     None
                 }
             }
         })
         .await;
-    let outcome = match result {
-        Ok(outcome) => outcome,
+    let outcome = match (result, candidate) {
+        (Ok(outcome), _) => outcome,
         // 凭据本身错(同 public login 的原因匹配);HTTP 仍统一 401,防枚举不变。
-        Err(idm::IdmError::InvalidCredentials(f)) => {
+        (Err(IdmError::InvalidCredentials(failure)), _) => {
             emit_auth_event(
-                &state.idm_outbox,
+                state.idm_outbox.as_deref(),
                 AuthEventType::LoginFailed,
                 Uuid::nil(),
                 failure_data(
                     &ctx,
-                    AuthChannel::Admin,
-                    None,
-                    Some(&identifier),
-                    FailureReason::from(&f),
-                    None,
+                    FailureEventData {
+                        channel: AuthChannel::Admin,
+                        user_id: None,
+                        identifier: Some(&identifier),
+                        reason: FailureReason::from(&failure),
+                        tenant_id: None,
+                    },
                 ),
             )
             .await;
-            return Err(idm::IdmError::InvalidCredentials(f).into());
+            return Err(IdmError::InvalidCredentials(failure).into());
         }
         // 验过密但没有后台准入(或挑中的租户刚好被并发移出)。
-        Err(idm::IdmError::Forbidden) if candidate.is_some() => {
-            let user_id = candidate.unwrap_or_default();
+        (Err(IdmError::Forbidden), Some(user_id)) => {
             emit_auth_event(
-                &state.idm_outbox,
+                state.idm_outbox.as_deref(),
                 AuthEventType::AdminAccessDenied,
                 user_id,
                 failure_data(
                     &ctx,
-                    AuthChannel::Admin,
-                    Some(user_id),
-                    Some(&identifier),
-                    FailureReason::NoAdminPerm,
-                    None,
+                    FailureEventData {
+                        channel: AuthChannel::Admin,
+                        user_id: Some(user_id),
+                        identifier: Some(&identifier),
+                        reason: FailureReason::NoAdminPerm,
+                        tenant_id: None,
+                    },
                 ),
             )
             .await;
             return Err(denial.unwrap_or(AppError::Forbidden).into());
         }
-        Err(e) => return Err(e.into()),
+        (Err(error), _) => return Err(error.into()),
     };
     // 不变量护栏:挑选与 /admin 组闸(`Policy::require_admin_entry`)是同一准入口径,进来的 token 必然过组闸。
     // 万一两边漂移:撤掉刚建的会话,403,不发 token(不然后台每接口 403)。
-    let entered = idm::AuthUser {
-        id: outcome.user.id,
-        username: outcome.user.username.clone(),
-        roles: outcome.user.roles.clone(),
-        tenant_id: outcome.tenant_id,
-        tenant_roles: outcome.tenant_roles.clone(),
-    };
-    if let Err(e) = state.policy.require_admin_entry(&entered, &[]) {
+    let mut entered = AuthUser::new(
+        outcome.user.id,
+        outcome.user.username.clone(),
+        outcome.user.roles.clone(),
+    );
+    entered.tenant_id = outcome.tenant_id;
+    entered.tenant_roles = outcome.tenant_roles.clone();
+    if let Err(error) = state.policy.require_admin_entry(&entered, &[]) {
         tracing::error!(user_id = %outcome.user.id, "后台登录挑出的上下文过不了后台组闸(准入口径漂移)");
         state.auth.logout(&outcome.refresh_token).await?;
-        return Err(e.into());
+        return Err(error.into());
     }
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::LoginSucceeded,
         outcome.user.id,
         success_data(
             &ctx,
-            AuthChannel::Admin,
-            outcome.user.id,
-            Some(outcome.session_id),
-            Some(&outcome.user.username),
-            outcome.tenant_id,
+            SuccessEventData {
+                channel: AuthChannel::Admin,
+                user_id: outcome.user.id,
+                session_id: Some(outcome.session_id),
+                actor: Some(&outcome.user.username),
+                tenant_id: outcome.tenant_id,
+            },
         ),
     )
     .await;

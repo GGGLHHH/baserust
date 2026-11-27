@@ -1,12 +1,14 @@
 //! 后台用户管理的 **HTTP 适配器**(admin 组,归 idm 进程)。线格式 ↔ 领域互转见 `dto`。每 handler 首行 `require_scoped(UsersAdmin)`
-//! (组闸之上再 gate 平台级 users:admin:平台管理员 + superadmin)。写操作 `by = ctx.audit_id()`。
-//! `#[utoipa::path]` **不手写 security** —— op_perms 经 `inject_operation_security` 注入。
+//! (组闸之上再 gate 平台级 users:admin:平台管理员 + superadmin)。写操作 `by = ctx.audit_id().as_deref()`。
+//! `#[utoipa::path]` **不手写 security** —— operation_permissions 经 `inject_operation_security` 注入。
 //! path 相对 admin 组(nest 加 `/api/v1/admin/auth`)→ 实际 `/api/v1/admin/auth/users*`。
 //!
 //! 2026-11-26 角色补充的两道闸(都在 handler,判断抽纯函数 / `Policy` 方法):
 //! - **superadmin 不经任何接口授予 / 撤销**(`assert_superadmin_untouched`):建号带它、改角色加上 / 去掉它 → 403;
 //! - **防接管**(`Policy::require_platform_role_authority`):授出平台角色、或目标账号**现有**平台角色(未过滤原始名)
 //!   → 操作者要 `platform:roles`(只有 superadmin)。平台管理员因此碰不到 superadmin 和别的平台管理员。
+
+use std::slice;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -17,16 +19,16 @@ use super::dto::{
     AdminUserView, CreateUserRequest, ListUsersFilter, ResetPasswordRequest, RoleView,
     SetRolesRequest, UpdateUserRequest,
 };
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 use crate::features::users::model;
-use crate::infra::authz::TokenScope;
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::kernel::authz::{Perm, Policy, RoleName};
-use crate::kernel::error::AppError;
-use crate::kernel::pagination::PageParams;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::{Permission, Policy, RoleName, RoleNames};
+use crate::kernel::pagination::{Page as CorePage, PageParams};
 
 // ── 授权守卫(自锁 / 提权):放 handler(授权边界),judgment 抽纯函数便于单测 ──
 
@@ -47,12 +49,15 @@ fn assert_not_self(actor: Uuid, target: Uuid) -> Result<(), AppError> {
 fn assert_no_escalation(
     policy: &Policy,
     granter: &AuthUser,
-    scope: &[Perm],
+    scope: &[Permission],
     granted_role_names: &[String],
 ) -> Result<(), AppError> {
     for name in granted_role_names {
-        for perm in policy.perms_for(std::slice::from_ref(name), &[]) {
-            policy.require_scoped(granter, scope, perm)?; // 缺该权 → Forbidden(403)
+        for permission in policy.permissions_for(RoleNames {
+            platform: slice::from_ref(name),
+            tenant: &[],
+        }) {
+            policy.require_scoped(granter, scope, permission)?; // 缺该权 → Forbidden(403)
         }
     }
     Ok(())
@@ -62,9 +67,9 @@ fn assert_no_escalation(
 /// 建号时为空)与 `new`(要写入的)里有没有 superadmin 必须一致,否则 403。保留它的改动(如再加个平台管理员)放行。
 /// 持 `platform:roles` 也不行:那条权限管的是平台管理员,不是 superadmin。
 fn assert_superadmin_untouched(current: &[String], new: &[String]) -> Result<(), AppError> {
-    let sa = RoleName::Superadmin.as_str();
-    let had = current.iter().any(|r| r == sa);
-    let has = new.iter().any(|r| r == sa);
+    let superadmin = RoleName::Superadmin.as_str();
+    let had = current.iter().any(|r| r == superadmin);
+    let has = new.iter().any(|r| r == superadmin);
     if had == has {
         Ok(())
     } else {
@@ -86,8 +91,11 @@ fn assert_self_keeps_admin(
 ) -> Result<(), AppError> {
     if actor == target
         && !policy
-            .perms_for(new_role_names, &[])
-            .contains(&Perm::UsersAdmin)
+            .permissions_for(RoleNames {
+                platform: new_role_names,
+                tenant: &[],
+            })
+            .contains(&Permission::UsersAdmin)
     {
         return Err(AppError::Conflict(
             "cannot remove your own admin access".into(),
@@ -123,14 +131,14 @@ pub async fn list_users(
 ) -> Result<Json<Page<AdminUserView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
-    let params = page.resolve()?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
+    let page_params = page.resolve()?;
     let filter = model::ListUsers::from(filter);
-    if matches!(params, PageParams::Cursor { .. }) && !filter.is_default_sort() {
+    if matches!(page_params, PageParams::Cursor { .. }) && !filter.is_default_sort() {
         return Err(AppError::Validation("sort_by requires offset/page pagination".into()).into());
     }
-    let page = state.user_admin.list(&filter, params).await?;
-    Ok(Json(Page::from_core(page, AdminUserView::from)))
+    let page = state.user_admin.list(&filter, page_params).await?;
+    Ok(Json(Page::from(page)))
 }
 
 /// 建号(原子含角色)。`by` = 当前 superadmin。
@@ -152,21 +160,24 @@ pub async fn create_user(
     user: CurrentUser,
     scope: TokenScope,
     Audit(ctx): Audit,
-    Json(req): Json<CreateUserRequest>,
+    Json(request): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<AdminUserView>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 提权闸:不能建带"超出自己权限"角色的号。名字经 service 的未过滤目录解析
     // (与落库校验同一实现,未知 id 此处即 422)—— 守卫失明/落库分裂从结构上不可能。
-    let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
+    let role_names = state.user_admin.role_names_by_ids(&request.roles).await?;
     // superadmin 授不出;授任何平台角色(任命平台管理员)要 platform:roles
     assert_superadmin_untouched(&[], &role_names)?;
     state
         .policy
         .require_platform_role_authority(&user.0, &scope.0, &role_names)?;
     assert_no_escalation(&state.policy, &user.0, &scope.0, &role_names)?;
-    let view = state.user_admin.create(req.into(), ctx.audit_id()).await?;
+    let view = state
+        .user_admin
+        .create(request.into(), ctx.audit_id().as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(view.into())))
 }
 
@@ -191,7 +202,7 @@ pub async fn get_user(
 ) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     Ok(Json(state.user_admin.get(id).await?.into()))
 }
 
@@ -217,11 +228,11 @@ pub async fn update_user(
     scope: TokenScope,
     Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-    Json(req): Json<UpdateUserRequest>,
+    Json(request): Json<UpdateUserRequest>,
 ) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 目标现有角色闸(同 delete / reset_password / set_roles):改身份字段也是对目标动手 ——
     // 改掉 superadmin 的 username 就等于把它锁在门外(登录靠 username/email)。
     // 本模块四个写端点口径统一:够得着目标的全部权,才动得了它;目标持平台角色还要 platform:roles(防接管)。
@@ -234,7 +245,7 @@ pub async fn update_user(
     Ok(Json(
         state
             .user_admin
-            .update(id, req.into(), ctx.audit_id())
+            .update(id, request.into(), ctx.audit_id().as_deref())
             .await?
             .into(),
     ))
@@ -263,7 +274,7 @@ pub async fn delete_user(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 自锁:不能删自己的账号。
     assert_not_self(user.0.id, id)?;
     // 提权闸(同 reset_password,闸目标现有角色):中间管理员不该能删掉比自己权大的账号。
@@ -274,7 +285,10 @@ pub async fn delete_user(
         &scope.0,
         &target_role_names(&state, id).await?,
     )?;
-    state.user_admin.delete(id, ctx.audit_id()).await?;
+    state
+        .user_admin
+        .delete(id, ctx.audit_id().as_deref())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -300,14 +314,14 @@ pub async fn set_user_roles(
     scope: TokenScope,
     Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-    Json(req): Json<SetRolesRequest>,
+    Json(request): Json<SetRolesRequest>,
 ) -> Result<Json<AdminUserView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 提权闸 + 自锁:不能授超出自己的权;改自己的角色不能丢 users:admin。
     // 名字经未过滤目录解析(未知 id 此处即 422,先于自锁 409,错误码不串台)。
-    let role_names = state.user_admin.role_names_by_ids(&req.roles).await?;
+    let role_names = state.user_admin.role_names_by_ids(&request.roles).await?;
     let current = target_role_names(&state, id).await?;
     // superadmin 授不出、撤不掉(含 superadmin 去掉自己的);授出平台角色要 platform:roles。
     assert_superadmin_untouched(&current, &role_names)?;
@@ -324,7 +338,7 @@ pub async fn set_user_roles(
     Ok(Json(
         state
             .user_admin
-            .set_roles(id, req.into(), ctx.audit_id())
+            .set_roles(id, request.into(), ctx.audit_id().as_deref())
             .await?
             .into(),
     ))
@@ -352,10 +366,10 @@ pub async fn list_roles(
 ) -> Result<Json<Page<RoleView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     let can_grant_platform = state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::PlatformRoles)
+        .require_scoped(&user.0, &scope.0, Permission::PlatformRoles)
         .is_ok();
     let items: Vec<model::Role> = state
         .user_admin
@@ -368,7 +382,7 @@ pub async fn list_roles(
     // 单页包络:limit 跟过滤后的条数走(同 service 的口径)
     let limit = items.len().max(1) as u64;
     Ok(Json(Page::from_core(
-        crate::kernel::pagination::Page::cursor(items, limit, None),
+        CorePage::new_with_cursor(items, limit, None),
         RoleView::from,
     )))
 }
@@ -393,14 +407,14 @@ pub async fn reset_user_password(
     user: CurrentUser,
     scope: TokenScope,
     Path(id): Path<Uuid>,
-    Json(req): Json<ResetPasswordRequest>,
+    Json(request): Json<ResetPasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 提权闸,闸的是**目标现有的角色**(不是被授的角色):改谁的密码 = 能以谁的身份登录,
     // 所以必须"自己已持有目标的全部权"才准改。少了这道闸,"有 users:admin 但非满权"的中间
-    // 管理员(role→perms 运行期可改,见 authz)虽被 set_roles 挡着授不出 superadmin,却能直接
+    // 管理员(role→权限运行期可改,见 `kernel::authorization`)虽被 set_roles 挡着授不出 superadmin,却能直接
     // 把 superadmin 的密码改成自己知道的再登进去 —— 本模块辛苦建的提权闸从这个端点整个绕过。
     // 平台管理员与 superadmin 的差只在 superadmin 独占权限上,所以目标持平台角色还要 platform:roles(防接管)。
     guard_target(
@@ -409,7 +423,7 @@ pub async fn reset_user_password(
         &scope.0,
         &target_role_names(&state, id).await?,
     )?;
-    state.user_admin.reset_password(id, req.into()).await?;
+    state.user_admin.reset_password(id, request.into()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -424,7 +438,7 @@ async fn target_role_names(state: &AppState, id: Uuid) -> Result<Vec<String>, Ap
 fn guard_target(
     state: &AppState,
     actor: &AuthUser,
-    scope: &[Perm],
+    scope: &[Permission],
     target_roles: &[String],
 ) -> Result<(), AppError> {
     state
@@ -438,13 +452,11 @@ mod tests {
     use super::*;
 
     fn auth(roles: &[&str]) -> AuthUser {
-        AuthUser {
-            id: Uuid::now_v7(),
-            username: "u".into(),
-            roles: roles.iter().map(|s| s.to_string()).collect(),
-            tenant_id: None,
-            tenant_roles: vec![],
-        }
+        AuthUser::new(
+            Uuid::now_v7(),
+            "u".into(),
+            roles.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     #[test]
@@ -460,11 +472,11 @@ mod tests {
     #[test]
     fn escalation_blocks_granting_perms_you_lack() {
         // 中间管理员:有 users:admin,但没有 tenants:admin(账号管理授的是平台角色,只比平台级权限)。
-        let policy = Policy::from_roles([
-            ("mgr".to_owned(), vec![Perm::UsersAdmin]),
-            ("tenancy".to_owned(), vec![Perm::TenantsAdmin]),
+        let policy = Policy::new([
+            ("mgr".to_owned(), vec![Permission::UsersAdmin]),
+            ("tenancy".to_owned(), vec![Permission::TenantsAdmin]),
             // 租户级权限经平台角色授出不生效,也就不算提权
-            ("purger".to_owned(), vec![Perm::ContentDelete]),
+            ("purger".to_owned(), vec![Permission::ContentDelete]),
         ]);
         let granter = auth(&["mgr"]);
         assert!(assert_no_escalation(&policy, &granter, &[], &["purger".to_owned()]).is_ok());
@@ -480,9 +492,9 @@ mod tests {
 
     #[test]
     fn superadmin_can_grant_anything() {
-        let policy = Policy::from_roles([
-            ("super".to_owned(), Perm::ALL.to_vec()),
-            ("tenancy".to_owned(), vec![Perm::TenantsAdmin]),
+        let policy = Policy::new([
+            ("super".to_owned(), Permission::ALL.to_vec()),
+            ("tenancy".to_owned(), vec![Permission::TenantsAdmin]),
         ]);
         let god = auth(&["super"]);
         assert!(assert_no_escalation(&policy, &god, &[], &["tenancy".to_owned()]).is_ok());
@@ -491,10 +503,11 @@ mod tests {
     /// superadmin 不经接口授出 / 撤掉:建号带它、加上、去掉都 403;保留它的改动、与它无关的改动放行。
     #[test]
     fn superadmin_is_never_granted_or_revoked() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let forbidden = |cur: &[&str], new: &[&str]| {
+        let to_strings =
+            |values: &[&str]| -> Vec<String> { values.iter().map(|x| x.to_string()).collect() };
+        let forbidden = |current: &[&str], new: &[&str]| {
             matches!(
-                assert_superadmin_untouched(&s(cur), &s(new)),
+                assert_superadmin_untouched(&to_strings(current), &to_strings(new)),
                 Err(AppError::Forbidden)
             )
         };
@@ -502,26 +515,39 @@ mod tests {
         assert!(forbidden(&["superadmin"], &[]), "撤掉");
         assert!(forbidden(&["superadmin"], &["platform_admin"]), "换掉");
         assert!(assert_superadmin_untouched(
-            &s(&["superadmin"]),
-            &s(&["superadmin", "platform_admin"])
+            &to_strings(&["superadmin"]),
+            &to_strings(&["superadmin", "platform_admin"])
         )
         .is_ok());
-        assert!(assert_superadmin_untouched(&s(&[]), &s(&["platform_admin"])).is_ok());
-        assert!(assert_superadmin_untouched(&s(&["platform_admin"]), &s(&[])).is_ok());
+        assert!(
+            assert_superadmin_untouched(&to_strings(&[]), &to_strings(&["platform_admin"])).is_ok()
+        );
+        assert!(
+            assert_superadmin_untouched(&to_strings(&["platform_admin"]), &to_strings(&[])).is_ok()
+        );
     }
 
     #[test]
     fn catalog_hides_superadmin_and_needs_platform_roles() {
-        assert!(!grantable_in_catalog(RoleName::Superadmin, true));
-        assert!(grantable_in_catalog(RoleName::PlatformAdmin, true));
-        assert!(!grantable_in_catalog(RoleName::PlatformAdmin, false));
+        assert!(!grantable_in_catalog(
+            RoleName::Superadmin,
+            /* can_grant_platform= */ true
+        ));
+        assert!(grantable_in_catalog(
+            RoleName::PlatformAdmin,
+            /* can_grant_platform= */ true
+        ));
+        assert!(!grantable_in_catalog(
+            RoleName::PlatformAdmin,
+            /* can_grant_platform= */ false
+        ));
     }
 
     #[test]
     fn self_role_change_must_keep_admin() {
-        let policy = Policy::from_roles([
-            ("mgr".to_owned(), vec![Perm::UsersAdmin]),
-            ("plain".to_owned(), vec![Perm::WidgetRead]),
+        let policy = Policy::new([
+            ("mgr".to_owned(), vec![Permission::UsersAdmin]),
+            ("plain".to_owned(), vec![Permission::WidgetRead]),
         ]);
         let me = Uuid::now_v7();
         // 改自己 + 仍含 users:admin → OK

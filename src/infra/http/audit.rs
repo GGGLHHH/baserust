@@ -7,13 +7,15 @@
 //!
 //! 身份类型 `AuthUser` 由 idm 库提供(`authenticate_token` 的产物);这里只做 HTTP 提取。
 
+use std::convert::Infallible;
+
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
 use crate::infra::http::error::ApiError;
+use crate::kernel::app_error::AppError;
 use crate::kernel::audit::AuditContext;
-use crate::kernel::error::AppError;
-use crate::kernel::tenant::TenantId;
+use crate::kernel::tenant_id::TenantId;
 use idm::AuthUser;
 
 /// 审计上下文提取器(handler 写 `Audit(ctx): Audit`):鉴权中间件验过 JWT 会在 extensions 塞 `AuthUser`;
@@ -22,16 +24,17 @@ use idm::AuthUser;
 pub struct Audit(pub AuditContext);
 
 impl<S: Send + Sync> FromRequestParts<S> for Audit {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         Ok(Self(match parts.extensions.get::<AuthUser>() {
             // 畸形 tenant_id(nil)不当租户:审计里记 None,租户级接口由 CurrentTenant 拒掉。
-            Some(u) => AuditContext::user(
-                u.id.to_string(),
-                u.tenant_id.and_then(|t| TenantId::new(t).ok()),
+            Some(user) => AuditContext::new_with_user(
+                user.id.to_string(),
+                user.tenant_id
+                    .and_then(|tenant| TenantId::try_new(tenant).ok()),
             ),
-            None => AuditContext::anonymous(),
+            None => AuditContext::new_anonymous(),
         }))
     }
 }
@@ -53,7 +56,7 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentTenant {
             .get::<AuthUser>()
             .ok_or(ApiError(AppError::Unauthorized))?;
         user.tenant_id
-            .and_then(|t| TenantId::new(t).ok())
+            .and_then(|tenant| TenantId::try_new(tenant).ok())
             .map(CurrentTenant)
             .ok_or(ApiError(AppError::TenantRequired))
     }
@@ -82,21 +85,17 @@ mod tests {
     use uuid::Uuid;
 
     fn parts_with(user: Option<AuthUser>) -> Parts {
-        let mut req = Request::new(());
-        if let Some(u) = user {
-            req.extensions_mut().insert(u);
+        let mut request = Request::new(());
+        if let Some(authenticated_user) = user {
+            request.extensions_mut().insert(authenticated_user);
         }
-        req.into_parts().0
+        request.into_parts().0
     }
 
     fn auth_user(tenant: Option<Uuid>) -> AuthUser {
-        AuthUser {
-            id: Uuid::from_u128(5),
-            username: "u".into(),
-            roles: vec![],
-            tenant_id: tenant,
-            tenant_roles: vec![],
-        }
+        let mut user = AuthUser::new(Uuid::from_u128(5), "u".into(), vec![]);
+        user.tenant_id = tenant;
+        user
     }
 
     async fn current_tenant(user: Option<AuthUser>) -> Result<CurrentTenant, AppError> {
@@ -107,9 +106,9 @@ mod tests {
 
     #[tokio::test]
     async fn current_tenant_comes_only_from_the_token() {
-        let t = Uuid::from_u128(42);
-        let got = current_tenant(Some(auth_user(Some(t)))).await.unwrap();
-        assert_eq!(got.0.as_uuid(), t);
+        let tenant = Uuid::from_u128(42);
+        let got = current_tenant(Some(auth_user(Some(tenant)))).await.unwrap();
+        assert_eq!(got.0.as_uuid(), tenant);
         // 平台上下文 → tenant_required(不落默认租户)
         assert!(matches!(
             current_tenant(Some(auth_user(None))).await,
@@ -129,16 +128,23 @@ mod tests {
 
     #[tokio::test]
     async fn audit_context_carries_tenant() {
-        let t = Uuid::from_u128(42);
-        let Audit(ctx) = Audit::from_request_parts(&mut parts_with(Some(auth_user(Some(t)))), &())
-            .await
-            .unwrap();
-        assert_eq!(ctx.tenant_id.map(|t| t.as_uuid()), Some(t));
-        assert_eq!(ctx.actor.tenant_id().map(|t| t.as_uuid()), Some(t));
+        let tenant = Uuid::from_u128(42);
+        let Audit(ctx) =
+            Audit::from_request_parts(&mut parts_with(Some(auth_user(Some(tenant)))), &())
+                .await
+                .unwrap();
+        assert_eq!(
+            ctx.tenant_id.map(|tenant_id| tenant_id.as_uuid()),
+            Some(tenant)
+        );
+        assert_eq!(
+            ctx.actor.tenant_id().map(|tenant_id| tenant_id.as_uuid()),
+            Some(tenant)
+        );
         assert_eq!(ctx.audit_id(), Some(Uuid::from_u128(5).to_string()));
-        let Audit(anon) = Audit::from_request_parts(&mut parts_with(None), &())
+        let Audit(anonymous) = Audit::from_request_parts(&mut parts_with(None), &())
             .await
             .unwrap();
-        assert!(anon.tenant_id.is_none());
+        assert!(anonymous.tenant_id.is_none());
     }
 }

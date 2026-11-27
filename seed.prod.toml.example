@@ -10,8 +10,8 @@
 #   cp seed.prod.toml.example seed.prod.toml && vi seed.prod.toml   # 填强密码
 #   SEED_FILE=seed.prod.toml just seed-prod
 #
-# 角色集 / 权限集是代码闭集(crates/core/src/kernel/authz.rs 的 RoleName / Perm),不在此;
-# role→权限默认由启动时 seed_authz 幂等灌 app 表(prod+dev 都跑)。
+# 角色集 / 权限集是代码闭集(crates/core/src/kernel/authorization.rs 的 RoleName / Permission),不在此;
+# role→权限默认由启动时 seed_authorization 幂等灌 app 表(prod+dev 都跑)。
 # 平台角色写 platform_roles:superadmin(只能有一个,只能在这里声明;多于一个启动即挂)、
 # platform_admin(平台管理员,可多个:管组织和普通账号,看不到监控 / 登录日志、碰不到持平台角色的账号);
 # 租户角色(admin / user)写 tenants = [{ slug, roles }]。

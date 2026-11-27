@@ -14,21 +14,26 @@
 //! 能上传 / 替换;头像端点对所有已登录用户可读、跨租户可见。租户作用域的内容不能当头像(绑定 422)。
 
 use axum::body::Body;
-use axum::extract::State;
+// 与本 crate 的 `Multipart` 提取器(包了一层错误映射)撞名,故改名。
+use axum::extract::{Multipart as AxumMultipart, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+use content::{ContentError, ContentScope, UploadContentInput};
 use uuid::Uuid;
 
 use super::dto::{AvatarForm, ProfileResponse, PutProfileRequest};
-use crate::app::state::AppState;
-use crate::features::profile::model::{self, is_allowed_avatar_mime};
-use crate::infra::authz::TokenScope;
+use crate::app::app_state::AppState;
+use crate::features::profile::model::{
+    is_allowed_avatar_mime, ProfileView, PutProfile, PutProfileOutcome,
+};
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::{Audit, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
-use crate::infra::http::extract::{Json, Multipart, Path};
-use crate::kernel::authz::Perm;
-use crate::kernel::error::AppError;
+use crate::infra::http::extract::{self, Json, Multipart, Path};
+use crate::kernel::app_error::AppError;
+use crate::kernel::audit::AuditContext;
+use crate::kernel::authorization::Permission;
 
 /// 按 id 读任意用户的资料(需 `profiles:read`,**平台级**:只有平台管理员有)。
 /// 响应含 phone 等 PII,且资料跨租户全局一份 —— 所以不给租户成员;本人读自己走 `/profiles/me`。
@@ -52,7 +57,7 @@ pub async fn get_profile(
 ) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ProfileRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::ProfileRead)?;
     Ok(Json(state.profiles.get(user_id).await?.into()))
 }
 
@@ -105,11 +110,11 @@ pub async fn put_profile(
 ) -> Result<(StatusCode, Json<ProfileResponse>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ProfileWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ProfileWrite)?;
     // ownership:path 即资源 owner(user_id 主键),无需查行 —— 越权直接 403。
     if !state
         .policy
-        .data_access(&user.0, &scope.0, Perm::ProfileWriteAll)
+        .data_access(&user.0, &scope.0, Permission::ProfileWriteAll)
         .allows(user_id)
     {
         return Err(AppError::Forbidden.into());
@@ -119,9 +124,12 @@ pub async fn put_profile(
     if user_id != user.0.id {
         state
             .policy
-            .require_scoped(&user.0, &scope.0, Perm::PlatformRoles)?;
+            .require_scoped(&user.0, &scope.0, Permission::PlatformRoles)?;
     }
-    let (created, view) = state.profiles.put(user_id, input.into(), &ctx).await?;
+    let PutProfileOutcome {
+        created,
+        profile: view,
+    } = state.profiles.put(user_id, input.into(), &ctx).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -150,7 +158,10 @@ pub async fn put_my_profile(
     Audit(ctx): Audit,
     Json(input): Json<PutProfileRequest>,
 ) -> Result<(StatusCode, Json<ProfileResponse>), ApiError> {
-    let (created, view) = state.profiles.put(user.0.id, input.into(), &ctx).await?;
+    let PutProfileOutcome {
+        created,
+        profile: view,
+    } = state.profiles.put(user.0.id, input.into(), &ctx).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -206,7 +217,7 @@ pub async fn get_user_avatar(
     _user: CurrentUser,
     Path(user_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cid = state
+    let content_id = state
         .profiles
         .avatar_content_id(user_id)
         .await?
@@ -219,10 +230,10 @@ pub async fn get_user_avatar(
     // 那份恒一致;这层兜住"绑定早于该约束的历史数据"。不可用 → 404(同本端点其余不可用分支)。
     if !state
         .contents
-        .get_content_metadata(scope, cid)
+        .get_content_metadata(scope, content_id)
         .await
         .ok()
-        .and_then(|m| m.mime_type)
+        .and_then(|metadata| metadata.mime_type)
         .as_deref()
         .is_some_and(is_allowed_avatar_mime)
     {
@@ -231,18 +242,18 @@ pub async fn get_user_avatar(
     // 出字节:presign 后端 → 307 到签名 URL;内存 backend → 代理 inline。刻意重复
     // content::preview_content 的服务段(去掉 owner 闸 —— 本端点契约就是"这个用户的公开头像"),
     // 而非跨 feature 复用其 handler(维持业务模块彼此零 import,胶水只在组合根)。
-    if let Some(url) = state.contents.preview_url(scope, cid).await? {
+    if let Some(url) = state.contents.preview_url(scope, content_id).await? {
         // 307 默认不可缓存(RFC 9110);no-store 防错配 CDN/代理缓存 5min 签名 URL。
-        let mut resp = Redirect::temporary(&url).into_response();
-        resp.headers_mut()
+        let mut response = Redirect::temporary(&url).into_response();
+        response
+            .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return Ok(resp);
+        return Ok(response);
     }
-    let p = state.contents.preview_content(scope, cid).await?;
-    let mime = p
+    let preview = state.contents.preview_content(scope, content_id).await?;
+    let mime = preview
         .metadata
-        .as_ref()
-        .and_then(|m| m.mime_type.clone())
+        .and_then(|metadata| metadata.mime_type)
         .unwrap_or_else(|| "application/octet-stream".to_owned());
     Response::builder()
         .header(CONTENT_TYPE, mime)
@@ -251,15 +262,13 @@ pub async fn get_user_avatar(
         // (model::is_allowed_avatar_mime 排除 SVG),此 header 再兜一层(代理分支专有;presign
         // 分支直连存储、加不了 CSP —— 故防线必须在上传白名单,不能靠出字节时补)。
         .header("content-security-policy", "sandbox")
-        .body(Body::from(p.data))
+        .body(Body::from(preview.data))
         .map_err(|e| AppError::Internal(e.into()).into())
 }
 
 // ── 后台资料管理(admin 组,路径仍在 /users/{id} 下、归 users:admin 授权面;
 //    handler 归 profile 模块:只编排 state.profiles/state.contents,与 users 模块零耦合;
 //    写操作对持平台角色的账号另要 platform:roles —— 防接管闸经组合根 `AppState::guard_platform_account`)──
-
-use content::{ContentScope, UploadContentInput};
 
 /// 后台读某用户资料(display_name/phone/avatar)。归 `users:admin`。资料未建 → 404。
 #[utoipa::path(
@@ -282,7 +291,7 @@ pub async fn get_user_profile(
 ) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     Ok(Json(state.profiles.get(id).await?.into()))
 }
 
@@ -310,10 +319,11 @@ pub async fn set_user_profile(
 ) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     // 防接管:改 superadmin / 平台管理员的资料要 platform:roles(superadmin 改自己的照常)
     state.guard_platform_account(&user.0, &scope.0, id).await?;
-    let (_created, view) = state.profiles.put(id, input.into(), &ctx).await?;
+    let PutProfileOutcome { profile: view, .. } =
+        state.profiles.put(id, input.into(), &ctx).await?;
     Ok(Json(view.into()))
 }
 
@@ -343,7 +353,7 @@ pub async fn set_user_avatar(
 ) -> Result<Json<ProfileResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::UsersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::UsersAdmin)?;
     state.guard_platform_account(&user.0, &scope.0, id).await?;
 
     let view = upload_and_bind_avatar(&state, id, &mut multipart, &ctx).await?;
@@ -360,10 +370,10 @@ pub async fn set_user_avatar(
 async fn upload_and_bind_avatar(
     state: &AppState,
     target: Uuid,
-    multipart: &mut axum::extract::Multipart,
-    ctx: &crate::kernel::audit::AuditContext,
-) -> Result<model::ProfileView, ApiError> {
-    let file = crate::infra::http::extract::file_part(multipart)
+    multipart: &mut AxumMultipart,
+    ctx: &AuditContext,
+) -> Result<ProfileView, ApiError> {
+    let file = extract::file_part(multipart)
         .await?
         .ok_or_else(|| AppError::Validation("missing `file` part".into()))?;
     // 先校验后写(transactions skill):非白名单 mime 就不该产生任何持久化副作用 ——
@@ -381,22 +391,12 @@ async fn upload_and_bind_avatar(
     }
 
     // content 归目标用户(是他的头像)。头像是个人内容(资料全局一份,不属于任何租户)→ Personal 作用域。
-    let input = UploadContentInput {
-        owner_id: target,
-        owner_type: None,
-        name: None,
-        description: None,
-        document_type: None,
-        object_key: None,
-        file_name: file.file_name,
-        mime_type: file.mime_type,
-        tags: Vec::new(),
-        custom_metadata: None,
-        data: file.data,
-    };
+    let mut input = UploadContentInput::new(target, file.data);
+    input.file_name = file.file_name;
+    input.mime_type = file.mime_type;
     let outcome = state
         .contents
-        .upload_content(ContentScope::Personal, input, ctx.audit_id())
+        .upload_content(ContentScope::Personal, input, ctx.audit_id().as_deref())
         .await?;
     let content_id = outcome.content.id;
 
@@ -404,17 +404,21 @@ async fn upload_and_bind_avatar(
     // content(app.contents)与 profile(app.profiles)跨表写,不共享一个事务:绑定任一步
     // 失败(get/put 报错)则 best-effort 软删刚上传的 content(owner=目标用户、尚无引用),
     // 避免留下无法回收的孤儿行/对象字节。清理失败只 warn,不掩盖原始错误。
-    let bind: Result<(Option<Uuid>, model::ProfileView), AppError> = async {
+    let bind: Result<(Option<Uuid>, ProfileView), AppError> = async {
         let (display_name, phone, previous) = match state.profiles.get(target).await {
-            Ok(p) => (p.display_name, p.phone, p.avatar_content_id),
+            Ok(existing) => (
+                existing.display_name,
+                existing.phone,
+                existing.avatar_content_id,
+            ),
             Err(AppError::NotFound) => (None, None, None),
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         };
-        let (_created, view) = state
+        let PutProfileOutcome { profile: view, .. } = state
             .profiles
             .put(
                 target,
-                model::PutProfile {
+                PutProfile {
                     avatar_content_id: Some(content_id),
                     display_name,
                     phone,
@@ -426,16 +430,20 @@ async fn upload_and_bind_avatar(
     }
     .await;
     let (previous, view) = match bind {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(bound) => bound,
+        Err(error) => {
             if let Err(cleanup) = state
                 .contents
-                .delete_content(ContentScope::Personal, content_id, ctx.audit_id())
+                .delete_content(
+                    ContentScope::Personal,
+                    content_id,
+                    ctx.audit_id().as_deref(),
+                )
                 .await
             {
                 tracing::warn!(error = %cleanup, %content_id, "头像绑定失败后清理孤儿 content 失败(软删)");
             }
-            return Err(e.into());
+            return Err(error.into());
         }
     };
     if let Some(old) = previous.filter(|old| *old != content_id) {
@@ -446,29 +454,24 @@ async fn upload_and_bind_avatar(
 
 /// best-effort 软删换下来的旧头像:只删 Personal 作用域里、owner 是 `owner` 的那一条(查不到 = 已删 / 不是个人内容 /
 /// 不是本人的 → 什么都不做)。任何失败只 warn —— 新头像已经绑好,不能因回收失败让请求报错。
-async fn retire_replaced_avatar(
-    state: &AppState,
-    owner: Uuid,
-    old: Uuid,
-    ctx: &crate::kernel::audit::AuditContext,
-) {
+async fn retire_replaced_avatar(state: &AppState, owner: Uuid, old: Uuid, ctx: &AuditContext) {
     match state
         .contents
         .get_content(ContentScope::Personal, old)
         .await
     {
-        Ok(c) if c.owner_id == owner => {
-            if let Err(e) = state
+        Ok(found) if found.owner_id == owner => {
+            if let Err(error) = state
                 .contents
-                .delete_content(ContentScope::Personal, old, ctx.audit_id())
+                .delete_content(ContentScope::Personal, old, ctx.audit_id().as_deref())
                 .await
             {
-                tracing::warn!(error = %e, content_id = %old, "回收换下来的旧头像失败(软删)");
+                tracing::warn!(error = %error, content_id = %old, "回收换下来的旧头像失败(软删)");
             }
         }
-        Ok(_) | Err(content::ContentError::NotFound) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, content_id = %old, "回收旧头像前读取失败,跳过");
+        Ok(_) | Err(ContentError::NotFound) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, content_id = %old, "回收旧头像前读取失败,跳过");
         }
     }
 }

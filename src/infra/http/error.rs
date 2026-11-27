@@ -1,25 +1,31 @@
 //! 核心错误 [`AppError`] 的 **HTTP 适配**:变体 → 状态码 / 机器码 / 安全消息 / 落日志,
-//! 以及统一错误响应体 `ErrorBody`。核心(`kernel::error`)只表达业务语义,不知道 HTTP。
+//! 以及统一错误响应体 `ErrorBody`。核心(`kernel::app_error`)只表达业务语义,不知道 HTTP。
 //!
 //! **统一错误契约(关键)**:任何携带底层原始错误的变体,原始细节只进**日志**
 //! (`log_detail`),响应体只给刻意写的**安全消息**(`client_message`)。不管来源是
 //! uuid 解析、sqlx、还是 io,都绝不会把原始措辞漏给客户端 —— 加新错误来源时只要走
-//! 这套契约,就天然不泄露。加错误种类 = 在 `kernel::error` 加变体 + 在下面四个 match 各补一行。
+//! 这套契约,就天然不泄露。加错误种类 = 在 `kernel::app_error` 加变体 + 在下面四个 match 各补一行。
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use content::ContentError;
+use idm::IdmError;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
 
 /// 核心错误的 **HTTP 映射**(状态码 / 机器码 / 安全消息 / 落日志)。`AppError` 在核心 crate,孤儿规则
 /// 不许在这里给它写固有方法 —— 用扩展 trait 承载。
 pub trait HttpErrorExt {
+    /// 响应的 HTTP 状态码。
     fn status_code(&self) -> StatusCode;
+    /// 机器可读错误类别 —— 前端按它分支,而非脆弱地解析人读消息。
     fn code(&self) -> ErrorCode;
+    /// 进响应 `error` 字段的消息 —— **永远安全、刻意写**,绝不含底层库的原始措辞。
     fn client_message(&self) -> String;
+    /// 排查需要的**原始细节** → 进日志。`None` = 无额外细节。
     fn log_detail(&self) -> Option<String>;
 }
 
@@ -58,12 +64,12 @@ impl HttpErrorExt for AppError {
         match self {
             AppError::NotFound => "Resource not found".to_owned(),
             AppError::AccountNotFound => "Account not found".to_owned(),
-            AppError::Validation(msg) => format!("Invalid request: {msg}"),
+            AppError::Validation(message) => format!("Invalid request: {message}"),
             AppError::BadRequest(_) => "Malformed request".to_owned(),
             AppError::Unauthorized | AppError::InvalidCredentials => {
                 "Authentication failed".to_owned()
             }
-            AppError::Conflict(msg) => msg.clone(),
+            AppError::Conflict(message) => message.clone(),
             AppError::Forbidden => "Forbidden".to_owned(),
             AppError::TenantRequired => "A current tenant is required".to_owned(),
             AppError::Internal(_) => "Internal server error".to_owned(),
@@ -90,8 +96,8 @@ impl HttpErrorExt for AppError {
     fn log_detail(&self) -> Option<String> {
         match self {
             AppError::BadRequest(detail) => Some(detail.clone()),
-            AppError::Internal(err) => Some(format!("{err:?}")),
-            AppError::Validation(msg) => Some(msg.clone()),
+            AppError::Internal(error) => Some(format!("{error:?}")),
+            AppError::Validation(message) => Some(message.clone()),
             AppError::NotFound
             | AppError::AccountNotFound
             | AppError::Unauthorized
@@ -129,7 +135,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 全部变体(wire round-trip 测试用)。镜像 `Perm::ALL`。
+    /// 全部变体(wire round-trip 测试用)。镜像 `Permission::ALL`。
     ///
     /// **加变体必补这里,但漏了没人拦** —— `ALL` 是数组字面量,加变体不会让它编译失败;
     /// round-trip 测试遍历的正是 `ALL`,漏掉的变体只是从不被测(那条测试就是为了钉住
@@ -153,6 +159,7 @@ impl ErrorCode {
     ];
 
     /// 日志字段用的 wire 串(== serde rename;`error_code_wire_matches` 测试钉死不漂移)。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::NotFound => "not_found",
@@ -186,47 +193,47 @@ pub struct ErrorBody {
 pub struct ApiError(pub AppError);
 
 impl From<AppError> for ApiError {
-    fn from(e: AppError) -> Self {
-        Self(e)
+    fn from(error: AppError) -> Self {
+        Self(error)
     }
 }
 
 // 常见上游错误直接 `?`(经 AppError 的同名 From 转换)。不写泛型 From —— 与标准库的自反 From 冲突。
 impl From<garde::Report> for ApiError {
-    fn from(e: garde::Report) -> Self {
-        Self(e.into())
+    fn from(error: garde::Report) -> Self {
+        Self(error.into())
     }
 }
 
-impl From<idm::IdmError> for ApiError {
-    fn from(e: idm::IdmError) -> Self {
-        Self(e.into())
+impl From<IdmError> for ApiError {
+    fn from(error: IdmError) -> Self {
+        Self(error.into())
     }
 }
 
-impl From<content::ContentError> for ApiError {
-    fn from(e: content::ContentError) -> Self {
-        Self(e.into())
+impl From<ContentError> for ApiError {
+    fn from(error: ContentError) -> Self {
+        Self(error.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let ApiError(e) = self;
-        let status = e.status_code();
+        let ApiError(error) = self;
+        let status = error.status_code();
         // 统一:任何带原始细节的错误都把原始内容写进日志(见 `log_detail`)。响应体里给什么由
         // `client_message` 单独决定 —— 多数变体只给通用措辞,Validation 例外(细节两边都给)。
         // 5xx 用 error、4xx 用 warn。日志在请求的 http span 内,自动带 request_id 可关联。
-        if let Some(detail) = e.log_detail() {
+        if let Some(detail) = error.log_detail() {
             if status.is_server_error() {
-                tracing::error!(code = e.code().as_str(), detail, "request failed");
+                tracing::error!(code = error.code().as_str(), detail, "request failed");
             } else {
-                tracing::warn!(code = e.code().as_str(), detail, "request rejected");
+                tracing::warn!(code = error.code().as_str(), detail, "request rejected");
             }
         }
         let body = ErrorBody {
-            code: e.code(),
-            error: e.client_message(),
+            code: error.code(),
+            error: error.client_message(),
         };
         (status, Json(body)).into_response()
     }
@@ -239,17 +246,17 @@ mod tests {
     #[test]
     fn raw_detail_goes_to_log_never_to_response() {
         // BadRequest:库原始措辞(uuid 解析失败)进日志,响应只给安全文案
-        let e = AppError::BadRequest("Cannot parse `id`: UUID parsing failed".to_owned());
-        assert_eq!(e.client_message(), "Malformed request");
-        assert!(!e.client_message().contains("UUID"));
-        assert!(e.log_detail().unwrap().contains("UUID"));
+        let error = AppError::BadRequest("Cannot parse `id`: UUID parsing failed".to_owned());
+        assert_eq!(error.client_message(), "Malformed request");
+        assert!(!error.client_message().contains("UUID"));
+        assert!(error.log_detail().unwrap().contains("UUID"));
 
         // Internal(将来 sqlx 错误同理):原始 SQL 进日志,响应只给通用文案
-        let e = AppError::Internal(anyhow::anyhow!("relation \"widgets\" does not exist"));
-        assert_eq!(e.client_message(), "Internal server error");
-        assert!(!e.client_message().contains("widgets"));
-        assert!(e.log_detail().unwrap().contains("widgets"));
-        assert_eq!(e.code().as_str(), "internal");
+        let error = AppError::Internal(anyhow::anyhow!("relation \"widgets\" does not exist"));
+        assert_eq!(error.client_message(), "Internal server error");
+        assert!(!error.client_message().contains("widgets"));
+        assert!(error.log_detail().unwrap().contains("widgets"));
+        assert_eq!(error.code().as_str(), "internal");
     }
 
     #[test]
@@ -258,9 +265,9 @@ mod tests {
         assert_eq!(AppError::NotFound.client_message(), "Resource not found");
         assert!(AppError::NotFound.log_detail().is_none());
 
-        let v = AppError::Validation("name: length is lower than 1".to_owned());
-        assert!(v.client_message().contains("name"));
-        assert_eq!(v.code().as_str(), "validation");
+        let validation = AppError::Validation("name: length is lower than 1".to_owned());
+        assert!(validation.client_message().contains("name"));
+        assert_eq!(validation.code().as_str(), "validation");
     }
 
     /// **422 的细节必须落日志**(而且照旧回传客户端 —— 两边都要)。
@@ -271,14 +278,14 @@ mod tests {
     /// 里拿不到,且 422 早于 `emit_auth_event`、`auth_events` 审计表也兜不住 → 三条观测路径全漏。
     #[test]
     fn validation_detail_reaches_both_log_and_client() {
-        let v = AppError::Validation("identifier: length is lower than 1".to_owned());
+        let validation = AppError::Validation("identifier: length is lower than 1".to_owned());
         assert_eq!(
-            v.log_detail().as_deref(),
+            validation.log_detail().as_deref(),
             Some("identifier: length is lower than 1"),
             "422 的原因必须能从日志回溯(否则只剩一个光秃秃的 status=422)"
         );
         assert!(
-            v.client_message().contains("identifier"),
+            validation.client_message().contains("identifier"),
             "同时照旧回传调用方 —— 这条细节本就是写给他的"
         );
 
@@ -296,58 +303,64 @@ mod tests {
     #[test]
     fn unauthorized_is_generic_to_prevent_enumeration() {
         // 401 文案必须通用:不暴露"是用户不存在还是密码错" —— 防账号枚举
-        let e = AppError::Unauthorized;
-        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(e.code().as_str(), "unauthorized");
-        assert_eq!(e.client_message(), "Authentication failed");
-        assert!(e.log_detail().is_none());
+        let error = AppError::Unauthorized;
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code().as_str(), "unauthorized");
+        assert_eq!(error.client_message(), "Authentication failed");
+        assert!(error.log_detail().is_none());
 
         // Conflict:409,消息写给用户、可回传
-        let c = AppError::Conflict("This email is already registered".to_owned());
-        assert_eq!(c.status_code(), StatusCode::CONFLICT);
-        assert_eq!(c.code().as_str(), "conflict");
-        assert_eq!(c.client_message(), "This email is already registered");
+        let conflict = AppError::Conflict("This email is already registered".to_owned());
+        assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
+        assert_eq!(conflict.code().as_str(), "conflict");
+        assert_eq!(
+            conflict.client_message(),
+            "This email is already registered"
+        );
     }
 
     #[test]
     fn account_not_found_is_404_with_its_own_code() {
-        let e = AppError::AccountNotFound;
-        assert_eq!(e.status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(e.code().as_str(), "account_not_found");
-        assert_eq!(e.client_message(), "Account not found");
-        assert!(e.log_detail().is_none());
+        let error = AppError::AccountNotFound;
+        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(error.code().as_str(), "account_not_found");
+        assert_eq!(error.client_message(), "Account not found");
+        assert!(error.log_detail().is_none());
     }
 
     #[test]
     fn tenant_required_is_403_with_its_own_code() {
-        let e = AppError::TenantRequired;
-        assert_eq!(e.status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(e.code().as_str(), "tenant_required");
-        assert!(e.log_detail().is_none());
+        let error = AppError::TenantRequired;
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(error.code().as_str(), "tenant_required");
+        assert!(error.log_detail().is_none());
     }
 
     #[test]
     fn invalid_credentials_maps_to_401() {
-        let e = AppError::from(idm::IdmError::InvalidCredentials(
+        let error = AppError::from(IdmError::InvalidCredentials(
             idm::CredentialFailure::BadPassword,
         ));
-        assert!(matches!(e, AppError::InvalidCredentials));
-        assert_eq!(e.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(error, AppError::InvalidCredentials));
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
         // 机器码与会话失效的 `unauthorized` 分开(前端据此不把「密码输错」当「会话过期」);
         // 文案仍与 Unauthorized 一样通用,不区分「用户不存在 / 密码错」(防枚举)。
-        assert_eq!(e.code().as_str(), "invalid_credentials");
-        assert_eq!(e.client_message(), AppError::Unauthorized.client_message());
-        assert!(e.log_detail().is_none());
+        assert_eq!(error.code().as_str(), "invalid_credentials");
+        assert_eq!(
+            error.client_message(),
+            AppError::Unauthorized.client_message()
+        );
+        assert!(error.log_detail().is_none());
     }
 
     #[test]
     fn error_code_wire_matches() {
-        for c in ErrorCode::ALL {
-            let wire = serde_json::to_value(c).unwrap();
+        for code in ErrorCode::ALL {
+            let wire = serde_json::to_value(code).unwrap();
             assert_eq!(
                 wire.as_str(),
-                Some(c.as_str()),
-                "{c:?}: as_str ↔ serde rename"
+                Some(code.as_str()),
+                "{code:?}: as_str ↔ serde rename"
             );
         }
     }

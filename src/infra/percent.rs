@@ -2,15 +2,17 @@
 //! 两处消费:连接串 userinfo([`config`](super::config))、`Content-Disposition` 的 `filename*`
 //! (content 下载)—— 都要把不可控字符塞进受限语法且对端能还原。过度编码(把 unreserved 也编)无害。
 
+use std::fmt::Write as _;
+
 /// 编码为 RFC3986 unreserved 之外全部 `%XX`(UTF-8 多字节逐字节编码)。
-pub(crate) fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
+pub(crate) fn encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
         } else {
-            out.push('%');
-            out.push_str(&format!("{b:02X}"));
+            // 往 String 里 write! 不会失败(`fmt::Write for String` 恒返回 Ok)。
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -23,9 +25,9 @@ pub(crate) fn encode(s: &str) -> String {
 pub(crate) fn content_disposition_attachment(filename: &str) -> String {
     let ascii_fallback: String = filename
         .chars()
-        .map(|c| {
-            if (c.is_ascii_graphic() && c != '"') || c == ' ' {
-                c
+        .map(|character| {
+            if (character.is_ascii_graphic() && character != '"') || character == ' ' {
+                character
             } else {
                 '_'
             }
@@ -51,19 +53,22 @@ mod tests {
 
     #[test]
     fn disposition_sanitizes_ascii_and_encodes_utf8() {
-        let d = content_disposition_attachment("报表 \"final\".pdf");
+        let disposition = content_disposition_attachment("报表 \"final\".pdf");
         // ascii 兜底:非 ASCII / 引号 → '_',空格与 .pdf 保留。
         assert!(
-            d.starts_with("attachment; filename=\"__ _final_.pdf\""),
-            "{d}"
+            disposition.starts_with("attachment; filename=\"__ _final_.pdf\""),
+            "{disposition}"
         );
         // filename*:UTF-8 百分号编码(引号与非 ASCII 均编码,浏览器解码得原名)。
         assert!(
-            d.contains("filename*=UTF-8''%E6%8A%A5%E8%A1%A8%20%22final%22.pdf"),
-            "{d}"
+            disposition.contains("filename*=UTF-8''%E6%8A%A5%E8%A1%A8%20%22final%22.pdf"),
+            "{disposition}"
         );
         // 控制字符不进 header(否则 HeaderValue 构造失败 → 500)。
-        let ctrl = content_disposition_attachment("a\nb\tc");
-        assert!(!ctrl.contains('\n') && !ctrl.contains('\t'), "{ctrl}");
+        let control = content_disposition_attachment("a\nb\tc");
+        assert!(
+            !control.contains('\n') && !control.contains('\t'),
+            "{control}"
+        );
     }
 }

@@ -4,19 +4,20 @@
 //! 为什么双模式:任意跳页需 OFFSET、深翻 O(log n) 需 keyset,一条 SQL 不可兼得 ——
 //! 所以两套并存,按参数选。默认 offset(后台管理跳页),带 cursor 即切高性能模式。
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::{Deserialize, Serialize};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::kernel::error::AppError;
-use crate::kernel::pagination::{self as core, PageParams};
+use crate::kernel::app_error::AppError;
+use crate::kernel::pagination::{Page as CorePage, PageInfo as CorePageInfo, PageParams};
 
 const DEFAULT_SIZE: u64 = 20;
 const MAX_SIZE: u64 = 100;
 
 /// 边界 query 参数(进 axum `Query` 提取 + OpenAPI)。扁平 `Option` 比 enum 更适合 query string。
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PageQuery {
     /// 提供 ⇒ offset 模式(可跳页),1-based。
@@ -24,7 +25,7 @@ pub struct PageQuery {
     /// 提供 ⇒ cursor 模式;opaque token,原样回传、勿解析。空值 `cursor=` = 首页。
     /// serde_html_form 基座(见 infra/http/extract.rs)会把空值 Option 解成 None,丢掉
     /// "cursor 模式首页"的表达 —— 自定义 deserializer 保住 `Some("")`。
-    #[serde(default, deserialize_with = "de_keep_empty")]
+    #[serde(default, deserialize_with = "deserialize_keep_empty")]
     pub cursor: Option<String>,
     /// 每页条数,两模式共用;越界自动 clamp 到 [1,100]。
     pub size: Option<u64>,
@@ -33,8 +34,10 @@ pub struct PageQuery {
 }
 
 /// 键存在即 `Some`(含空值),键缺席走 `#[serde(default)]` → `None`。
-fn de_keep_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    serde::Deserialize::deserialize(d).map(Some)
+fn deserialize_keep_empty<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 impl PageQuery {
@@ -50,11 +53,11 @@ impl PageQuery {
             )),
             // 有 cursor 参数即 cursor 模式:空字符串 = 首页(after=None),非空 = 解码锚点。
             // (空 cursor 让"cursor 模式第一页"可表达,否则首页无 cursor 就只能退回 offset)
-            (_, Some(c)) => Ok(PageParams::Cursor {
-                after: if c.is_empty() {
+            (_, Some(cursor)) => Ok(PageParams::Cursor {
+                after: if cursor.is_empty() {
                     None
                 } else {
-                    Some(decode_cursor(&c)?)
+                    Some(decode_cursor(&cursor)?)
                 },
                 limit: size,
             }),
@@ -97,9 +100,9 @@ pub enum PageInfo {
 
 impl<T> Page<T> {
     /// 核心分页结果 → 响应 DTO:item 逐个转成 DTO,cursor 锚点编成 opaque token。
-    pub fn from_core<U>(page: core::Page<U>, item: impl FnMut(U) -> T) -> Self {
+    pub fn from_core<U>(page: CorePage<U>, item: impl FnMut(U) -> T) -> Self {
         let page_info = match page.page_info {
-            core::PageInfo::Offset {
+            CorePageInfo::Offset {
                 page,
                 size,
                 total,
@@ -110,7 +113,7 @@ impl<T> Page<T> {
                 total,
                 total_pages,
             },
-            core::PageInfo::Cursor {
+            CorePageInfo::Cursor {
                 limit,
                 next_after,
                 has_more,
@@ -127,16 +130,28 @@ impl<T> Page<T> {
     }
 }
 
+/// 核心分页结果 → 响应 DTO,item 按它自己的 `From` 转(即 `Page::from_core(page, T::from)`)。
+/// 「Naming initialization functions」:值到值的转换 `from_core` 配这个 `From` 实现;要自定义映射时用 `from_core`。
+impl<T, U> From<CorePage<U>> for Page<T>
+where
+    T: From<U>,
+{
+    fn from(page: CorePage<U>) -> Self {
+        Self::from_core(page, T::from)
+    }
+}
+
 /// cursor = 上一页最后一行的 v7 id,编成 opaque base64url(16 字节)。
 /// v7 单列即严格全序,keyset 只需 `id < cursor`。opaque:客户端不能解析 → 日后换键不破契约。
+#[must_use]
 pub fn encode_cursor(id: Uuid) -> String {
     URL_SAFE_NO_PAD.encode(id.as_bytes())
 }
 
 /// 解码 cursor;失败一律 → `BadRequest`(原始细节进日志、不泄露),绝不 panic/500。
-pub fn decode_cursor(s: &str) -> Result<Uuid, AppError> {
+pub fn decode_cursor(cursor: &str) -> Result<Uuid, AppError> {
     let raw = URL_SAFE_NO_PAD
-        .decode(s)
+        .decode(cursor)
         .map_err(|_| AppError::BadRequest("Invalid cursor".into()))?;
     Uuid::from_slice(&raw).map_err(|_| AppError::BadRequest("Invalid cursor".into()))
 }
@@ -144,7 +159,34 @@ pub fn decode_cursor(s: &str) -> Result<Uuid, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::pagination::PageParams;
+    use crate::kernel::pagination::OffsetPosition;
+
+    /// `From<CorePage<U>>` 和 `from_core(page, T::from)` 结果一样(offset / cursor 两种元信息都原样带过去)。
+    #[test]
+    fn from_impl_matches_from_core() {
+        let offset =
+            CorePage::new_with_offset(vec![1_u8, 2], OffsetPosition { page: 2, size: 2 }, Some(5));
+        let via_from: Page<u16> = Page::from(offset.clone());
+        let via_core: Page<u16> = Page::from_core(offset, u16::from);
+        assert_eq!(via_from.items, via_core.items);
+        assert_eq!(
+            serde_json::to_value(&via_from.page_info).unwrap(),
+            serde_json::to_value(&via_core.page_info).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&via_from.page_info).unwrap(),
+            serde_json::json!({"mode": "offset", "page": 2, "size": 2, "total": 5, "total_pages": 3})
+        );
+
+        let after = Uuid::now_v7();
+        let cursor = CorePage::new_with_cursor(vec![7_u8], 1, Some(after));
+        let via_from: Page<u16> = Page::from(cursor);
+        assert_eq!(via_from.items, vec![7]);
+        assert_eq!(
+            serde_json::to_value(&via_from.page_info).unwrap(),
+            serde_json::json!({"mode": "cursor", "limit": 1, "next_cursor": encode_cursor(after), "has_more": true})
+        );
+    }
 
     #[test]
     fn cursor_roundtrips() {
@@ -162,43 +204,40 @@ mod tests {
 
     #[test]
     fn page_and_cursor_mutually_exclusive() {
-        let q = PageQuery {
+        let query = PageQuery {
             page: Some(1),
             cursor: Some("x".into()),
-            size: None,
-            with_total: None,
+            ..PageQuery::default()
         };
-        assert!(matches!(q.resolve(), Err(AppError::Validation(_))));
+        assert!(matches!(query.resolve(), Err(AppError::Validation(_))));
         // 空 cursor= 也互斥:不能静默吞 page 进 cursor 首页。
-        let q = PageQuery {
+        let query = PageQuery {
             page: Some(2),
             cursor: Some(String::new()),
-            size: None,
-            with_total: None,
+            ..PageQuery::default()
         };
-        assert!(matches!(q.resolve(), Err(AppError::Validation(_))));
+        assert!(matches!(query.resolve(), Err(AppError::Validation(_))));
         // 单独的空 cursor= = keyset 首页。
-        let q = PageQuery {
+        let query = PageQuery {
             page: None,
             cursor: Some(String::new()),
-            size: None,
-            with_total: None,
+            ..PageQuery::default()
         };
         assert!(matches!(
-            q.resolve(),
+            query.resolve(),
             Ok(PageParams::Cursor { after: None, .. })
         ));
     }
 
     #[test]
     fn size_clamps_to_max() {
-        let q = PageQuery {
+        let query = PageQuery {
             page: Some(1),
             cursor: None,
             size: Some(99999),
             with_total: None,
         };
-        match q.resolve().unwrap() {
+        match query.resolve().unwrap() {
             PageParams::Offset { size, .. } => assert_eq!(size, MAX_SIZE),
             _ => panic!("应是 offset 模式"),
         }

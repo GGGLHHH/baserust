@@ -1,25 +1,34 @@
 //! 监控数据的持久化端口:分钟级 / 小时级指标、接口与数据库操作的小时明细、日志。
 //!
 //! 实现两份:[`MemoryOpsStore`](默认:不配 `OPS_DB_HOST` 时用,也是测试的假实现,只留最近一段)、
-//! [`super::store_pg::PgOpsStore`](ops schema)。保留期见 [`Retention`]。
+//! [`super::pg_ops_store::PgOpsStore`](ops schema)。保留期见 [`Retention`]。
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
+use std::error::Error;
+use std::fmt;
+use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use utoipa::ToSchema;
 
-use super::hist::Hist;
+use super::histogram::Histogram;
+use super::lock_or_reset;
+use crate::kernel::time_range::TimeRange;
 
 /// 分层保留期(参照 CloudWatch 的降采样:细粒度短留、粗粒度长留)。
 pub struct Retention;
 
 impl Retention {
+    /// 分钟级指标。
     pub const MINUTE: Duration = Duration::days(15);
+    /// 小时级指标(约 13 个月,够做同比)。
     pub const HOUR: Duration = Duration::days(395);
+    /// 接口 / 数据库操作的小时明细。
     pub const DETAIL: Duration = Duration::days(30);
+    /// 日志。
     pub const LOGS: Duration = Duration::days(15);
 }
 
@@ -29,9 +38,9 @@ pub struct PeriodTotals {
     pub requests: u64,
     pub errors_4xx: u64,
     pub errors_5xx: u64,
-    pub latency: Hist,
+    pub latency: Histogram,
     pub db_calls: u64,
-    pub db_latency: Hist,
+    pub db_latency: Histogram,
     pub outbox_published: u64,
     pub outbox_failures: u64,
     pub projector_processed: u64,
@@ -45,34 +54,35 @@ pub struct PeriodTotals {
     pub cpu_percent_max: Option<f64>,
 }
 
-fn max_opt<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(if y > x { y } else { x }),
-        (x, None) => x,
-        (None, y) => y,
+/// 两个可缺读数取大;一边缺就用另一边。
+fn max_option<T: PartialOrd + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if right > left { right } else { left }),
+        (left, None) => left,
+        (None, right) => right,
     }
 }
 
 impl PeriodTotals {
     /// 合并另一段:计数相加、读数取大。
-    pub fn merge(&mut self, o: &PeriodTotals) {
-        self.requests += o.requests;
-        self.errors_4xx += o.errors_4xx;
-        self.errors_5xx += o.errors_5xx;
-        self.latency.add(&o.latency);
-        self.db_calls += o.db_calls;
-        self.db_latency.add(&o.db_latency);
-        self.outbox_published += o.outbox_published;
-        self.outbox_failures += o.outbox_failures;
-        self.projector_processed += o.projector_processed;
-        self.projector_failed += o.projector_failed;
-        self.in_flight_max = self.in_flight_max.max(o.in_flight_max);
-        self.pool_in_use_max = self.pool_in_use_max.max(o.pool_in_use_max);
-        self.pool_max = self.pool_max.max(o.pool_max);
-        self.sse_max = self.sse_max.max(o.sse_max);
-        self.projector_pending_max = self.projector_pending_max.max(o.projector_pending_max);
-        self.rss_bytes_max = max_opt(self.rss_bytes_max, o.rss_bytes_max);
-        self.cpu_percent_max = max_opt(self.cpu_percent_max, o.cpu_percent_max);
+    pub fn merge(&mut self, other: &PeriodTotals) {
+        self.requests += other.requests;
+        self.errors_4xx += other.errors_4xx;
+        self.errors_5xx += other.errors_5xx;
+        self.latency.add(&other.latency);
+        self.db_calls += other.db_calls;
+        self.db_latency.add(&other.db_latency);
+        self.outbox_published += other.outbox_published;
+        self.outbox_failures += other.outbox_failures;
+        self.projector_processed += other.projector_processed;
+        self.projector_failed += other.projector_failed;
+        self.in_flight_max = self.in_flight_max.max(other.in_flight_max);
+        self.pool_in_use_max = self.pool_in_use_max.max(other.pool_in_use_max);
+        self.pool_max = self.pool_max.max(other.pool_max);
+        self.sse_max = self.sse_max.max(other.sse_max);
+        self.projector_pending_max = self.projector_pending_max.max(other.projector_pending_max);
+        self.rss_bytes_max = max_option(self.rss_bytes_max, other.rss_bytes_max);
+        self.cpu_percent_max = max_option(self.cpu_percent_max, other.cpu_percent_max);
     }
 }
 
@@ -84,14 +94,37 @@ pub struct RouteTotals {
     pub requests: u64,
     pub errors_4xx: u64,
     pub errors_5xx: u64,
-    pub latency: Hist,
+    pub latency: Histogram,
 }
 
 /// 某数据库操作在一段时间内的统计(调用次数 = 直方图总数)。
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct DbOpTotals {
+pub struct DbOperationTotals {
     pub operation: String,
-    pub latency: Hist,
+    pub latency: Histogram,
+}
+
+/// 某进程的一条接口合计([`OpsStore::route_totals`] 的结果行)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceRouteTotals {
+    pub instance: String,
+    pub totals: RouteTotals,
+}
+
+/// 某进程的一条数据库操作合计([`OpsStore::db_operation_totals`] 的结果行)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceDbOperationTotals {
+    pub instance: String,
+    pub totals: DbOperationTotals,
+}
+
+/// 日志分页查询的结果([`OpsStore::logs`])。
+#[derive(Clone, Debug)]
+pub struct LogPage {
+    /// 本页。
+    pub logs: Vec<StoredLog>,
+    /// 符合条件的总数。
+    pub total: u64,
 }
 
 /// 一分钟的落盘记录。
@@ -102,7 +135,7 @@ pub struct MinuteRecord {
     pub bucket: OffsetDateTime,
     pub totals: PeriodTotals,
     pub routes: Vec<RouteTotals>,
-    pub db_ops: Vec<DbOpTotals>,
+    pub db_operations: Vec<DbOperationTotals>,
 }
 
 /// 一个时间段的汇总行(查询结果)。
@@ -120,6 +153,21 @@ pub enum Tier {
     Hour,
 }
 
+/// 标签串(存储 / 线格式里的 `WARN`、`app`…)不是任何已知取值:[`FromStr`] 的错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownLabel {
+    /// 标签种类(如 `severity`),只用于错误消息。
+    pub kind: &'static str,
+}
+
+impl fmt::Display for UnknownLabel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "未知的 {} 取值", self.kind)
+    }
+}
+
+impl Error for UnknownLabel {}
+
 /// 日志级别(只存 WARN 及以上)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -129,18 +177,24 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// 存储里的级别串(`WARN` / `ERROR`,与 serde 同名)。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Severity::Warn => "WARN",
             Severity::Error => "ERROR",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Option<Severity> {
-        match s {
-            "WARN" => Some(Severity::Warn),
-            "ERROR" => Some(Severity::Error),
-            _ => None,
+impl FromStr for Severity {
+    type Err = UnknownLabel;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "WARN" => Ok(Severity::Warn),
+            "ERROR" => Ok(Severity::Error),
+            _ => Err(UnknownLabel { kind: "severity" }),
         }
     }
 }
@@ -157,6 +211,8 @@ pub enum Service {
 }
 
 impl Service {
+    /// 存储里的服务名(与 serde 同名)。
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Service::App => "app",
@@ -164,13 +220,17 @@ impl Service {
             Service::Web => "web",
         }
     }
+}
 
-    pub fn parse(s: &str) -> Option<Service> {
-        match s {
-            "app" => Some(Service::App),
-            "idm" => Some(Service::Idm),
-            "web" => Some(Service::Web),
-            _ => None,
+impl FromStr for Service {
+    type Err = UnknownLabel;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "app" => Ok(Service::App),
+            "idm" => Ok(Service::Idm),
+            "web" => Ok(Service::Web),
+            _ => Err(UnknownLabel { kind: "service" }),
         }
     }
 }
@@ -193,25 +253,45 @@ const IDM_TARGETS: [&str; 6] = [
     "baserust::features::search",
 ];
 
+/// 一条日志从哪来([`classify_service`] 的入参):三个字符串按名字区分,不靠参数位置。
+#[derive(Clone, Copy, Debug)]
+pub struct LogOrigin<'origin> {
+    /// 进程身份(`app` / `idm` / 合体进程的名字)。
+    pub instance: &'origin str,
+    /// 产生日志的模块(tracing target)。
+    pub target: &'origin str,
+    /// 请求的路由模板;不在请求里 = `None`。
+    pub route: Option<&'origin str>,
+}
+
 /// 判定一条日志属于哪个服务:进程身份明确(app / idm)就用它;单进程时有接口路径按分流规则,
 /// 否则按产生日志的模块,都不像 idm 的归 app。
-pub fn classify_service(instance: &str, target: &str, route: Option<&str>) -> Service {
+#[must_use]
+pub fn classify_service(origin: LogOrigin<'_>) -> Service {
+    let LogOrigin {
+        instance,
+        target,
+        route,
+    } = origin;
     match instance {
         "app" => return Service::App,
         "idm" => return Service::Idm,
         _ => {}
     }
     if let Some(route) = route {
-        return if IDM_ROUTE_PREFIXES.iter().any(|p| route.starts_with(p)) {
+        return if IDM_ROUTE_PREFIXES
+            .iter()
+            .any(|prefix| route.starts_with(prefix))
+        {
             Service::Idm
         } else {
             Service::App
         };
     }
-    let idm_module = IDM_TARGETS.iter().any(|m| {
-        target == *m
+    let idm_module = IDM_TARGETS.iter().any(|module| {
+        target == *module
             || target
-                .strip_prefix(m)
+                .strip_prefix(module)
                 .is_some_and(|rest| rest.starts_with("::"))
     });
     if idm_module {
@@ -224,7 +304,7 @@ pub fn classify_service(instance: &str, target: &str, route: Option<&str>) -> Se
 /// 一条日志(字段对齐 OpenTelemetry 日志数据模型;请求上下文单独成字段便于筛选)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogEntry {
-    pub ts: OffsetDateTime,
+    pub timestamp: OffsetDateTime,
     pub instance: String,
     pub service: Service,
     pub severity: Severity,
@@ -255,45 +335,59 @@ pub struct LogQuery {
     pub instance: Option<String>,
     pub service: Option<Service>,
     /// 消息 / 模块 / 接口的子串(不区分大小写)。
-    pub q: Option<String>,
+    pub query: Option<String>,
     pub request_id: Option<String>,
     pub page: u64,
     pub size: u64,
 }
 
 impl LogQuery {
+    /// 本页第一条的偏移(`page` 从 1 开始)。
+    #[must_use]
     pub fn offset(&self) -> u64 {
-        self.page.saturating_sub(1) * self.size
+        // 饱和乘:page 极大时不在 debug 构建里溢出 panic(结果只是查不到数据)。
+        self.page.saturating_sub(1).saturating_mul(self.size)
     }
 
     /// 内存实现与测试用的匹配逻辑(PG 实现用 SQL 表达同一口径)。
-    pub fn matches(&self, e: &LogEntry) -> bool {
-        if self.from.is_some_and(|f| e.ts < f) || self.to.is_some_and(|t| e.ts >= t) {
+    #[must_use]
+    pub fn matches(&self, entry: &LogEntry) -> bool {
+        if self.from.is_some_and(|from| entry.timestamp < from)
+            || self.to.is_some_and(|to| entry.timestamp >= to)
+        {
             return false;
         }
-        if self.min_severity.is_some_and(|m| e.severity < m) {
+        if self
+            .min_severity
+            .is_some_and(|min_severity| entry.severity < min_severity)
+        {
             return false;
         }
-        if self.instance.as_ref().is_some_and(|i| &e.instance != i) {
+        if self
+            .instance
+            .as_ref()
+            .is_some_and(|instance| &entry.instance != instance)
+        {
             return false;
         }
-        if self.service.is_some_and(|s| e.service != s) {
+        if self.service.is_some_and(|service| entry.service != service) {
             return false;
         }
         if self
             .request_id
             .as_ref()
-            .is_some_and(|r| e.request_id.as_ref() != Some(r))
+            .is_some_and(|request_id| entry.request_id.as_ref() != Some(request_id))
         {
             return false;
         }
-        if let Some(q) = &self.q {
-            let q = q.to_lowercase();
-            let hit = e.body.to_lowercase().contains(&q)
-                || e.target.to_lowercase().contains(&q)
-                || e.route
+        if let Some(term) = &self.query {
+            let term = term.to_lowercase();
+            let hit = entry.body.to_lowercase().contains(&term)
+                || entry.target.to_lowercase().contains(&term)
+                || entry
+                    .route
                     .as_ref()
-                    .is_some_and(|r| r.to_lowercase().contains(&q));
+                    .is_some_and(|route| route.to_lowercase().contains(&term));
             if !hit {
                 return false;
             }
@@ -315,29 +409,20 @@ pub struct PurgeCounts {
 #[async_trait]
 pub trait OpsStore: Send + Sync {
     /// 落一分钟:写分钟表,同时把它累加进所在小时的汇总与明细。
-    async fn record_minute(&self, rec: &MinuteRecord) -> anyhow::Result<()>;
+    async fn record_minute(&self, record: &MinuteRecord) -> anyhow::Result<()>;
+    /// 批量写日志(写入任务攒一批调一次)。
     async fn insert_logs(&self, logs: &[LogEntry]) -> anyhow::Result<()>;
     /// `[from, to)` 内的汇总行,按时间升序。
-    async fn series(
-        &self,
-        tier: Tier,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<SeriesRow>>;
+    async fn series(&self, tier: Tier, range: TimeRange) -> anyhow::Result<Vec<SeriesRow>>;
     /// `[from, to)` 内各进程、各接口的合计。
-    async fn route_totals(
-        &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<(String, RouteTotals)>>;
+    async fn route_totals(&self, range: TimeRange) -> anyhow::Result<Vec<InstanceRouteTotals>>;
     /// `[from, to)` 内各进程、各数据库操作的合计。
-    async fn db_op_totals(
+    async fn db_operation_totals(
         &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<(String, DbOpTotals)>>;
-    /// 分页查日志,返回(本页, 总数)。
-    async fn logs(&self, q: &LogQuery) -> anyhow::Result<(Vec<StoredLog>, u64)>;
+        range: TimeRange,
+    ) -> anyhow::Result<Vec<InstanceDbOperationTotals>>;
+    /// 分页查日志,返回本页与总数。
+    async fn logs(&self, query: &LogQuery) -> anyhow::Result<LogPage>;
     /// 删掉超过保留期的数据。
     async fn purge(&self, now: OffsetDateTime) -> anyhow::Result<PurgeCounts>;
     /// 是否真的持久化(内存实现 = false,页面据此提示"只有最近一段")。
@@ -345,18 +430,20 @@ pub trait OpsStore: Send + Sync {
 }
 
 /// 截到整点。
-pub fn hour_start(t: OffsetDateTime) -> OffsetDateTime {
-    t.replace_minute(0)
-        .and_then(|t| t.replace_second(0))
-        .and_then(|t| t.replace_nanosecond(0))
-        .unwrap_or(t)
+#[must_use]
+pub fn hour_start(time: OffsetDateTime) -> OffsetDateTime {
+    time.replace_minute(0)
+        .and_then(|truncated| truncated.replace_second(0))
+        .and_then(|truncated| truncated.replace_nanosecond(0))
+        .unwrap_or(time)
 }
 
 /// 截到整分。
-pub fn minute_start(t: OffsetDateTime) -> OffsetDateTime {
-    t.replace_second(0)
-        .and_then(|t| t.replace_nanosecond(0))
-        .unwrap_or(t)
+#[must_use]
+pub fn minute_start(time: OffsetDateTime) -> OffsetDateTime {
+    time.replace_second(0)
+        .and_then(|truncated| truncated.replace_nanosecond(0))
+        .unwrap_or(time)
 }
 
 /// 内存实现:只留最近 [`MemoryOpsStore::MINUTES`] 分钟的指标和最近 [`MemoryOpsStore::LOGS`] 条日志。
@@ -371,6 +458,16 @@ struct MemoryInner {
     next_log_id: i64,
 }
 
+impl MemoryInner {
+    /// 空存储,日志 id 从 1 开始。
+    fn new() -> Self {
+        Self {
+            next_log_id: 1,
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for MemoryOpsStore {
     fn default() -> Self {
         Self::new()
@@ -383,25 +480,25 @@ impl MemoryOpsStore {
     /// 最多留这么多条日志。
     pub const LOGS: usize = 2000;
 
+    /// 空存储,日志 id 从 1 开始。
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(MemoryInner {
-                next_log_id: 1,
-                ..Default::default()
-            }),
+            inner: Mutex::new(MemoryInner::new()),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// 中毒 → 按 [`lock_or_reset`] 的锁中毒策略清空重来(内存版只是最近一段的缓存,丢了可以接受)。
+    fn lock(&self) -> MutexGuard<'_, MemoryInner> {
+        lock_or_reset(&self.inner, MemoryInner::new)
     }
 }
 
 #[async_trait]
 impl OpsStore for MemoryOpsStore {
-    async fn record_minute(&self, rec: &MinuteRecord) -> anyhow::Result<()> {
+    async fn record_minute(&self, record: &MinuteRecord) -> anyhow::Result<()> {
         let mut inner = self.lock();
-        inner.minutes.push_back(rec.clone());
+        inner.minutes.push_back(record.clone());
         while inner.minutes.len() > Self::MINUTES {
             inner.minutes.pop_front();
         }
@@ -424,26 +521,22 @@ impl OpsStore for MemoryOpsStore {
         Ok(())
     }
 
-    async fn series(
-        &self,
-        tier: Tier,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<SeriesRow>> {
+    async fn series(&self, tier: Tier, range: TimeRange) -> anyhow::Result<Vec<SeriesRow>> {
+        let TimeRange { from, to } = range;
         let inner = self.lock();
         let mut out: BTreeMap<(OffsetDateTime, String), PeriodTotals> = BTreeMap::new();
-        for m in inner
+        let in_range = inner
             .minutes
             .iter()
-            .filter(|m| m.bucket >= from && m.bucket < to)
-        {
+            .filter(|minute| minute.bucket >= from && minute.bucket < to);
+        for minute in in_range {
             let bucket = match tier {
-                Tier::Minute => m.bucket,
-                Tier::Hour => hour_start(m.bucket),
+                Tier::Minute => minute.bucket,
+                Tier::Hour => hour_start(minute.bucket),
             };
-            out.entry((bucket, m.instance.clone()))
+            out.entry((bucket, minute.instance.clone()))
                 .or_default()
-                .merge(&m.totals);
+                .merge(&minute.totals);
         }
         Ok(out
             .into_iter()
@@ -455,85 +548,103 @@ impl OpsStore for MemoryOpsStore {
             .collect())
     }
 
-    async fn route_totals(
-        &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<(String, RouteTotals)>> {
+    async fn route_totals(&self, range: TimeRange) -> anyhow::Result<Vec<InstanceRouteTotals>> {
+        let TimeRange { from, to } = range;
         let inner = self.lock();
         let mut out: BTreeMap<(String, String, String), RouteTotals> = BTreeMap::new();
-        for m in inner
+        let in_range = inner
             .minutes
             .iter()
-            .filter(|m| m.bucket >= from && m.bucket < to)
-        {
-            for r in &m.routes {
-                let acc = out
-                    .entry((m.instance.clone(), r.method.clone(), r.route.clone()))
-                    .or_insert_with(|| RouteTotals {
-                        method: r.method.clone(),
-                        route: r.route.clone(),
-                        ..Default::default()
-                    });
-                acc.requests += r.requests;
-                acc.errors_4xx += r.errors_4xx;
-                acc.errors_5xx += r.errors_5xx;
-                acc.latency.add(&r.latency);
+            .filter(|minute| minute.bucket >= from && minute.bucket < to);
+        for minute in in_range {
+            for route in &minute.routes {
+                let key = (
+                    minute.instance.clone(),
+                    route.method.clone(),
+                    route.route.clone(),
+                );
+                let totals = out.entry(key).or_insert_with(|| RouteTotals {
+                    method: route.method.clone(),
+                    route: route.route.clone(),
+                    ..Default::default()
+                });
+                totals.requests += route.requests;
+                totals.errors_4xx += route.errors_4xx;
+                totals.errors_5xx += route.errors_5xx;
+                totals.latency.add(&route.latency);
             }
         }
-        Ok(out.into_iter().map(|((i, _, _), r)| (i, r)).collect())
+        Ok(out
+            .into_iter()
+            .map(|((instance, _, _), totals)| InstanceRouteTotals { instance, totals })
+            .collect())
     }
 
-    async fn db_op_totals(
+    async fn db_operation_totals(
         &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> anyhow::Result<Vec<(String, DbOpTotals)>> {
+        range: TimeRange,
+    ) -> anyhow::Result<Vec<InstanceDbOperationTotals>> {
+        let TimeRange { from, to } = range;
         let inner = self.lock();
-        let mut out: BTreeMap<(String, String), DbOpTotals> = BTreeMap::new();
-        for m in inner
+        let mut out: BTreeMap<(String, String), DbOperationTotals> = BTreeMap::new();
+        let in_range = inner
             .minutes
             .iter()
-            .filter(|m| m.bucket >= from && m.bucket < to)
-        {
-            for d in &m.db_ops {
-                out.entry((m.instance.clone(), d.operation.clone()))
-                    .or_insert_with(|| DbOpTotals {
-                        operation: d.operation.clone(),
+            .filter(|minute| minute.bucket >= from && minute.bucket < to);
+        for minute in in_range {
+            for operation in &minute.db_operations {
+                out.entry((minute.instance.clone(), operation.operation.clone()))
+                    .or_insert_with(|| DbOperationTotals {
+                        operation: operation.operation.clone(),
                         ..Default::default()
                     })
                     .latency
-                    .add(&d.latency);
+                    .add(&operation.latency);
             }
         }
-        Ok(out.into_iter().map(|((i, _), d)| (i, d)).collect())
+        Ok(out
+            .into_iter()
+            .map(|((instance, _), totals)| InstanceDbOperationTotals { instance, totals })
+            .collect())
     }
 
-    async fn logs(&self, q: &LogQuery) -> anyhow::Result<(Vec<StoredLog>, u64)> {
+    async fn logs(&self, query: &LogQuery) -> anyhow::Result<LogPage> {
         let inner = self.lock();
-        let mut hits: Vec<&StoredLog> = inner.logs.iter().filter(|l| q.matches(&l.entry)).collect();
-        hits.sort_by(|a, b| b.entry.ts.cmp(&a.entry.ts).then(b.id.cmp(&a.id)));
+        let mut hits: Vec<&StoredLog> = inner
+            .logs
+            .iter()
+            .filter(|log| query.matches(&log.entry))
+            .collect();
+        hits.sort_by(|left, right| {
+            right
+                .entry
+                .timestamp
+                .cmp(&left.entry.timestamp)
+                .then(right.id.cmp(&left.id))
+        });
         let total = hits.len() as u64;
-        let page = hits
+        let page: Vec<StoredLog> = hits
             .into_iter()
-            .skip(q.offset() as usize)
-            .take(q.size as usize)
+            .skip(usize::try_from(query.offset()).unwrap_or(usize::MAX))
+            .take(usize::try_from(query.size).unwrap_or(usize::MAX))
             .cloned()
             .collect();
-        Ok((page, total))
+        Ok(LogPage { logs: page, total })
     }
 
     async fn purge(&self, now: OffsetDateTime) -> anyhow::Result<PurgeCounts> {
         let mut inner = self.lock();
-        let before_m = inner.minutes.len();
+        let minutes_before = inner.minutes.len();
         inner
             .minutes
-            .retain(|m| m.bucket >= now - Retention::MINUTE);
-        let before_l = inner.logs.len();
-        inner.logs.retain(|l| l.entry.ts >= now - Retention::LOGS);
+            .retain(|minute| minute.bucket >= now - Retention::MINUTE);
+        let logs_before = inner.logs.len();
+        inner
+            .logs
+            .retain(|log| log.entry.timestamp >= now - Retention::LOGS);
         Ok(PurgeCounts {
-            minutes: (before_m - inner.minutes.len()) as u64,
-            logs: (before_l - inner.logs.len()) as u64,
+            minutes: (minutes_before - inner.minutes.len()) as u64,
+            logs: (logs_before - inner.logs.len()) as u64,
             ..Default::default()
         })
     }
@@ -545,40 +656,55 @@ impl OpsStore for MemoryOpsStore {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     #[test]
     fn process_identity_wins() {
         assert_eq!(
-            classify_service(
-                "idm",
-                "baserust::features::widget",
-                Some("/api/v1/frontend/widgets")
-            ),
+            classify_service(LogOrigin {
+                instance: "idm",
+                target: "baserust::features::widget",
+                route: Some("/api/v1/frontend/widgets")
+            }),
             Service::Idm
         );
-        assert_eq!(classify_service("app", "idm::session", None), Service::App);
+        assert_eq!(
+            classify_service(LogOrigin {
+                instance: "app",
+                target: "idm::session",
+                route: None
+            }),
+            Service::App
+        );
     }
 
     #[test]
     fn combined_follows_nginx_routing_then_module() {
-        let c = |t: &str, r: Option<&str>| classify_service("combined", t, r);
+        let classify = |target: &str, route: Option<&str>| {
+            classify_service(LogOrigin {
+                instance: "combined",
+                target,
+                route,
+            })
+        };
         assert_eq!(
-            c(
+            classify(
                 "baserust::infra::http::error",
                 Some("/api/v1/public/auth/login")
             ),
             Service::Idm
         );
         assert_eq!(
-            c(
+            classify(
                 "baserust::infra::http::error",
                 Some("/api/v1/admin/auth/users/{id}")
             ),
             Service::Idm
         );
         assert_eq!(
-            c(
+            classify(
                 "baserust::infra::http::error",
                 Some("/api/v1/admin/platform/tenants/{id}")
             ),
@@ -586,31 +712,82 @@ mod tests {
             "平台租户管理归 idm(nginx 同样转给 idm)"
         );
         assert_eq!(
-            c("baserust::features::tenants::adapters::http", None),
+            classify("baserust::features::tenants::adapters::http", None),
             Service::Idm
         );
         assert_eq!(
-            c(
+            classify(
                 "baserust::infra::http::error",
                 Some("/api/v1/admin/widgets")
             ),
             Service::App
         );
-        assert_eq!(c("http.access", Some("unmatched")), Service::App);
+        assert_eq!(classify("http.access", Some("unmatched")), Service::App);
         assert_eq!(
-            c("baserust::features::auth_audit::adapters::projector", None),
+            classify(
+                "baserust::features::auth_audit::adapters::auth_event_projector",
+                None
+            ),
             Service::Idm
         );
         assert_eq!(
-            c("baserust::features::auth::adapters::emit", None),
+            classify("baserust::features::auth::adapters::emit", None),
             Service::Idm
         );
-        assert_eq!(c("idm::service", None), Service::Idm);
+        assert_eq!(classify("idm::service", None), Service::Idm);
         assert_eq!(
-            c("baserust::features::authz_like", None),
+            classify("baserust::features::authz_like", None),
             Service::App,
             "前缀要按模块边界匹配"
         );
-        assert_eq!(c("baserust::infra::outbox", None), Service::App);
+        assert_eq!(classify("baserust::infra::outbox", None), Service::App);
+    }
+
+    #[test]
+    fn offset_saturates_on_huge_page() {
+        let query = LogQuery {
+            page: u64::MAX,
+            size: 100,
+            ..Default::default()
+        };
+        assert_eq!(query.offset(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn memory_logs_with_huge_page_is_empty_instead_of_panicking() {
+        let store = MemoryOpsStore::new();
+        let query = LogQuery {
+            page: u64::MAX,
+            size: u64::MAX,
+            ..Default::default()
+        };
+        let LogPage { logs: page, total } = store.logs(&query).await.unwrap();
+        assert!(page.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_store_resets_after_poison() {
+        let store = MemoryOpsStore::new();
+        thread::scope(|scope| {
+            let result = scope
+                .spawn(|| {
+                    let _guard = store.inner.lock();
+                    panic!("测试:持锁时 panic,让锁中毒");
+                })
+                .join();
+            assert!(result.is_err());
+        });
+        assert!(store.inner.is_poisoned());
+        let query = LogQuery {
+            page: 1,
+            size: 10,
+            ..Default::default()
+        };
+        assert!(
+            store.logs(&query).await.is_ok(),
+            "中毒后清空重来,不永久报错"
+        );
+        assert!(!store.inner.is_poisoned());
     }
 }

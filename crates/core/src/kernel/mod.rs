@@ -5,9 +5,10 @@
 //! 这些件的线格式(HTTP 状态码、JSON 形状、query 解析、opaque cursor)归适配层 `infra::http`,
 //! 数据库侧的映射(sea-query 排序方向等)归 `infra::pg`。
 
+pub mod app_error;
 pub mod audit;
-pub mod authz;
-pub mod error;
+pub mod authorization;
 pub mod pagination;
-pub mod sort;
-pub mod tenant;
+pub mod sort_order;
+pub mod tenant_id;
+pub mod time_range;

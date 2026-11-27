@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::watch;
+use tokio::time;
 use uuid::Uuid;
 
-use crate::kernel::error::AppError;
+use crate::infra::telemetry;
+use crate::kernel::app_error::AppError;
 
 /// relay 从某个发件箱源拉到的一条待发布事件 —— 已是发布就绪的形状
 /// (`subject` + `event_id` 作未来 JetStream `Nats-Msg-Id` 去重键 + 序列化好的 payload 字节)。
@@ -36,6 +39,18 @@ pub trait OutboxSource: Send + Sync {
     async fn mark_published(&self, ids: &[i64]) -> Result<(), AppError>;
 }
 
+/// 一条源发件箱记录的借用视图([`build_outbox_item`] 的入参)。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutboxRecordRef<'record> {
+    /// `"idm"` / `"app"`。
+    pub schema: &'record str,
+    /// 源表行 id。
+    pub id: i64,
+    pub event_type: &'record str,
+    pub aggregate_id: Uuid,
+    pub payload: &'record Value,
+}
+
 /// 各 schema 适配器共用的 wire-format 组装,唯一定义处。`schema` 是 `"idm"`/`"app"`;
 /// `id` 是源表行 id(per-schema 自增,兼作 envelope 里的 `seq` —— 后续 P3 projector 拿它当
 /// 该 schema 的水位线,不用解析 subject/event_id 字符串)。
@@ -43,13 +58,14 @@ pub trait OutboxSource: Send + Sync {
 /// **`tenant_id`**(多租户,spec §4.4):payload 里带合法(非 nil)的 `tenant_id` 就抄到信封上,否则为
 /// `null`。租户事件(idm 的 `tenant.*`)、进了租户的认证事件都带;`user.*` / `profile.*`(账号、资料全局)
 /// 不带 —— **消费方不得要求它**(按需用 payload 里的那份)。outbox 表本身是全局表,不加列。
-pub(crate) fn build_outbox_item(
-    schema: &str,
-    id: i64,
-    event_type: &str,
-    aggregate_id: Uuid,
-    payload: &Value,
-) -> OutboxItem {
+pub(crate) fn build_outbox_item(record: OutboxRecordRef<'_>) -> OutboxItem {
+    let OutboxRecordRef {
+        schema,
+        id,
+        event_type,
+        aggregate_id,
+        payload,
+    } = record;
     let event_id = format!("{schema}-{id}");
     let envelope = json!({
         "event_id": event_id,
@@ -80,10 +96,22 @@ fn payload_tenant(payload: &Value) -> Option<Uuid> {
 
 /// relay 发布事件依赖的窄端口 —— relay 只认这个 trait,不认具体 `JetStreamPublisher`,
 /// 换成 fake 就能脱离 NATS 单测(见下方 tests)。`JetStreamPublisher` 的实现见
-/// `src/infra/jetstream.rs`,转调它已有的同名 inherent 方法。
+/// `src/infra/jet_stream_publisher.rs`,转调它已有的同名 inherent 方法。
 #[async_trait]
 pub trait EventPublisher: Send + Sync {
-    async fn publish(&self, subject: &str, event_id: &str, payload: &[u8]) -> anyhow::Result<()>;
+    /// 发布一条事件,**服务端确认持久化后**才返回 `Ok`;`event.event_id` 是去重键。
+    async fn publish(&self, event: OutboundEvent<'_>) -> anyhow::Result<()>;
+}
+
+/// 要发布的一条事件([`EventPublisher::publish`] 的入参):subject 与去重键都是字符串,按名字区分。
+#[derive(Clone, Copy, Debug)]
+pub struct OutboundEvent<'event> {
+    /// 发到哪个 subject(`events.<source>.<type>`)。
+    pub subject: &'event str,
+    /// 去重键(JetStream `Nats-Msg-Id`)。
+    pub event_id: &'event str,
+    /// 序列化好的信封。
+    pub payload: &'event [u8],
 }
 
 /// 通用发件箱中继:轮询 [`OutboxSource`] → 按 id 升序逐条发布到 [`EventPublisher`] →
@@ -95,26 +123,28 @@ pub struct OutboxRelay {
     source: Arc<dyn OutboxSource>,
     publisher: Arc<dyn EventPublisher>,
     poll_interval: Duration,
-    batch: i64,
+    batch_size: i64,
 }
 
 impl OutboxRelay {
+    /// 每 `poll_interval` 从 `source` 取至多 `batch_size` 条发给 `publisher`;来源名缺省 `outbox`。
     pub fn new(
         source: Arc<dyn OutboxSource>,
         publisher: Arc<dyn EventPublisher>,
         poll_interval: Duration,
-        batch: i64,
+        batch_size: i64,
     ) -> Self {
         Self {
             name: "outbox",
             source,
             publisher,
             poll_interval,
-            batch,
+            batch_size,
         }
     }
 
     /// 来源名(指标标签 `source`、链路 span 字段)。
+    #[must_use]
     pub fn named(mut self, name: &'static str) -> Self {
         self.name = name;
         self
@@ -123,12 +153,11 @@ impl OutboxRelay {
     /// 一轮:poll → 逐条 publish(id 升序,首次失败即停)→ 标记已发布前缀。
     /// 拆成独立方法是为了脱离真实 sleep/shutdown 循环单测(见 tests)。
     async fn poll_once(&self) {
-        use crate::infra::telemetry;
         use tracing::Instrument;
-        let items = match self.source.poll_unpublished(self.batch).await {
+        let items = match self.source.poll_unpublished(self.batch_size).await {
             Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(error = %err, "outbox poll_unpublished 失败,下轮重试");
+            Err(error) => {
+                tracing::warn!(error = %error, "outbox poll_unpublished 失败,下轮重试");
                 return;
             }
         };
@@ -152,14 +181,18 @@ impl OutboxRelay {
         for item in items {
             match self
                 .publisher
-                .publish(&item.subject, &item.event_id, &item.payload)
+                .publish(OutboundEvent {
+                    subject: &item.subject,
+                    event_id: &item.event_id,
+                    payload: &item.payload,
+                })
                 .await
             {
                 Ok(()) => published_ids.push(item.id),
-                Err(err) => {
-                    crate::infra::telemetry::outbox_publish_failed(self.name);
+                Err(error) => {
+                    telemetry::outbox_publish_failed(self.name);
                     tracing::warn!(
-                        error = %err,
+                        error = %error,
                         event_id = %item.event_id,
                         "outbox publish 失败,停止本批以保序,下轮重试"
                     );
@@ -170,8 +203,8 @@ impl OutboxRelay {
 
         let published = published_ids.len();
         if !published_ids.is_empty() {
-            if let Err(err) = self.source.mark_published(&published_ids).await {
-                tracing::warn!(error = %err, "outbox mark_published 失败,下轮重试(可能重复发布)");
+            if let Err(error) = self.source.mark_published(&published_ids).await {
+                tracing::warn!(error = %error, "outbox mark_published 失败,下轮重试(可能重复发布)");
             }
         }
         published
@@ -179,8 +212,8 @@ impl OutboxRelay {
 
     /// 后台循环:poll_once → 睡 `poll_interval` 或等 shutdown。`shutdown` 置 `true`
     /// 或发送端被丢弃(`changed()` 返回 `Err`)都视为退出信号。
-    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        crate::infra::telemetry::outbox_started(self.name);
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        telemetry::outbox_started(self.name);
         loop {
             if *shutdown.borrow() {
                 break;
@@ -189,7 +222,7 @@ impl OutboxRelay {
             self.poll_once().await;
 
             tokio::select! {
-                _ = tokio::time::sleep(self.poll_interval) => {}
+                () = time::sleep(self.poll_interval) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
@@ -202,13 +235,21 @@ impl OutboxRelay {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     #[test]
     fn builds_subject_event_id_and_envelope() {
         let aggregate_id = Uuid::now_v7();
         let payload = json!({"username": "alice"});
-        let item = build_outbox_item("idm", 42, "user.created", aggregate_id, &payload);
+        let item = build_outbox_item(OutboxRecordRef {
+            schema: "idm",
+            id: 42,
+            event_type: "user.created",
+            aggregate_id,
+            payload: &payload,
+        });
 
         assert_eq!(item.id, 42);
         assert_eq!(item.subject, "events.idm.user.created");
@@ -233,7 +274,13 @@ mod tests {
         let tenant = Uuid::now_v7();
         let user = Uuid::now_v7();
         let payload = json!({ "tenant_id": tenant, "user_id": user, "roles": ["admin"] });
-        let item = build_outbox_item("idm", 7, "tenant.member_added", tenant, &payload);
+        let item = build_outbox_item(OutboxRecordRef {
+            schema: "idm",
+            id: 7,
+            event_type: "tenant.member_added",
+            aggregate_id: tenant,
+            payload: &payload,
+        });
         let envelope: Value = serde_json::from_slice(&item.payload).unwrap();
         assert_eq!(envelope["tenant_id"], tenant.to_string());
         assert_eq!(envelope["data"], payload, "payload 原样不动");
@@ -242,7 +289,13 @@ mod tests {
             json!({ "tenant_id": Uuid::nil() }),
             json!({ "tenant_id": "nope" }),
         ] {
-            let item = build_outbox_item("idm", 8, "tenant.member_added", tenant, &bad);
+            let item = build_outbox_item(OutboxRecordRef {
+                schema: "idm",
+                id: 8,
+                event_type: "tenant.member_added",
+                aggregate_id: tenant,
+                payload: &bad,
+            });
             let envelope: Value = serde_json::from_slice(&item.payload).unwrap();
             assert!(envelope["tenant_id"].is_null(), "{bad}: 不是合法租户");
         }
@@ -261,15 +314,15 @@ mod tests {
 
     /// 内存发件箱源:未发布队列 + 已标记 id 记录。
     struct FakeSource {
-        unpublished: std::sync::Mutex<Vec<OutboxItem>>,
-        marked: std::sync::Mutex<Vec<i64>>,
+        unpublished: Mutex<Vec<OutboxItem>>,
+        marked: Mutex<Vec<i64>>,
     }
 
     impl FakeSource {
         fn new(items: Vec<OutboxItem>) -> Self {
             Self {
-                unpublished: std::sync::Mutex::new(items),
-                marked: std::sync::Mutex::new(Vec::new()),
+                unpublished: Mutex::new(items),
+                marked: Mutex::new(Vec::new()),
             }
         }
     }
@@ -281,11 +334,11 @@ mod tests {
             Ok(guard
                 .iter()
                 .take(limit.max(0) as usize)
-                .map(|it| OutboxItem {
-                    id: it.id,
-                    subject: it.subject.clone(),
-                    event_id: it.event_id.clone(),
-                    payload: it.payload.clone(),
+                .map(|pending| OutboxItem {
+                    id: pending.id,
+                    subject: pending.subject.clone(),
+                    event_id: pending.event_id.clone(),
+                    payload: pending.payload.clone(),
                 })
                 .collect())
         }
@@ -294,7 +347,7 @@ mod tests {
             self.unpublished
                 .lock()
                 .unwrap()
-                .retain(|it| !ids.contains(&it.id));
+                .retain(|pending| !ids.contains(&pending.id));
             self.marked.lock().unwrap().extend_from_slice(ids);
             Ok(())
         }
@@ -303,15 +356,15 @@ mod tests {
     /// fake 发布端:记录发布顺序;`fail_event_ids` 中的 event_id 发布时返回 Err
     /// (测试用它模拟"这轮失败、下轮恢复")。
     struct FakePublisher {
-        published: std::sync::Mutex<Vec<String>>,
-        fail_event_ids: std::sync::Mutex<Vec<String>>,
+        published: Mutex<Vec<String>>,
+        fail_event_ids: Mutex<Vec<String>>,
     }
 
     impl FakePublisher {
         fn new() -> Self {
             Self {
-                published: std::sync::Mutex::new(Vec::new()),
-                fail_event_ids: std::sync::Mutex::new(Vec::new()),
+                published: Mutex::new(Vec::new()),
+                fail_event_ids: Mutex::new(Vec::new()),
             }
         }
 
@@ -332,12 +385,8 @@ mod tests {
 
     #[async_trait]
     impl EventPublisher for FakePublisher {
-        async fn publish(
-            &self,
-            _subject: &str,
-            event_id: &str,
-            _payload: &[u8],
-        ) -> anyhow::Result<()> {
+        async fn publish(&self, event: OutboundEvent<'_>) -> anyhow::Result<()> {
+            let event_id = event.event_id;
             if self
                 .fail_event_ids
                 .lock()
@@ -401,7 +450,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|it| it.id)
+            .map(|pending| pending.id)
             .collect();
         assert_eq!(remaining, vec![2, 3]);
 

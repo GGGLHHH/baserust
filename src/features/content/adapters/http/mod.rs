@@ -6,7 +6,7 @@ mod routes;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
 /// 本模块路由 + OpenAPI,挂到主 router(`/api/v1` 前缀由组合根的 nest 加)。
 pub fn router() -> OpenApiRouter<AppState> {

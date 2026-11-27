@@ -7,24 +7,27 @@
 //!
 //! 数据见 `seed.toml`(`SEED_FILE` 可覆盖)。`just seed` 即调它。配置全经 `Config`(.env + 环境变量)。
 
+// Google Rust 风格指南:必须 panic 时用 expect("原因") 说明不变量,不用 unwrap。
+#![warn(clippy::unwrap_used)]
+
 use anyhow::Context;
-use baserust::app::avatar_repair::repair_legacy_avatars;
-use baserust::app::policy_repo;
-use baserust::app::seed::{apply, apply_profiles, IdmSeedRepos, SeedData};
+use baserust::app::seed::{self, IdmSeedRepos, SeedData};
+use baserust::app::{avatar_repair, policy_repo};
 use baserust::features::profile::PgProfileRepo;
 use baserust::infra::config::Config;
 use idm::{Argon2Hasher, PgMemberRepo, PgRoleRepo, PgTenantRepo, PgUserRepo};
 use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::from_path(".env"); // 与 app 进程同源:.env + 环境变量,读取/默认全在 Config
-    let config = Config::load()?;
+    let config = Config::try_new()?;
     // 日志过滤也走 Config(不用 fmt::init() 直读 RUST_LOG)—— env 读取全收口在 Config。
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(config.log_filter()))
+        .with_env_filter(EnvFilter::new(config.log_filter()))
         .init();
-    let data = SeedData::load(config.seed_file.as_deref())?; // seed 含租户 + 账号;角色/权限是代码闭集
+    let data = SeedData::try_new(config.seed_file.as_deref())?; // seed 含租户 + 账号;角色/权限是代码闭集
 
     // idm schema:roles / tenants / users / 成员关系。
     let idm_url = config
@@ -35,13 +38,11 @@ async fn main() -> anyhow::Result<()> {
         .connect(&idm_url)
         .await
         .context("连接 idm 数据库失败")?;
-    let (users, roles, tenants, members) = (
-        PgUserRepo::new(idm_pool.clone()),
-        PgRoleRepo::new(idm_pool.clone()),
-        PgTenantRepo::new(idm_pool.clone()),
-        PgMemberRepo::new(idm_pool.clone()),
-    );
-    let report = apply(
+    let users = PgUserRepo::new(idm_pool.clone());
+    let roles = PgRoleRepo::new(idm_pool.clone());
+    let tenants = PgTenantRepo::new(idm_pool.clone());
+    let members = PgMemberRepo::new(idm_pool.clone());
+    let report = seed::apply(
         IdmSeedRepos {
             users: &users,
             roles: &roles,
@@ -50,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         },
         &Argon2Hasher,
         &data,
-        Some("system".to_owned()),
+        Some("system"),
     )
     .await?;
 
@@ -62,10 +63,10 @@ async fn main() -> anyhow::Result<()> {
             .connect(&app_url)
             .await
             .context("连接 app 数据库失败")?;
-        policy_repo::seed_authz(&app_pool, &data).await?;
+        policy_repo::seed_authorization(&app_pool, &data).await?;
         // 初始 profile:username 经 idm 解析成 user_id(标识引用),数据写 app —— 两个 pool 各连各的
         // schema,不跨 schema join。已有资料的账号跳过(不把用户改过的资料按回 seed 值)。
-        apply_profiles(
+        seed::apply_profiles(
             &PgProfileRepo::new(app_pool.clone()),
             &PgUserRepo::new(idm_pool),
             &data,
@@ -76,13 +77,17 @@ async fn main() -> anyhow::Result<()> {
 
         // 旧头像修复(幂等,见 app::avatar_repair):要 content 的 system 账号(BYPASSRLS),设了 CONTENT_DB_HOST 才跑。
         // 进程启动时也会跑同一步;这里让「先 seed 再起服务」的部署顺序也能一次修好。
-        if let Some(content_sys_url) = config.content_system_database_url() {
-            let content_sys = PgPoolOptions::new()
+        if let Some(content_system_url) = config.content_system_database_url() {
+            let content_system = PgPoolOptions::new()
                 .max_connections(2)
-                .connect(&content_sys_url)
+                .connect(&content_system_url)
                 .await
                 .context("连接 content system 账号失败(老库先补账号:just db-ensure-roles)")?;
-            let report = repair_legacy_avatars(&app_pool, &content_sys).await?;
+            let report = avatar_repair::repair_legacy_avatars(avatar_repair::AvatarRepairPools {
+                app: &app_pool,
+                content_system: &content_system,
+            })
+            .await?;
             println!("旧头像修复:改动 {} 行", report.rows());
         }
     }

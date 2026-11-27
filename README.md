@@ -11,6 +11,12 @@ crate 名 `baserust`;示例域 `features/widget/` 是范式样板,加真实业�
 npx degit GGGLHHH/baserust my-app    # 只拉当前快照,无 .git;进去再 git init
 ```
 
+## 开发环境
+
+- Rust 工具链版本由仓库根的 `rust-toolchain.toml` 决定(`rustup` 会自动装);命令用 [just](https://github.com/casey/just)。
+- `just lint` / `just fmt` 另外要 nightly 的 rustfmt(Google Rust 风格指南要求的三项格式化配置只有 nightly 支持):
+  `rustup toolchain install nightly --profile minimal --component rustfmt`。
+
 ## 跑起来
 
 ```bash
@@ -83,26 +89,27 @@ just dev                    # .env 默认 APP_DB_HOST=localhost → 连 pg
 
 ```
 crates/core/src/features/<name>/          核心(独立 crate,依赖里没有任何 web / 数据库 / 消息框架)
-  model.rs · ports.rs · service.rs        领域模型 / 端口 trait / 用例
-  memory.rs                               内存适配器(默认实现 + 核心单测的假适配器)
+  model.rs · ports.rs                     领域模型 / 端口 trait
+  <name>_service.rs                       用例(<Name>Service;文件按主要条目命名)
+  in_memory_<name>_repo.rs                内存适配器(默认实现 + 核心单测的假适配器)
 src/features/<name>/
-  mod.rs                                  重新导出核心
+  mod.rs                                  按名重新导出核心
   adapters/http/{dto,routes,mod}.rs       HTTP 适配器:线格式 DTO ↔ 领域模型、handler、router
-  adapters/postgres.rs                    仓储实现(PG 行结构只在这)
+  adapters/pg_<name>_repo.rs              仓储实现 Pg<Name>Repo(PG 行结构只在这)
 ```
 
-然后 **4 处装配**:`features/mod.rs`(`pub mod`)、`app/state.rs`(AppState 加字段 + 装配)、`app/router.rs`(路由 merge 进 `/api/v1`)、`infra/openapi.rs`(tags)。基础设施(分页 / 审计 / 软删除 / 错误契约 / 提取器)全部复用,只写业务特有部分。
+然后 **4 处装配**:`features/mod.rs`(`pub mod`)、`app/app_state.rs`(AppState 加字段 + 装配)、`app/router.rs`(路由 merge 进 `/api/v1`)、`infra/openapi.rs`(tags)。基础设施(分页 / 审计 / 软删除 / 错误契约 / 提取器)全部复用,只写业务特有部分。
 
 ## 架构
 
 ```
 src/
   main.rs · lib.rs        入口(瘦) / 库根(解锁 tests/)
-  app/                    装配层:state(AppState) · router(build_router)
+  app/                    装配层:app_state(AppState) · router(build_router)
   infra/                  适配器侧横切:config · http(错误→HTTP / 提取器 / 分页查询)· openapi · pg · outbox …
   health.rs               探针
   features/widget/        业务模块的适配器(adapters/);核心在 crates/core
-crates/core/              核心 crate baserust-core:kernel(error · pagination · sort · audit · authz)+ 各模块 model/ports/service/memory
+crates/core/              核心 crate baserust-core:kernel(app_error · pagination · sort_order · audit · authorization · tenant_id)+ 各模块 model / ports / <name>_service / in_memory_*
 ```
 
 范式要点:
@@ -111,7 +118,7 @@ crates/core/              核心 crate baserust-core:kernel(error · pagination 
 - **可拔插实现**:`Arc<dyn Repo>` 端口,启动按 `APP_DB_HOST` 注入内存或 Postgres 实现
 - **统一不泄露错误契约**:核心 `AppError` → HTTP 适配器 `IntoResponse`,原始细节只进日志、响应只给 `{code,error}`
 - **role/schema 隔离**:每个 schema 一个 pg role(role 的 search_path 指向同名 schema),代码/迁移零 schema 前缀
-- **多租户账号拆分**:app / content / search 各三个账号 —— `<schema>_owner` 跑迁移、拥有表;`<schema>` 运行时只有 DML、非 owner、受 RLS 约束(`infra::pg::tenant_tx` 设事务级 `app.tenant_id`);`<schema>_system` BYPASSRLS,给后台任务的单独连接池。建库脚本 `scripts/initdb/10-tenancy-roles.sh`(幂等,老库 `just db-ensure-roles` 升级);`tests/rls_audit.rs` 守「每张表要么租户隔离、要么在全局表白名单」
+- **多租户账号拆分**:app / content / search 各三个账号 —— `<schema>_owner` 跑迁移、拥有表;`<schema>` 运行时只有 DML、非 owner、受 RLS 约束(`infra::pg::tenant_transaction` 设事务级 `app.tenant_id`);`<schema>_system` BYPASSRLS,给后台任务的单独连接池。建库脚本 `scripts/initdb/10-tenancy-roles.sh`(幂等,老库 `just db-ensure-roles` 升级);`tests/rls_audit.rs` 守「每张表要么租户隔离、要么在全局表白名单」
 - **search 读模型(多租户)**:`account_index` 账号目录(全局)+ `admin_user_index` 租户成员索引(主键 `(tenant_id, user_id)`,RLS),投影器与保留期任务用 `search_system` 池写(账号目录运行时账号只读);后台「用户」列表 = 平台账号列表(全部账号,读账号目录,运行时池),租户成员列表读成员索引(运行时池 + 租户事务)。**从多租户之前的版本升级**:search 迁移 0003 建出的成员索引是空的,迁移后跑一次 `rebuild_search`(本地 `cargo run --bin rebuild_search`;容器镜像里同名二进制,覆盖 entrypoint 运行,环境变量同 app 进程;baserust-stack 的 deploy.sh 发现索引为空会自动跑)
 - **从多租户之前的版本升级(本机)**:`just db-ensure-roles`(拆账号,**在迁移之前**)→ `just migrate` → `cargo run --bin rebuild_search`。旧数据全部归默认组织;app 启动(和 `seed`)时会把资料引用的旧头像转成个人内容,用 content 的 system 账号改表(UPDATE 权限由 `10-tenancy-roles.sh` 授)。生产步骤见 baserust-stack 的 `scripts/prod/README.md`「从多租户之前的版本升级」
 - **基础实体**:审计字段(created_by/at · updated_by/at)+ 软删除(`deleted_at`,`base_select` 收口);`updated_at` 由 DB 触发器维护
@@ -140,7 +147,7 @@ just test          # 默认:零 DB,单测 + API 集成 + 黑盒 HTTP 验收 + Op
 just test-http     # 只跑黑盒 HTTP 验收(tests/http_*.rs:真实端口 + reqwest,换 web 框架时原样当验收标准)
 just pg-test-grant # 一次性:给 app_owner(sqlx::test 建库 / 迁移的账号)授 CREATEDB + CREATE ON DATABASE
 just test-pg       # repo conformance 打真 PG(sqlx::test 临时库以 app_owner 迁移、仓储走运行时账号 app;再加 RLS 审计)
-just test-all      # 内存 + PG
+just test-all      # 内存 + PG + NATS
 ```
 
 防漂移:`widget_repo_contract` 一份契约,内存实现和 PG 实现各跑一遍,任一方在软删过滤/分页/幂等/审计上偏离立刻被抓。

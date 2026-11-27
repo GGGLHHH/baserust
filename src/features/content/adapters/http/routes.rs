@@ -9,11 +9,15 @@
 //! - 头像等个人内容(`ContentScope::Personal`)只归 profile 模块,这里看不到、也碰不到。
 
 use axum::body::Body;
+use axum::extract::multipart::Field;
 use axum::extract::State;
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
+use content::{Content, ContentError, ContentScope, CreateContentInput, UploadContentInput};
+use garde::Validate;
+use idm::AuthUser;
 use uuid::Uuid;
 
 use super::dto::{
@@ -21,16 +25,15 @@ use super::dto::{
     PrepareUploadRequest, PrepareUploadResponse, SetContentMetadataRequest, UpdateContentRequest,
     UploadResponse,
 };
-use crate::app::state::AppState;
-use crate::infra::authz::TokenScope;
+use crate::app::app_state::AppState;
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::{Audit, CurrentTenant, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Multipart, Path};
-use crate::kernel::authz::Perm;
-use crate::kernel::error::AppError;
-use crate::kernel::tenant::TenantId;
-use content::{ContentScope, CreateContentInput, UploadContentInput};
-use garde::Validate;
+use crate::infra::percent;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::Permission;
+use crate::kernel::tenant_id::TenantId;
 
 /// 本模块所有 content 调用的作用域 = 当前租户(`CurrentTenant` 已保证非 nil)。
 fn tenant_scope(tenant: TenantId) -> ContentScope {
@@ -45,21 +48,32 @@ fn tenant_scope(tenant: TenantId) -> ContentScope {
 async fn fetch_content_owned(
     state: &AppState,
     tenant: TenantId,
-    user: &idm::AuthUser,
-    scope: &[Perm],
-    all_perm: Perm,
+    user: &AuthUser,
+    scope: &[Permission],
+    all_permission: Permission,
     id: Uuid,
-) -> Result<content::Content, AppError> {
-    let c = state.contents.get_content(tenant_scope(tenant), id).await?;
+) -> Result<Content, AppError> {
+    let found = state.contents.get_content(tenant_scope(tenant), id).await?;
     let owned = state
         .policy
-        .data_access(user, scope, all_perm)
-        .allows(c.owner_id);
+        .data_access(user, scope, all_permission)
+        .allows(found.owner_id);
     if owned {
-        Ok(c)
+        Ok(found)
     } else {
         Err(AppError::NotFound)
     }
+}
+
+/// 307 跳到短时效签名 URL,带 `Cache-Control: no-store`。
+///
+/// 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
+fn no_store_redirect(url: &str) -> Response {
+    let mut response = Redirect::temporary(url).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// 可安全 inline 渲染的 MIME 白名单(浏览器不执行脚本):栅格图 / 视频 / 音频 / PDF / 纯文本。
@@ -115,21 +129,19 @@ pub async fn create_content(
 ) -> Result<(StatusCode, Json<ContentResponse>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
     input.validate()?;
-    let domain = CreateContentInput {
-        owner_id: user.0.id,
-        owner_type: input.owner_type,
-        name: input.name,
-        description: input.description,
-        document_type: input.document_type,
-        derivation_type: input.derivation_type,
-    };
+    let mut domain = CreateContentInput::new(user.0.id);
+    domain.owner_type = input.owner_type;
+    domain.name = input.name;
+    domain.description = input.description;
+    domain.document_type = input.document_type;
+    domain.derivation_type = input.derivation_type;
     let content = state
         .contents
-        .create_content(tenant_scope(tenant), domain, ctx.audit_id())
+        .create_content(tenant_scope(tenant), domain, ctx.audit_id().as_deref())
         .await?;
-    Ok((StatusCode::CREATED, Json(content.into())))
+    Ok((StatusCode::CREATED, Json(content.try_into()?)))
 }
 
 /// 一次性上传(multipart/form-data):建 content + object 行、推字节、同步元数据、翻状态。需 `contents:write`。
@@ -158,7 +170,7 @@ pub async fn upload_content(
 ) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
 
     let mut data: Option<Bytes> = None;
     let mut file_name: Option<String> = None;
@@ -221,24 +233,17 @@ pub async fn upload_content(
         mime_type,
         tags,
     } = fields;
-    let input = UploadContentInput {
-        owner_id: user.0.id,
-        owner_type: None,
-        name,
-        description: None,
-        document_type,
-        object_key: None,
-        file_name,
-        mime_type,
-        tags,
-        custom_metadata: None,
-        data,
-    };
+    let mut input = UploadContentInput::new(user.0.id, data);
+    input.name = name;
+    input.document_type = document_type;
+    input.file_name = file_name;
+    input.mime_type = mime_type;
+    input.tags = tags;
     let outcome = state
         .contents
-        .upload_content(tenant_scope(tenant), input, ctx.audit_id())
+        .upload_content(tenant_scope(tenant), input, ctx.audit_id().as_deref())
         .await?;
-    Ok((StatusCode::CREATED, Json(outcome.into())))
+    Ok((StatusCode::CREATED, Json(outcome.try_into()?)))
 }
 
 /// 列当前用户在**当前租户**里的内容。需 `contents:read`。
@@ -263,12 +268,16 @@ pub async fn list_contents(
 ) -> Result<Json<Vec<ContentResponse>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
     let items = state
         .contents
         .list_content(tenant_scope(tenant), user.0.id)
         .await?;
-    Ok(Json(items.into_iter().map(ContentResponse::from).collect()))
+    let responses: Vec<ContentResponse> = items
+        .into_iter()
+        .map(ContentResponse::try_from)
+        .collect::<Result<_, AppError>>()?;
+    Ok(Json(responses))
 }
 
 /// 按 id 取内容。需 `contents:read`。不存在 / 已软删 → 404。
@@ -293,10 +302,17 @@ pub async fn get_content(
 ) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    let c =
-        fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
-    Ok(Json(c.into()))
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
+    let found = fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentReadAll,
+        id,
+    )
+    .await?;
+    Ok(Json(found.try_into()?))
 }
 
 /// 全量更新内容可编辑字段(PUT)。需 `contents:write`。不存在 → 404。
@@ -325,14 +341,27 @@ pub async fn update_content(
 ) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
     input.validate()?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentWriteAll,
+        id,
+    )
+    .await?;
     let updated = state
         .contents
-        .update_content(tenant_scope(tenant), id, input.into_input(), ctx.audit_id())
+        .update_content(
+            tenant_scope(tenant),
+            id,
+            input.into(),
+            ctx.audit_id().as_deref(),
+        )
         .await?;
-    Ok(Json(updated.into()))
+    Ok(Json(updated.try_into()?))
 }
 
 /// 软删内容。需 `contents:delete`。不存在 → 404。
@@ -358,11 +387,19 @@ pub async fn delete_content(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentDelete)?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentDelete)?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentWriteAll,
+        id,
+    )
+    .await?;
     state
         .contents
-        .delete_content(tenant_scope(tenant), id, ctx.audit_id())
+        .delete_content(tenant_scope(tenant), id, ctx.audit_id().as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -392,42 +429,42 @@ pub async fn download_content(
 ) -> Result<Response, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentReadAll,
+        id,
+    )
+    .await?;
     // presign 可用 → 307(字节直达存储);不可用 → 走下面的代理现状。
     if let Some(url) = state
         .contents
         .download_url(tenant_scope(tenant), id)
         .await?
     {
-        // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
-        let mut resp = Redirect::temporary(&url).into_response();
-        resp.headers_mut().insert(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-        return Ok(resp);
+        return Ok(no_store_redirect(&url));
     }
     let bytes = state
         .contents
         .download_content(tenant_scope(tenant), id)
         .await?;
     // 元数据用于命名/类型;缺失(未同步)→ 通用兜底,不致命。
-    let meta = state
+    let metadata = state
         .contents
         .get_content_metadata(tenant_scope(tenant), id)
         .await
         .ok();
-    let mime = meta
-        .as_ref()
-        .and_then(|m| m.mime_type.clone())
-        .unwrap_or_else(|| "application/octet-stream".to_owned());
-    let file_name = meta
-        .as_ref()
-        .and_then(|m| m.file_name.clone())
-        .unwrap_or_else(|| id.to_string());
+    let (mime_type, file_name) = match metadata {
+        Some(metadata) => (metadata.mime_type, metadata.file_name),
+        None => (None, None),
+    };
+    let mime = mime_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+    let file_name = file_name.unwrap_or_else(|| id.to_string());
     // RFC 6266 文件名(ascii 兜底 + filename*),与 presign 下载路径同口径(见 percent 模块)。
-    let disposition = crate::infra::percent::content_disposition_attachment(&file_name);
+    let disposition = percent::content_disposition_attachment(&file_name);
     Response::builder()
         .header(CONTENT_TYPE, mime)
         .header(CONTENT_DISPOSITION, disposition)
@@ -461,11 +498,19 @@ pub async fn preview_content(
 ) -> Result<Response, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
     // 严格 owner 隔离(同 get/download):非 owner 且无 contents:read:all → 404。
     // 头像跨用户展示不再从这里"放行任意 image"(那会让 owner 隔离被整体绕过)——
     // 改由 `profiles/{user_id}/avatar` 专用端点服务:只出被指定为头像、且属主本人的那一张图。
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentReadAll,
+        id,
+    )
+    .await?;
     // inline 是否安全:活动内容(html/svg/xml…)绝不 inline。presign 分支 app 加不了 CSP,relative-presign
     // 拓扑下又与 app 同源 —— 不安全类型强制 attachment(浏览器下载不执行),安全类型才 inline 预览。
     let safe_inline = state
@@ -487,23 +532,16 @@ pub async fn preview_content(
             .await?
     };
     if let Some(url) = presigned {
-        // 307 默认不可缓存(RFC 9110),no-store 是对错配置 CDN/代理缓存 300s 签名 URL 的防御。
-        let mut resp = Redirect::temporary(&url).into_response();
-        resp.headers_mut().insert(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-        return Ok(resp);
+        return Ok(no_store_redirect(&url));
     }
     // 代理回退(memory 后端):Preview 自带元数据说明书(不像 download 代理路径要二次查询)。
-    let p = state
+    let preview = state
         .contents
         .preview_content(tenant_scope(tenant), id)
         .await?;
-    let mime = p
+    let mime = preview
         .metadata
-        .as_ref()
-        .and_then(|m| m.mime_type.clone())
+        .and_then(|metadata| metadata.mime_type)
         .unwrap_or_else(|| "application/octet-stream".to_owned());
     // 安全类型 inline 渲染;活动类型已降级 attachment(不渲染即不执行)。CSP sandbox 再兜一层:
     // 禁脚本/表单/同源访问,即便 inline 的用户可控 mime 也拿不到 app origin 的任何东西。
@@ -512,7 +550,7 @@ pub async fn preview_content(
         .header(CONTENT_TYPE, mime)
         .header(CONTENT_DISPOSITION, disposition)
         .header("content-security-policy", "sandbox")
-        .body(Body::from(p.data))
+        .body(Body::from(preview.data))
         .map_err(|e| AppError::Internal(e.into()).into())
 }
 
@@ -538,12 +576,22 @@ pub async fn list_content_objects(
 ) -> Result<Json<Vec<ObjectResponse>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentReadAll,
+        id,
+    )
+    .await?;
     let objects = state.contents.get_objects(tenant_scope(tenant), id).await?;
-    Ok(Json(
-        objects.into_iter().map(ObjectResponse::from).collect(),
-    ))
+    let responses: Vec<ObjectResponse> = objects
+        .into_iter()
+        .map(ObjectResponse::try_from)
+        .collect::<Result<_, AppError>>()?;
+    Ok(Json(responses))
 }
 
 /// 取内容元数据。需 `contents:read`。不存在 → 404。
@@ -568,8 +616,16 @@ pub async fn get_content_metadata(
 ) -> Result<Json<ContentMetadataResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentRead)?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentReadAll, id).await?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentRead)?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentReadAll,
+        id,
+    )
+    .await?;
     Ok(Json(
         state
             .contents
@@ -604,9 +660,17 @@ pub async fn set_content_metadata(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
     input.validate()?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentWriteAll,
+        id,
+    )
+    .await?;
     // mime 服务端所有:原样回填现有值(库端全量替换,不带 = 清空)。**不能让客户端改** ——
     // 改了就能与 S3 里那份 Content-Type 分叉,骗过 inline 闸门(见 SetContentMetadataRequest)。
     //
@@ -614,15 +678,15 @@ pub async fn set_content_metadata(
     // 其余错误(连接抖动/池超时)必须上抛:`.ok()` 会把它们一起吞成 None,于是这次全量替换把好端端
     // 的 mime 写成 NULL 还回 204 —— 而 mime 是服务端所有物,客户端再也没法把它写回来,只能重传整个
     // content(preview 从此恒 attachment;若是头像,`get_user_avatar` 的栅格闸会让它永久 404)。
-    // 口径照抄库里同一调用的两处(content service.rs:441/460)。
+    // 口径照抄库里同一调用的两处(content 库 `content_service.rs` 的 `preview_content` / `download_url`)。
     let mime_type = match state
         .contents
         .get_content_metadata(tenant_scope(tenant), id)
         .await
     {
-        Ok(m) => m.mime_type,
-        Err(content::ContentError::NotFound) => None,
-        Err(e) => return Err(e.into()),
+        Ok(metadata) => metadata.mime_type,
+        Err(ContentError::NotFound) => None,
+        Err(error) => return Err(error.into()),
     };
     state
         .contents
@@ -635,7 +699,7 @@ pub async fn set_content_metadata(
 /// 同样的领域字段走 JSON(两步上传)还是 multipart(一步上传),不该有两套契约。
 ///
 /// `file_name` 尤其不能不封顶:它会被原样编进 `Content-Disposition` 当作 S3 PUT 的**请求头**
-/// (见 infra::objectstore::upload),几十 KB 的文件名足以让后端拒绝 —— 而 2MB 的 body 上限
+/// (见 infra::s3_object_store::upload),几十 KB 的文件名足以让后端拒绝 —— 而 2MB 的 body 上限
 /// 随手就塞得下。(`UploadForm` 是纯文档 schema、不参与反序列化,且不含 file_name/mime_type
 /// 这两个来自 part 头的字段,故另立此结构而非给它加 derive。)
 #[derive(Validate)]
@@ -653,7 +717,7 @@ struct UploadFields {
 }
 
 /// multipart 标量字段读成 String(失败 → 400)。
-async fn read_text(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
+async fn read_text(field: Field<'_>) -> Result<String, AppError> {
     field
         .text()
         .await
@@ -684,22 +748,22 @@ pub async fn prepare_upload(
 ) -> Result<(StatusCode, Json<PrepareUploadResponse>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
     input.validate()?;
-    let out = state
+    let prepared = state
         .contents
         .prepare_upload(
             tenant_scope(tenant),
             input.into_input(user.0.id),
-            ctx.audit_id(),
+            ctx.audit_id().as_deref(),
         )
         .await?;
     Ok((
         StatusCode::CREATED,
         Json(PrepareUploadResponse {
-            content: out.content.into(),
-            object: out.object.into(),
-            upload_url: out.upload_url,
+            content: prepared.content.try_into()?,
+            object: prepared.object.try_into()?,
+            upload_url: prepared.upload_url,
         }),
     ))
 }
@@ -729,13 +793,21 @@ pub async fn confirm_upload(
 ) -> Result<Json<ContentResponse>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::ContentWrite)?;
-    fetch_content_owned(&state, tenant, &user.0, &scope.0, Perm::ContentWriteAll, id).await?;
-    let c = state
+        .require_scoped(&user.0, &scope.0, Permission::ContentWrite)?;
+    fetch_content_owned(
+        &state,
+        tenant,
+        &user.0,
+        &scope.0,
+        Permission::ContentWriteAll,
+        id,
+    )
+    .await?;
+    let confirmed = state
         .contents
-        .confirm_upload(tenant_scope(tenant), id, ctx.audit_id())
+        .confirm_upload(tenant_scope(tenant), id, ctx.audit_id().as_deref())
         .await?;
-    Ok(Json(c.into()))
+    Ok(Json(confirmed.try_into()?))
 }
 
 #[cfg(test)]

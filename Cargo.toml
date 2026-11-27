@@ -14,11 +14,11 @@ members = ["crates/core"]
 [workspace.dependencies]
 # idm 认证**领域/服务库**(独立 repo github.com/GGGLHHH/rust-idm,零 HTTP),git tag 锁版本。
 # 本地联调 idm 时临时改回 `path = "../rust-idm"`;稳定走 tag。
-idm = { git = "https://github.com/GGGLHHH/rust-idm", rev = "00f4e4d" } # v0.6.0(多租户)+ 复审修复;未打 tag,按提交钉住
+idm = { git = "https://github.com/GGGLHHH/rust-idm", rev = "7f5eaf4" } # v0.7.0(Google Rust 风格);未打 tag,按提交钉住
 # content 内容/对象存储**领域/服务库**(独立 repo github.com/GGGLHHH/rust-content,零 HTTP):
 # app 拥有 HTTP 边界 + minio/S3 接线 + OpenAPI + authz。本地联调时临时改回 `path = "../rust-content"`
 # (注意 path 依赖期间 docker compose build 不可用 —— 路径在构建上下文外);稳定走 tag。
-content = { git = "https://github.com/GGGLHHH/rust-content", rev = "fa3e600" } # v0.4.0(多租户)+ 复审修复;未打 tag,按提交钉住
+content = { git = "https://github.com/GGGLHHH/rust-content", rev = "75f4e1b" } # v0.5.0(Google Rust 风格 + 时钟决定时间戳);未打 tag,按提交钉住
 
 # lint 配置(替 .golangci.yml):clippy + 编译器内置 lint 一处声明,两个 crate 共用
 [workspace.lints.rust]
@@ -26,6 +26,17 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+# Google Rust 风格指南(https://google.github.io/styleguide/rustguide.html)里能交给 clippy 守的条目。
+# 阈值配置在 clippy.toml;unwrap_used 只对产品代码开(各 crate 根的 #![warn]),测试里的 panic 就是断言。
+# 类型、trait 导入后不带路径用;跨模块的函数用「模块名::函数名」调用(超过两段的路径 → 改成 use)。
+absolute_paths = "warn"
+# 纯函数 / 返回值不能丢的函数加 #[must_use]。
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+# 会 panic 的公开函数在文档里写 # Panics。
+missing_panics_doc = "warn"
+# .clone() 不能代替借用。
+redundant_clone = "warn"
 
 [dependencies]
 # 核心:领域模型 / 端口 / 用例 / 内存适配器(本 crate 只放适配器与组合根)
@@ -35,7 +46,7 @@ idm = { workspace = true }
 content = { workspace = true }
 
 # 异步运行时 —— 一切的地基
-# sync:widget 事件总线用 broadcast(勿靠 aws-sdk 的传递特性碰巧解锁)
+# sync:watch(后台任务关停信号)/ mpsc(日志落库)/ broadcast(审计 SSE)(勿靠 aws-sdk 的传递特性碰巧解锁)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
 
 # Web 框架 + 中间件(multipart:content 一次性上传走 multipart/form-data)
@@ -64,8 +75,7 @@ garde = { version = "0.23", features = ["derive", "email"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# 错误处理:库层 typed + 应用层 context 链
-thiserror = "2"
+# 错误处理:应用层 context 链(typed 错误 `AppError` 在核心 crate,thiserror 归它)
 anyhow = "1"
 
 # SQL:连接 + 仓储范式就位(默认走内存,设 APP_DB_HOST 才连)
@@ -90,22 +100,15 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # 字节缓冲:content 的 ObjectStore 端口收/发 owned Bytes(minio 上传/下载、multipart 解析)。
 bytes = "1"
 
-# 对象存储后端:minio/S3(content 字节落这)。app 在 infra/objectstore.rs 实现 content 的 ObjectStore 端口。
+# 对象存储后端:minio/S3(content 字节落这)。app 在 infra/s3_object_store.rs 实现 content 的 ObjectStore 端口。
 # aws-sdk-s3 需显式 BehaviorVersion;minio 必须 force_path_style(true)。设了 S3_ENDPOINT 才接,否则走内存 backend。
 aws-config = "1"
 aws-sdk-s3 = "1"
 
-# 密码哈希:argon2id。PHC 串自描述(算法 id/盐/参数都在串里),verify 天然支持多算法迁移。
-# std feature 拉入 rand + getrandom,SaltString::generate(OsRng) 才可用。
-argon2 = { version = "0.5", features = ["std"] }
-
-# JWT access token(Ed25519 非对称):app 自己的 claim 形状 + 签验(features/auth/token.rs 的
+# JWT access token(Ed25519 非对称):app 自己的 claim 形状 + 签验(features/auth/adapters/token.rs 的
 # AppTokenSigner 私钥签发 / AppTokenVerifier 公钥验签,实现 idm 的 TokenSigner/TokenVerifier 端口)。
 # 签发只在 idm 进程,app 只持公钥。claim 由 app 显式拥有,要换 KMS/轮换 kid 改这两个类型。
 jsonwebtoken = "9"
-# refresh token:sha2 算 SHA-256 hash 落库,rand 出 32B CSPRNG 明文。
-sha2 = "0.10"
-rand = "0.8"
 
 # seed 数据源:toml(避开已废弃的 serde_yaml;dtolnay 维护、与 serde 同源)
 toml = "0.8"
@@ -124,7 +127,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 async-nats = "0.49"
 
 # feature 开关:pg-conformance 开了才编译"打真库的仓储一致性测试"(需 DATABASE_URL + 跑着的 pg)。
-# 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用本地 `just test-pg` 显式触发(将来接 CI 时单列一个 job 跑它)。
+# 默认 cargo test 不开它 → 零 DB、永远可跑;PG 一致性用 `just test-pg` 显式触发(CI 的 pg-conformance job 也跑它)。
 [features]
 pg-conformance = []
 # 同上口径:开了才编译"打真 NATS 的事件总线一致性测试"(先 `just up` 起 nats;用 `just test-nats`)。

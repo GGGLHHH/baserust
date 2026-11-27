@@ -38,7 +38,7 @@ pub struct UpdateWidget {
 }
 
 /// 列表排序字段(**白名单** —— 只开放可排的字段)。默认 `CreatedAt`(配 `SortOrder::Desc` = 最新在前)。
-/// 排序方向共享(`kernel::sort::SortOrder`),可排字段各 feature 自己圈定;到列名的映射归仓储适配器。
+/// 排序方向共享(`kernel::sort_order::SortOrder`),可排字段各 feature 自己圈定;到列名的映射归仓储适配器。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WidgetSortField {
     #[default]
@@ -55,6 +55,7 @@ impl WidgetSortField {
     ///
     /// **放开一个键 = 改这里 + 加索引 + 加一条 conformance 用例。**
     /// 不满足就留 `false`:该键只走 offset,handler 返回 422 而非静默按别的键排。
+    #[must_use]
     pub fn keyset_capable(&self) -> bool {
         match self {
             // v7 id 代理创建序,复用主键索引,无需额外索引也无需读锚点行。
@@ -82,19 +83,20 @@ pub struct WidgetView {
 
 impl WidgetView {
     /// 用一页富化结果(id→brief)把一个 `Widget` 拼成 `WidgetView`。
-    pub fn enrich(w: Widget, dir: &HashMap<Uuid, UserBrief>) -> Self {
-        let created_by_user = w
+    #[must_use]
+    pub fn new_with_directory(widget: Widget, directory: &HashMap<Uuid, UserBrief>) -> Self {
+        let created_by_user = widget
             .created_by
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok()) // 'system'/NULL/脏值 parse 失败即不富化
-            .and_then(|id| dir.get(&id).cloned());
+            .and_then(|id| directory.get(&id).cloned());
         Self {
-            id: w.id,
-            name: w.name,
-            created_by: w.created_by,
-            created_at: w.created_at,
-            updated_by: w.updated_by,
-            updated_at: w.updated_at,
+            id: widget.id,
+            name: widget.name,
+            created_by: widget.created_by,
+            created_at: widget.created_at,
+            updated_by: widget.updated_by,
+            updated_at: widget.updated_at,
             created_by_user,
         }
     }

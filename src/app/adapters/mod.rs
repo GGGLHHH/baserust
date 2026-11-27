@@ -5,16 +5,16 @@
 mod app_outbox_source;
 mod content_avatar_probe;
 mod idm_outbox_source;
-mod idm_user_directory;
 mod in_process_profile_directory;
-mod member_search_index;
+mod in_process_user_directory;
+mod member_search_adapter;
 mod profile_display_names;
-mod user_search_index;
+mod search_index_adapter;
 
 pub use content_avatar_probe::ContentAvatarProbe;
 pub use idm_outbox_source::IdmOutboxSource;
-pub use idm_user_directory::InProcessUserDirectory;
 pub use in_process_profile_directory::InProcessProfileDirectory;
-pub use member_search_index::MemberSearchAdapter;
+pub use in_process_user_directory::InProcessUserDirectory;
+pub use member_search_adapter::MemberSearchAdapter;
 pub use profile_display_names::ProfileDisplayNames;
-pub use user_search_index::SearchIndexAdapter;
+pub use search_index_adapter::SearchIndexAdapter;

@@ -6,8 +6,10 @@
 //! 或 `just openapi-snapshot-accept`(= `INSTA_UPDATE=always cargo test --test openapi_snapshot`)直接接受;
 //! 然后把 .snap 的 diff 跟代码一起提交,评审时一眼看到接口变了什么。
 
+use baserust::app::router;
+
 #[test]
 fn openapi_spec_snapshot() {
-    let spec = serde_json::to_value(baserust::app::router::api_spec()).expect("规范可序列化");
+    let spec = serde_json::to_value(router::api_spec()).expect("规范可序列化");
     insta::assert_json_snapshot!("openapi", spec);
 }

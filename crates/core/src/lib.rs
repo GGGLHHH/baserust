@@ -7,5 +7,8 @@
 //!
 //! 适配器(HTTP / Postgres / NATS / S3 / JWT)与组合根在主 crate `baserust`。
 
+// Google Rust 风格指南:必须 panic 时用 expect("原因") 说明不变量,不用 unwrap。
+#![warn(clippy::unwrap_used)]
+
 pub mod features;
 pub mod kernel;

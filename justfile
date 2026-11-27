@@ -18,7 +18,7 @@ dev:
 up *flags:
     docker compose up -d {{flags}} pg migrate minio minio-init nats dbhub
 
-# 编译/clippy 实时反馈面板(改代码即时看红线,不跑服务;面板内按 c/l/t 切 check/clippy/test)
+# 编译/clippy 实时反馈面板(改代码即时看红线,不跑服务;bacon 默认键位:面板内按 c 切 clippy、t 切 test、d 开文档)
 watch:
     bacon clippy
 
@@ -46,7 +46,7 @@ pg-test-grant:
 #   仓储走运行时账号 APP_DB_USER / APP_DB_PASSWORD(非 owner,RLS 真的生效);
 #   SEARCH_OWNER_DATABASE_URL 跑 search 迁移;search 契约写走 SEARCH_SYSTEM_DATABASE_URL(system,同投影器)、
 #   读走 SEARCH_DATABASE_URL(运行时,RLS 生效);auth_event(平台级)走 system;
-#   rls_audit 以 *_OWNER_DATABASE_URL 迁移三个 schema,再用 APP_DATABASE_URL(运行时)查系统目录、试 tenant_tx。
+#   rls_audit 以 *_OWNER_DATABASE_URL 迁移三个 schema,再用 APP_DATABASE_URL(运行时)查系统目录、试 tenant_transaction。
 # 授权前置 pg-test-grant 自动跑(幂等:ALTER ROLE CREATEDB / GRANT 重复执行均 no-op)。
 test-pg: pg-test-grant
     DATABASE_URL="{{app_owner_db_url}}" APP_DATABASE_URL="{{app_db_url}}" APP_OWNER_DATABASE_URL="{{app_owner_db_url}}" CONTENT_OWNER_DATABASE_URL="{{content_owner_db_url}}" SEARCH_DATABASE_URL="{{search_db_url}}" SEARCH_SYSTEM_DATABASE_URL="{{search_system_db_url}}" SEARCH_OWNER_DATABASE_URL="{{search_owner_db_url}}" OPS_DATABASE_URL="{{ops_db_url}}" cargo test --features pg-conformance --test widget_repo_conformance --test policy_repo_test --test event_bus_conformance --test profile_repo_conformance --test search_repo_conformance --test auth_event_repo_conformance --test ops_store_conformance --test rls_audit --test avatar_repair_pg -- --nocapture
@@ -180,11 +180,16 @@ gen-keys out="./keys/prod-ed25519":
 # lint:格式检查 + clippy(警告即失败)
 lint:
     cargo fmt --all -- --check
+    cargo +nightly fmt --all -- --check --config {{google_fmt}}
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # 自动格式化
 fmt:
     cargo fmt --all
+    cargo +nightly fmt --all -- --config {{google_fmt}}
+
+# Google Rust 风格指南要求、但只有 nightly rustfmt 支持的三项(稳定版只有 rustfmt.toml 里的 max_width)
+google_fmt := "imports_granularity=Module,hex_literal_case=Lower,format_macro_matchers=true"
 
 # 自动修复(类似 eslint --fix):clippy 机器可应用的建议自动改 + 格式化。一键修掉能自动修的。
 # --allow-dirty/--allow-staged:clippy --fix 默认要求 git 干净,开发时工作区常有改动,放开。

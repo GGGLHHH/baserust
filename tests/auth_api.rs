@@ -4,6 +4,15 @@
 //! idm 削成纯库后,HTTP 边界(端点/校验/cookie)归 app,这套契约从 idm crate 搬来,改打 app 的真实
 //! 路由(`build_router`,内存 repo、无 DB)—— 等于"app 拥有 auth HTTP"的黑盒回归。
 
+use axum::body;
+use baserust::app::{AppAuthService, AppContentService};
+use baserust::features::profile::{InMemoryProfileRepo, ProfileService, StaticAvatarProbe};
+use baserust::features::tenants::{StaticMemberProfiles, TenantAdminService};
+use baserust::features::users::{StaticProfileDirectory, UserAdminService};
+use baserust::features::widget::{EventBus, MemoryEventBus};
+use baserust::infra::config::Config;
+use baserust::kernel::authorization::Policy;
+use idm::{InMemoryMemberRepo, InMemoryTenantRepo};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -15,54 +24,53 @@ use tower::ServiceExt; // oneshot
 use baserust::app::{build_router, AppState, Mount};
 use baserust::features::auth::{AppTokenSigner, AppTokenVerifier};
 use baserust::features::widget::{InMemoryWidgetRepo, StaticUserDirectory, WidgetService};
-use idm::{AuthService, FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
+use idm::{FakeHasher, InMemoryRoleRepo, InMemorySessionRepo, InMemoryUserRepo};
 
 /// 内存仓储的测试 app(无 DB);AppState 字段 pub,直接装配,过完整中间件栈打真实 auth 端点。
 fn test_app() -> Router {
-    let signer = Arc::new(AppTokenSigner::dev());
-    let verifier = Arc::new(AppTokenVerifier::dev());
-    let bus: Arc<dyn baserust::features::widget::EventBus> =
-        Arc::new(baserust::features::widget::MemoryEventBus::new());
+    let signer = Arc::new(AppTokenSigner::new_with_development_key());
+    let verifier = Arc::new(AppTokenVerifier::new_with_development_key());
+    let bus: Arc<dyn EventBus> = Arc::new(MemoryEventBus::new());
     let state = AppState {
         widgets: WidgetService::new(
             Arc::new(InMemoryWidgetRepo::new()),
-            Arc::new(StaticUserDirectory::empty()),
+            Arc::new(StaticUserDirectory::new()),
             bus.clone(),
         ),
         widget_events: bus,
-        profiles: baserust::features::profile::ProfileService::new(
-            std::sync::Arc::new(baserust::features::profile::InMemoryProfileRepo::new()),
-            std::sync::Arc::new(baserust::features::profile::StaticAvatarProbe::empty()),
+        profiles: ProfileService::new(
+            Arc::new(InMemoryProfileRepo::new()),
+            Arc::new(StaticAvatarProbe::new()),
         ),
-        contents: content::ContentService::new(
+        contents: AppContentService::new(
             Arc::new(content::InMemoryContentRepo::new()),
             Arc::new(content::InMemoryObjectRepo::new()),
             Arc::new(content::InMemoryObjectStore::new()),
             "memory",
         ),
         auth: test_auth(signer.clone(), verifier.clone()),
-        user_admin: baserust::features::users::UserAdminService::new(
+        user_admin: UserAdminService::new(
             Arc::new(InMemoryUserRepo::new()),
             Arc::new(InMemoryRoleRepo::new()),
             Arc::new(InMemorySessionRepo::new()),
             Arc::new(FakeHasher),
-            Arc::new(baserust::features::users::StaticProfileDirectory::empty()),
+            Arc::new(StaticProfileDirectory::new()),
             None,
         ),
-        tenant_admin: baserust::features::tenants::TenantAdminService::new(
-            std::sync::Arc::new(idm::InMemoryTenantRepo::new()),
-            std::sync::Arc::new(idm::InMemoryMemberRepo::new()),
-            std::sync::Arc::new(idm::InMemoryUserRepo::new()),
-            std::sync::Arc::new(idm::InMemoryRoleRepo::new()),
-            std::sync::Arc::new(idm::InMemorySessionRepo::new()),
-            std::sync::Arc::new(baserust::features::tenants::StaticMemberProfiles::empty()),
+        tenant_admin: TenantAdminService::new(
+            Arc::new(InMemoryTenantRepo::new()),
+            Arc::new(InMemoryMemberRepo::new()),
+            Arc::new(InMemoryUserRepo::new()),
+            Arc::new(InMemoryRoleRepo::new()),
+            Arc::new(InMemorySessionRepo::new()),
+            Arc::new(StaticMemberProfiles::new()),
             None,
         ),
         probes: Default::default(),
         monitoring: Default::default(),
         cookie_secure: false,
-        policy: Arc::new(baserust::kernel::authz::Policy::default()), // 这套契约不测授权
-        token_signer: Some(signer.clone()),
+        policy: Arc::new(Policy::default()), // 这套契约不测授权
+        token_signer: Some(signer),
         token_verifier: verifier,
         idm_outbox: None,
         auth_audit: None,
@@ -71,33 +79,30 @@ fn test_app() -> Router {
         content_system_pool: None,
         search_system_pool: None,
     };
-    build_router(
-        state,
-        &baserust::infra::config::Config::default(),
-        Mount::Both,
-    )
+    build_router(state, &Config::default(), Mount::Both)
 }
 
 /// 测试用 AuthService:FakeHasher(躲 argon2 ~100ms)+ 内存 repo + **生产同款非对称签验**(app 显式 claim)。
-fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> AuthService {
-    AuthService::builder(
+fn test_auth(signer: Arc<AppTokenSigner>, verifier: Arc<AppTokenVerifier>) -> Arc<AppAuthService> {
+    let auth = AppAuthService::builder(
         Arc::new(InMemoryUserRepo::new()),
         Arc::new(InMemorySessionRepo::new()),
         Arc::new(InMemoryRoleRepo::new()),
-        Arc::new(idm::InMemoryMemberRepo::new()),
+        Arc::new(InMemoryMemberRepo::new()),
     )
-    .hasher(Arc::new(FakeHasher))
+    .hasher(FakeHasher)
     // 独立的空角色仓储:注册不授租户角色(配置了目录里没有的角色会响亮失败)
-    .signup_roles(Vec::new())
+    .signup_roles(Vec::<String>::new())
     .signer(signer)
     .verifier(verifier)
-    .access_ttl_secs(900)
-    .refresh_ttl_secs(604_800)
-    .build()
+    .access_ttl(time::Duration::seconds(900))
+    .refresh_ttl(time::Duration::seconds(604_800))
+    .build();
+    Arc::new(auth)
 }
 
-async fn body_string(resp: Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+async fn body_string(response: Response) -> String {
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -111,8 +116,9 @@ fn post_json(uri: &str, json: &str) -> Request<Body> {
 }
 
 /// 所有 Set-Cookie 拼成一行,便于断言。
-fn set_cookie_line(resp: &Response) -> String {
-    resp.headers()
+fn set_cookie_line(response: &Response) -> String {
+    response
+        .headers()
         .get_all("set-cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -121,14 +127,16 @@ fn set_cookie_line(resp: &Response) -> String {
 }
 
 /// 提取 Set-Cookie 里某个 cookie 的值。
-fn cookie_value(resp: &Response, name: &str) -> Option<String> {
+fn cookie_value(response: &Response, name: &str) -> Option<String> {
     let prefix = format!("{name}=");
-    resp.headers()
+    response
+        .headers()
         .get_all("set-cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find_map(|c| {
-            c.strip_prefix(&prefix)
+        .find_map(|cookie| {
+            cookie
+                .strip_prefix(&prefix)
                 .map(|rest| rest.split(';').next().unwrap_or("").to_owned())
         })
 }
@@ -159,16 +167,16 @@ fn post_with_cookie(uri: &str, cookie: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn register_sets_httponly_cookie_and_returns_user() {
-    let resp = test_app()
+    let response = test_app()
         .oneshot(post_json(
             "/api/v1/public/auth/register",
             r#"{"username":"alice","email":"a@b.com","password":"password123"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     // token 进 httponly cookie,不进 body
-    let cookies = set_cookie_line(&resp);
+    let cookies = set_cookie_line(&response);
     assert!(
         cookies.contains("access_token="),
         "应 Set-Cookie access_token: {cookies}"
@@ -181,7 +189,7 @@ async fn register_sets_httponly_cookie_and_returns_user() {
         cookies.to_lowercase().contains("httponly"),
         "cookie 必须 HttpOnly: {cookies}"
     );
-    let body = body_string(resp).await;
+    let body = body_string(response).await;
     assert!(
         body.contains("\"username\":\"alice\""),
         "body 应是 UserResponse: {body}"
@@ -198,34 +206,36 @@ async fn register_duplicate_username_is_409() {
         .oneshot(post_json("/api/v1/public/auth/register", body))
         .await
         .unwrap();
-    let resp = app
+    let response = app
         .oneshot(post_json("/api/v1/public/auth/register", body))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert!(body_string(resp).await.contains("\"code\":\"conflict\""));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(body_string(response)
+        .await
+        .contains("\"code\":\"conflict\""));
 }
 
 #[tokio::test]
 async fn register_weak_password_is_422() {
     // 低于 password 最小长度(min=3)→ 422;此处发 2 字符。
-    let resp = test_app()
+    let response = test_app()
         .oneshot(post_json(
             "/api/v1/public/auth/register",
             r#"{"username":"bob","email":"b@b.com","password":"ab"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
 async fn register_malformed_json_is_400() {
-    let resp = test_app()
+    let response = test_app()
         .oneshot(post_json("/api/v1/public/auth/register", r#"{not json"#))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── 登录 + 鉴权 ──
@@ -240,7 +250,7 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
         ))
         .await
         .unwrap();
-    let resp = app
+    let response = app
         .clone()
         .oneshot(post_json(
             "/api/v1/public/auth/login",
@@ -248,8 +258,8 @@ async fn login_sets_cookie_then_me_works_via_cookie_and_bearer() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let token = cookie_value(&resp, "access_token").expect("login 应 Set-Cookie access_token");
+    assert_eq!(response.status(), StatusCode::OK);
+    let token = cookie_value(&response, "access_token").expect("login 应 Set-Cookie access_token");
 
     // cookie 鉴权
     let via_cookie = app
@@ -288,7 +298,7 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
         .await
         .unwrap();
 
-    let wrong_pw = app
+    let wrong_password = app
         .clone()
         .oneshot(post_json(
             "/api/v1/public/auth/login",
@@ -304,10 +314,10 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
         .await
         .unwrap();
 
-    assert_eq!(wrong_pw.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong_password.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        body_string(wrong_pw).await,
+        body_string(wrong_password).await,
         body_string(unknown).await,
         "密码错与用户不存在的响应必须逐字节相同(防枚举)"
     );
@@ -317,30 +327,30 @@ async fn login_wrong_password_and_unknown_identifier_are_indistinguishable() {
 
 #[tokio::test]
 async fn me_without_credentials_is_401() {
-    let resp = test_app()
+    let response = test_app()
         .oneshot(get_plain("/api/v1/frontend/auth/me"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn me_with_garbage_cookie_is_401() {
-    let resp = test_app()
+    let response = test_app()
         .oneshot(get_with_cookie(
             "/api/v1/frontend/auth/me",
             "access_token=garbage.token.xxx",
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── 登出 ──
 
 #[tokio::test]
 async fn logout_clears_cookies_and_204() {
-    let resp = test_app()
+    let response = test_app()
         .oneshot(
             Request::post("/api/v1/public/auth/logout")
                 .body(Body::empty())
@@ -348,9 +358,9 @@ async fn logout_clears_cookies_and_204() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
     // 清除 = 回收同名 cookie(Max-Age=0 / 空值)
-    let cookies = set_cookie_line(&resp);
+    let cookies = set_cookie_line(&response);
     assert!(
         cookies.contains("access_token="),
         "logout 应回收 access cookie: {cookies}"
@@ -383,7 +393,7 @@ async fn refresh_rotates_and_old_token_is_revoked() {
     let old = cookie_value(&login, "refresh_token").expect("login 应发 refresh cookie");
 
     // 带 refresh cookie 刷新 → 200 + 轮换出新 refresh
-    let resp = app
+    let response = app
         .clone()
         .oneshot(post_with_cookie(
             "/api/v1/public/auth/refresh",
@@ -391,8 +401,8 @@ async fn refresh_rotates_and_old_token_is_revoked() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let new = cookie_value(&resp, "refresh_token").expect("refresh 应发新 refresh cookie");
+    assert_eq!(response.status(), StatusCode::OK);
+    let new = cookie_value(&response, "refresh_token").expect("refresh 应发新 refresh cookie");
     assert_ne!(old, new, "refresh 应轮换:新旧 token 不同");
 
     // 旧 refresh 已撤销 → 再用 → 401(防重放)
@@ -413,18 +423,18 @@ async fn refresh_rotates_and_old_token_is_revoked() {
 // ── me 修改 ──
 
 /// 带 cookie 的任意方法请求(PATCH/DELETE/POST + 可选 json body)。
-fn req_with_cookie(method: &str, uri: &str, cookie: &str, json: Option<&str>) -> Request<Body> {
-    let mut b = Request::builder()
+fn request_with_cookie(method: &str, uri: &str, cookie: &str, json: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
         .method(method)
         .uri(uri)
         .header("cookie", cookie);
-    let body = if let Some(j) = json {
-        b = b.header("content-type", "application/json");
-        Body::from(j.to_owned())
+    let body = if let Some(json_body) = json {
+        builder = builder.header("content-type", "application/json");
+        Body::from(json_body.to_owned())
     } else {
         Body::empty()
     };
-    b.body(body).unwrap()
+    builder.body(body).unwrap()
 }
 
 /// 注册一个用户,返回 register 响应(含 Set-Cookie)。
@@ -441,14 +451,14 @@ async fn register_user(app: &Router, username: &str, password: &str) -> Response
 #[tokio::test]
 async fn update_me_changes_username() {
     let app = test_app();
-    let reg = register_user(&app, "upduser", "password123").await;
+    let registered = register_user(&app, "upduser", "password123").await;
     let cookie = format!(
         "access_token={}",
-        cookie_value(&reg, "access_token").unwrap()
+        cookie_value(&registered, "access_token").unwrap()
     );
 
-    let resp = app
-        .oneshot(req_with_cookie(
+    let response = app
+        .oneshot(request_with_cookie(
             "PUT",
             "/api/v1/frontend/auth/me",
             &cookie,
@@ -456,8 +466,8 @@ async fn update_me_changes_username() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(body_string(resp)
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_string(response)
         .await
         .contains("\"username\":\"upduser2\""));
 }
@@ -465,15 +475,15 @@ async fn update_me_changes_username() {
 #[tokio::test]
 async fn delete_me_soft_deletes_and_blocks_login() {
     let app = test_app();
-    let reg = register_user(&app, "deluser", "password123").await;
+    let registered = register_user(&app, "deluser", "password123").await;
     let cookie = format!(
         "access_token={}",
-        cookie_value(&reg, "access_token").unwrap()
+        cookie_value(&registered, "access_token").unwrap()
     );
 
-    let resp = app
+    let response = app
         .clone()
-        .oneshot(req_with_cookie(
+        .oneshot(request_with_cookie(
             "DELETE",
             "/api/v1/frontend/auth/me",
             &cookie,
@@ -481,7 +491,7 @@ async fn delete_me_soft_deletes_and_blocks_login() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
     // 软删后再登录 → 401
     let relogin = app
         .oneshot(post_json(
@@ -496,15 +506,15 @@ async fn delete_me_soft_deletes_and_blocks_login() {
 #[tokio::test]
 async fn change_password_old_fails_new_works() {
     let app = test_app();
-    let reg = register_user(&app, "pwuser", "password123").await;
+    let registered = register_user(&app, "pwuser", "password123").await;
     let cookie = format!(
         "access_token={}",
-        cookie_value(&reg, "access_token").unwrap()
+        cookie_value(&registered, "access_token").unwrap()
     );
 
-    let resp = app
+    let response = app
         .clone()
-        .oneshot(req_with_cookie(
+        .oneshot(request_with_cookie(
             "POST",
             "/api/v1/frontend/auth/me/password",
             &cookie,
@@ -512,7 +522,7 @@ async fn change_password_old_fails_new_works() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
     // 旧密码 → 401,新密码 → 200
     let old = app
         .clone()
@@ -535,24 +545,28 @@ async fn change_password_old_fails_new_works() {
 
 // ── 进程内 seed ──
 
-/// 走真实 `AppState::new`(非 test_app 直构)→ dev 内存模式启动时进程内 seed:
+/// 走真实 `AppState::try_new`(非 test_app 直构)→ dev 内存模式启动时进程内 seed:
 /// seed.toml 的 superadmin/pwd 可登录、且带 superadmin 角色。覆盖 test_app 绕过的 seed 路径。
 /// 用真 Argon2(seed 与登录验密同一把),稍慢但端到端证明 seed 生效。
 #[tokio::test]
 async fn in_process_seed_lets_superadmin_log_in() {
-    let config = baserust::infra::config::Config::default(); // dev → seed_on_start = true
-    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
+    let config = Config::default(); // dev → seed_on_start = true
+    let state = AppState::try_new(&config, Mount::Both).await.unwrap().state;
     let app = build_router(state, &config, Mount::Both);
 
-    let resp = app
+    let response = app
         .oneshot(post_json(
             "/api/v1/public/auth/login",
             r#"{"identifier":"superadmin","password":"pwd"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "seed 的 superadmin 应能登录");
-    let body = body_string(resp).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "seed 的 superadmin 应能登录"
+    );
+    let body = body_string(response).await;
     assert!(body.contains("\"username\":\"superadmin\""), "body: {body}");
     assert!(
         body.contains("\"roles\":[\"superadmin\"]"),

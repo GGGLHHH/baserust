@@ -45,9 +45,18 @@ pub enum PageInfo {
     },
 }
 
+/// offset 模式下这一页的位置:第几页(从 1 起)、每页几条。两个 `u64` 按名字区分,不靠参数位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffsetPosition {
+    pub page: u64,
+    pub size: u64,
+}
+
 impl<T> Page<T> {
     /// offset 结果组装。total 为 `None` 表示未计算(with_total=false)。
-    pub fn offset(items: Vec<T>, page: u64, size: u64, total: Option<u64>) -> Self {
+    #[must_use]
+    pub fn new_with_offset(items: Vec<T>, position: OffsetPosition, total: Option<u64>) -> Self {
+        let OffsetPosition { page, size } = position;
         let total_pages = total.map(|t| t.div_ceil(size.max(1)));
         Page {
             items,
@@ -61,7 +70,8 @@ impl<T> Page<T> {
     }
 
     /// cursor 结果组装:多取的一行(limit+1)由调用方先 trim、传入下一页锚点。
-    pub fn cursor(items: Vec<T>, limit: u64, next_after: Option<Uuid>) -> Self {
+    #[must_use]
+    pub fn new_with_cursor(items: Vec<T>, limit: u64, next_after: Option<Uuid>) -> Self {
         Page {
             items,
             page_info: PageInfo::Cursor {
@@ -73,9 +83,9 @@ impl<T> Page<T> {
     }
 
     /// 把每个 item 映射成另一类型,`page_info` 原样保留(跨模块**边缘富化** / 转 DTO 用)。
-    pub fn map_items<U>(self, f: impl FnMut(T) -> U) -> Page<U> {
+    pub fn map_items<U>(self, transform: impl FnMut(T) -> U) -> Page<U> {
         Page {
-            items: self.items.into_iter().map(f).collect(),
+            items: self.items.into_iter().map(transform).collect(),
             page_info: self.page_info,
         }
     }

@@ -92,11 +92,11 @@ services:
       JWT_PUBLIC_KEY_FILE: /keys/prod-ed25519.pub.pem
       IDM_DB_HOST: pg
       IDM_DB_PORT: "5432"
-      # 分进程拓扑下 **idm relay 归本进程**(state.rs 的 build_outbox_relays:设了 NATS_URL 且
+      # 分进程拓扑下 **idm relay 归本进程**(app_state.rs 的 build_outbox_relays:设了 NATS_URL 且
       # 持有该 schema 的 pool 才起)。少了 NATS_URL → 0 个 relay,idm.outbox 只进不出。
       NATS_URL: nats://nats:4222
-      # search pool:auth_audit 读句柄 + auth_event 投影器都要它(state.rs 的 auth_audit /
-      # auth_events_bus 都是 needs_idm && NATS_URL && search pool 三者齐才 Some)。
+      # search pool:auth_audit 读句柄 + auth_event 投影器都要它(app_state.rs 的 auth_audit 有 search pool
+      # 就 Some;auth_events_bus 要 needs_idm && NATS_URL && search pool 三者齐才 Some)。
       # 少了它 → /admin/auth/auth-events 返回 404「审计后端未接线」,前端 auth-log 页空转。
       # 库/角色/密码走 env_file 的 SEARCH_DB_{USER,PASSWORD,DATABASE};system 账号池(投影器等后台路径,
       # BYPASSRLS)同 host,账号密码走 SEARCH_DB_SYSTEM_{USER,PASSWORD}。
@@ -181,7 +181,7 @@ services:
     logging: *logging
     image: nats:alpine
     restart: unless-stopped
-    # -js:app 的 JetStream 发布端(infra/jetstream.rs)启动即 ensure 流 USER_SEARCH_EVENTS,
+    # -js:app 的 JetStream 发布端(infra/jet_stream_publisher.rs)启动即 ensure 流 USER_SEARCH_EVENTS,
     # 不开 -js 则 app 起不来(jetstream unavailable)。dev compose 一直带着,prod 这边曾漏。
     # -sd:JetStream 落盘目录。PG outbox 才是真相源,但 relay 发布拿到 ack 就 mark_published ——
     # store 跟着容器没了 = 那批已发布、下游还没消费的事件永久丢(保留窗口 7 天)。故同 pg/minio 落 ./data。

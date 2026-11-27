@@ -7,19 +7,21 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::Stream;
+use futures_util::{stream, Stream};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use super::dto::{AuthEventFilter, AuthEventRow, AuthStats, StatsQuery};
-use crate::app::state::AppState;
-use crate::infra::authz::TokenScope;
+use crate::app::app_state::AppState;
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::CurrentUser;
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::kernel::authz::Perm;
-use crate::kernel::error::AppError;
+use crate::infra::telemetry::SseConnectionGuard;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::Permission;
+use crate::kernel::time_range::RequestedTimeRange;
 
 /// 某用户的认证事件历史(后台用户详情页 / 排障用)。
 #[utoipa::path(
@@ -45,12 +47,12 @@ pub async fn list_user_auth_events(
 ) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
-    let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
-    let page = svc
+        .require_scoped(&user.0, &scope.0, Permission::AuditRead)?;
+    let service = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
+    let page = service
         .list_for_user(id, filter.into(), page.resolve()?)
         .await?;
-    Ok(Json(Page::from_core(page, AuthEventRow::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 全局认证审计流(后台安全排障用)。
@@ -76,10 +78,10 @@ pub async fn list_auth_events(
 ) -> Result<Json<Page<AuthEventRow>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
-    let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
-    let page = svc.list(filter.into(), page.resolve()?).await?;
-    Ok(Json(Page::from_core(page, AuthEventRow::from)))
+        .require_scoped(&user.0, &scope.0, Permission::AuditRead)?;
+    let service = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
+    let page = service.list(filter.into(), page.resolve()?).await?;
+    Ok(Json(Page::from(page)))
 }
 
 /// 认证审计仪表盘(时间序列 + 各维度 group-by 计数 + KPI)。默认区间最近 24h。
@@ -99,13 +101,17 @@ pub async fn stats_auth_events(
     State(state): State<AppState>,
     user: CurrentUser,
     scope: TokenScope,
-    Query(q): Query<StatsQuery>,
+    Query(range): Query<StatsQuery>,
 ) -> Result<Json<AuthStats>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
-    let svc = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
-    Ok(Json(svc.stats(q.from, q.to).await?.into()))
+        .require_scoped(&user.0, &scope.0, Permission::AuditRead)?;
+    let service = state.auth_audit.as_ref().ok_or(AppError::NotFound)?;
+    let requested = RequestedTimeRange {
+        from: range.from,
+        to: range.to,
+    };
+    Ok(Json(service.stats(requested).await?.into()))
 }
 
 /// 认证事件实时推送(SSE)。projector 落库成功后立即推送;镜像 `widget` 的 `widget_events` handler
@@ -129,19 +135,19 @@ pub async fn stream_auth_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::AuditRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::AuditRead)?;
     let bus = state.auth_events_bus.as_ref().ok_or(AppError::NotFound)?;
-    let rx = bus.subscribe();
-    let guard = crate::infra::telemetry::SseConnectionGuard::new("auth_events");
-    let stream = futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+    let receiver = bus.subscribe();
+    let guard = SseConnectionGuard::new("auth_events");
+    let events = stream::unfold((receiver, guard), |(mut receiver, guard)| async move {
         loop {
-            match rx.recv().await {
+            match receiver.recv().await {
                 Ok(row) => {
                     let frame = Event::default()
                         .event("auth_event")
                         .json_data(AuthEventRow::from(row))
                         .ok()?;
-                    return Some((Ok::<_, Infallible>(frame), (rx, guard)));
+                    return Some((Ok::<_, Infallible>(frame), (receiver, guard)));
                 }
                 // 慢消费者掉队:跳过丢失的继续收,不断流(同 widget 事件总线契约)。
                 Err(RecvError::Lagged(_)) => continue,
@@ -150,5 +156,5 @@ pub async fn stream_auth_events(
             }
         }
     });
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

@@ -7,16 +7,19 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::app::app_state::AppContentService;
 use crate::features::profile::{AvatarInfo, AvatarProbe};
-use crate::kernel::error::AppError;
-use content::{ContentError, ContentScope, ContentService, ContentStatus};
+use crate::kernel::app_error::AppError;
+use content::{ContentError, ContentScope, ContentStatus};
 
+/// 按个人内容作用域查 content,回答「这个 content 能不能当头像」。
 pub struct ContentAvatarProbe {
-    contents: ContentService,
+    contents: AppContentService,
 }
 
 impl ContentAvatarProbe {
-    pub fn new(contents: ContentService) -> Self {
+    #[must_use]
+    pub fn new(contents: AppContentService) -> Self {
         Self { contents }
     }
 }
@@ -25,26 +28,26 @@ impl ContentAvatarProbe {
 impl AvatarProbe for ContentAvatarProbe {
     async fn probe(&self, content_id: Uuid) -> Result<Option<AvatarInfo>, AppError> {
         let scope = ContentScope::Personal;
-        let c = match self.contents.get_content(scope, content_id).await {
-            Ok(c) => c,
+        let stored_content = match self.contents.get_content(scope, content_id).await {
+            Ok(stored_content) => stored_content,
             Err(ContentError::NotFound) => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(other) => return Err(other.into()),
         };
         // ready 集合与库的 confirm 幂等集合一致(Uploaded|Processed|Archived = 已销账可读)。
         let ready = matches!(
-            c.status,
+            stored_content.status,
             ContentStatus::Uploaded | ContentStatus::Processed | ContentStatus::Archived
         );
         // mime 取 content_metadata(用户声明,prepare 时即写);行在而 metadata 缺 → None(非错误)。
         let mime_type = match self.contents.get_content_metadata(scope, content_id).await {
-            Ok(m) => m.mime_type,
+            Ok(metadata) => metadata.mime_type,
             Err(ContentError::NotFound) => None,
-            Err(e) => return Err(e.into()),
+            Err(other) => return Err(other.into()),
         };
         Ok(Some(AvatarInfo {
             mime_type,
             ready,
-            owner_id: c.owner_id,
+            owner_id: stored_content.owner_id,
         }))
     }
 }

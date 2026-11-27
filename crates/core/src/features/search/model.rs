@@ -13,7 +13,7 @@
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::kernel::tenant::TenantId;
+use crate::kernel::tenant_id::TenantId;
 
 /// `account_index` 一行(账号目录,全局)。**idm 源列**(username/email/email_verified/roles/created_at/deleted +
 /// `idm_seq`)与 **profile 源列**(display_name + `profile_seq`)不相交。`roles` = **平台角色**(`user.roles_set`)。
@@ -27,8 +27,29 @@ pub struct AccountIndexRow {
     pub roles: Vec<String>,
     pub created_at: Option<OffsetDateTime>,
     pub deleted: bool,
-    pub idm_seq: Option<i64>,
-    pub profile_seq: Option<i64>,
+    pub idm_sequence: Option<i64>,
+    pub profile_sequence: Option<i64>,
+}
+
+/// idm `user.created` 带来的账号字段([`SearchIndexRepo::apply_user_created`](super::search_index_repo::SearchIndexRepo::apply_user_created) 的入参)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AccountCreated<'fields> {
+    pub user_id: Uuid,
+    pub username: &'fields str,
+    pub email: Option<&'fields str>,
+    pub email_verified: bool,
+    /// 平台角色。
+    pub roles: &'fields [String],
+    pub created_at: OffsetDateTime,
+}
+
+/// idm `user.updated` 带来的账号字段([`SearchIndexRepo::apply_user_updated`](super::search_index_repo::SearchIndexRepo::apply_user_updated) 的入参)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountUpdated<'fields> {
+    pub user_id: Uuid,
+    pub username: &'fields str,
+    pub email: Option<&'fields str>,
+    pub email_verified: bool,
 }
 
 /// `admin_user_index` 一行(租户成员索引)。账号列(username … deleted + `idm_seq` / display_name +
@@ -44,19 +65,20 @@ pub struct AdminUserIndexRow {
     pub display_name: Option<String>,
     pub created_at: Option<OffsetDateTime>,
     pub deleted: bool,
-    pub idm_seq: Option<i64>,
-    pub profile_seq: Option<i64>,
+    pub idm_sequence: Option<i64>,
+    pub profile_sequence: Option<i64>,
     /// 该租户内的租户角色名。
     pub roles: Vec<String>,
     /// 成员状态(idm `MemberStatus` 的线上串:`active` / `inactive`);只来过账号列、还没来成员事件时为 `None`。
     pub status: Option<String>,
     pub removed: bool,
-    pub member_seq: Option<i64>,
+    pub member_sequence: Option<i64>,
 }
 
 impl AdminUserIndexRow {
     /// 某租户里某账号的空行(成员行的起点:账号列从账号目录抄,没有就留空)。
-    pub fn empty(tenant_id: TenantId, user_id: Uuid) -> Self {
+    #[must_use]
+    pub fn new(tenant_id: TenantId, user_id: Uuid) -> Self {
         Self {
             tenant_id,
             user_id,
@@ -66,12 +88,12 @@ impl AdminUserIndexRow {
             display_name: None,
             created_at: None,
             deleted: false,
-            idm_seq: None,
-            profile_seq: None,
+            idm_sequence: None,
+            profile_sequence: None,
             roles: Vec::new(),
             status: None,
             removed: false,
-            member_seq: None,
+            member_sequence: None,
         }
     }
 }
@@ -83,7 +105,7 @@ impl AdminUserIndexRow {
 #[derive(Debug, Clone, Default)]
 pub struct IndexQuery {
     pub username: Option<String>,
-    pub q: Option<String>,
+    pub query: Option<String>,
     pub roles_any: Vec<String>,
     pub roles_none: Vec<String>,
     pub created_from: Option<OffsetDateTime>,

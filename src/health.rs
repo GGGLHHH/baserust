@@ -10,8 +10,9 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
+/// 探针路由:`/livez`、`/readyz`、`/health`,挂在根路径(不带 `/api/v1` 前缀)。
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(livez))
@@ -25,7 +26,8 @@ async fn livez() -> &'static str {
     "ok"
 }
 
-/// 兼容别名 = livez,保留早期 `/health` 引用不破。
+/// 与 livez 相同(进程活着即 ok,不查依赖)。生产 nginx 对外只暴露这个探活入口
+/// (`location = /health`),外层负载均衡和部署脚本都探它。
 #[utoipa::path(get, path = "/health", tag = "health", responses((status = 200, body = str)))]
 async fn health() -> &'static str {
     "ok"
@@ -65,18 +67,19 @@ pub struct ReadinessCheck {
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadinessReport>) {
     let results = state.probes.check().await;
     let all_ok = results.iter().all(|r| r.ok);
-    for r in results.iter().filter(|r| !r.ok) {
-        tracing::warn!(check = %r.name, error = ?r.error, "readyz: 依赖不可用");
+    let failed = results.iter().filter(|r| !r.ok);
+    for check in failed {
+        tracing::warn!(check = %check.name, error = ?check.error, "readyz: 依赖不可用");
     }
-    let checks = results
+    let checks: BTreeMap<String, ReadinessCheck> = results
         .into_iter()
-        .map(|r| {
+        .map(|result| {
             (
-                r.name,
+                result.name,
                 ReadinessCheck {
-                    ok: r.ok,
-                    latency_ms: r.latency_ms,
-                    error: r.error,
+                    ok: result.ok,
+                    latency_ms: result.latency_ms,
+                    error: result.error,
                 },
             )
         })

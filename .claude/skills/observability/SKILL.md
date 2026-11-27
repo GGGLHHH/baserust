@@ -22,10 +22,10 @@ baserust 的监控是**后台里的「系统监控」页**(`/admin/monitoring`,�
 存储分两层:
 - **实时(1 小时)**:`Monitor` 进程全局单例,全部是**累计值**;`app::monitoring::run_sampler` 每 15s 存一份累计快照,
   环形保留 1 小时。窗口统计 = 当前 − 最老快照,曲线 = 相邻快照之差。
-- **历史 / 日志**:`OpsStore` 端口(`infra/monitor/store.rs`,PG 实现 `store_pg.rs`,表在 `migrations/ops`)。
+- **历史 / 日志**:`OpsStore` 端口(`infra/monitor/store.rs`,PG 实现 `pg_ops_store.rs`,表在 `migrations/ops`)。
   `run_minute_flusher` 每分钟 `take_minute` 落一行(同时累加进小时表与小时明细);`run_log_writer` 把采集队列里的日志批量写入;
   `run_retention` 每小时按保留期删(分钟 15 天 / 小时 13 个月 / 明细 30 天 / 日志 15 天,常量在 `store::Retention`)。
-  延迟存成固定分桶直方图数组(`hist.rs`),任意时间段相加后都能重算分位数 —— **改桶界 = 历史数据作废**,别随手改。
+  延迟存成固定分桶直方图数组(`histogram.rs`),任意时间段相加后都能重算分位数 —— **改桶界 = 历史数据作废**,别随手改。
 - **日志采集**:`logs::LogCaptureLayer` 收 WARN / ERROR 事件(带所在 `http` span 的 request_id / 路由),`record_access` 记 5xx 与 ≥1s 的请求;
   进有界队列,满了丢弃并计数,绝不阻塞请求。字段名像 password / token / cookie 的值入库前替换为 `[REDACTED]`。
   写库失败的日志用 `target: logs::STORE_TARGET` 打,采集层跳过它(否则失败日志又进队列、循环)。
@@ -33,7 +33,7 @@ baserust 的监控是**后台里的「系统监控」页**(`/admin/monitoring`,�
 
 ## 判断
 
-- **新 PG 仓储方法 → 必须加 `pg.*` span**(照抄 `features/widget/adapters/postgres.rs`):不加,监控页的数据库操作表里就没有它。`skip_all`:参数里有用户数据,别进日志字段。
+- **新 PG 仓储方法 → 必须加 `pg.*` span**(照抄 `features/widget/adapters/pg_widget_repo.rs`):不加,监控页的数据库操作表里就没有它。`skip_all`:参数里有用户数据,别进日志字段。
   `<表>` 用模块的**主表名**(子表操作也记在主表下,如 `widgets.tags_of`);两个 schema 里同名的表加前缀区分
   (app 的发件箱是 `pg.app_outbox.*`,idm 的是 `pg.outbox.*`:单进程模式下同名会并成一行)。**已有的 span 名不改**:
   历史按 span 名存,改名后新旧数据断开(所以 `pg.auth_events.*`、`pg.search_index.*` 保留现名)。

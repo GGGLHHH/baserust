@@ -6,7 +6,7 @@ mod routes;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
 /// frontend 组(组闸「需登录」由 composition root 上):CRUD / 仅登录样板 / SSE。
 pub fn router() -> OpenApiRouter<AppState> {

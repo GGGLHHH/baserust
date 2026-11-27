@@ -3,18 +3,21 @@
 //!
 //! 加新提取需求时照此包一层:调 axum 原提取器,失败分支映射进 AppError。
 
-use crate::infra::http::error::ApiError;
-use axum::extract::{FromRequest, FromRequestParts, Path as AxumPath, Request};
-// serde_html_form 基座:支持重复 key 解进 Vec(如 `?role=a&role=b`),serde_urlencoded 不能。
-// 标量解析与 serde_urlencoded 等价,现有 13 处 Query<...> 调用点无感。
+use axum::extract::{
+    FromRequest, FromRequestParts, Multipart as AxumMultipart, Path as AxumPath, Request,
+};
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::Json as AxumJson;
+// serde_html_form 基座:支持重复 key 解进 Vec(如 `?role=a&role=b`),serde_urlencoded 不能。
+// 标量解析与 serde_urlencoded 等价,现有 Query<...> 调用点无感。
 use axum_extra::extract::Query as AxumQuery;
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::kernel::error::AppError;
+use crate::infra::http::error::ApiError;
+use crate::kernel::app_error::AppError;
 
 /// 路径参数提取器。失败(类型不匹配,如 `123` 不是 UUID)→ `AppError::BadRequest`(400 + 统一 JSON)。
 pub struct Path<T>(pub T);
@@ -62,8 +65,8 @@ where
 {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match AxumJson::<T>::from_request(req, state).await {
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumJson::<T>::from_request(request, state).await {
             Ok(AxumJson(value)) => Ok(Self(value)),
             Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
@@ -72,7 +75,7 @@ where
 
 /// multipart 表单提取器。边界/Content-Type 拒绝(如 InvalidBoundary)→ `AppError::BadRequest`
 /// (400 + 统一 JSON),不再漏 axum 的纯文本响应。字段级读取错误仍由 handler 逐字段处理。
-pub struct Multipart(pub axum::extract::Multipart);
+pub struct Multipart(pub AxumMultipart);
 
 impl<S> FromRequest<S> for Multipart
 where
@@ -80,9 +83,9 @@ where
 {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::extract::Multipart::from_request(req, state).await {
-            Ok(mp) => Ok(Self(mp)),
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumMultipart::from_request(request, state).await {
+            Ok(multipart) => Ok(Self(multipart)),
             Err(rejection) => Err(AppError::BadRequest(rejection.to_string()).into()),
         }
     }
@@ -92,15 +95,13 @@ where
 pub struct FilePart {
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
-    pub data: bytes::Bytes,
+    pub data: Bytes,
 }
 
 /// 读出 multipart 中名为 `file` 的部分,排空其余部分(推进流)。
 /// 无 `file` 部分 → `Ok(None)`(调用方按自己的语义回 422);读取失败 → 400。
 /// 单文件表单(如头像上传)直接用;多字段表单(如 contents/upload)仍手写循环。
-pub async fn file_part(
-    multipart: &mut axum::extract::Multipart,
-) -> Result<Option<FilePart>, ApiError> {
+pub async fn file_part(multipart: &mut AxumMultipart) -> Result<Option<FilePart>, ApiError> {
     let mut out = None;
     while let Some(field) = multipart
         .next_field()

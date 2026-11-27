@@ -16,12 +16,18 @@
 //!    故用 `sqlx::migrate!("migrations/idm")` 幂等应用它;app 侧用 `migrations/app`(含 0004)。
 #![cfg(all(feature = "pg-conformance", feature = "nats-conformance"))]
 
+use async_nats::jetstream;
+use async_nats::jetstream::consumer::{pull, DeliverPolicy};
+use serde_json::Value;
+use sqlx::PgPool;
+use std::env;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 use futures_util::StreamExt;
 use uuid::Uuid;
 
-use baserust::app::state::{connect_for_schema, Schema};
+use baserust::app::app_state::{connect_for_schema, Schema};
 use baserust::app::{AppState, Mount};
 use baserust::features::profile::PutProfile;
 use baserust::infra::config::Config;
@@ -30,29 +36,24 @@ use idm::RegisterInput;
 
 /// 迁移要用 owner 账号(spec §4.4:运行时账号只有 DML,建不了表):同一个库,账号换成
 /// `<SCHEMA>_DB_OWNER_USER`(缺省 = 运行时账号名 + `_owner`)/ `<SCHEMA>_DB_OWNER_PASSWORD`(缺省 pwd)。
-async fn owner_pool(
-    runtime: &sqlx::PgPool,
-    prefix: &str,
-    runtime_user: &str,
-) -> anyhow::Result<sqlx::PgPool> {
-    let user = std::env::var(format!("{prefix}_DB_OWNER_USER"))
+async fn owner_pool(runtime: &PgPool, prefix: &str, runtime_user: &str) -> anyhow::Result<PgPool> {
+    let user = env::var(format!("{prefix}_DB_OWNER_USER"))
         .unwrap_or_else(|_| format!("{runtime_user}_owner"));
-    let password =
-        std::env::var(format!("{prefix}_DB_OWNER_PASSWORD")).unwrap_or_else(|_| "pwd".into());
-    let opts = runtime
+    let password = env::var(format!("{prefix}_DB_OWNER_PASSWORD")).unwrap_or_else(|_| "pwd".into());
+    let options = runtime
         .connect_options()
         .as_ref()
         .clone()
         .username(&user)
         .password(&password);
-    Ok(sqlx::PgPool::connect_with(opts).await?)
+    Ok(PgPool::connect_with(options).await?)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
     // 1. config from .env → 满 pg+nats(内存模式跑不了本测试)。
     dotenvy::from_path(".env").ok();
-    let config = Config::load()?;
+    let config = Config::try_new()?;
     assert!(
         config.nats_url.is_some(),
         "缺 NATS_URL:先 `just up` 起 nats 并确保 .env 配好"
@@ -64,7 +65,7 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
 
     // 2. 保证 outbox 表存在(幂等:sqlx 追踪已应用版本,只补未应用的)。
     //    idm outbox 在本仓 migrations/idm/0003,app outbox 在本仓 migrations/app/0004。
-    //    必须先于 AppState::new —— seed/mock 写会 emit 到 outbox,表不在会炸启动。
+    //    必须先于 AppState::try_new —— seed/mock 写会 emit 到 outbox,表不在会炸启动。
     let idm_pool = connect_for_schema(&config, Schema::Idm)
         .await?
         .expect("idm pool(idm_database_url 已断言 Some)");
@@ -77,9 +78,11 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
         .await?;
 
     // 3. 起真 app:pg 仓储 + JetStreamPublisher + 装 outbox relay(Task 8 接线)。
-    let (state, bg) = AppState::new(&config, Mount::Both).await?;
+    let assembled = AppState::try_new(&config, Mount::Both).await?;
+    let state = assembled.state;
+    let background = assembled.background_tasks;
     assert!(
-        !bg.relays.is_empty(),
+        !background.relays.is_empty(),
         "pg+nats 下应装出 outbox relay(证明 Task 8 按进程接了线)"
     );
 
@@ -87,34 +90,34 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
     //    consumer 建好之后发布的消息,天然免疫流里上一轮/历史堆积,精确框住本轮事件。
     //    空 filter = 覆盖流内全 subject(events.idm.> + events.app.>)。
     let client = async_nats::connect(config.nats_url.clone().unwrap()).await?;
-    let js = async_nats::jetstream::new(client);
-    let stream = js.get_stream("USER_SEARCH_EVENTS").await?;
+    let jetstream_context = jetstream::new(client);
+    let stream = jetstream_context.get_stream("USER_SEARCH_EVENTS").await?;
     let consumer = stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+        .create_consumer(pull::Config {
+            deliver_policy: DeliverPolicy::New,
             ..Default::default()
         })
         .await?;
 
     // 5. 起 relay 后台循环(poll 每 1s;shutdown 经 watch 通道)。
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    for r in bg.relays {
-        tokio::spawn(r.run(rx.clone()));
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    for relay in background.relays {
+        tokio::spawn(relay.run(shutdown_receiver.clone()));
     }
 
     // 6. 经真 service 驱动写(emit 在 repo 层,无需 HTTP/鉴权)。用 v7 uuid 造每轮唯一名。
-    let uniq = format!("dep1-{}", Uuid::now_v7().simple());
-    let disp = format!("Name {uniq}");
+    let unique = format!("dep1-{}", Uuid::now_v7().simple());
+    let display_name = format!("Name {unique}");
     // register → users.create → 事务内 emit user.created 到 idm.outbox(payload 含 username)。
     let outcome = state
         .auth
         .register(
             RegisterInput {
-                username: uniq.clone(),
+                username: unique.clone(),
                 email: None,
                 password: "password123".into(),
             },
-            Some("durable-e2e".into()),
+            Some("durable-e2e"),
         )
         .await?;
     let user_id = outcome.user.id;
@@ -124,11 +127,11 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
         .put(
             user_id,
             PutProfile {
-                display_name: Some(disp.clone()),
+                display_name: Some(display_name.clone()),
                 phone: None,
                 avatar_content_id: None,
             },
-            &AuditContext::system(),
+            &AuditContext::new_system(),
         )
         .await?;
 
@@ -145,34 +148,31 @@ async fn user_write_lands_as_durable_event() -> anyhow::Result<()> {
             .expires(Duration::from_secs(2))
             .messages()
             .await?;
-        while let Some(msg) = batch.next().await {
-            let msg = msg.map_err(|e| anyhow::anyhow!("consumer fetch: {e}"))?;
+        while let Some(message) = batch.next().await {
+            let message = message.map_err(|e| anyhow::anyhow!("consumer fetch: {e}"))?;
             // envelope(Task 5):{event_id, schema, type, aggregate_id, seq, data};data 是原 payload。
-            let env: serde_json::Value =
-                serde_json::from_slice(msg.payload.as_ref()).unwrap_or(serde_json::Value::Null);
-            match msg.subject.as_str() {
+            let envelope: Value =
+                serde_json::from_slice(message.payload.as_ref()).unwrap_or(Value::Null);
+            match message.subject.as_str() {
                 "events.idm.user.created"
-                    if env["data"]["username"].as_str() == Some(uniq.as_str()) =>
+                    if envelope["data"]["username"].as_str() == Some(unique.as_str()) =>
                 {
-                    idm_event_id = env["event_id"].as_str().map(str::to_owned);
+                    idm_event_id = envelope["event_id"].as_str().map(str::to_owned);
                 }
                 "events.app.profile.updated"
-                    if env["data"]["display_name"].as_str() == Some(disp.as_str()) =>
+                    if envelope["data"]["display_name"].as_str() == Some(display_name.as_str()) =>
                 {
-                    app_event_id = env["event_id"].as_str().map(str::to_owned);
+                    app_event_id = envelope["event_id"].as_str().map(str::to_owned);
                 }
                 _ => {}
             }
-            let _ = msg.ack().await;
+            let _ = message.ack().await;
         }
     }
 
     // 8. 收尾:停 relay + best-effort 删本轮用户(reruns 干净;删会 emit user.deleted,无害)。
-    let _ = tx.send(true);
-    let _ = state
-        .user_admin
-        .delete(user_id, Some("durable-e2e".into()))
-        .await;
+    let _ = shutdown_sender.send(true);
+    let _ = state.user_admin.delete(user_id, Some("durable-e2e")).await;
 
     // 9. 断言:两条事件都落了,且 event_id 互异(idm-<n> vs app-<m>)。
     let idm_id =

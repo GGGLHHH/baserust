@@ -1,31 +1,13 @@
 //! 监控报告的线格式(`GET /api/v1/admin/monitoring` 的响应体;idm 进程的 `/internal/monitoring` 也回 [`InstanceReport`])。
 //! 同时 `Deserialize`:app 进程拉 idm 的报告后原样并进自己的响应。
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 
-use super::store::{Service, Severity, Tier};
-
-impl InstanceRole {
-    /// 存储里的实例名。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            InstanceRole::App => "app",
-            InstanceRole::Idm => "idm",
-            InstanceRole::Combined => "combined",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<InstanceRole> {
-        match s {
-            "app" => Some(InstanceRole::App),
-            "idm" => Some(InstanceRole::Idm),
-            "combined" => Some(InstanceRole::Combined),
-            _ => None,
-        }
-    }
-}
+use super::store::{Service, Severity, Tier, UnknownLabel};
 
 /// 实例角色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -37,6 +19,31 @@ pub enum InstanceRole {
     Idm,
     /// 单进程同时挂 app + idm(本地开发)。
     Combined,
+}
+
+impl InstanceRole {
+    /// 存储里的实例名。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstanceRole::App => "app",
+            InstanceRole::Idm => "idm",
+            InstanceRole::Combined => "combined",
+        }
+    }
+}
+
+impl FromStr for InstanceRole {
+    type Err = UnknownLabel;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "app" => Ok(InstanceRole::App),
+            "idm" => Ok(InstanceRole::Idm),
+            "combined" => Ok(InstanceRole::Combined),
+            _ => Err(UnknownLabel { kind: "instance" }),
+        }
+    }
 }
 
 /// 整体报告:每个进程一份。
@@ -60,11 +67,14 @@ pub struct InstanceReport {
     pub version: String,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
-    pub uptime_secs: u64,
+    #[serde(rename = "uptime_secs")]
+    pub uptime_seconds: u64,
     /// 统计窗口长度(秒)。
-    pub window_secs: u64,
+    #[serde(rename = "window_secs")]
+    pub window_seconds: u64,
     /// 历史曲线的采样间隔(秒)。
-    pub sample_interval_secs: u64,
+    #[serde(rename = "sample_interval_secs")]
+    pub sample_interval_seconds: u64,
     /// 依赖检查(与 `/readyz` 同源)。
     pub checks: Vec<DependencyCheck>,
     pub process: ProcessStatus,
@@ -85,16 +95,17 @@ pub struct InstanceReport {
 
 impl InstanceReport {
     /// 拉不到报告的进程:只带角色和原因。
-    pub fn unreachable(role: InstanceRole, error: String) -> Self {
+    #[must_use]
+    pub fn new_unreachable(role: InstanceRole, error: String) -> Self {
         Self {
             role,
             reachable: false,
             error: Some(error),
             version: String::new(),
             started_at: None,
-            uptime_secs: 0,
-            window_secs: 0,
-            sample_interval_secs: 0,
+            uptime_seconds: 0,
+            window_seconds: 0,
+            sample_interval_seconds: 0,
             checks: Vec::new(),
             process: ProcessStatus::default(),
             in_flight: 0,
@@ -129,7 +140,8 @@ pub struct ProcessStatus {
     /// CPU 占用(百分比,按单核计,多核可超过 100)。最近一个采样间隔的均值。
     pub cpu_percent: Option<f64>,
     pub threads: Option<u64>,
-    pub open_fds: Option<u64>,
+    #[serde(rename = "open_fds")]
+    pub open_file_descriptors: Option<u64>,
 }
 
 /// 数据库连接池。
@@ -253,6 +265,8 @@ pub enum HistoryRange {
 }
 
 impl HistoryRange {
+    /// 范围的总长度(从现在往回算)。
+    #[must_use]
     pub fn duration(self) -> Duration {
         match self {
             HistoryRange::Day => Duration::hours(24),
@@ -264,6 +278,7 @@ impl HistoryRange {
     }
 
     /// 曲线上一个点代表多长时间(每个范围约 300~370 个点)。
+    #[must_use]
     pub fn step(self) -> Duration {
         match self {
             HistoryRange::Day => Duration::minutes(5),
@@ -275,10 +290,11 @@ impl HistoryRange {
     }
 
     /// 从哪一层读:7 天以内读分钟级(保留 15 天),更长读小时级。
+    #[must_use]
     pub fn tier(self) -> Tier {
         match self {
             HistoryRange::Day | HistoryRange::Week => Tier::Minute,
-            _ => Tier::Hour,
+            HistoryRange::Month | HistoryRange::Quarter | HistoryRange::Year => Tier::Hour,
         }
     }
 }
@@ -301,7 +317,8 @@ pub struct HistoryReport {
     #[serde(with = "time::serde::rfc3339")]
     pub to: OffsetDateTime,
     /// 曲线上一个点代表的秒数。
-    pub step_secs: u64,
+    #[serde(rename = "step_secs")]
+    pub step_seconds: u64,
     /// 数据是否持久化。`false` = 没配 ops 数据库,只有进程内存里最近一段(重启清空)。
     pub persistent: bool,
     /// 接口 / 数据库明细的起点:明细只留 30 天,范围更长时只覆盖最近 30 天。
@@ -340,7 +357,8 @@ pub struct LogsQuery {
     #[param(value_type = Option<Service>)]
     pub service: Option<Service>,
     /// 消息 / 模块 / 接口的子串,不区分大小写。
-    pub q: Option<String>,
+    #[serde(rename = "q")]
+    pub query: Option<String>,
     /// 精确匹配请求 id(响应头 `x-request-id`)。
     pub request_id: Option<String>,
     /// 页码,从 1 开始。
@@ -357,7 +375,7 @@ impl Default for LogsQuery {
             level: None,
             instance: None,
             service: None,
-            q: None,
+            query: None,
             request_id: None,
             page: 1,
             size: 50,
@@ -370,7 +388,8 @@ impl Default for LogsQuery {
 pub struct LogRecordView {
     pub id: i64,
     #[serde(with = "time::serde::rfc3339")]
-    pub ts: OffsetDateTime,
+    #[serde(rename = "ts")]
+    pub timestamp: OffsetDateTime,
     pub instance: InstanceRole,
     /// 归属服务(app / idm)。
     pub service: Service,

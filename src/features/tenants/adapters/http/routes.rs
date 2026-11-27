@@ -1,6 +1,6 @@
 //! 租户 / 成员管理的 **HTTP 适配器**(admin 组,归 idm 进程)。每个 handler 首行 `require_scoped`:
 //! 平台接口 gate `tenants:admin`(平台级),成员接口 gate `members:read` / `members:admin`(租户级)。
-//! 写操作 `by = ctx.audit_id()`。`#[utoipa::path]` **不手写 security** —— op_perms 经 `inject_operation_security` 注入。
+//! 写操作 `by = ctx.audit_id().as_deref()`。`#[utoipa::path]` **不手写 security** —— operation_permissions 经 `inject_operation_security` 注入。
 //!
 //! 租户从哪来:租户级接口**只**用 token 的当前租户(`CurrentTenant`,不收 query / body 里的 tenant_id),别的租户的
 //! 成员 id → 404;平台接口用路径里的租户 id(先确认租户存在,不存在 → 404)。
@@ -8,6 +8,8 @@
 //! 防接管(2026-11-26):改角色 / 移出一个**持平台角色**的成员(superadmin / 平台管理员)要 `platform:roles`
 //! (只有 superadmin)—— 组织角色比较拦不住(superadmin 在默认组织里也只是 admin)。经 `AppState::guard_platform_account`
 //! 看目标的原始平台角色名;组织内接口先确认是本租户成员再判(别的租户的人仍 404,不借 403 泄露他是谁)。
+
+use std::slice;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -18,15 +20,15 @@ use super::dto::{
     AddMemberRequest, CreateTenantRequest, ListMembersFilter, MemberRolesRequest, MemberView,
     TenantView, UpdateTenantRequest,
 };
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 use crate::features::tenants::model;
-use crate::infra::authz::TokenScope;
+use crate::infra::authorization::TokenScope;
 use crate::infra::http::audit::{Audit, CurrentTenant, CurrentUser};
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::{Json, Path, Query};
 use crate::infra::http::pagination::{Page, PageQuery};
-use crate::kernel::authz::{Perm, Policy, RoleName};
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::{Permission, Policy, RoleName, RoleNames};
 
 // ── 授权守卫(自锁 / 提权):放 handler(授权边界),判断抽纯函数便于单测 ──
 
@@ -36,12 +38,15 @@ use crate::kernel::error::AppError;
 fn assert_can_grant(
     policy: &Policy,
     granter: &AuthUser,
-    scope: &[Perm],
+    scope: &[Permission],
     role_names: &[String],
 ) -> Result<(), AppError> {
     for name in role_names {
-        for perm in policy.perms_for(&[], std::slice::from_ref(name)) {
-            policy.require_scoped(granter, scope, perm)?; // 缺该权 → 403
+        for permission in policy.permissions_for(RoleNames {
+            platform: &[],
+            tenant: slice::from_ref(name),
+        }) {
+            policy.require_scoped(granter, scope, permission)?; // 缺该权 → 403
         }
     }
     Ok(())
@@ -56,8 +61,11 @@ fn assert_self_keeps_members_admin(
 ) -> Result<(), AppError> {
     if actor == target
         && !policy
-            .perms_for(&[], new_role_names)
-            .contains(&Perm::MembersAdmin)
+            .permissions_for(RoleNames {
+                platform: &[],
+                tenant: new_role_names,
+            })
+            .contains(&Permission::MembersAdmin)
     {
         return Err(AppError::Conflict(
             "cannot remove your own member management access".into(),
@@ -77,6 +85,7 @@ fn assert_not_self(actor: Uuid, target: Uuid) -> Result<(), AppError> {
     }
 }
 
+/// 角色闭集 → `Policy` 认的原始角色名。
 fn role_names(roles: &[RoleName]) -> Vec<String> {
     roles.iter().map(|r| r.as_str().to_owned()).collect()
 }
@@ -103,9 +112,9 @@ pub async fn list_tenants(
 ) -> Result<Json<Page<TenantView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     let page = state.tenant_admin.list_tenants(page.resolve()?).await?;
-    Ok(Json(Page::from_core(page, TenantView::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 建租户(status = active,还没有成员;用 PUT 成员接口指定第一个管理员)。
@@ -127,16 +136,16 @@ pub async fn create_tenant(
     user: CurrentUser,
     scope: TokenScope,
     Audit(ctx): Audit,
-    Json(req): Json<CreateTenantRequest>,
+    Json(request): Json<CreateTenantRequest>,
 ) -> Result<(StatusCode, Json<TenantView>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
-    let t = state
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
+    let tenant = state
         .tenant_admin
-        .create_tenant(req.into(), ctx.audit_id())
+        .create_tenant(request.into(), ctx.audit_id().as_deref())
         .await?;
-    Ok((StatusCode::CREATED, Json(t.into())))
+    Ok((StatusCode::CREATED, Json(tenant.into())))
 }
 
 /// 租户详情。不存在 / 已删除 → 404。
@@ -160,7 +169,7 @@ pub async fn get_tenant(
 ) -> Result<Json<TenantView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     Ok(Json(state.tenant_admin.get_tenant(id).await?.into()))
 }
 
@@ -186,15 +195,15 @@ pub async fn update_tenant(
     scope: TokenScope,
     Audit(ctx): Audit,
     Path(id): Path<Uuid>,
-    Json(req): Json<UpdateTenantRequest>,
+    Json(request): Json<UpdateTenantRequest>,
 ) -> Result<Json<TenantView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     Ok(Json(
         state
             .tenant_admin
-            .update_tenant(id, req.into(), ctx.audit_id())
+            .update_tenant(id, request.into(), ctx.audit_id().as_deref())
             .await?
             .into(),
     ))
@@ -226,13 +235,13 @@ pub async fn list_tenant_members(
 ) -> Result<Json<Page<MemberView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     let tenant = state.tenant_admin.tenant_scope(id).await?;
     let page = state
         .tenant_admin
         .list_members(tenant, &model::ListMembers::from(filter), page.resolve()?)
         .await?;
-    Ok(Json(Page::from_core(page, MemberView::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 设某租户的成员(PUT:不是成员则加入,是成员则全量替换租户角色)。用于给新租户指定第一个管理员。
@@ -260,11 +269,11 @@ pub async fn put_tenant_member(
     scope: TokenScope,
     Audit(ctx): Audit,
     Path((id, user_id)): Path<(Uuid, Uuid)>,
-    Json(req): Json<MemberRolesRequest>,
+    Json(request): Json<MemberRolesRequest>,
 ) -> Result<Json<MemberView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     let tenant = state.tenant_admin.tenant_scope(id).await?;
     // 防接管:已是成员时这是「改角色」,目标持平台角色要 platform:roles(把他加进新组织不算动他,放行)
     match state.tenant_admin.member_role_names(tenant, user_id).await {
@@ -274,12 +283,12 @@ pub async fn put_tenant_member(
                 .await?
         }
         Err(AppError::NotFound) => {}
-        Err(e) => return Err(e.into()),
+        Err(error) => return Err(error.into()),
     }
     Ok(Json(
         state
             .tenant_admin
-            .put_member(tenant, user_id, &req.roles, ctx.audit_id())
+            .put_member(tenant, user_id, &request.roles, ctx.audit_id().as_deref())
             .await?
             .into(),
     ))
@@ -310,7 +319,7 @@ pub async fn remove_tenant_member(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::TenantsAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::TenantsAdmin)?;
     let tenant = state.tenant_admin.tenant_scope(id).await?;
     // 防接管:移出持平台角色的账号要 platform:roles
     state
@@ -318,7 +327,7 @@ pub async fn remove_tenant_member(
         .await?;
     state
         .tenant_admin
-        .remove_member(tenant, user_id, ctx.audit_id())
+        .remove_member(tenant, user_id, ctx.audit_id().as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -349,12 +358,12 @@ pub async fn list_members(
 ) -> Result<Json<Page<MemberView>>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::MembersRead)?;
+        .require_scoped(&user.0, &scope.0, Permission::MembersRead)?;
     let page = state
         .tenant_admin
         .list_members(tenant, &model::ListMembers::from(filter), page.resolve()?)
         .await?;
-    Ok(Json(Page::from_core(page, MemberView::from)))
+    Ok(Json(Page::from(page)))
 }
 
 /// 按**完整用户名**把已有账号加进本租户(spec §4.5)。精确匹配(邮箱、大小写不同都不算),查不到 → 404
@@ -380,23 +389,32 @@ pub async fn add_member(
     scope: TokenScope,
     CurrentTenant(tenant): CurrentTenant,
     Audit(ctx): Audit,
-    Json(req): Json<AddMemberRequest>,
+    Json(request): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<MemberView>), ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::MembersAdmin)?;
-    assert_can_grant(&state.policy, &user.0, &scope.0, &role_names(&req.roles))?;
-    let req: model::AddMember = req.into();
+        .require_scoped(&user.0, &scope.0, Permission::MembersAdmin)?;
+    assert_can_grant(
+        &state.policy,
+        &user.0,
+        &scope.0,
+        &role_names(&request.roles),
+    )?;
+    let request: model::AddMember = request.into();
     // 防接管:先找到目标账号(422 / 404 口径不变),对方持平台角色 → 要 platform:roles
-    let (target, _) = state.tenant_admin.resolve_add_member(&req).await?;
+    let target = state
+        .tenant_admin
+        .resolve_add_member(&request)
+        .await?
+        .user_id;
     state
         .guard_platform_account(&user.0, &scope.0, target)
         .await?;
-    let m = state
+    let member = state
         .tenant_admin
-        .add_member(tenant, req, ctx.audit_id())
+        .add_member(tenant, request, ctx.audit_id().as_deref())
         .await?;
-    Ok((StatusCode::CREATED, Json(m.into())))
+    Ok((StatusCode::CREATED, Json(member.into())))
 }
 
 /// 全量设本租户某成员的租户角色(原子替换)。别的租户的成员 / 不是成员 → 404。
@@ -423,12 +441,12 @@ pub async fn set_member_roles(
     CurrentTenant(tenant): CurrentTenant,
     Audit(ctx): Audit,
     Path(user_id): Path<Uuid>,
-    Json(req): Json<MemberRolesRequest>,
+    Json(request): Json<MemberRolesRequest>,
 ) -> Result<Json<MemberView>, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::MembersAdmin)?;
-    let granted = role_names(&req.roles);
+        .require_scoped(&user.0, &scope.0, Permission::MembersAdmin)?;
+    let granted = role_names(&request.roles);
     assert_self_keeps_members_admin(&state.policy, user.0.id, user_id, &granted)?;
     assert_can_grant(&state.policy, &user.0, &scope.0, &granted)?;
     // 目标现有角色闸(不是本租户成员 → 404):不能把权限比自己大的成员降权 / 清空。
@@ -444,7 +462,7 @@ pub async fn set_member_roles(
     Ok(Json(
         state
             .tenant_admin
-            .set_member_roles(tenant, user_id, &req.roles, ctx.audit_id())
+            .set_member_roles(tenant, user_id, &request.roles, ctx.audit_id().as_deref())
             .await?
             .into(),
     ))
@@ -475,7 +493,7 @@ pub async fn remove_member(
 ) -> Result<StatusCode, ApiError> {
     state
         .policy
-        .require_scoped(&user.0, &scope.0, Perm::MembersAdmin)?;
+        .require_scoped(&user.0, &scope.0, Permission::MembersAdmin)?;
     assert_not_self(user.0.id, user_id)?;
     // 目标现有角色闸。已不是本租户成员(含别的租户的人)→ 没有可比的角色,交给 service:它照样补吊销
     // 该人在本租户的会话(上次移出成功、吊销失败的重试靠这个补上)再回 404。
@@ -488,11 +506,11 @@ pub async fn remove_member(
                 .await?;
         }
         Err(AppError::NotFound) => {}
-        Err(e) => return Err(e.into()),
+        Err(error) => return Err(error.into()),
     }
     state
         .tenant_admin
-        .remove_member(tenant, user_id, ctx.audit_id())
+        .remove_member(tenant, user_id, ctx.audit_id().as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -500,47 +518,52 @@ pub async fn remove_member(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::tenant::DEFAULT_TENANT_ID;
+    use crate::kernel::tenant_id::DEFAULT_TENANT_ID;
 
     fn member(roles: &[&str]) -> AuthUser {
-        AuthUser {
-            id: Uuid::now_v7(),
-            username: "m".into(),
-            roles: vec![],
-            tenant_id: Some(DEFAULT_TENANT_ID.as_uuid()),
-            tenant_roles: roles.iter().map(|s| s.to_string()).collect(),
-        }
+        AuthUser::new(Uuid::now_v7(), "m".into(), vec![]).in_tenant(
+            DEFAULT_TENANT_ID.as_uuid(),
+            roles.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     /// 「有 members:admin 但非满权」的租户成员:授不出自己没有的权,平台级权限不参与(租户角色给不了)。
     #[test]
     fn grant_is_limited_to_own_tenant_perms() {
-        let policy = Policy::from_roles([
-            ("mgr".to_owned(), vec![Perm::MembersAdmin, Perm::WidgetRead]),
-            ("purger".to_owned(), vec![Perm::WidgetDelete]),
+        let policy = Policy::new([
+            (
+                "mgr".to_owned(),
+                vec![Permission::MembersAdmin, Permission::WidgetRead],
+            ),
+            ("purger".to_owned(), vec![Permission::WidgetDelete]),
             // 平台级权限经租户角色不生效,也就不算提权
-            ("weird".to_owned(), vec![Perm::UsersAdmin]),
+            ("weird".to_owned(), vec![Permission::UsersAdmin]),
         ]);
-        let mgr = member(&["mgr"]);
-        assert!(assert_can_grant(&policy, &mgr, &[], &["mgr".to_owned()]).is_ok());
-        assert!(assert_can_grant(&policy, &mgr, &[], &["weird".to_owned()]).is_ok());
-        assert!(assert_can_grant(&policy, &mgr, &[], &[]).is_ok());
+        let manager = member(&["mgr"]);
+        assert!(assert_can_grant(&policy, &manager, &[], &["mgr".to_owned()]).is_ok());
+        assert!(assert_can_grant(&policy, &manager, &[], &["weird".to_owned()]).is_ok());
+        assert!(assert_can_grant(&policy, &manager, &[], &[]).is_ok());
         assert!(matches!(
-            assert_can_grant(&policy, &mgr, &[], &["purger".to_owned()]),
+            assert_can_grant(&policy, &manager, &[], &["purger".to_owned()]),
             Err(AppError::Forbidden)
         ));
         // token scope 收窄后,自己的角色也授不出
         assert!(matches!(
-            assert_can_grant(&policy, &mgr, &[Perm::MembersAdmin], &["mgr".to_owned()]),
+            assert_can_grant(
+                &policy,
+                &manager,
+                &[Permission::MembersAdmin],
+                &["mgr".to_owned()]
+            ),
             Err(AppError::Forbidden)
         ));
     }
 
     #[test]
     fn self_locks() {
-        let policy = Policy::from_roles([
-            ("mgr".to_owned(), vec![Perm::MembersAdmin]),
-            ("plain".to_owned(), vec![Perm::WidgetRead]),
+        let policy = Policy::new([
+            ("mgr".to_owned(), vec![Permission::MembersAdmin]),
+            ("plain".to_owned(), vec![Permission::WidgetRead]),
         ]);
         let me = Uuid::now_v7();
         let other = Uuid::now_v7();

@@ -10,11 +10,12 @@
 mod http_support;
 
 use std::sync::Arc;
+use uuid::Uuid;
 
 use baserust::app::monitoring::MonitoringSetup;
 use baserust::app::Mount;
 use baserust::infra::config::Config;
-use baserust::infra::monitor::hist::Hist;
+use baserust::infra::monitor::histogram::Histogram;
 use baserust::infra::monitor::store::{
     minute_start, LogEntry, MemoryOpsStore, MinuteRecord, OpsStore, PeriodTotals, RouteTotals,
     Service, Severity,
@@ -24,19 +25,25 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 
-const MON: &str = "/api/v1/admin/monitoring";
+const MONITORING: &str = "/api/v1/admin/monitoring";
 
-fn routes(instance: &Value) -> Vec<(String, String, u64)> {
+/// 监控报告里的一行按路由统计。
+#[derive(Debug)]
+struct RouteStat {
+    method: String,
+    route: String,
+    requests: u64,
+}
+
+fn routes(instance: &Value) -> Vec<RouteStat> {
     instance["routes"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| {
-            (
-                r["method"].as_str().unwrap().to_owned(),
-                r["route"].as_str().unwrap().to_owned(),
-                r["requests"].as_u64().unwrap(),
-            )
+        .map(|row| RouteStat {
+            method: row["method"].as_str().unwrap().to_owned(),
+            route: row["route"].as_str().unwrap().to_owned(),
+            requests: row["requests"].as_u64().unwrap(),
         })
         .collect()
 }
@@ -44,17 +51,25 @@ fn routes(instance: &Value) -> Vec<(String, String, u64)> {
 /// 只有 `ops:read`(superadmin 独占)能看:未登录 401、租户 admin 403、平台管理员(有 users:admin)也 403。
 #[tokio::test]
 async fn monitoring_requires_ops_read() {
-    let s = TestServer::start().await;
-    expect(s.anon().get(MON).await, StatusCode::UNAUTHORIZED).await;
-    let admin = s.login(ADMIN, PASSWORD).await;
-    expect(admin.get(MON).await, StatusCode::FORBIDDEN).await;
-    expect(platform_admin(&s).get(MON).await, StatusCode::FORBIDDEN).await;
+    let server = TestServer::start().await;
+    expect(
+        server.anonymous().get(MONITORING).await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let admin = server.login(ADMIN, PASSWORD).await;
+    expect(admin.get(MONITORING).await, StatusCode::FORBIDDEN).await;
+    expect(
+        platform_admin(&server).get(MONITORING).await,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
 }
 
 /// 平台管理员令牌(平台上下文,平台角色 platform_admin)。
-fn platform_admin(s: &TestServer) -> http_support::Client {
-    s.bearer(&mint(
-        uuid::Uuid::now_v7(),
+fn platform_admin(server: &TestServer) -> http_support::Client {
+    server.bearer(&mint(
+        Uuid::now_v7(),
         "pa",
         &["platform_admin"],
         None,
@@ -67,21 +82,21 @@ fn platform_admin(s: &TestServer) -> http_support::Client {
 /// 监控接口自己的轮询不计入。
 #[tokio::test]
 async fn single_process_report_counts_requests_by_route() {
-    let s = TestServer::start().await;
-    let sa = s.login(SUPERADMIN, PASSWORD).await;
+    let server = TestServer::start().await;
+    let superadmin = server.login(SUPERADMIN, PASSWORD).await;
     for _ in 0..3 {
         expect(
-            sa.get("/api/v1/frontend/widgets/stats").await,
+            superadmin.get("/api/v1/frontend/widgets/stats").await,
             StatusCode::OK,
         )
         .await;
     }
-    expect(sa.get("/no/such/path").await, StatusCode::NOT_FOUND).await;
-    expect(sa.get(MON).await, StatusCode::OK).await;
+    expect(superadmin.get("/no/such/path").await, StatusCode::NOT_FOUND).await;
+    expect(superadmin.get(MONITORING).await, StatusCode::OK).await;
 
-    let v = expect_json(sa.get(MON).await, StatusCode::OK).await;
-    let instances = v["instances"].as_array().unwrap();
-    assert_eq!(instances.len(), 1, "{v}");
+    let report = expect_json(superadmin.get(MONITORING).await, StatusCode::OK).await;
+    let instances = report["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1, "{report}");
     let me = &instances[0];
     assert_eq!(me["role"], "combined");
     assert_eq!(me["reachable"], true);
@@ -90,20 +105,23 @@ async fn single_process_report_counts_requests_by_route() {
     assert!(me["traffic"]["requests"].as_u64().unwrap() >= 4, "{me}");
     assert!(me["traffic"]["errors_4xx"].as_u64().unwrap() >= 1, "{me}");
 
-    let rs = routes(me);
-    let stats = rs
+    let route_stats = routes(me);
+    let stats = route_stats
         .iter()
-        .find(|(m, r, _)| m == "GET" && r == "/api/v1/frontend/widgets/stats")
-        .unwrap_or_else(|| panic!("缺 widgets/stats: {rs:?}"));
-    assert!(stats.2 >= 3, "{rs:?}");
-    assert!(rs.iter().any(|(_, r, _)| r == "unmatched"), "{rs:?}");
+        .find(|r| r.method == "GET" && r.route == "/api/v1/frontend/widgets/stats")
+        .unwrap_or_else(|| panic!("缺 widgets/stats: {route_stats:?}"));
+    assert!(stats.requests >= 3, "{route_stats:?}");
     assert!(
-        rs.iter().all(|(_, r, _)| r != MON),
-        "监控轮询不计入: {rs:?}"
+        route_stats.iter().any(|r| r.route == "unmatched"),
+        "{route_stats:?}"
     );
     assert!(
-        rs.iter().all(|(_, r, _)| !r.contains("/no/such")),
-        "未匹配路径不能原样成为一行: {rs:?}"
+        route_stats.iter().all(|r| r.route != MONITORING),
+        "监控轮询不计入: {route_stats:?}"
+    );
+    assert!(
+        route_stats.iter().all(|r| !r.route.contains("/no/such")),
+        "未匹配路径不能原样成为一行: {route_stats:?}"
     );
 }
 
@@ -112,27 +130,32 @@ async fn single_process_report_counts_requests_by_route() {
 async fn app_aggregates_idm_instance() {
     let idm = TestServer::start_mounted(Mount::Idm, |_| {}).await;
     // idm 进程上没有 admin 监控接口,只有内部端点
-    expect(idm.anon().get(MON).await, StatusCode::NOT_FOUND).await;
-    let internal = expect_json(idm.anon().get("/internal/monitoring").await, StatusCode::OK).await;
+    expect(idm.anonymous().get(MONITORING).await, StatusCode::NOT_FOUND).await;
+    let internal = expect_json(
+        idm.anonymous().get("/internal/monitoring").await,
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(internal["role"], "idm");
 
     let config = Config {
         idm_internal_url: Some(idm.base.clone()),
         ..Config::default()
     };
-    let app =
-        TestServer::start_with(|st| st.monitoring = MonitoringSetup::new(&config, Mount::App))
-            .await;
-    let sa = app.login(SUPERADMIN, PASSWORD).await;
-    let v = expect_json(sa.get(MON).await, StatusCode::OK).await;
-    let roles: Vec<&str> = v["instances"]
+    let app = TestServer::start_with(|state| {
+        state.monitoring = MonitoringSetup::new(&config, Mount::App)
+    })
+    .await;
+    let superadmin = app.login(SUPERADMIN, PASSWORD).await;
+    let report = expect_json(superadmin.get(MONITORING).await, StatusCode::OK).await;
+    let roles: Vec<&str> = report["instances"]
         .as_array()
         .unwrap()
         .iter()
         .map(|i| i["role"].as_str().unwrap())
         .collect();
-    assert_eq!(roles, ["app", "idm"], "{v}");
-    assert_eq!(v["instances"][1]["reachable"], true, "{v}");
+    assert_eq!(roles, ["app", "idm"], "{report}");
+    assert_eq!(report["instances"][1]["reachable"], true, "{report}");
 }
 
 /// idm 拉不到:页面照常出,只把那个实例标成不可达(原因是概括性的,不带原始错误)。
@@ -143,23 +166,27 @@ async fn unreachable_idm_is_reported_not_fatal() {
         idm_internal_url: Some("http://127.0.0.1:9".to_owned()),
         ..Config::default()
     };
-    let app =
-        TestServer::start_with(|st| st.monitoring = MonitoringSetup::new(&config, Mount::App))
-            .await;
-    let sa = app.login(SUPERADMIN, PASSWORD).await;
-    let v = expect_json(sa.get(MON).await, StatusCode::OK).await;
-    let idm = &v["instances"][1];
-    assert_eq!(idm["role"], "idm", "{v}");
-    assert_eq!(idm["reachable"], false, "{v}");
-    assert!(idm["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
-    assert_eq!(v["instances"][0]["reachable"], true);
+    let app = TestServer::start_with(|state| {
+        state.monitoring = MonitoringSetup::new(&config, Mount::App)
+    })
+    .await;
+    let superadmin = app.login(SUPERADMIN, PASSWORD).await;
+    let report = expect_json(superadmin.get(MONITORING).await, StatusCode::OK).await;
+    let idm = &report["instances"][1];
+    assert_eq!(idm["role"], "idm", "{report}");
+    assert_eq!(idm["reachable"], false, "{report}");
+    assert!(
+        idm["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{report}"
+    );
+    assert_eq!(report["instances"][0]["reachable"], true);
 }
 
 const HISTORY: &str = "/api/v1/admin/monitoring/history";
 const LOGS: &str = "/api/v1/admin/monitoring/logs";
 
 fn minute(instance: &str, at: OffsetDateTime, requests: u64, errors_5xx: u64) -> MinuteRecord {
-    let mut latency = Hist::default();
+    let mut latency = Histogram::default();
     for _ in 0..requests {
         latency.record(12.0);
     }
@@ -180,13 +207,13 @@ fn minute(instance: &str, at: OffsetDateTime, requests: u64, errors_5xx: u64) ->
             latency,
             ..Default::default()
         }],
-        db_ops: vec![],
+        db_operations: vec![],
     }
 }
 
 fn log(severity: Severity, body: &str, request_id: Option<&str>, ago: Duration) -> LogEntry {
     LogEntry {
-        ts: OffsetDateTime::now_utc() - ago,
+        timestamp: OffsetDateTime::now_utc() - ago,
         instance: "combined".into(),
         service: if body.contains("projector") {
             Service::Idm
@@ -206,8 +233,8 @@ fn log(severity: Severity, body: &str, request_id: Option<&str>, ago: Duration) 
 }
 
 async fn server_with(store: Arc<MemoryOpsStore>) -> TestServer {
-    TestServer::start_with(|st| {
-        st.monitoring = MonitoringSetup::default().with_store(store);
+    TestServer::start_with(|state| {
+        state.monitoring = MonitoringSetup::default().with_store(store);
     })
     .await
 }
@@ -215,13 +242,13 @@ async fn server_with(store: Arc<MemoryOpsStore>) -> TestServer {
 /// 历史与日志同样只给 ops:read。
 #[tokio::test]
 async fn history_and_logs_require_ops_read() {
-    let s = TestServer::start().await;
-    let admin = s.login(ADMIN, PASSWORD).await;
-    let pa = platform_admin(&s);
+    let server = TestServer::start().await;
+    let admin = server.login(ADMIN, PASSWORD).await;
+    let platform_admin_client = platform_admin(&server);
     for path in [HISTORY, LOGS] {
-        expect(s.anon().get(path).await, StatusCode::UNAUTHORIZED).await;
+        expect(server.anonymous().get(path).await, StatusCode::UNAUTHORIZED).await;
         expect(admin.get(path).await, StatusCode::FORBIDDEN).await;
-        expect(pa.get(path).await, StatusCode::FORBIDDEN).await;
+        expect(platform_admin_client.get(path).await, StatusCode::FORBIDDEN).await;
     }
 }
 
@@ -230,25 +257,25 @@ async fn history_and_logs_require_ops_read() {
 async fn history_aggregates_stored_minutes() {
     let store = Arc::new(MemoryOpsStore::new());
     let base = minute_start(OffsetDateTime::now_utc()) - Duration::minutes(20);
-    for k in 0..10 {
+    for minute_offset in 0..10 {
         store
             .record_minute(&minute(
                 "combined",
-                base + Duration::minutes(k),
+                base + Duration::minutes(minute_offset),
                 3,
-                u64::from(k == 4),
+                u64::from(minute_offset == 4),
             ))
             .await
             .unwrap();
     }
-    let s = server_with(store).await;
-    let sa = s.login(SUPERADMIN, PASSWORD).await;
+    let server = server_with(store).await;
+    let superadmin = server.login(SUPERADMIN, PASSWORD).await;
 
-    let v = expect_json(sa.get(HISTORY).await, StatusCode::OK).await;
-    assert_eq!(v["range"], "24h", "默认 24 小时");
-    assert_eq!(v["step_secs"], 300);
-    assert_eq!(v["persistent"], false);
-    let me = &v["instances"][0];
+    let history = expect_json(superadmin.get(HISTORY).await, StatusCode::OK).await;
+    assert_eq!(history["range"], "24h", "默认 24 小时");
+    assert_eq!(history["step_secs"], 300);
+    assert_eq!(history["persistent"], false);
+    let me = &history["instances"][0];
     assert_eq!(me["role"], "combined");
     assert_eq!(me["traffic"]["requests"], 30);
     assert_eq!(me["traffic"]["errors_5xx"], 1);
@@ -261,10 +288,14 @@ async fn history_aggregates_stored_minutes() {
     assert_eq!(sum, 30, "各点相加 = 合计");
     assert_eq!(me["routes"][0]["requests"], 30);
 
-    let v = expect_json(sa.get(&format!("{HISTORY}?range=7d")).await, StatusCode::OK).await;
-    assert_eq!(v["step_secs"], 1800);
+    let history = expect_json(
+        superadmin.get(&format!("{HISTORY}?range=7d")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(history["step_secs"], 1800);
     expect(
-        sa.get(&format!("{HISTORY}?range=2d")).await,
+        superadmin.get(&format!("{HISTORY}?range=2d")).await,
         StatusCode::BAD_REQUEST,
     )
     .await;
@@ -292,12 +323,12 @@ async fn logs_filter_and_paginate() {
         ])
         .await
         .unwrap();
-    let s = server_with(store).await;
-    let sa = s.login(SUPERADMIN, PASSWORD).await;
+    let server = server_with(store).await;
+    let superadmin = server.login(SUPERADMIN, PASSWORD).await;
 
-    let v = expect_json(sa.get(LOGS).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 3);
-    let bodies: Vec<&str> = v["items"]
+    let logs = expect_json(superadmin.get(LOGS).await, StatusCode::OK).await;
+    assert_eq!(logs["page_info"]["total"], 3);
+    let bodies: Vec<&str> = logs["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -309,41 +340,57 @@ async fn logs_filter_and_paginate() {
         "新的在前"
     );
 
-    let v = expect_json(sa.get(&format!("{LOGS}?level=ERROR")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 1);
-    assert_eq!(v["items"][0]["severity"], "ERROR");
-
-    let v = expect_json(
-        sa.get(&format!("{LOGS}?request_id=req-1")).await,
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?level=ERROR")).await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["items"][0]["request_id"], "req-1");
+    assert_eq!(logs["page_info"]["total"], 1);
+    assert_eq!(logs["items"][0]["severity"], "ERROR");
 
-    let v = expect_json(sa.get(&format!("{LOGS}?q=PROJECTOR")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 1, "关键字不区分大小写");
-
-    let v = expect_json(sa.get(&format!("{LOGS}?service=idm")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 1);
-    assert_eq!(v["items"][0]["service"], "idm");
-    let v = expect_json(sa.get(&format!("{LOGS}?service=app")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 2);
-
-    let v = expect_json(
-        sa.get(&format!("{LOGS}?page=2&size=2")).await,
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?request_id=req-1")).await,
         StatusCode::OK,
     )
     .await;
-    assert_eq!(v["items"].as_array().unwrap().len(), 1);
-    assert_eq!(v["page_info"]["total_pages"], 2);
+    assert_eq!(logs["items"][0]["request_id"], "req-1");
+
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?q=PROJECTOR")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["page_info"]["total"], 1, "关键字不区分大小写");
+
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?service=idm")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["page_info"]["total"], 1);
+    assert_eq!(logs["items"][0]["service"], "idm");
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?service=app")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["page_info"]["total"], 2);
+
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?page=2&size=2")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["items"].as_array().unwrap().len(), 1);
+    assert_eq!(logs["page_info"]["total_pages"], 2);
 
     expect(
-        sa.get(&format!("{LOGS}?size=0")).await,
+        superadmin.get(&format!("{LOGS}?size=0")).await,
         StatusCode::UNPROCESSABLE_ENTITY,
     )
     .await;
     expect(
-        sa.get(&format!("{LOGS}?size=500")).await,
+        superadmin.get(&format!("{LOGS}?size=500")).await,
         StatusCode::UNPROCESSABLE_ENTITY,
     )
     .await;
@@ -355,7 +402,7 @@ const CLIENT_ERRORS: &str = "/api/v1/public/client-errors";
 #[tokio::test]
 async fn client_errors_land_in_logs_as_web() {
     let store = Arc::new(MemoryOpsStore::new());
-    let s = server_with(store).await;
+    let server = server_with(store).await;
     let body = serde_json::json!({
         "errors": [{
             "kind": "render",
@@ -366,35 +413,44 @@ async fn client_errors_land_in_logs_as_web() {
         }]
     });
     expect(
-        s.anon().post_json(CLIENT_ERRORS, &body).await,
+        server.anonymous().post_json(CLIENT_ERRORS, &body).await,
         StatusCode::NO_CONTENT,
     )
     .await;
 
-    let sa = s.login(SUPERADMIN, PASSWORD).await;
-    let v = expect_json(sa.get(&format!("{LOGS}?service=web")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 1);
-    let item = &v["items"][0];
+    let superadmin = server.login(SUPERADMIN, PASSWORD).await;
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?service=web")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["page_info"]["total"], 1);
+    let item = &logs["items"][0];
     assert_eq!(item["service"], "web");
     assert_eq!(item["severity"], "ERROR");
     assert_eq!(item["route"], "/admin/users", "query 去掉了");
     assert_eq!(item["attributes"]["kind"], "render");
     assert_eq!(item["attributes"]["release"], "test-build");
     assert!(item["body"].as_str().unwrap().contains("reading 'name'"));
-    let v = expect_json(sa.get(&format!("{LOGS}?service=app")).await, StatusCode::OK).await;
-    assert_eq!(v["page_info"]["total"], 0, "前端错误不混进 app");
+    let logs = expect_json(
+        superadmin.get(&format!("{LOGS}?service=app")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(logs["page_info"]["total"], 0, "前端错误不混进 app");
 
     let one = serde_json::json!({"kind": "error", "message": "boom"});
-    for n in [0, 11] {
-        let batch = serde_json::json!({ "errors": vec![one.clone(); n] });
+    for count in [0, 11] {
+        let batch = serde_json::json!({ "errors": vec![one.clone(); count] });
         expect(
-            s.anon().post_json(CLIENT_ERRORS, &batch).await,
+            server.anonymous().post_json(CLIENT_ERRORS, &batch).await,
             StatusCode::UNPROCESSABLE_ENTITY,
         )
         .await;
     }
     expect(
-        s.anon()
+        server
+            .anonymous()
             .post_json(
                 CLIENT_ERRORS,
                 &serde_json::json!({"errors": [{"kind": "nope", "message": "x"}]}),
@@ -405,7 +461,7 @@ async fn client_errors_land_in_logs_as_web() {
     .await;
     // 请求体超过 64 KB:和别的接口一样回 400(统一错误体),不进日志
     expect(
-        s.anon()
+        server.anonymous()
             .post_json(
                 CLIENT_ERRORS,
                 &serde_json::json!({"errors": [{"kind": "error", "message": "x".repeat(70 * 1024)}]}),

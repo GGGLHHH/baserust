@@ -3,21 +3,26 @@
 //! (不开 feature)不编译本文件;`just test-nats` 连它一起跑。
 #![cfg(feature = "nats-conformance")]
 
-use baserust::infra::jetstream::JetStreamPublisher;
+use async_nats::jetstream::consumer::{pull, DeliverPolicy};
+use async_nats::{jetstream, HeaderMap};
+use baserust::infra::jet_stream_publisher::JetStreamPublisher;
+use baserust::infra::outbox::OutboundEvent;
+use std::env;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn nats_url() -> String {
-    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:2224".to_owned())
+    env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:2224".to_owned())
 }
 
 /// connect 是幂等的(`get_or_create_stream`):同一进程/repeat run 连两次都不该报错。
 #[tokio::test]
 async fn connect_is_idempotent() {
     let url = nats_url();
-    JetStreamPublisher::connect(&url)
+    JetStreamPublisher::try_new(&url)
         .await
         .expect("首次 connect 应成功(需要跑着的 NATS,先 just up)");
-    JetStreamPublisher::connect(&url)
+    JetStreamPublisher::try_new(&url)
         .await
         .expect("重复 connect 应幂等成功(get_or_create_stream 不应因流已存在报错)");
 }
@@ -27,7 +32,7 @@ async fn connect_is_idempotent() {
 /// 兼容本测试被反复跑(流是持久化的,历史消息会攒着)。
 #[tokio::test]
 async fn publish_lands_and_is_readable_back() {
-    let publisher = JetStreamPublisher::connect(&nats_url())
+    let publisher = JetStreamPublisher::try_new(&nats_url())
         .await
         .expect("需要跑着的 NATS(先 just up)");
 
@@ -35,7 +40,11 @@ async fn publish_lands_and_is_readable_back() {
     let payload = format!("payload-{event_id}");
 
     publisher
-        .publish("events.idm.user.created", &event_id, payload.as_bytes())
+        .publish(OutboundEvent {
+            subject: "events.idm.user.created",
+            event_id: &event_id,
+            payload: payload.as_bytes(),
+        })
         .await
         .expect("publish 应成功并拿到 server ack");
 
@@ -43,18 +52,18 @@ async fn publish_lands_and_is_readable_back() {
     let client = async_nats::connect(nats_url())
         .await
         .expect("裸 client 连接应成功");
-    let js = async_nats::jetstream::new(client);
-    let stream = js
+    let jetstream_context = jetstream::new(client);
+    let stream = jetstream_context
         .get_stream("USER_SEARCH_EVENTS")
         .await
-        .expect("流应已被 JetStreamPublisher::connect 建好");
+        .expect("流应已被 JetStreamPublisher::try_new 建好");
     // 用 `LastPerSubject` 而非 `All`+`fetch(50)`:流会持久化累积历史消息(max_age 7 天,
     // 重启不清空),固定拉最老 50 条早晚会把刚发的这条挤出窗口外 —— 不可重复跑。
     // `LastPerSubject` 配上这里的单一 `filter_subject` 只会投递该 subject 上最新一条,
     // 不管流里已经攒了多少历史消息,天然可重复跑。
     let consumer = stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::LastPerSubject,
+        .create_consumer(pull::Config {
+            deliver_policy: DeliverPolicy::LastPerSubject,
             filter_subject: "events.idm.user.created".to_owned(),
             ..Default::default()
         })
@@ -64,28 +73,28 @@ async fn publish_lands_and_is_readable_back() {
     let mut messages = consumer
         .fetch()
         .max_messages(1)
-        .expires(std::time::Duration::from_secs(5))
+        .expires(Duration::from_secs(5))
         .messages()
         .await
         .expect("fetch 一批消息应成功");
     use futures_util::StreamExt;
-    let msg = messages
+    let message = messages
         .next()
         .await
         .expect("LastPerSubject 应能投递该 subject 上最新一条")
         .expect("消息应可读");
     assert_eq!(
-        msg.payload.as_ref(),
+        message.payload.as_ref(),
         payload.as_bytes(),
         "读回的应是刚发布的这条(唯一 payload 保证是本次跑的消息)"
     );
-    let msg_id = msg
+    let message_id = message
         .headers
         .as_ref()
         .and_then(|h| h.get("Nats-Msg-Id"))
         .map(|v| v.to_string());
-    assert_eq!(msg_id.as_deref(), Some(event_id.as_str()));
-    msg.ack().await.expect("ack 应成功");
+    assert_eq!(message_id.as_deref(), Some(event_id.as_str()));
+    message.ack().await.expect("ack 应成功");
 }
 
 /// dedup:同一 `event_id` 发两次,`duplicate_window` 内 server 只落一次 —— 用两次都拿到的
@@ -102,19 +111,19 @@ async fn publish_lands_and_is_readable_back() {
 #[tokio::test]
 async fn duplicate_event_id_is_deduped() {
     // connect 一次确保流已建好(裸 client 发布不会自动建流)。
-    JetStreamPublisher::connect(&nats_url())
+    JetStreamPublisher::try_new(&nats_url())
         .await
         .expect("需要跑着的 NATS(先 just up)");
 
     let client = async_nats::connect(nats_url())
         .await
         .expect("裸 client 连接应成功");
-    let context = async_nats::jetstream::new(client);
+    let context = jetstream::new(client);
 
     let event_id = format!("smoke-dedup-{}", Uuid::new_v4());
     let payload = b"dedup-payload";
 
-    let mut headers = async_nats::HeaderMap::new();
+    let mut headers = HeaderMap::new();
     headers.insert("Nats-Msg-Id", event_id.as_str());
     let ack1 = context
         .publish_with_headers(

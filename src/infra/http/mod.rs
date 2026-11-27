@@ -7,4 +7,4 @@ pub mod error;
 pub mod extract;
 pub mod pagination;
 pub mod schema;
-pub mod sort;
+pub mod sort_order;

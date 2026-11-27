@@ -6,7 +6,7 @@
 //! - 都进一个**有界队列**,由写入任务批量落库([`take_receiver`]);队列满了就丢、只计数,绝不拖慢请求;
 //! - 写入前脱敏:字段名像密码 / token / cookie 的值一律替换,正文与字段值截断。
 
-use std::fmt::Write as _;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -15,12 +15,14 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::field::{Field, Visit};
-use tracing::{span, Event, Level, Subscriber};
+use tracing::{span, Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use super::store::{classify_service, LogEntry, Severity};
+use super::lock_or_reset;
+use super::monitor::RequestOutcome;
+use super::store::{classify_service, LogEntry, LogOrigin, Severity};
 
 /// 队列容量:写库跟不上时最多积这么多条,再多就丢。
 const QUEUE_CAPACITY: usize = 10_000;
@@ -36,6 +38,7 @@ pub const STORE_TARGET: &str = "ops_store";
 /// 本进程在日志里的实例名(app / idm / combined),启动时设一次。
 static INSTANCE: OnceLock<String> = OnceLock::new();
 
+/// 设本进程的实例名(启动时调一次;再调不生效)。
 pub fn set_instance(name: &str) {
     let _ = INSTANCE.set(name.to_owned());
 }
@@ -54,17 +57,21 @@ struct Sink {
 }
 
 static SINK: LazyLock<Sink> = LazyLock::new(|| {
-    let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+    let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     Sink {
-        tx,
-        rx: Mutex::new(Some(rx)),
+        tx: sender,
+        rx: Mutex::new(Some(receiver)),
         dropped: AtomicU64::new(0),
     }
 });
 
 /// 取走队列的接收端(写入任务启动时调一次;第二次调返回 `None`)。
+///
+/// 存接收端的锁按 [`lock_or_reset`] 的锁中毒策略处理:中毒时重置成 `None`(当作已被取走),
+/// 不读里面的数据。锁内只有一次 `Option::take`,持锁时不会 panic,实际不会走到那一步。
+#[must_use = "接收端只能取一次,丢掉它日志队列就再也没有消费者"]
 pub fn take_receiver() -> Option<mpsc::Receiver<LogEntry>> {
-    SINK.rx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    lock_or_reset(&SINK.rx, || None).take()
 }
 
 /// 取出并清零"因队列满而丢弃"的条数(写入任务定期报告)。
@@ -79,11 +86,11 @@ fn emit(entry: LogEntry) {
 }
 
 /// 按字符截断(不能按字节切:多字节字符会 panic),截掉的用 `…` 标出。
-pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
+pub(crate) fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
     } else {
-        let mut out: String = s.chars().take(max).collect();
+        let mut out: String = text.chars().take(max).collect();
         out.push('…');
         out
     }
@@ -91,7 +98,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 
 /// 字段名像敏感信息 → 值不入库。
 fn is_sensitive(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
+    let lowercase = name.to_ascii_lowercase();
     [
         "password",
         "passwd",
@@ -103,7 +110,7 @@ fn is_sensitive(name: &str) -> bool {
         "apikey",
     ]
     .iter()
-    .any(|k| n.contains(k))
+    .any(|keyword| lowercase.contains(keyword))
 }
 
 const REDACTED: &str = "[REDACTED]";
@@ -128,13 +135,12 @@ impl FieldCollector {
 }
 
 impl Visit for FieldCollector {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let mut s = String::new();
-        let _ = write!(s, "{value:?}");
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        let text = format!("{value:?}");
         if field.name() == "message" {
-            self.message = Some(s);
+            self.message = Some(text);
         } else {
-            self.put(field, Value::String(truncate(&s, MAX_VALUE_CHARS)));
+            self.put(field, Value::String(truncate(&text, MAX_VALUE_CHARS)));
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -167,16 +173,16 @@ struct HttpContext {
 }
 
 impl Visit for HttpContext {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let v = format!("{value:?}");
-        self.record_str(field, &v);
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        let text = format!("{value:?}");
+        self.record_str(field, &text);
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        let v = (!value.is_empty() && value != "-").then(|| value.to_owned());
+        let present = (!value.is_empty() && value != "-").then(|| value.to_owned());
         match field.name() {
-            "request_id" => self.request_id = v,
-            "method" => self.method = v,
-            "route" => self.route = v,
+            "request_id" => self.request_id = present,
+            "method" => self.method = present,
+            "route" => self.route = present,
             _ => {}
         }
     }
@@ -187,11 +193,12 @@ pub struct LogCaptureLayer;
 
 impl LogCaptureLayer {
     /// 只放行:WARN 及以上的事件(跳过写库失败自己的日志),以及 `http` span(取请求上下文)。
-    pub fn wants(meta: &tracing::Metadata<'_>) -> bool {
-        if meta.is_span() {
-            return meta.name() == "http";
+    #[must_use]
+    pub fn wants(metadata: &Metadata<'_>) -> bool {
+        if metadata.is_span() {
+            return metadata.name() == "http";
         }
-        *meta.level() <= Level::WARN && meta.target() != STORE_TARGET
+        *metadata.level() <= Level::WARN && metadata.target() != STORE_TARGET
     }
 }
 
@@ -199,42 +206,51 @@ impl<S> Layer<S> for LogCaptureLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        if attrs.metadata().name() != "http" {
+    fn on_new_span(
+        &self,
+        attributes: &span::Attributes<'_>,
+        id: &span::Id,
+        context: Context<'_, S>,
+    ) {
+        if attributes.metadata().name() != "http" {
             return;
         }
         let mut http = HttpContext::default();
-        attrs.record(&mut http);
-        if let Some(span) = ctx.span(id) {
+        attributes.record(&mut http);
+        if let Some(span) = context.span(id) {
             span.extensions_mut().insert(http);
         }
     }
 
-    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let meta = event.metadata();
-        let severity = if *meta.level() == Level::ERROR {
+    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
+        let metadata = event.metadata();
+        let severity = if *metadata.level() == Level::ERROR {
             Severity::Error
-        } else if *meta.level() == Level::WARN {
+        } else if *metadata.level() == Level::WARN {
             Severity::Warn
         } else {
             return;
         };
         let mut fields = FieldCollector::default();
         event.record(&mut fields);
-        let http = ctx.event_scope(event).and_then(|scope| {
+        let http = context.event_scope(event).and_then(|scope| {
             scope
                 .from_root()
                 .find_map(|span| span.extensions().get::<HttpContext>().cloned())
         });
         let http = http.unwrap_or_default();
         let instance = instance();
-        let service = classify_service(&instance, meta.target(), http.route.as_deref());
+        let service = classify_service(LogOrigin {
+            instance: &instance,
+            target: metadata.target(),
+            route: http.route.as_deref(),
+        });
         emit(LogEntry {
-            ts: OffsetDateTime::now_utc(),
+            timestamp: OffsetDateTime::now_utc(),
             instance,
             service,
             severity,
-            target: meta.target().to_owned(),
+            target: metadata.target().to_owned(),
             body: truncate(fields.message.as_deref().unwrap_or(""), MAX_BODY_CHARS),
             request_id: http.request_id,
             method: http.method,
@@ -247,13 +263,13 @@ where
 }
 
 /// 请求统计中间件对**失败请求(5xx)与慢请求**各记一条(其余请求不进日志库)。
-pub fn record_access(
-    request_id: Option<String>,
-    method: &str,
-    route: &str,
-    status: u16,
-    elapsed: Duration,
-) {
+pub fn record_access(request_id: Option<String>, outcome: RequestOutcome<'_>) {
+    let RequestOutcome {
+        method,
+        route,
+        status,
+        elapsed,
+    } = outcome;
     let slow = elapsed >= SLOW_REQUEST;
     if status < 500 && !slow {
         return;
@@ -271,9 +287,13 @@ pub fn record_access(
         )
     };
     let instance = instance();
-    let service = classify_service(&instance, "http.access", Some(route));
+    let service = classify_service(LogOrigin {
+        instance: &instance,
+        target: "http.access",
+        route: Some(route),
+    });
     emit(LogEntry {
-        ts: OffsetDateTime::now_utc(),
+        timestamp: OffsetDateTime::now_utc(),
         instance,
         service,
         severity,
@@ -294,32 +314,50 @@ mod tests {
 
     #[test]
     fn access_records_only_failed_and_slow_requests() {
-        let mut rx = take_receiver().expect("本测试是唯一的接收方");
-        record_access(None, "GET", "/ok", 200, Duration::from_millis(5));
+        let mut receiver = take_receiver().expect("本测试是唯一的接收方");
+        record_access(
+            None,
+            RequestOutcome {
+                method: "GET",
+                route: "/ok",
+                status: 200,
+                elapsed: Duration::from_millis(5),
+            },
+        );
         record_access(
             Some("r1".into()),
-            "GET",
-            "/boom",
-            503,
-            Duration::from_millis(5),
+            RequestOutcome {
+                method: "GET",
+                route: "/boom",
+                status: 503,
+                elapsed: Duration::from_millis(5),
+            },
         );
-        record_access(None, "POST", "/slow", 200, Duration::from_millis(1500));
-        let a = rx.try_recv().unwrap();
+        record_access(
+            None,
+            RequestOutcome {
+                method: "POST",
+                route: "/slow",
+                status: 200,
+                elapsed: Duration::from_millis(1500),
+            },
+        );
+        let failed = receiver.try_recv().unwrap();
         assert_eq!(
-            (a.severity, a.status, a.request_id.as_deref()),
+            (failed.severity, failed.status, failed.request_id.as_deref()),
             (Severity::Error, Some(503), Some("r1"))
         );
-        let b = rx.try_recv().unwrap();
+        let slow = receiver.try_recv().unwrap();
         assert_eq!(
-            (b.severity, b.route.as_deref()),
+            (slow.severity, slow.route.as_deref()),
             (Severity::Warn, Some("/slow"))
         );
-        assert!(rx.try_recv().is_err(), "正常请求不记");
+        assert!(receiver.try_recv().is_err(), "正常请求不记");
     }
 
     #[test]
     fn sensitive_field_names_are_detected() {
-        for n in [
+        for field_name in [
             "password",
             "new_password",
             "access_token",
@@ -327,10 +365,10 @@ mod tests {
             "authorization",
             "client_secret",
         ] {
-            assert!(is_sensitive(n), "{n}");
+            assert!(is_sensitive(field_name), "{field_name}");
         }
-        for n in ["user_id", "route", "status", "identifier"] {
-            assert!(!is_sensitive(n), "{n}");
+        for field_name in ["user_id", "route", "status", "identifier"] {
+            assert!(!is_sensitive(field_name), "{field_name}");
         }
     }
 
@@ -343,26 +381,32 @@ mod tests {
 
     #[test]
     fn collector_redacts_sensitive_values() {
+        use std::sync::Arc;
+
+        use tracing::subscriber;
         use tracing_subscriber::layer::SubscriberExt;
         type Captured = (Option<String>, Map<String, Value>);
         #[derive(Clone, Default)]
-        struct Grab(std::sync::Arc<Mutex<Vec<Captured>>>);
+        struct Grab(Arc<Mutex<Vec<Captured>>>);
         impl<S: Subscriber> Layer<S> for Grab {
             fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-                let mut f = FieldCollector::default();
-                event.record(&mut f);
-                self.0.lock().unwrap().push((f.message, f.attrs));
+                let mut collector = FieldCollector::default();
+                event.record(&mut collector);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((collector.message, collector.attrs));
             }
         }
         let grab = Grab::default();
-        let sub = tracing_subscriber::registry().with(grab.clone());
-        tracing::subscriber::with_default(sub, || {
+        let test_subscriber = tracing_subscriber::registry().with(grab.clone());
+        subscriber::with_default(test_subscriber, || {
             tracing::warn!(password = "hunter2", user_id = 7, "登录失败");
         });
         let got = grab.0.lock().unwrap();
-        let (msg, attrs) = &got[0];
-        assert_eq!(msg.as_deref(), Some("登录失败"));
-        assert_eq!(attrs["password"], Value::String(REDACTED.to_owned()));
-        assert_eq!(attrs["user_id"], Value::from(7));
+        let (message, attributes) = &got[0];
+        assert_eq!(message.as_deref(), Some("登录失败"));
+        assert_eq!(attributes["password"], Value::String(REDACTED.to_owned()));
+        assert_eq!(attributes["user_id"], Value::from(7));
     }
 }

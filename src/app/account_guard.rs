@@ -10,9 +10,9 @@
 use idm::AuthUser;
 use uuid::Uuid;
 
-use crate::app::state::AppState;
-use crate::kernel::authz::Perm;
-use crate::kernel::error::AppError;
+use crate::app::app_state::AppState;
+use crate::kernel::app_error::AppError;
+use crate::kernel::authorization::Permission;
 
 impl AppState {
     /// 目标账号持有任一平台角色(superadmin / platform_admin / 闭集外的平台角色名)→ 操作者须持 `platform:roles`,否则 403。
@@ -20,13 +20,13 @@ impl AppState {
     pub async fn guard_platform_account(
         &self,
         actor: &AuthUser,
-        scope: &[Perm],
+        scope: &[Permission],
         target: Uuid,
     ) -> Result<(), AppError> {
         let roles = match self.user_admin.raw_role_names(target).await {
             Ok(roles) => roles,
             Err(AppError::NotFound) => return Ok(()),
-            Err(e) => return Err(e),
+            Err(other) => return Err(other),
         };
         self.policy
             .require_platform_role_authority(actor, scope, &roles)

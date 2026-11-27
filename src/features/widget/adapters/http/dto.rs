@@ -1,4 +1,4 @@
-//! widget 的 **HTTP 线格式**:请求/响应 JSON + OpenAPI schema,与领域模型(`model` / `events` /
+//! widget 的 **HTTP 线格式**:请求/响应 JSON + OpenAPI schema,与领域模型(`model` / `widget_event` /
 //! `ports::UserBrief`)互转。核心不知道这些类型的存在。
 //!
 //! **schema 名与 JSON 形状是对前端的契约**(前端按 OpenAPI 生成类型):类型名即 schema 名,改名 /
@@ -10,9 +10,9 @@ use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::features::widget::{events, model, ports};
-use crate::kernel::error::AppError;
-use crate::kernel::tenant::TenantId;
+use crate::features::widget::{model, ports, widget_event};
+use crate::kernel::app_error::AppError;
+use crate::kernel::tenant_id::TenantId;
 
 /// 一个 widget(示例资源)+ 基础审计字段。时间是 RFC3339。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -28,27 +28,27 @@ pub struct Widget {
 }
 
 impl From<model::Widget> for Widget {
-    fn from(w: model::Widget) -> Self {
+    fn from(widget: model::Widget) -> Self {
         Self {
-            id: w.id,
-            name: w.name,
-            created_by: w.created_by,
-            created_at: w.created_at,
-            updated_by: w.updated_by,
-            updated_at: w.updated_at,
+            id: widget.id,
+            name: widget.name,
+            created_by: widget.created_by,
+            created_at: widget.created_at,
+            updated_by: widget.updated_by,
+            updated_at: widget.updated_at,
         }
     }
 }
 
 impl From<Widget> for model::Widget {
-    fn from(w: Widget) -> Self {
+    fn from(widget: Widget) -> Self {
         Self {
-            id: w.id,
-            name: w.name,
-            created_by: w.created_by,
-            created_at: w.created_at,
-            updated_by: w.updated_by,
-            updated_at: w.updated_at,
+            id: widget.id,
+            name: widget.name,
+            created_by: widget.created_by,
+            created_at: widget.created_at,
+            updated_by: widget.updated_by,
+            updated_at: widget.updated_at,
         }
     }
 }
@@ -60,8 +60,8 @@ pub struct CreateWidget {
 }
 
 impl From<CreateWidget> for model::CreateWidget {
-    fn from(c: CreateWidget) -> Self {
-        Self { name: c.name }
+    fn from(input: CreateWidget) -> Self {
+        Self { name: input.name }
     }
 }
 
@@ -72,8 +72,8 @@ pub struct UpdateWidget {
 }
 
 impl From<UpdateWidget> for model::UpdateWidget {
-    fn from(u: UpdateWidget) -> Self {
-        Self { name: u.name }
+    fn from(input: UpdateWidget) -> Self {
+        Self { name: input.name }
     }
 }
 
@@ -87,8 +87,8 @@ pub enum WidgetSortField {
 }
 
 impl From<WidgetSortField> for model::WidgetSortField {
-    fn from(f: WidgetSortField) -> Self {
-        match f {
+    fn from(field: WidgetSortField) -> Self {
+        match field {
             WidgetSortField::CreatedAt => Self::CreatedAt,
             WidgetSortField::Name => Self::Name,
         }
@@ -104,11 +104,11 @@ pub struct UserBrief {
 }
 
 impl From<ports::UserBrief> for UserBrief {
-    fn from(b: ports::UserBrief) -> Self {
+    fn from(brief: ports::UserBrief) -> Self {
         Self {
-            id: b.id,
-            username: b.username,
-            email: b.email,
+            id: brief.id,
+            username: brief.username,
+            email: brief.email,
         }
     }
 }
@@ -130,15 +130,15 @@ pub struct WidgetView {
 }
 
 impl From<model::WidgetView> for WidgetView {
-    fn from(v: model::WidgetView) -> Self {
+    fn from(view: model::WidgetView) -> Self {
         Self {
-            id: v.id,
-            name: v.name,
-            created_by: v.created_by,
-            created_at: v.created_at,
-            updated_by: v.updated_by,
-            updated_at: v.updated_at,
-            created_by_user: v.created_by_user.map(UserBrief::from),
+            id: view.id,
+            name: view.name,
+            created_by: view.created_by,
+            created_at: view.created_at,
+            updated_by: view.updated_by,
+            updated_at: view.updated_at,
+            created_by_user: view.created_by_user.map(UserBrief::from),
         }
     }
 }
@@ -170,18 +170,18 @@ pub enum WidgetEvent {
     },
 }
 
-impl From<events::WidgetEvent> for WidgetEvent {
-    fn from(e: events::WidgetEvent) -> Self {
-        match e {
-            events::WidgetEvent::Created { tenant_id, widget } => Self::Created {
+impl From<widget_event::WidgetEvent> for WidgetEvent {
+    fn from(event: widget_event::WidgetEvent) -> Self {
+        match event {
+            widget_event::WidgetEvent::Created { tenant_id, widget } => Self::Created {
                 tenant_id: tenant_id.as_uuid(),
                 widget: widget.into(),
             },
-            events::WidgetEvent::Updated { tenant_id, widget } => Self::Updated {
+            widget_event::WidgetEvent::Updated { tenant_id, widget } => Self::Updated {
                 tenant_id: tenant_id.as_uuid(),
                 widget: widget.into(),
             },
-            events::WidgetEvent::Deleted {
+            widget_event::WidgetEvent::Deleted {
                 tenant_id,
                 id,
                 created_by,
@@ -195,17 +195,17 @@ impl From<events::WidgetEvent> for WidgetEvent {
 }
 
 /// 线格式 → 领域事件(总线订阅侧)。`tenant_id` 是 nil → 拒(nil 永远不是合法租户),订阅侧当坏 payload 跳过。
-impl TryFrom<WidgetEvent> for events::WidgetEvent {
+impl TryFrom<WidgetEvent> for widget_event::WidgetEvent {
     type Error = AppError;
 
-    fn try_from(e: WidgetEvent) -> Result<Self, Self::Error> {
-        Ok(match e {
+    fn try_from(event: WidgetEvent) -> Result<Self, Self::Error> {
+        Ok(match event {
             WidgetEvent::Created { tenant_id, widget } => Self::Created {
-                tenant_id: TenantId::new(tenant_id)?,
+                tenant_id: TenantId::try_new(tenant_id)?,
                 widget: widget.into(),
             },
             WidgetEvent::Updated { tenant_id, widget } => Self::Updated {
-                tenant_id: TenantId::new(tenant_id)?,
+                tenant_id: TenantId::try_new(tenant_id)?,
                 widget: widget.into(),
             },
             WidgetEvent::Deleted {
@@ -213,7 +213,7 @@ impl TryFrom<WidgetEvent> for events::WidgetEvent {
                 id,
                 created_by,
             } => Self::Deleted {
-                tenant_id: TenantId::new(tenant_id)?,
+                tenant_id: TenantId::try_new(tenant_id)?,
                 id,
                 created_by,
             },
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn event_name_matches_wire_tag() {
         let now = OffsetDateTime::now_utc();
-        let w = model::Widget {
+        let widget = model::Widget {
             id: Uuid::now_v7(),
             name: "n".into(),
             created_by: None,
@@ -237,31 +237,30 @@ mod tests {
             updated_by: None,
             updated_at: now,
         };
-        let t = TenantId::new(Uuid::now_v7()).unwrap();
-        for e in [
-            events::WidgetEvent::Created {
-                tenant_id: t,
-                widget: w.clone(),
+        let tenant = TenantId::try_new(Uuid::now_v7()).unwrap();
+        for event in [
+            widget_event::WidgetEvent::Created {
+                tenant_id: tenant,
+                widget: widget.clone(),
             },
-            events::WidgetEvent::Updated {
-                tenant_id: t,
-                widget: w.clone(),
+            widget_event::WidgetEvent::Updated {
+                tenant_id: tenant,
+                widget: widget.clone(),
             },
-            events::WidgetEvent::Deleted {
-                tenant_id: t,
-                id: w.id,
+            widget_event::WidgetEvent::Deleted {
+                tenant_id: tenant,
+                id: widget.id,
                 created_by: None,
             },
         ] {
-            let wire = serde_json::to_value(WidgetEvent::from(e.clone())).unwrap();
-            assert_eq!(wire["type"].as_str(), Some(e.name()));
+            let wire = serde_json::to_value(WidgetEvent::from(event.clone())).unwrap();
+            assert_eq!(wire["type"].as_str(), Some(event.name()));
             // 租户随线格式走(跨实例总线负载靠它让订阅侧先按租户过滤)
-            assert_eq!(wire["tenant_id"], serde_json::json!(t.as_uuid()));
+            assert_eq!(wire["tenant_id"], serde_json::json!(tenant.as_uuid()));
             // 往返:线格式 → 领域,无损(含租户)
-            let back =
-                events::WidgetEvent::try_from(serde_json::from_value::<WidgetEvent>(wire).unwrap())
-                    .unwrap();
-            assert_eq!(back, e);
+            let parsed: WidgetEvent = serde_json::from_value(wire).unwrap();
+            let back = widget_event::WidgetEvent::try_from(parsed).unwrap();
+            assert_eq!(back, event);
         }
     }
 
@@ -273,6 +272,6 @@ mod tests {
             id: Uuid::now_v7(),
             created_by: None,
         };
-        assert!(events::WidgetEvent::try_from(wire).is_err());
+        assert!(widget_event::WidgetEvent::try_from(wire).is_err());
     }
 }

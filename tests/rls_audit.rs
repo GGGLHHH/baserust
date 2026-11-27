@@ -11,20 +11,19 @@
 //!    `<schema>_owner` / `<schema>_system` 的成员(`pg_auth_members`,含间接:成员能 SET ROLE 过去,等于拿到它的权);
 //!    `<schema>_owner` 拥有 schema 与表;`<schema>_system` 有 BYPASSRLS(后台任务 / 平台级读)。
 //!
-//! [`PENDING_TABLES`] 是**过渡清单**:还没改造成租户隔离的业务表。后续任务每改造一张就删一行,
-//! 全部改完时必须为空;已经改造好却还挂在清单里的表同样判失败(清单不许虚报)。
-//!
 //! 仅 `--features pg-conformance`(`just test-pg`)。每个用例先以 owner 账号幂等跑一遍 app / content /
 //! search 的迁移(`*_OWNER_DATABASE_URL`,CI 的全新库也能审),再连 `APP_DATABASE_URL`(运行时 app 账号即可:
 //! 只读系统目录,不碰业务表)。缺省都回退本地 compose 的账号。
 #![cfg(feature = "pg-conformance")]
 
+use sqlx::FromRow;
 use std::collections::BTreeSet;
+use std::env;
 
-use baserust::app::state::{connect_system_for_schema, Schema};
+use baserust::app::app_state::{connect_system_for_schema, Schema};
 use baserust::infra::config::Config;
-use baserust::infra::pg::tenant_tx;
-use baserust::kernel::tenant::TenantId;
+use baserust::infra::pg::tenant_transaction;
+use baserust::kernel::tenant_id::TenantId;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -49,9 +48,6 @@ const GLOBAL_TABLES: &[&str] = &[
     "search.auth_event",
 ];
 
-/// 尚未改造成租户隔离的业务表(过渡清单)。每改造一张删一行;全部完成时必须为空。
-const PENDING_TABLES: &[&str] = &[];
-
 /// 某 schema 的三个账号名:运行时 / owner / system。名字跟部署脚本同一套环境变量与缺省
 /// (`<SCHEMA>_DB_USER`,owner / system 缺省是它加 `_owner` / `_system` 后缀)。
 struct Roles {
@@ -61,24 +57,26 @@ struct Roles {
 }
 
 fn roles_for(schema: &str) -> Roles {
-    let up = schema.to_uppercase();
-    let env = |k: String| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let runtime = env(format!("{up}_DB_USER")).unwrap_or_else(|| schema.to_owned());
+    let upper_schema = schema.to_uppercase();
+    let env = |name: String| env::var(name).ok().filter(|v| !v.is_empty());
+    let runtime = env(format!("{upper_schema}_DB_USER")).unwrap_or_else(|| schema.to_owned());
     Roles {
-        owner: env(format!("{up}_DB_OWNER_USER")).unwrap_or_else(|| format!("{runtime}_owner")),
-        system: env(format!("{up}_DB_SYSTEM_USER")).unwrap_or_else(|| format!("{runtime}_system")),
+        owner: env(format!("{upper_schema}_DB_OWNER_USER"))
+            .unwrap_or_else(|| format!("{runtime}_owner")),
+        system: env(format!("{upper_schema}_DB_SYSTEM_USER"))
+            .unwrap_or_else(|| format!("{runtime}_system")),
         runtime,
     }
 }
 
 fn app_url() -> String {
-    std::env::var("APP_DATABASE_URL")
+    env::var("APP_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://app:pwd@localhost:5821/baserust?sslmode=disable".into())
 }
 
 fn owner_url(schema: &str) -> String {
-    let up = schema.to_uppercase();
-    std::env::var(format!("{up}_OWNER_DATABASE_URL")).unwrap_or_else(|_| {
+    let upper_schema = schema.to_uppercase();
+    env::var(format!("{upper_schema}_OWNER_DATABASE_URL")).unwrap_or_else(|_| {
         format!("postgres://{schema}_owner:pwd@localhost:5821/baserust?sslmode=disable")
     })
 }
@@ -93,8 +91,10 @@ async fn migrate_all() {
     for (schema, migrator) in migrators {
         let owner = PgPool::connect(&owner_url(schema))
             .await
-            .unwrap_or_else(|e| {
-                panic!("连 {schema} 的 owner 账号失败(先 `just up` + `just db-ensure-roles`): {e}")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "连 {schema} 的 owner 账号失败(先 `just up` + `just db-ensure-roles`): {error}"
+                )
             });
         migrator
             .run(&owner)
@@ -112,7 +112,7 @@ async fn connect() -> PgPool {
 }
 
 /// 一张表的 RLS 状态(`schema.table` 全名)。
-#[derive(sqlx::FromRow)]
+#[derive(FromRow)]
 struct TableRls {
     name: String,
     rls: bool,
@@ -123,7 +123,7 @@ struct TableRls {
 
 async fn tables(pool: &PgPool) -> Vec<TableRls> {
     let schemas: Vec<String> = SCHEMAS.iter().map(|s| (*s).to_owned()).collect();
-    sqlx::query_as::<_, TableRls>(
+    sqlx::query_as(
         "select n.nspname || '.' || c.relname as name,
                 c.relrowsecurity as rls,
                 c.relforcerowsecurity as force,
@@ -140,8 +140,8 @@ async fn tables(pool: &PgPool) -> Vec<TableRls> {
     .expect("查 pg_class")
 }
 
-fn isolated(t: &TableRls) -> bool {
-    t.rls && t.force && t.policies > 0
+fn isolated(table: &TableRls) -> bool {
+    table.rls && table.force && table.policies > 0
 }
 
 #[tokio::test]
@@ -154,42 +154,36 @@ async fn every_table_is_tenant_isolated_or_whitelisted() {
     );
     let names: BTreeSet<&str> = all.iter().map(|t| t.name.as_str()).collect();
     let global: BTreeSet<&str> = GLOBAL_TABLES.iter().copied().collect();
-    let pending: BTreeSet<&str> = PENDING_TABLES.iter().copied().collect();
 
-    let mut errs = Vec::new();
-    for both in global.intersection(&pending) {
-        errs.push(format!("{both}:同时在 GLOBAL_TABLES 和 PENDING_TABLES 里"));
-    }
-    for listed in global.iter().chain(pending.iter()) {
+    let mut errors = Vec::new();
+    for listed in &global {
         if !names.contains(listed) {
-            errs.push(format!(
-                "{listed}:清单里有、库里没有(表改名 / 删了就从清单删掉)"
+            errors.push(format!(
+                "{listed}:GLOBAL_TABLES 里有、库里没有(表改名 / 删了就从白名单删掉)"
             ));
         }
     }
-    for t in &all {
-        let name = t.name.as_str();
+    for table in &all {
+        let name = table.name.as_str();
         if global.contains(name) {
             continue;
         }
-        if pending.contains(name) {
-            if isolated(t) {
-                errs.push(format!("{name}:已经租户隔离了,从 PENDING_TABLES 删掉"));
-            }
-            continue;
-        }
-        if !isolated(t) {
-            errs.push(format!(
+        if !isolated(table) {
+            errors.push(format!(
                 "{name}:既没租户隔离(rls={} force={} policies={}),也不在 GLOBAL_TABLES",
-                t.rls, t.force, t.policies
+                table.rls, table.force, table.policies
             ));
         }
     }
-    assert!(errs.is_empty(), "RLS 审计不通过:\n  {}", errs.join("\n  "));
+    assert!(
+        errors.is_empty(),
+        "RLS 审计不通过:\n  {}",
+        errors.join("\n  ")
+    );
 }
 
 /// 一条 RLS 策略(`pg_policies`)。`qual` = USING,`with_check` = WITH CHECK(没写为 NULL)。
-#[derive(sqlx::FromRow)]
+#[derive(FromRow)]
 struct Policy {
     name: String,
     policy: String,
@@ -200,7 +194,7 @@ struct Policy {
 
 async fn policies(pool: &PgPool) -> Vec<Policy> {
     let schemas: Vec<String> = SCHEMAS.iter().map(|s| (*s).to_owned()).collect();
-    sqlx::query_as::<_, Policy>(
+    sqlx::query_as(
         "select schemaname || '.' || tablename as name, policyname::text as policy, permissive,
                 qual, with_check
            from pg_policies where schemaname = any($1) order by 1, 2",
@@ -214,19 +208,19 @@ async fn policies(pool: &PgPool) -> Vec<Policy> {
 /// 策略表达式(PG 反解析出来的文本)是否只按租户放行:
 /// - 必须有 `tenant_id = …current_setting('app.tenant_id'…` 这一支;
 /// - 不许有别的 OR 分支 —— 唯一例外是 content 的个人内容:`tenant_id IS NULL AND current_setting('app.personal_scope'…) = 'on'`。
-fn tenant_bound(schema: &str, expr: &str) -> Result<(), String> {
-    let e = expr.to_lowercase();
-    if !(e.contains("tenant_id =") && e.contains("current_setting('app.tenant_id'")) {
+fn tenant_bound(schema: &str, expression: &str) -> Result<(), String> {
+    let lowered = expression.to_lowercase();
+    if !(lowered.contains("tenant_id =") && lowered.contains("current_setting('app.tenant_id'")) {
         return Err("没按 app.tenant_id 判".into());
     }
-    let ors = e.matches(" or ").count();
-    if ors == 0 {
+    let or_count = lowered.matches(" or ").count();
+    if or_count == 0 {
         return Ok(());
     }
     let personal = schema == "content"
-        && ors == 1
-        && e.contains("tenant_id is null")
-        && e.contains("current_setting('app.personal_scope'");
+        && or_count == 1
+        && lowered.contains("tenant_id is null")
+        && lowered.contains("current_setting('app.personal_scope'");
     if personal {
         Ok(())
     } else {
@@ -239,30 +233,32 @@ async fn isolation_policies_are_bound_to_tenant_id() {
     let pool = connect().await;
     let global: BTreeSet<&str> = GLOBAL_TABLES.iter().copied().collect();
     let all = policies(&pool).await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     let mut checked = 0usize;
-    for t in tables(&pool).await {
-        if global.contains(t.name.as_str()) || !isolated(&t) {
+    for table in tables(&pool).await {
+        if global.contains(table.name.as_str()) || !isolated(&table) {
             continue; // 白名单表不审;没隔离的表由 every_table_is_tenant_isolated_or_whitelisted 报
         }
-        let schema = t.name.split('.').next().unwrap_or_default();
-        for p in all.iter().filter(|p| p.name == t.name) {
-            let exprs: Vec<(&str, &str)> = [("USING", &p.qual), ("WITH CHECK", &p.with_check)]
-                .into_iter()
-                .filter_map(|(k, v)| v.as_deref().map(|v| (k, v)))
-                .collect();
-            if exprs.is_empty() {
-                errs.push(format!(
+        let schema = table.name.split('.').next().unwrap_or_default();
+        let table_policies = all.iter().filter(|p| p.name == table.name);
+        for policy in table_policies {
+            let expressions: Vec<(&str, &str)> =
+                [("USING", &policy.qual), ("WITH CHECK", &policy.with_check)]
+                    .into_iter()
+                    .filter_map(|(k, v)| v.as_deref().map(|v| (k, v)))
+                    .collect();
+            if expressions.is_empty() {
+                errors.push(format!(
                     "{} 的策略 {}:既没有 USING 也没有 WITH CHECK",
-                    t.name, p.policy
+                    table.name, policy.policy
                 ));
             }
-            for (kind, expr) in exprs {
+            for (kind, expression) in expressions {
                 checked += 1;
-                if let Err(why) = tenant_bound(schema, expr) {
-                    errs.push(format!(
-                        "{} 的策略 {}({}){kind} {why}:{expr}",
-                        t.name, p.policy, p.permissive
+                if let Err(why) = tenant_bound(schema, expression) {
+                    errors.push(format!(
+                        "{} 的策略 {}({}){kind} {why}:{expression}",
+                        table.name, policy.policy, policy.permissive
                     ));
                 }
             }
@@ -270,9 +266,9 @@ async fn isolation_policies_are_bound_to_tenant_id() {
     }
     assert!(checked > 0, "一条策略表达式都没审到:库没迁移?");
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "RLS 策略审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
@@ -315,40 +311,49 @@ async fn is_member_of(pool: &PgPool, member: &str, role: &str) -> bool {
 #[tokio::test]
 async fn runtime_roles_are_not_members_of_owner_or_system() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for schema in SCHEMAS {
-        let r = roles_for(schema);
+        let roles = roles_for(schema);
         for (member, role) in [
-            (&r.runtime, &r.owner),
-            (&r.runtime, &r.system),
-            (&r.system, &r.owner),
+            (&roles.runtime, &roles.owner),
+            (&roles.runtime, &roles.system),
+            (&roles.system, &roles.owner),
         ] {
             if is_member_of(&pool, member, role).await {
-                errs.push(format!("{member} 是 {role} 的成员(pg_auth_members)"));
+                errors.push(format!("{member} 是 {role} 的成员(pg_auth_members)"));
             }
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "账号成员关系审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
-/// 账号属性:rolsuper / rolbypassrls。
-async fn role_attrs(pool: &PgPool, role: &str) -> Option<(bool, bool)> {
-    sqlx::query_as::<_, (bool, bool)>(
-        "select rolsuper, rolbypassrls from pg_roles where rolname = $1",
-    )
-    .bind(role)
-    .fetch_optional(pool)
-    .await
-    .expect("查 pg_roles")
+/// 账号属性(`pg_roles` 的 rolsuper / rolbypassrls)。
+struct RoleAttributes {
+    superuser: bool,
+    bypass_rls: bool,
+}
+
+/// 查账号属性;账号不存在 → `None`。
+async fn role_attributes(pool: &PgPool, role: &str) -> Option<RoleAttributes> {
+    let row: Option<(bool, bool)> =
+        sqlx::query_as("select rolsuper, rolbypassrls from pg_roles where rolname = $1")
+            .bind(role)
+            .fetch_optional(pool)
+            .await
+            .expect("查 pg_roles");
+    row.map(|(superuser, bypass_rls)| RoleAttributes {
+        superuser,
+        bypass_rls,
+    })
 }
 
 /// 该账号在整个库里拥有的表 / 视图 / 序列(`schema.name`)。
 async fn owned_relations(pool: &PgPool, role: &str) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
+    sqlx::query_scalar(
         "select n.nspname || '.' || c.relname
            from pg_class c join pg_namespace n on n.oid = c.relnamespace
           where c.relkind in ('r', 'p', 'v', 'm', 'S', 'f')
@@ -363,7 +368,7 @@ async fn owned_relations(pool: &PgPool, role: &str) -> Vec<String> {
 
 /// `role` 在 `schema` 里缺哪些业务表的 DML(select/insert/update/delete 任一缺即列出;迁移台账除外)。
 async fn missing_dml(pool: &PgPool, role: &str, schema: &str) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
+    sqlx::query_scalar(
         "select n.nspname || '.' || c.relname
            from pg_class c join pg_namespace n on n.oid = c.relnamespace
           where c.relkind in ('r', 'p') and n.nspname = $2
@@ -392,57 +397,63 @@ async fn missing_dml(pool: &PgPool, role: &str, schema: &str) -> Vec<String> {
 #[tokio::test]
 async fn runtime_roles_are_not_owners_and_cannot_bypass_rls() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for schema in SCHEMAS {
-        let r = roles_for(schema);
-        match role_attrs(&pool, &r.runtime).await {
-            None => errs.push(format!("运行时账号 {} 不存在", r.runtime)),
-            Some((sup, bypass)) => {
-                if sup || bypass {
-                    errs.push(format!(
-                        "运行时账号 {} 不能是超级用户 / BYPASSRLS(super={sup} bypassrls={bypass})",
-                        r.runtime
+        let roles = roles_for(schema);
+        match role_attributes(&pool, &roles.runtime).await {
+            None => errors.push(format!("运行时账号 {} 不存在", roles.runtime)),
+            Some(RoleAttributes {
+                superuser,
+                bypass_rls,
+            }) => {
+                if superuser || bypass_rls {
+                    errors.push(format!(
+                        "运行时账号 {} 不能是超级用户 / BYPASSRLS(super={superuser} bypassrls={bypass_rls})",
+                        roles.runtime
                     ));
                 }
             }
         }
-        let owned = owned_relations(&pool, &r.runtime).await;
+        let owned = owned_relations(&pool, &roles.runtime).await;
         if !owned.is_empty() {
-            errs.push(format!("运行时账号 {} 不能拥有表:{owned:?}", r.runtime));
+            errors.push(format!("运行时账号 {} 不能拥有表:{owned:?}", roles.runtime));
         }
-        let missing = missing_dml(&pool, &r.runtime, schema).await;
+        let missing = missing_dml(&pool, &roles.runtime, schema).await;
         if !missing.is_empty() {
-            errs.push(format!("运行时账号 {} 缺 DML 权限:{missing:?}", r.runtime));
+            errors.push(format!(
+                "运行时账号 {} 缺 DML 权限:{missing:?}",
+                roles.runtime
+            ));
         }
         // 运行时账号不能在自己的 schema 里建表(只有 DML)。
         let can_create: bool = sqlx::query_scalar("select has_schema_privilege($1, $2, 'create')")
-            .bind(&r.runtime)
+            .bind(&roles.runtime)
             .bind(*schema)
             .fetch_one(&pool)
             .await
             .expect("查 schema 权限");
         if can_create {
-            errs.push(format!(
+            errors.push(format!(
                 "运行时账号 {} 不该有 schema {schema} 的 CREATE",
-                r.runtime
+                roles.runtime
             ));
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "运行时账号审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
 #[tokio::test]
 async fn owner_roles_own_schemas_and_tables() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for schema in SCHEMAS {
-        let r = roles_for(schema);
-        if role_attrs(&pool, &r.owner).await.is_none() {
-            errs.push(format!("owner 账号 {} 不存在", r.owner));
+        let roles = roles_for(schema);
+        if role_attributes(&pool, &roles.owner).await.is_none() {
+            errors.push(format!("owner 账号 {} 不存在", roles.owner));
             continue;
         }
         let schema_owner: Option<String> = sqlx::query_scalar(
@@ -452,83 +463,89 @@ async fn owner_roles_own_schemas_and_tables() {
         .fetch_optional(&pool)
         .await
         .expect("查 schema owner");
-        if schema_owner.as_deref() != Some(r.owner.as_str()) {
-            errs.push(format!(
+        if schema_owner.as_deref() != Some(roles.owner.as_str()) {
+            errors.push(format!(
                 "schema {schema} 的 owner 应是 {},实际 {schema_owner:?}",
-                r.owner
+                roles.owner
             ));
         }
-        for t in tables(&pool).await {
-            if t.name.starts_with(&format!("{schema}.")) && t.owner != r.owner {
-                errs.push(format!(
+        for table in tables(&pool).await {
+            if table.name.starts_with(&format!("{schema}.")) && table.owner != roles.owner {
+                errors.push(format!(
                     "{} 的 owner 应是 {},实际 {}",
-                    t.name, r.owner, t.owner
+                    table.name, roles.owner, table.owner
                 ));
             }
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "owner 账号审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
 #[tokio::test]
 async fn system_roles_bypass_rls_with_dml_only() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for schema in SCHEMAS {
-        let r = roles_for(schema);
-        match role_attrs(&pool, &r.system).await {
+        let roles = roles_for(schema);
+        match role_attributes(&pool, &roles.system).await {
             None => {
-                errs.push(format!("system 账号 {} 不存在", r.system));
+                errors.push(format!("system 账号 {} 不存在", roles.system));
                 continue;
             }
-            Some((sup, bypass)) => {
-                if sup || !bypass {
-                    errs.push(format!(
-                        "system 账号 {} 应是非超级用户 + BYPASSRLS(super={sup} bypassrls={bypass})",
-                        r.system
+            Some(RoleAttributes {
+                superuser,
+                bypass_rls,
+            }) => {
+                if superuser || !bypass_rls {
+                    errors.push(format!(
+                        "system 账号 {} 应是非超级用户 + BYPASSRLS(super={superuser} bypassrls={bypass_rls})",
+                        roles.system
                     ));
                 }
             }
         }
-        let owned = owned_relations(&pool, &r.system).await;
+        let owned = owned_relations(&pool, &roles.system).await;
         if !owned.is_empty() {
-            errs.push(format!("system 账号 {} 不能拥有表:{owned:?}", r.system));
+            errors.push(format!("system 账号 {} 不能拥有表:{owned:?}", roles.system));
         }
-        let missing = missing_dml(&pool, &r.system, schema).await;
+        let missing = missing_dml(&pool, &roles.system, schema).await;
         if !missing.is_empty() {
-            errs.push(format!("system 账号 {} 缺 DML 权限:{missing:?}", r.system));
+            errors.push(format!(
+                "system 账号 {} 缺 DML 权限:{missing:?}",
+                roles.system
+            ));
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "system 账号审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
-/// `tenant_tx`:事务内能读到 `app.tenant_id`;commit 后**同一条连接**上不再有租户(事务级,不串请求)。
+/// `tenant_transaction`:事务内能读到 `app.tenant_id`;commit 后**同一条连接**上不再有租户(事务级,不串请求)。
 #[tokio::test]
-async fn tenant_tx_sets_a_transaction_local_tenant() {
+async fn tenant_transaction_sets_a_transaction_local_tenant() {
     // 单连接池:commit 后的查询必然落在刚才那条连接上。
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&app_url())
         .await
         .expect("连 app 运行时账号");
-    let tenant = TenantId::new(Uuid::now_v7()).unwrap();
+    let tenant = TenantId::try_new(Uuid::now_v7()).unwrap();
 
-    let mut tx = tenant_tx(&pool, tenant).await.unwrap();
+    let mut transaction = tenant_transaction(&pool, tenant).await.unwrap();
     let inside: Option<String> =
         sqlx::query_scalar("select current_setting('app.tenant_id', true)")
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *transaction)
             .await
             .unwrap();
     assert_eq!(inside, Some(tenant.to_string()), "事务内应能读到租户");
-    tx.commit().await.unwrap();
+    transaction.commit().await.unwrap();
 
     let after: Option<String> = sqlx::query_scalar("select current_setting('app.tenant_id', true)")
         .fetch_one(&pool)
@@ -544,31 +561,31 @@ async fn tenant_tx_sets_a_transaction_local_tenant() {
 #[tokio::test]
 async fn system_pools_connect_as_bypassrls_roles() {
     let _ = connect().await; // 迁移 + 确认库在
-    let opts: PgConnectOptions = app_url().parse().expect("APP_DATABASE_URL");
-    let host = opts.get_host().to_owned();
-    let port = opts.get_port();
-    let db = opts.get_database().unwrap_or("baserust").to_owned();
+    let options: PgConnectOptions = app_url().parse().expect("APP_DATABASE_URL");
+    let host = options.get_host().to_owned();
+    let port = options.get_port();
+    let db = options.get_database().unwrap_or("baserust").to_owned();
     let (app, content, search) = (roles_for("app"), roles_for("content"), roles_for("search"));
-    let pw = |k: &str| std::env::var(k).unwrap_or_else(|_| "pwd".into());
-    let cfg = Config {
+    let password = |name: &str| env::var(name).unwrap_or_else(|_| "pwd".into());
+    let config = Config {
         app_db_host: Some(host.clone()),
         app_db_port: port,
         app_db_database: db.clone(),
         app_db_user: app.runtime.clone(),
         app_db_system_user: Some(app.system.clone()),
-        app_db_system_password: pw("APP_DB_SYSTEM_PASSWORD"),
+        app_db_system_password: password("APP_DB_SYSTEM_PASSWORD"),
         content_db_host: Some(host.clone()),
         content_db_port: port,
         content_db_database: db.clone(),
         content_db_user: content.runtime.clone(),
         content_db_system_user: Some(content.system.clone()),
-        content_db_system_password: pw("CONTENT_DB_SYSTEM_PASSWORD"),
+        content_db_system_password: password("CONTENT_DB_SYSTEM_PASSWORD"),
         search_db_host: Some(host),
         search_db_port: port,
         search_db_database: db,
         search_db_user: search.runtime.clone(),
         search_db_system_user: Some(search.system.clone()),
-        search_db_system_password: pw("SEARCH_DB_SYSTEM_PASSWORD"),
+        search_db_system_password: password("SEARCH_DB_SYSTEM_PASSWORD"),
         ..Config::default()
     };
     for (schema, expected) in [
@@ -576,7 +593,7 @@ async fn system_pools_connect_as_bypassrls_roles() {
         (Schema::Content, &content.system),
         (Schema::Search, &search.system),
     ] {
-        let pool = connect_system_for_schema(&cfg, schema)
+        let pool = connect_system_for_schema(&config, schema)
             .await
             .unwrap_or_else(|e| panic!("{schema:?} system 池连不上: {e:#}"))
             .unwrap_or_else(|| panic!("{schema:?} 配了 host 却没有 system 池"));
@@ -597,16 +614,16 @@ async fn system_pools_connect_as_bypassrls_roles() {
 #[tokio::test]
 async fn migration_ledger_is_writable_only_by_owner() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for schema in SCHEMAS {
-        let r = roles_for(schema);
+        let roles = roles_for(schema);
         let table = format!("{schema}._sqlx_migrations");
         for (who, role) in [
-            ("运行时", &r.runtime),
-            ("system", &r.system),
-            ("owner", &r.owner),
+            ("运行时", &roles.runtime),
+            ("system", &roles.system),
+            ("owner", &roles.owner),
         ] {
-            let (ins, upd, del): (bool, bool, bool) = sqlx::query_as(
+            let (can_insert, can_update, can_delete): (bool, bool, bool) = sqlx::query_as(
                 // 按 oid 查(文本表名要解析 schema,审计用的 app 账号没有别的 schema 的 USAGE)。
                 "select has_table_privilege($1, c.oid, 'insert'),
                         has_table_privilege($1, c.oid, 'update'),
@@ -619,21 +636,21 @@ async fn migration_ledger_is_writable_only_by_owner() {
             .fetch_one(&pool)
             .await
             .expect("查台账权限");
-            let can_write = ins || upd || del;
+            let can_write = can_insert || can_update || can_delete;
             if who == "owner" && !can_write {
-                errs.push(format!("owner 账号 {role} 应能写 {table}"));
+                errors.push(format!("owner 账号 {role} 应能写 {table}"));
             }
             if who != "owner" && can_write {
-                errs.push(format!(
-                    "{who}账号 {role} 不该能写 {table}(insert={ins} update={upd} delete={del})"
+                errors.push(format!(
+                    "{who}账号 {role} 不该能写 {table}(insert={can_insert} update={can_update} delete={can_delete})"
                 ));
             }
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "迁移台账权限审计不通过:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }
 
@@ -643,40 +660,42 @@ const SYSTEM_WRITE_ONLY: &[(&str, &str)] = &[("search", "account_index"), ("sear
 #[tokio::test]
 async fn system_only_write_tables() {
     let pool = connect().await;
-    let mut errs = Vec::new();
+    let mut errors = Vec::new();
     for (schema, table) in SYSTEM_WRITE_ONLY {
-        let r = roles_for(schema);
-        for (who, role, should_write) in
-            [("运行时", &r.runtime, false), ("system", &r.system, true)]
-        {
-            let (sel, ins, upd, del): (bool, bool, bool, bool) = sqlx::query_as(
-                "select has_table_privilege($1, c.oid, 'select'),
+        let roles = roles_for(schema);
+        for (who, role, should_write) in [
+            ("运行时", &roles.runtime, false),
+            ("system", &roles.system, true),
+        ] {
+            let (can_select, can_insert, can_update, can_delete): (bool, bool, bool, bool) =
+                sqlx::query_as(
+                    "select has_table_privilege($1, c.oid, 'select'),
                         has_table_privilege($1, c.oid, 'insert'),
                         has_table_privilege($1, c.oid, 'update'),
                         has_table_privilege($1, c.oid, 'delete')
                    from pg_class c join pg_namespace n on n.oid = c.relnamespace
                   where n.nspname = $2 and c.relname = $3",
-            )
-            .bind(role)
-            .bind(*schema)
-            .bind(*table)
-            .fetch_one(&pool)
-            .await
-            .expect("查表权限");
-            if !sel {
-                errs.push(format!("{who}账号 {role} 应能读 {schema}.{table}"));
+                )
+                .bind(role)
+                .bind(*schema)
+                .bind(*table)
+                .fetch_one(&pool)
+                .await
+                .expect("查表权限");
+            if !can_select {
+                errors.push(format!("{who}账号 {role} 应能读 {schema}.{table}"));
             }
-            let writes = ins || upd || del;
+            let writes = can_insert || can_update || can_delete;
             if writes != should_write {
-                errs.push(format!(
-                    "{who}账号 {role} 对 {schema}.{table} 的写权限应为 {should_write}(insert={ins} update={upd} delete={del})"
+                errors.push(format!(
+                    "{who}账号 {role} 对 {schema}.{table} 的写权限应为 {should_write}(insert={can_insert} update={can_update} delete={can_delete})"
                 ));
             }
         }
     }
     assert!(
-        errs.is_empty(),
+        errors.is_empty(),
         "只许 system 写的表权限不对:\n  {}",
-        errs.join("\n  ")
+        errors.join("\n  ")
     );
 }

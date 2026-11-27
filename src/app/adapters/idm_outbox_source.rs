@@ -1,20 +1,22 @@
 //! `infra::outbox::OutboxSource` 的 idm 侧适配器:把 idm 的 `Arc<dyn idm::OutboxRepo>`
 //! (`OutboxRecord`)翻译成 relay 认的窄端口(`OutboxItem`)。薄翻译(map + 转调,无业务判断),
-//! 镜像 `idm_user_directory.rs` 的风格。
+//! 镜像 `in_process_user_directory.rs` 的风格。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use idm::OutboxRepo;
 
-use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxSource};
-use crate::kernel::error::AppError;
+use crate::infra::outbox::{build_outbox_item, OutboxItem, OutboxRecordRef, OutboxSource};
+use crate::kernel::app_error::AppError;
 
+/// idm 发件箱 → relay 的 `OutboxSource`(subject 前缀 `events.idm.`)。
 pub struct IdmOutboxSource {
     repo: Arc<dyn OutboxRepo>,
 }
 
 impl IdmOutboxSource {
+    #[must_use]
     pub fn new(repo: Arc<dyn OutboxRepo>) -> Self {
         Self { repo }
     }
@@ -26,7 +28,15 @@ impl OutboxSource for IdmOutboxSource {
         let records = self.repo.poll_unpublished(limit).await?;
         Ok(records
             .into_iter()
-            .map(|r| build_outbox_item("idm", r.id, &r.event_type, r.aggregate_id, &r.payload))
+            .map(|record| {
+                build_outbox_item(OutboxRecordRef {
+                    schema: "idm",
+                    id: record.id,
+                    event_type: &record.event_type,
+                    aggregate_id: record.aggregate_id,
+                    payload: &record.payload,
+                })
+            })
             .collect())
     }
 
@@ -87,13 +97,13 @@ mod tests {
     async fn maps_user_created_record_and_delegates_mark_published() {
         let aggregate_id = Uuid::now_v7();
         let payload = json!({"username": "alice"});
-        let record = OutboxRecord {
-            id: 42,
-            event_type: "user.created".to_owned(),
+        let record = OutboxRecord::new(
+            42,
+            "user.created".to_owned(),
             aggregate_id,
-            payload: payload.clone(),
-            created_at: OffsetDateTime::now_utc(),
-        };
+            payload.clone(),
+            OffsetDateTime::now_utc(),
+        );
         let repo = Arc::new(FakeIdmOutboxRepo {
             rows: vec![record],
             published: Mutex::new(Vec::new()),

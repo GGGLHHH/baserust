@@ -3,7 +3,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
+use axum::response::Response;
+use axum::{body, Router};
+use idm::LoginInput;
 use tower::ServiceExt;
 
 use baserust::app::{build_router, AppState, Mount};
@@ -11,7 +13,7 @@ use baserust::infra::config::Config;
 
 async fn setup() -> (Router, AppState) {
     let config = Config::default();
-    let (state, _bg) = AppState::new(&config, Mount::Both).await.unwrap();
+    let state = AppState::try_new(&config, Mount::Both).await.unwrap().state;
     let app = build_router(state.clone(), &config, Mount::Both);
     (app, state)
 }
@@ -20,7 +22,7 @@ async fn setup() -> (Router, AppState) {
 async fn bearer(state: &AppState, who: &str) -> String {
     state
         .auth
-        .login(idm::LoginInput {
+        .login(LoginInput {
             identifier: who.to_owned(),
             password: "pwd".to_owned(),
         })
@@ -30,23 +32,23 @@ async fn bearer(state: &AppState, who: &str) -> String {
 }
 
 async fn get(app: &Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {
-    let mut b = Request::get(uri);
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
+    let mut builder = Request::get(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    let resp = app
+    let response = app
         .clone()
-        .oneshot(b.body(Body::empty()).unwrap())
+        .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-async fn post_login(app: &Router, uri: &str, identifier: &str) -> axum::response::Response {
+async fn post_login(app: &Router, uri: &str, identifier: &str) -> Response {
     let body = format!(r#"{{"identifier":"{identifier}","password":"pwd"}}"#);
     app.clone()
         .oneshot(
@@ -63,20 +65,20 @@ async fn post_login(app: &Router, uri: &str, identifier: &str) -> axum::response
 #[tokio::test]
 async fn public_group_reachable_without_token() {
     let (app, _state) = setup().await;
-    let resp = post_login(&app, "/api/v1/public/auth/login", "user").await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    let response = post_login(&app, "/api/v1/public/auth/login", "user").await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// frontend 组:无 token → 401 统一 ErrorBody;登录即过组闸。
 #[tokio::test]
 async fn frontend_group_requires_login() {
     let (app, state) = setup().await;
-    let (s, body) = get(&app, "/api/v1/frontend/widgets", None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (status, body) = get(&app, "/api/v1/frontend/widgets", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body.contains("\"code\""), "应是统一 ErrorBody: {body}");
-    let t = bearer(&state, "user").await;
-    let (s, _) = get(&app, "/api/v1/frontend/widgets", Some(&t)).await;
-    assert_eq!(s, StatusCode::OK);
+    let token = bearer(&state, "user").await;
+    let (status, _) = get(&app, "/api/v1/frontend/widgets", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// 组内未知路径 → 404 不过闸(axum `.layer()` 只包已注册路由,不包 fallback;spec 实证修正后钉死)。
@@ -86,8 +88,8 @@ async fn frontend_group_requires_login() {
 #[tokio::test]
 async fn frontend_unknown_path_is_404_not_gated() {
     let (app, _state) = setup().await;
-    let (s, body) = get(&app, "/api/v1/frontend/no-such-thing", None).await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (status, body) = get(&app, "/api/v1/frontend/no-such-thing", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
         body.contains("\"code\":\"not_found\""),
         "404 也必须走统一 ErrorBody 契约: {body}"
@@ -99,19 +101,19 @@ async fn frontend_unknown_path_is_404_not_gated() {
 async fn wrong_method_is_405_with_error_body() {
     let (app, _state) = setup().await;
     // /health 只注册了 GET
-    let resp = app
+    let response = app
         .oneshot(
-            axum::http::Request::builder()
+            Request::builder()
                 .method("POST")
                 .uri("/health")
-                .body(axum::body::Body::empty())
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     let body = String::from_utf8(
-        axum::body::to_bytes(resp.into_body(), usize::MAX)
+        body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap()
             .to_vec(),
@@ -129,29 +131,29 @@ async fn wrong_method_is_405_with_error_body() {
 #[tokio::test]
 async fn fallback_responses_still_pass_through_middleware() {
     let (app, _state) = setup().await;
-    let resp = app
+    let response = app
         .oneshot(
-            axum::http::Request::builder()
+            Request::builder()
                 .method("GET")
                 .uri("/api/v1/definitely-not-a-route")
                 .header("origin", "http://example.test")
-                .body(axum::body::Body::empty())
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let h = resp.headers();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let headers = response.headers();
     assert!(
-        h.contains_key("x-request-id"),
+        headers.contains_key("x-request-id"),
         "404 也该带 request-id(否则日志里对不回这条请求)"
     );
     assert!(
-        h.contains_key("x-content-type-options") && h.contains_key("x-frame-options"),
+        headers.contains_key("x-content-type-options") && headers.contains_key("x-frame-options"),
         "404 也该带安全响应头"
     );
     assert!(
-        h.contains_key("access-control-allow-origin"),
+        headers.contains_key("access-control-allow-origin"),
         "404 也该带 CORS —— 否则浏览器根本读不到这个错误体"
     );
 }
@@ -161,22 +163,22 @@ async fn fallback_responses_still_pass_through_middleware() {
 #[tokio::test]
 async fn admin_group_gate_401_403_200() {
     let (app, state) = setup().await;
-    let (s, _) = get(&app, "/api/v1/admin/auth/me", None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (status, _) = get(&app, "/api/v1/admin/auth/me", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let t = bearer(&state, "user").await;
-    let (s, body) = get(&app, "/api/v1/admin/auth/me", Some(&t)).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    let token = bearer(&state, "user").await;
+    let (status, body) = get(&app, "/api/v1/admin/auth/me", Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("\"code\""), "应是统一 ErrorBody: {body}");
 
     // admin(有 admin:login,但无 users:admin)也过后台准入闸 —— 拆分后的核心行为
-    let t = bearer(&state, "admin").await;
-    let (s, _) = get(&app, "/api/v1/admin/auth/me", Some(&t)).await;
-    assert_eq!(s, StatusCode::OK, "admin 有 admin:login → 过组闸");
+    let token = bearer(&state, "admin").await;
+    let (status, _) = get(&app, "/api/v1/admin/auth/me", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "admin 有 admin:login → 过组闸");
 
-    let t = bearer(&state, "superadmin").await;
-    let (s, body) = get(&app, "/api/v1/admin/auth/me", Some(&t)).await;
-    assert_eq!(s, StatusCode::OK);
+    let token = bearer(&state, "superadmin").await;
+    let (status, body) = get(&app, "/api/v1/admin/auth/me", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
     assert!(body.contains("superadmin"), "应返回当前管理员: {body}");
 }
 
@@ -187,13 +189,13 @@ async fn admin_login_rejects_non_admin_without_tokens() {
     let (app, _state) = setup().await;
 
     for who in ["superadmin", "admin", "user"] {
-        let resp = post_login(&app, "/api/v1/admin/auth/login", who).await;
-        assert_eq!(resp.status(), StatusCode::OK, "{who} 应能登后台");
-        let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
+        let response = post_login(&app, "/api/v1/admin/auth/login", who).await;
+        assert_eq!(response.status(), StatusCode::OK, "{who} 应能登后台");
+        let cookies: Vec<_> = response.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 2, "{who}: access + refresh cookie");
     }
 
-    let reg = app
+    let registered = app
         .clone()
         .oneshot(
             Request::post("/api/v1/public/auth/register")
@@ -203,11 +205,11 @@ async fn admin_login_rejects_non_admin_without_tokens() {
         )
         .await
         .unwrap();
-    assert_eq!(reg.status(), StatusCode::CREATED);
-    let resp = post_login(&app, "/api/v1/admin/auth/login", "plain").await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(registered.status(), StatusCode::CREATED);
+    let response = post_login(&app, "/api/v1/admin/auth/login", "plain").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(
-        resp.headers().get("set-cookie").is_none(),
+        response.headers().get("set-cookie").is_none(),
         "403 不得发任何 cookie"
     );
 }

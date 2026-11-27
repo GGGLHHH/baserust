@@ -1,22 +1,26 @@
 //! content 模块的 HTTP DTO —— **app 拥有的对外形状**(投影自 content 库的领域类型)。
 //! 出参 DTO:`Serialize` + `ToSchema`,`status` 投影成闭集视图枚举(镜像库里的 typed 枚举);
-//! 入参 DTO:`Deserialize` + garde `Validate`,handler 校验后 `.into_input()` 成库的领域 input。
+//! 入参 DTO:`Deserialize` + garde `Validate`,handler 校验后转成库的领域 input(无额外参数的走 `From`,
+//! 要补服务端字段的走 `into_input(..)`)。
 //!
 //! owner/tenant 约定见 routes.rs:owner_id = 认证主体的 UUID(不入参);租户 = 当前租户(只来自令牌,请求里没有 tenant_id)。
 
 use garde::Validate;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::kernel::app_error::AppError;
 use content::{
     Content, ContentMetadata, ContentStatus, Object, ObjectStatus, PrepareUploadInput,
     SetContentMetadataInput, UpdateContentInput, UploadOutcome,
 };
 
 /// 内容生命周期状态闭集(镜像 `content::ContentStatus` 的 wire 串;库零 HTTP 不 derive
-/// ToSchema,视图枚举归消费方 —— 见 closed-enums skill)。`From` 穷尽匹配:库加变体这里编译错。
+/// ToSchema,视图枚举归消费方 —— 见 closed-enums skill)。库的枚举是 `#[non_exhaustive]`,转换用 `TryFrom`:
+/// 已知变体逐个列出,库以后新加的变体 → 500(细节只进日志)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentStatusView {
@@ -29,16 +33,23 @@ pub enum ContentStatusView {
     Archived,
 }
 
-impl From<ContentStatus> for ContentStatusView {
-    fn from(s: ContentStatus) -> Self {
-        match s {
-            ContentStatus::Created => Self::Created,
-            ContentStatus::Uploading => Self::Uploading,
-            ContentStatus::Uploaded => Self::Uploaded,
-            ContentStatus::Processing => Self::Processing,
-            ContentStatus::Processed => Self::Processed,
-            ContentStatus::Failed => Self::Failed,
-            ContentStatus::Archived => Self::Archived,
+// 不静默折成某个已知状态:通配分支报错而不是映射到某个已知视图。
+impl TryFrom<ContentStatus> for ContentStatusView {
+    type Error = AppError;
+
+    fn try_from(status: ContentStatus) -> Result<Self, Self::Error> {
+        match status {
+            ContentStatus::Created => Ok(Self::Created),
+            ContentStatus::Uploading => Ok(Self::Uploading),
+            ContentStatus::Uploaded => Ok(Self::Uploaded),
+            ContentStatus::Processing => Ok(Self::Processing),
+            ContentStatus::Processed => Ok(Self::Processed),
+            ContentStatus::Failed => Ok(Self::Failed),
+            ContentStatus::Archived => Ok(Self::Archived),
+            // 指南「Don't omit patterns on non_exhaustive enums when matching」:通配只兜库以后新加的变体。
+            other => Err(AppError::Internal(anyhow::anyhow!(
+                "content status {other} has no API view"
+            ))),
         }
     }
 }
@@ -55,15 +66,21 @@ pub enum ObjectStatusView {
     Failed,
 }
 
-impl From<ObjectStatus> for ObjectStatusView {
-    fn from(s: ObjectStatus) -> Self {
-        match s {
-            ObjectStatus::Created => Self::Created,
-            ObjectStatus::Uploading => Self::Uploading,
-            ObjectStatus::Uploaded => Self::Uploaded,
-            ObjectStatus::Processing => Self::Processing,
-            ObjectStatus::Processed => Self::Processed,
-            ObjectStatus::Failed => Self::Failed,
+impl TryFrom<ObjectStatus> for ObjectStatusView {
+    type Error = AppError;
+
+    fn try_from(status: ObjectStatus) -> Result<Self, Self::Error> {
+        match status {
+            ObjectStatus::Created => Ok(Self::Created),
+            ObjectStatus::Uploading => Ok(Self::Uploading),
+            ObjectStatus::Uploaded => Ok(Self::Uploaded),
+            ObjectStatus::Processing => Ok(Self::Processing),
+            ObjectStatus::Processed => Ok(Self::Processed),
+            ObjectStatus::Failed => Ok(Self::Failed),
+            // 同 ContentStatusView:通配只兜库以后新加的变体。
+            other => Err(AppError::Internal(anyhow::anyhow!(
+                "object status {other} has no API view"
+            ))),
         }
     }
 }
@@ -89,21 +106,23 @@ pub struct ContentResponse {
     pub updated_at: OffsetDateTime,
 }
 
-impl From<Content> for ContentResponse {
-    fn from(c: Content) -> Self {
-        Self {
-            id: c.id,
-            tenant_id: c.tenant_id,
-            owner_id: c.owner_id,
-            owner_type: c.owner_type,
-            name: c.name,
-            description: c.description,
-            document_type: c.document_type,
-            status: c.status.into(),
-            derivation_type: c.derivation_type,
-            created_at: c.created_at,
-            updated_at: c.updated_at,
-        }
+impl TryFrom<Content> for ContentResponse {
+    type Error = AppError;
+
+    fn try_from(content: Content) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: content.id,
+            tenant_id: content.tenant_id,
+            owner_id: content.owner_id,
+            owner_type: content.owner_type,
+            name: content.name,
+            description: content.description,
+            document_type: content.document_type,
+            status: content.status.try_into()?,
+            derivation_type: content.derivation_type,
+            created_at: content.created_at,
+            updated_at: content.updated_at,
+        })
     }
 }
 
@@ -126,21 +145,23 @@ pub struct ObjectResponse {
     pub updated_at: OffsetDateTime,
 }
 
-impl From<Object> for ObjectResponse {
-    fn from(o: Object) -> Self {
-        Self {
-            id: o.id,
-            content_id: o.content_id,
-            storage_backend_name: o.storage_backend_name,
-            storage_class: o.storage_class,
-            object_key: o.object_key,
-            file_name: o.file_name,
-            version: o.version,
-            object_type: o.object_type,
-            status: o.status.into(),
-            created_at: o.created_at,
-            updated_at: o.updated_at,
-        }
+impl TryFrom<Object> for ObjectResponse {
+    type Error = AppError;
+
+    fn try_from(object: Object) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: object.id,
+            content_id: object.content_id,
+            storage_backend_name: object.storage_backend_name,
+            storage_class: object.storage_class,
+            object_key: object.object_key,
+            file_name: object.file_name,
+            version: object.version,
+            object_type: object.object_type,
+            status: object.status.try_into()?,
+            created_at: object.created_at,
+            updated_at: object.updated_at,
+        })
     }
 }
 
@@ -155,7 +176,7 @@ pub struct ContentMetadataResponse {
     pub checksum: Option<String>,
     pub checksum_algorithm: Option<String>,
     /// 自由表单 JSONB。
-    pub metadata: serde_json::Value,
+    pub metadata: Value,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -163,25 +184,24 @@ pub struct ContentMetadataResponse {
 }
 
 impl From<ContentMetadata> for ContentMetadataResponse {
-    fn from(m: ContentMetadata) -> Self {
+    fn from(metadata: ContentMetadata) -> Self {
         Self {
-            content_id: m.content_id,
-            tags: m.tags,
-            file_size: m.file_size,
-            file_name: m.file_name,
-            mime_type: m.mime_type,
-            checksum: m.checksum,
-            checksum_algorithm: m.checksum_algorithm,
-            metadata: m.metadata,
-            created_at: m.created_at,
-            updated_at: m.updated_at,
+            content_id: metadata.content_id,
+            tags: metadata.tags,
+            file_size: metadata.file_size,
+            file_name: metadata.file_name,
+            mime_type: metadata.mime_type,
+            checksum: metadata.checksum,
+            checksum_algorithm: metadata.checksum_algorithm,
+            metadata: metadata.metadata,
+            created_at: metadata.created_at,
+            updated_at: metadata.updated_at,
         }
     }
 }
 
 /// 一次性上传的 multipart 表单形状(只为 OpenAPI 文档,handler 逐字段手解)。
 #[derive(Debug, ToSchema)]
-#[allow(dead_code)] // 仅供 utoipa 生成 request_body schema,不实际反序列化
 pub struct UploadForm {
     /// 文件本体(必填,带 filename + content-type)。
     #[schema(value_type = String, format = Binary)]
@@ -199,12 +219,14 @@ pub struct UploadResponse {
     pub object: ObjectResponse,
 }
 
-impl From<UploadOutcome> for UploadResponse {
-    fn from(o: UploadOutcome) -> Self {
-        Self {
-            content: o.content.into(),
-            object: o.object.into(),
-        }
+impl TryFrom<UploadOutcome> for UploadResponse {
+    type Error = AppError;
+
+    fn try_from(outcome: UploadOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            content: outcome.content.try_into()?,
+            object: outcome.object.try_into()?,
+        })
     }
 }
 
@@ -236,13 +258,13 @@ pub struct UpdateContentRequest {
     pub document_type: Option<String>,
 }
 
-impl UpdateContentRequest {
-    pub fn into_input(self) -> UpdateContentInput {
-        UpdateContentInput {
-            owner_type: self.owner_type,
-            name: self.name,
-            description: self.description,
-            document_type: self.document_type,
+impl From<UpdateContentRequest> for UpdateContentInput {
+    fn from(request: UpdateContentRequest) -> Self {
+        Self {
+            owner_type: request.owner_type,
+            name: request.name,
+            description: request.description,
+            document_type: request.document_type,
         }
     }
 }
@@ -270,28 +292,28 @@ pub struct SetContentMetadataRequest {
     /// 自由表单 JSONB(省略 → `{}`)。
     #[garde(skip)]
     #[serde(default)]
-    pub metadata: serde_json::Value,
+    pub metadata: Value,
 }
 
 impl SetContentMetadataRequest {
     /// `mime_type` 由调用方从**现有元数据**取来原样回填(库端是全量替换,不带就等于清空)——
     /// 客户端给不了,见类型头。无现有行(upsert 建首行)→ `None`:没有字节就没有 mime,
     /// 且 `None` 在所有闸门下都是 fail-closed(不 inline)。
+    #[must_use]
     pub fn into_input(
         self,
         content_id: Uuid,
         mime_type: Option<String>,
     ) -> SetContentMetadataInput {
-        SetContentMetadataInput {
-            content_id,
-            tags: self.tags,
-            file_size: self.file_size,
-            file_name: self.file_name,
-            mime_type,
-            checksum: self.checksum,
-            checksum_algorithm: self.checksum_algorithm,
-            metadata: self.metadata,
-        }
+        let mut input = SetContentMetadataInput::new(content_id);
+        input.tags = self.tags;
+        input.file_size = self.file_size;
+        input.file_name = self.file_name;
+        input.mime_type = mime_type;
+        input.checksum = self.checksum;
+        input.checksum_algorithm = self.checksum_algorithm;
+        input.metadata = self.metadata;
+        input
     }
 }
 
@@ -325,18 +347,18 @@ pub struct PrepareUploadResponse {
 }
 
 impl PrepareUploadRequest {
+    /// 转成库的领域 input;`owner_id` 由 handler 从认证主体取(不入参)。对象 key 与自定义元数据
+    /// 不开放给客户端,恒为 `None`。
+    #[must_use]
     pub fn into_input(self, owner_id: Uuid) -> PrepareUploadInput {
-        PrepareUploadInput {
-            owner_id,
-            owner_type: self.owner_type,
-            name: self.name,
-            description: self.description,
-            document_type: self.document_type,
-            object_key: None,
-            file_name: self.file_name,
-            mime_type: self.mime_type,
-            tags: self.tags,
-            custom_metadata: None,
-        }
+        let mut input = PrepareUploadInput::new(owner_id);
+        input.owner_type = self.owner_type;
+        input.name = self.name;
+        input.description = self.description;
+        input.document_type = self.document_type;
+        input.file_name = self.file_name;
+        input.mime_type = self.mime_type;
+        input.tags = self.tags;
+        input
     }
 }

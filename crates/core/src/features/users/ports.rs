@@ -2,8 +2,8 @@
 //! - [`ProfileDirectory`] 跨模块富化:按 user_id 批量取 profile 瘦快照(users 不 import profile)
 //! - [`UserSearchIndex`] 只读检索:列表/搜索走 search 模块的 CQRS 投影(users 不 import search)
 //!
-//! 身份写侧的端口是 idm 领域库自己的 trait(`idm::UserRepo` / `RoleRepo` / `SessionRepo` / `PwHasher`)。
-//! 测试替身 `StaticProfileDirectory` 在 `adapters::memory`。
+//! 身份写侧的端口是 idm 领域库自己的 trait(`idm::UserRepo` / `RoleRepo` / `SessionRepo` / `PasswordHasher`)。
+//! 测试替身 `StaticProfileDirectory` 在 `static_profile_directory`。
 
 use std::collections::HashMap;
 
@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
 use crate::kernel::pagination::PageParams;
-use crate::kernel::sort::SortOrder;
+use crate::kernel::sort_order::SortOrder;
 
 /// profile 瘦快照 —— 只含 users 列表要展示的两个富化字段(窄接口)。
 #[derive(Clone, Debug, Default)]
@@ -28,12 +28,11 @@ pub trait ProfileDirectory: Send + Sync {
     async fn batch(&self, user_ids: &[Uuid]) -> Result<HashMap<Uuid, ProfileBrief>, AppError>;
 }
 
-/// users 的**只读检索端口**:平台账号列表 / 搜索走 search 模块的 CQRS 投影(**账号目录** `account_index`,全局),
-/// 但 users 不 import search 的具体类型(`IndexQuery`/`AccountIndexRow` 等)——只认这套窄类型。适配在 `app/adapters/`。
+/// [`UserSearchIndex::query`] 的过滤条件(语义同 search 投影的 `IndexQuery`,类型不共享)。全部留空 = 不过滤。
 #[derive(Debug, Clone, Default)]
 pub struct UserSearchFilter {
     pub username: Option<String>,
-    pub q: Option<String>,
+    pub query: Option<String>,
     pub roles_any: Vec<String>,
     pub roles_none: Vec<String>,
     pub created_from: Option<OffsetDateTime>,
@@ -71,6 +70,8 @@ pub struct UserSearchPage {
     pub next_after: Option<Uuid>,
 }
 
+/// users 的**只读检索端口**:平台账号列表 / 搜索走 search 模块的 CQRS 投影(**账号目录** `account_index`,全局),
+/// 但 users 不 import search 的具体类型(`IndexQuery`/`AccountIndexRow` 等)——只认这套窄类型。适配在 `app/adapters/`。
 #[async_trait]
 pub trait UserSearchIndex: Send + Sync {
     /// 全部账号(平台级)。

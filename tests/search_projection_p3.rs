@@ -9,32 +9,40 @@
 //! `just check`/`just test`/`just lint` 全不受影响。跑它:`just test-search`
 //! (需全栈:先 `just up` 起 pg + nats + `just migrate-search`,`.env` 配好 pg + NATS_URL)。
 //!
-//! **关键设置**:`.env` 不设 `SEARCH_DB_HOST` → 默认无投影 backend。本测试在 `Config::load` **前**
+//! **关键设置**:`.env` 不设 `SEARCH_DB_HOST` → 默认无投影 backend。本测试在 `Config::try_new` **前**
 //! 补上 `SEARCH_DB_*`(只补没设的:环境里已给的 host / port 优先,方便指向别的测试库)才装得出 projector。
 //!
 //! **独立 durable**:dev server(若在跑)用固定 durable `admin_user_projector`;JetStream 同名
-//! durable 竞争投递(每条只给一个消费者)。故本测试**不** spawn `bg.projector`,自建一个
-//! 唯一 durable(`proj_test_<uniq>`)的 projector,与 dev server 不抢。同时 spawn `bg.relays`
+//! durable 竞争投递(每条只给一个消费者)。故本测试**不** spawn `background.projector`,自建一个
+//! 唯一 durable(`proj_test_<unique>`)的 projector,与 dev server 不抢。同时 spawn `background.relays`
 //! (它们把 idm/app outbox 的事件发布到流,projector 才有得消费)。
 #![cfg(all(feature = "pg-conformance", feature = "nats-conformance"))]
 
+use async_nats::jetstream;
+use async_nats::jetstream::consumer::{pull, AckPolicy};
+use baserust::infra::jet_stream_publisher::DurableConsumer;
+use idm::{MemberKey, NewTenant};
+use sqlx::PgPool;
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tokio::time;
 
 use uuid::Uuid;
 
 use baserust::app::adapters::ProfileDisplayNames;
-use baserust::app::state::{connect_for_schema, connect_system_for_schema, Schema};
+use baserust::app::app_state::{connect_for_schema, connect_system_for_schema, Schema};
 use baserust::app::{AppState, Mount};
-use baserust::features::auth::adapters::emit::{emit_auth_event, success_data};
-use baserust::features::auth_audit::adapters::projector::AuthEventProjector;
+use baserust::features::auth::adapters::emit::{emit_auth_event, success_data, SuccessEventData};
+use baserust::features::auth_audit::adapters::auth_event_projector::AuthEventProjector;
 use baserust::features::auth_audit::{
     AuthChannel, AuthEventQuery, AuthEventRepo, AuthEventType, PgAuthEventRepo,
 };
 use baserust::features::profile::{PgProfileRepo, PutProfile};
 use baserust::features::search::projector::Projector;
 use baserust::features::search::{
-    rebuild, AdminUserIndexRow, IdmSources, PgSearchIndexRepo, SearchIndexRepo,
+    rebuild, AdminUserIndexRow, IdmSources, PgSearchIndexRepo, SearchIndexRepo, Watermarks,
 };
 use baserust::features::users::model::CreateUser;
 use baserust::features::users::{ListUsers, UserSortField};
@@ -42,16 +50,16 @@ use baserust::infra::client_context::ClientContext;
 use baserust::infra::config::Config;
 use baserust::kernel::audit::AuditContext;
 use baserust::kernel::pagination::PageParams;
-use baserust::kernel::tenant::{TenantId, DEFAULT_TENANT_ID};
+use baserust::kernel::tenant_id::{TenantId, DEFAULT_TENANT_ID};
 use idm::{MemberRepo, PgMemberRepo, PgTenantRepo, PgUserRepo, RegisterInput, TenantRepo};
 
-/// 轮询 `index_repo.get_member(tenant, user_id)` 直到 `pred(&row)` 为真或超时;超时 → `None`。
+/// 轮询 `index_repo.get_member(tenant, user_id)` 直到 `predicate(&row)` 为真或超时;超时 → `None`。
 async fn poll_member(
-    index: &Arc<dyn SearchIndexRepo>,
+    index: &dyn SearchIndexRepo,
     tenant: TenantId,
     user_id: Uuid,
     budget: Duration,
-    pred: impl Fn(&AdminUserIndexRow) -> bool,
+    predicate: impl Fn(&AdminUserIndexRow) -> bool,
 ) -> Option<AdminUserIndexRow> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
@@ -60,45 +68,40 @@ async fn poll_member(
             .await
             .expect("get_member 投影行不应报错")
         {
-            if pred(&row) {
+            if predicate(&row) {
                 return Some(row);
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(500)).await;
     }
     None
 }
 
 /// 只在环境里没设时才设(环境优先:`SEARCH_DB_PORT=15821` 之类指向测试库)。
 fn set_default_env(key: &str, value: &str) {
-    if std::env::var_os(key).is_none() {
-        std::env::set_var(key, value);
+    if env::var_os(key).is_none() {
+        env::set_var(key, value);
     }
 }
 
 /// 迁移要用 owner 账号(spec §4.4:运行时账号只有 DML,建不了表):同一个库,账号换成
 /// `<SCHEMA>_DB_OWNER_USER`(缺省 = 运行时账号名 + `_owner`)/ `<SCHEMA>_DB_OWNER_PASSWORD`(缺省 pwd)。
-async fn owner_pool(
-    runtime: &sqlx::PgPool,
-    prefix: &str,
-    runtime_user: &str,
-) -> anyhow::Result<sqlx::PgPool> {
-    let user = std::env::var(format!("{prefix}_DB_OWNER_USER"))
+async fn owner_pool(runtime: &PgPool, prefix: &str, runtime_user: &str) -> anyhow::Result<PgPool> {
+    let user = env::var(format!("{prefix}_DB_OWNER_USER"))
         .unwrap_or_else(|_| format!("{runtime_user}_owner"));
-    let password =
-        std::env::var(format!("{prefix}_DB_OWNER_PASSWORD")).unwrap_or_else(|_| "pwd".into());
-    let opts = runtime
+    let password = env::var(format!("{prefix}_DB_OWNER_PASSWORD")).unwrap_or_else(|_| "pwd".into());
+    let options = runtime
         .connect_options()
         .as_ref()
         .clone()
         .username(&user)
         .password(&password);
-    Ok(sqlx::PgPool::connect_with(opts).await?)
+    Ok(PgPool::connect_with(options).await?)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
-    // 1. **先补 SEARCH_DB_*(Config::load 前)** 再载 .env —— dotenvy 默认不覆盖已设 env,
+    // 1. **先补 SEARCH_DB_*(Config::try_new 前)** 再载 .env —— dotenvy 默认不覆盖已设 env,
     //    .env 无 SEARCH_DB_* → 我们设的值存活。默认端口 5432,本地 compose 的 PG 在 5821。
     set_default_env("SEARCH_DB_HOST", "localhost");
     set_default_env("SEARCH_DB_PORT", "5821");
@@ -106,7 +109,7 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
     set_default_env("SEARCH_DB_PASSWORD", "pwd");
     set_default_env("SEARCH_DB_DATABASE", "baserust");
     dotenvy::from_path(".env").ok();
-    let config = Config::load()?;
+    let config = Config::try_new()?;
     assert!(
         config.search_database_url().is_some(),
         "缺 SEARCH backend:测试应已设 SEARCH_DB_HOST"
@@ -120,7 +123,7 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
         "缺 pg 配置(APP_DB_HOST/IDM_DB_HOST):先 `just up` 并确保 .env 配好"
     );
 
-    // 2. 起三个 schema 的池 + 幂等迁移(sqlx 追已应用版本,只补未应用的)。必须先于 AppState::new
+    // 2. 起三个 schema 的池 + 幂等迁移(sqlx 追已应用版本,只补未应用的)。必须先于 AppState::try_new
     //    —— seed/mock 写会 emit 到 outbox,表不在会炸启动。
     let idm_pool = connect_for_schema(&config, Schema::Idm)
         .await?
@@ -140,30 +143,32 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
         .await?;
 
     // 3. 起真 app(pg+nats,Both)→ 断言 projector 已装出(Task 4 接线证据)。
-    let (state, bg) = AppState::new(&config, Mount::Both).await?;
+    let assembled = AppState::try_new(&config, Mount::Both).await?;
+    let state = assembled.state;
+    let background = assembled.background_tasks;
     assert!(
-        bg.projector.is_some(),
+        background.projector.is_some(),
         "pg+nats+search 下应装出 projector(Task 4)"
     );
 
     assert!(
-        bg.auth_projector.is_some(),
+        background.auth_projector.is_some(),
         "pg+nats+search 下应装出 auth_event projector"
     );
 
-    // 4. 本测试自建 projector,用唯一 durable(不 spawn bg.projector,避与 dev server 固定 durable 抢)。
+    // 4. 本测试自建 projector,用唯一 durable(不 spawn background.projector,避与 dev server 固定 durable 抢)。
     //    写侧用 search 的 **system 池**(BYPASSRLS,同组合根);读侧 `state.user_admin` 走运行时池 + 租户事务。
     //    **老 durable 升级**:先按多租户之前的过滤主题(只有 user.> / app.>)建好 durable,再 connect ——
     //    connect 应把 tenant.> 补进过滤主题,否则成员事件永远到不了投影器。
-    let uniq_suffix = Uuid::now_v7().simple().to_string();
-    let durable = format!("proj_test_{uniq_suffix}");
+    let unique_suffix = Uuid::now_v7().simple().to_string();
+    let durable = format!("proj_test_{unique_suffix}");
     let nats_url = config.nats_url.clone().unwrap();
-    let js = async_nats::jetstream::new(async_nats::connect(&nats_url).await?);
-    let stream = js.get_stream("USER_SEARCH_EVENTS").await?;
+    let jetstream_context = jetstream::new(async_nats::connect(&nats_url).await?);
+    let stream = jetstream_context.get_stream("USER_SEARCH_EVENTS").await?;
     stream
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+        .create_consumer(pull::Config {
             durable_name: Some(durable.clone()),
-            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            ack_policy: AckPolicy::Explicit,
             filter_subjects: vec!["events.idm.user.>".to_owned(), "events.app.>".to_owned()],
             ..Default::default()
         })
@@ -173,9 +178,16 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
         .expect("search system 池");
     let index_repo: Arc<dyn SearchIndexRepo> =
         Arc::new(PgSearchIndexRepo::new(search_system.clone()));
-    let projector = Projector::connect(&nats_url, index_repo.clone(), &durable).await?;
+    let projector = Projector::try_new(
+        DurableConsumer {
+            nats_url: &nats_url,
+            durable_name: &durable,
+        },
+        index_repo.clone(),
+    )
+    .await?;
     let mut info = stream
-        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&durable)
+        .get_consumer::<pull::Config>(&durable)
         .await
         .map_err(|e| anyhow::anyhow!("get_consumer: {e}"))?;
     let filters = info
@@ -192,35 +204,38 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
 
     // auth_event 投影器同理自建唯一 durable(写 auth_event 用 system 池)。
     let auth_repo: Arc<dyn AuthEventRepo> = Arc::new(PgAuthEventRepo::new(search_system.clone()));
-    let auth_projector = AuthEventProjector::connect(
-        &nats_url,
+    let auth_durable = format!("auth_test_{unique_suffix}");
+    let auth_projector = AuthEventProjector::try_new(
+        DurableConsumer {
+            nats_url: &nats_url,
+            durable_name: &auth_durable,
+        },
         auth_repo.clone(),
-        &format!("auth_test_{uniq_suffix}"),
         None,
     )
     .await?;
 
     // 5. 一个 watch 通道统管关停:spawn relays(发布事件)+ 测试 projector(消费投影)。
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    for r in bg.relays {
-        tokio::spawn(r.run(rx.clone()));
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    for relay in background.relays {
+        tokio::spawn(relay.run(shutdown_receiver.clone()));
     }
-    tokio::spawn(projector.run(rx.clone()));
-    tokio::spawn(auth_projector.run(rx.clone()));
+    tokio::spawn(projector.run(shutdown_receiver.clone()));
+    tokio::spawn(auth_projector.run(shutdown_receiver.clone()));
 
     // 6. 经真 service 驱动写:register(→ user.created,roles [])+ profile put(→ profile.updated)。
     //    唯一名贯穿两源,收敛判据 = 同一行同时有本轮的 username(idm 源)与 display_name(profile 源)。
-    let uniq = format!("p3-{uniq_suffix}");
-    let disp = format!("Disp {uniq}");
+    let unique = format!("p3-{unique_suffix}");
+    let display_name = format!("Disp {unique}");
     let outcome = state
         .auth
         .register(
             RegisterInput {
-                username: uniq.clone(),
+                username: unique.clone(),
                 email: None,
                 password: "password123".into(),
             },
-            Some("p3-e2e".into()),
+            Some("p3-e2e"),
         )
         .await?;
     let user_id = outcome.user.id;
@@ -229,30 +244,30 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
         .put(
             user_id,
             PutProfile {
-                display_name: Some(disp.clone()),
+                display_name: Some(display_name.clone()),
                 phone: None,
                 avatar_content_id: None,
             },
-            &AuditContext::system(),
+            &AuditContext::new_system(),
         )
         .await?;
 
     // 7. 轮询收敛(≤25s):注册自动加入默认租户(角色 user)→ 默认租户的成员行同时有 username(idm 账号)、
     //    租户角色(idm 成员)、display_name(profile)三源。
     let row = poll_member(
-        &index_repo,
+        index_repo.as_ref(),
         DEFAULT_TENANT_ID,
         user_id,
         Duration::from_secs(25),
         |row| {
-            row.username.as_deref() == Some(uniq.as_str())
-                && row.display_name.as_deref() == Some(disp.as_str())
-                && row.member_seq.is_some()
+            row.username.as_deref() == Some(unique.as_str())
+                && row.display_name.as_deref() == Some(display_name.as_str())
+                && row.member_sequence.is_some()
         },
     )
     .await
     .unwrap_or_else(|| {
-        panic!("25s 内默认租户的成员行未收敛(username={uniq} + display_name={disp} + 成员事件)")
+        panic!("25s 内默认租户的成员行未收敛(username={unique} + display_name={display_name} + 成员事件)")
     });
     assert_eq!(
         row.roles,
@@ -261,17 +276,21 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
     );
     assert_eq!(row.status.as_deref(), Some("active"));
     assert!(!row.deleted && !row.removed);
-    assert!(row.idm_seq.is_some(), "idm 源已投 → idm_seq 应非空");
+    assert!(row.idm_sequence.is_some(), "idm 源已投 → idm_seq 应非空");
     assert!(
-        row.profile_seq.is_some(),
+        row.profile_sequence.is_some(),
         "profile 源已投 → profile_seq 应非空"
     );
     let account = index_repo
         .get_account(user_id)
         .await?
         .expect("账号目录也有这一行");
-    assert_eq!(account.username.as_deref(), Some(uniq.as_str()));
-    assert_eq!(account.roles, Vec::<String>::new(), "register 无平台角色");
+    assert_eq!(account.username.as_deref(), Some(unique.as_str()));
+    assert!(
+        account.roles.is_empty(),
+        "register 无平台角色: {:?}",
+        account.roles
+    );
 
     // 7a. 第二个租户:把同一账号加进去(idm 成员仓储 → tenant.member_added)→ 第二个租户里也有一行;
     //     再改资料 → 两个租户的行都刷新(资料全局一份)。
@@ -279,61 +298,76 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
     let members = PgMemberRepo::new(idm_pool.clone());
     let second = tenants
         .create(
-            &format!("p3-{}", &uniq_suffix[..12]),
-            "P3 second",
-            Some("p3-e2e".into()),
+            NewTenant {
+                slug: &format!("p3-{}", &unique_suffix[..12]),
+                name: "P3 second",
+            },
+            Some("p3-e2e"),
         )
         .await?;
-    let second_id = TenantId::new(second.id)?;
+    let second_id = TenantId::try_new(second.id)?;
     members
-        .add(second.id, user_id, &[], Some("p3-e2e".into()))
+        .add(
+            MemberKey {
+                tenant_id: second.id,
+                user_id,
+            },
+            &[],
+            Some("p3-e2e"),
+        )
         .await?;
     poll_member(
-        &index_repo,
+        index_repo.as_ref(),
         second_id,
         user_id,
         Duration::from_secs(25),
         |row| {
-            row.username.as_deref() == Some(uniq.as_str())
-                && row.display_name.as_deref() == Some(disp.as_str())
+            row.username.as_deref() == Some(unique.as_str())
+                && row.display_name.as_deref() == Some(display_name.as_str())
         },
     )
     .await
     .expect("25s 内第二个租户的成员行未出现(账号列应从账号目录抄)");
-    let disp2 = format!("Disp2 {uniq}");
+    let updated_display_name = format!("Disp2 {unique}");
     state
         .profiles
         .put(
             user_id,
             PutProfile {
-                display_name: Some(disp2.clone()),
+                display_name: Some(updated_display_name.clone()),
                 phone: None,
                 avatar_content_id: None,
             },
-            &AuditContext::system(),
+            &AuditContext::new_system(),
         )
         .await?;
-    for t in [DEFAULT_TENANT_ID, second_id] {
-        poll_member(&index_repo, t, user_id, Duration::from_secs(25), |row| {
-            row.display_name.as_deref() == Some(disp2.as_str())
-        })
+    for tenant in [DEFAULT_TENANT_ID, second_id] {
+        poll_member(
+            index_repo.as_ref(),
+            tenant,
+            user_id,
+            Duration::from_secs(25),
+            |row| row.display_name.as_deref() == Some(updated_display_name.as_str()),
+        )
         .await
-        .unwrap_or_else(|| panic!("25s 内租户 {t} 的成员行显示名未刷新"));
+        .unwrap_or_else(|| panic!("25s 内租户 {tenant} 的成员行显示名未刷新"));
     }
-    let disp = disp2;
+    let display_name = updated_display_name;
 
     // 7a'. 认证审计记租户:发一条切换租户事件(handler 同款组装)→ relay → auth_event 投影器 → 行上有 tenant_id。
     emit_auth_event(
-        &state.idm_outbox,
+        state.idm_outbox.as_deref(),
         AuthEventType::TenantSwitched,
         user_id,
         success_data(
             &ClientContext::default(),
-            AuthChannel::Public,
-            user_id,
-            None,
-            Some(&uniq),
-            Some(second.id),
+            SuccessEventData {
+                channel: AuthChannel::Public,
+                user_id,
+                session_id: None,
+                actor: Some(&unique),
+                tenant_id: Some(second.id),
+            },
         ),
     )
     .await;
@@ -360,7 +394,7 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
             Instant::now() < deadline,
             "25s 内 auth.tenant_switched 未落 auth_event"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(500)).await;
     };
     assert_eq!(
         switched.tenant_id,
@@ -379,27 +413,33 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
 
     // display_name 侧:取 disp 独有的前缀子串("Disp p3-" + 4 位 hex,uniq 里不含 "Disp"),
     // 只可能经投影的 display_name 列命中,证 P4 的"display_name 可搜"这一核心落点。
-    let disp_substr = &disp[..12];
-    let filter_by_disp = ListUsers {
-        q: Some(disp_substr.to_string()),
+    let display_name_substring = &display_name[..12];
+    let filter_by_display_name = ListUsers {
+        query: Some(display_name_substring.to_string()),
         ..Default::default()
     };
-    let page = state.user_admin.list(&filter_by_disp, list_page(1)).await?;
+    let page = state
+        .user_admin
+        .list(&filter_by_display_name, list_page(1))
+        .await?;
     assert!(
         page.items.iter().any(|u| u.id == user_id),
-        "q={disp_substr}(display_name 独有子串)应命中 user_id={user_id},实际 items={:?}",
+        "q={display_name_substring}(display_name 独有子串)应命中 user_id={user_id},实际 items={:?}",
         page.items.iter().map(|u| u.id).collect::<Vec<_>>()
     );
 
     // username 侧:q=完整 uniq(username 本身)应命中。
-    let filter_by_uniq = ListUsers {
-        q: Some(uniq.clone()),
+    let filter_by_username = ListUsers {
+        query: Some(unique.clone()),
         ..Default::default()
     };
-    let page = state.user_admin.list(&filter_by_uniq, list_page(1)).await?;
+    let page = state
+        .user_admin
+        .list(&filter_by_username, list_page(1))
+        .await?;
     assert!(
         page.items.iter().any(|u| u.id == user_id),
-        "q={uniq}(username)应命中 user_id={user_id},实际 items={:?}",
+        "q={unique}(username)应命中 user_id={user_id},实际 items={:?}",
         page.items.iter().map(|u| u.id).collect::<Vec<_>>()
     );
 
@@ -416,7 +456,7 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
 
     // 7c. 平台账号列表(全局账号目录,不分租户):平台管理员新建、**不属于任何租户**的账号投影进账号目录后,
     //     `/users` 列表(运行时池读 account_index)搜得到它;它在任何租户里都没有成员行。
-    let lonely_name = format!("p3-lonely-{uniq_suffix}");
+    let lonely_name = format!("p3-lonely-{unique_suffix}");
     let lonely = state
         .user_admin
         .create(
@@ -426,11 +466,11 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
                 password: "password123".into(),
                 roles: vec![],
             },
-            Some("p3-e2e".into()),
+            Some("p3-e2e"),
         )
         .await?;
     let filter_lonely = ListUsers {
-        q: Some(lonely_name.clone()),
+        query: Some(lonely_name.clone()),
         ..Default::default()
     };
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -443,7 +483,7 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
             Instant::now() < deadline,
             "25s 内不属于任何租户的新账号没出现在平台账号列表里"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(500)).await;
     }
     assert!(
         index_repo
@@ -454,39 +494,40 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
     );
 
     // 8. 删用户 → 轮询直到两个租户的成员行 deleted 都翻 true(user.deleted 事件投影到该用户所有行)。
-    state
-        .user_admin
-        .delete(user_id, Some("p3-e2e".into()))
-        .await?;
-    for t in [DEFAULT_TENANT_ID, second_id] {
-        let deleted_row = poll_member(&index_repo, t, user_id, Duration::from_secs(25), |row| {
-            row.deleted
-        })
+    state.user_admin.delete(user_id, Some("p3-e2e")).await?;
+    for tenant in [DEFAULT_TENANT_ID, second_id] {
+        let deleted_row = poll_member(
+            index_repo.as_ref(),
+            tenant,
+            user_id,
+            Duration::from_secs(25),
+            |row| row.deleted,
+        )
         .await
-        .unwrap_or_else(|| panic!("25s 内 user.deleted 未把租户 {t} 的行 deleted 翻 true"));
+        .unwrap_or_else(|| panic!("25s 内 user.deleted 未把租户 {tenant} 的行 deleted 翻 true"));
         assert!(deleted_row.deleted);
     }
 
     // 9. 重建实测(真 PG):建第二个用户 U2(不删)→ 读 outbox 水位 → rebuild 从当前状态回填 →
     //    断言 U2 行命中,且 idm_seq = 快照水位。connect_for_schema 已按 role 设 search_path,
     //    `outbox` 分别解析到 idm.outbox / app.outbox。
-    let u2_uniq = format!("p3-rebuild-{uniq_suffix}");
-    let u2 = state
+    let second_username = format!("p3-rebuild-{unique_suffix}");
+    let second_user = state
         .auth
         .register(
             RegisterInput {
-                username: u2_uniq.clone(),
+                username: second_username.clone(),
                 email: None,
                 password: "password123".into(),
             },
-            Some("p3-e2e".into()),
+            Some("p3-e2e"),
         )
         .await?;
-    let u2_id = u2.user.id;
-    let p_idm: i64 = sqlx::query_scalar("select coalesce(max(id),0) from outbox")
+    let second_user_id = second_user.user.id;
+    let idm_watermark: i64 = sqlx::query_scalar("select coalesce(max(id),0) from outbox")
         .fetch_one(&idm_pool)
         .await?;
-    let p_app: i64 = sqlx::query_scalar("select coalesce(max(id),0) from outbox")
+    let app_watermark: i64 = sqlx::query_scalar("select coalesce(max(id),0) from outbox")
         .fetch_one(&app_pool)
         .await?;
     let users = PgUserRepo::new(idm_pool.clone());
@@ -498,36 +539,47 @@ async fn relay_and_projectors_work_with_rls_on() -> anyhow::Result<()> {
         },
         &ProfileDisplayNames::new(Arc::new(PgProfileRepo::new(app_pool.clone()))),
         &*index_repo,
-        p_idm,
-        p_app,
+        Watermarks {
+            idm: idm_watermark,
+            app: app_watermark,
+        },
     )
     .await?;
     assert!(counts.accounts >= 1 && counts.members >= 1, "{counts:?}");
-    let u2_row = index_repo
-        .get_account(u2_id)
+    let second_user_row = index_repo
+        .get_account(second_user_id)
         .await?
         .expect("rebuild 后 U2 账号行应命中");
-    assert_eq!(u2_row.username.as_deref(), Some(u2_uniq.as_str()));
     assert_eq!(
-        u2_row.idm_seq,
-        Some(p_idm),
+        second_user_row.username.as_deref(),
+        Some(second_username.as_str())
+    );
+    assert_eq!(
+        second_user_row.idm_sequence,
+        Some(idm_watermark),
         "rebuild 应把 idm_seq 设为快照水位"
     );
-    let u2_member = index_repo
-        .get_member(DEFAULT_TENANT_ID, u2_id)
+    let second_user_member = index_repo
+        .get_member(DEFAULT_TENANT_ID, second_user_id)
         .await?
         .expect("rebuild 后 U2 在默认租户的成员行应命中(一个成员关系一行)");
-    assert_eq!(u2_member.username.as_deref(), Some(u2_uniq.as_str()));
-    assert_eq!(u2_member.roles, vec!["user".to_owned()]);
-    assert_eq!(u2_member.member_seq, Some(p_idm));
+    assert_eq!(
+        second_user_member.username.as_deref(),
+        Some(second_username.as_str())
+    );
+    assert_eq!(second_user_member.roles, vec!["user".to_owned()]);
+    assert_eq!(second_user_member.member_sequence, Some(idm_watermark));
 
     // 10. 收尾:停后台任务 + best-effort 删 U2 / 第二个租户 / 测试 durable(reruns 干净)。
-    let _ = tx.send(true);
-    let _ = state.user_admin.delete(u2_id, Some("p3-e2e".into())).await;
-    let _ = tenants.soft_delete(second.id, Some("p3-e2e".into())).await;
+    let _ = shutdown_sender.send(true);
+    let _ = state
+        .user_admin
+        .delete(second_user_id, Some("p3-e2e"))
+        .await;
+    let _ = tenants.soft_delete(second.id, Some("p3-e2e")).await;
     let _ = stream.delete_consumer(&durable).await;
     let _ = stream
-        .delete_consumer(&format!("auth_test_{uniq_suffix}"))
+        .delete_consumer(&format!("auth_test_{unique_suffix}"))
         .await;
 
     Ok(())

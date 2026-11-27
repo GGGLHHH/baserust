@@ -7,7 +7,7 @@ mod routes;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 
 /// public 组(无闸):注册/登录/刷新/登出。
 pub fn public_router() -> OpenApiRouter<AppState> {

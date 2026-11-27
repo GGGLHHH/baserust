@@ -13,6 +13,7 @@
 //! 直接写日志库、不走采集队列:量已被限流封顶,而且写完就能在日志页查到。
 
 use std::collections::HashMap;
+use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -26,14 +27,15 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::app::state::AppState;
+use crate::app::app_state::AppState;
 use crate::infra::client_context::ClientContext;
 use crate::infra::http::error::{ApiError, ErrorBody};
 use crate::infra::http::extract::Json;
+use crate::infra::monitor::lock_or_reset;
 use crate::infra::monitor::logs::{self, truncate};
 use crate::infra::monitor::store::{LogEntry, Service, Severity};
 use crate::infra::telemetry;
-use crate::kernel::error::AppError;
+use crate::kernel::app_error::AppError;
 
 /// 一次最多上报几条。
 pub const MAX_BATCH: usize = 10;
@@ -121,11 +123,10 @@ pub async fn report_client_errors(
     }
     let ip = client.ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let want = batch.errors.len();
-    let (admitted, first_drop) = LIMITER.lock().unwrap_or_else(|e| e.into_inner()).admit(
-        limit_key(ip),
-        Instant::now(),
-        want,
-    );
+    let Admission {
+        admitted,
+        first_drop,
+    } = admit_now(ip, want);
     if admitted < want {
         telemetry::client_errors_dropped(want - admitted);
         if first_drop {
@@ -148,42 +149,47 @@ pub async fn report_client_errors(
         .take(admitted)
         .map(|r| to_entry(r, now, &instance, client.ip, client.user_agent.as_deref()))
         .collect();
-    if let Err(e) = state.monitoring.store().insert_logs(&entries).await {
-        tracing::warn!(target: logs::STORE_TARGET, error = %e, "前端错误上报:写日志库失败");
+    if let Err(error) = state.monitoring.store().insert_logs(&entries).await {
+        tracing::warn!(target: logs::STORE_TARGET, error = %error, "前端错误上报:写日志库失败");
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 fn to_entry(
-    r: ClientErrorReport,
-    ts: OffsetDateTime,
+    report: ClientErrorReport,
+    received_at: OffsetDateTime,
     instance: &str,
     ip: Option<IpAddr>,
     user_agent: Option<&str>,
 ) -> LogEntry {
     let mut attributes = Map::new();
-    let mut put = |k: &str, v: Option<String>| {
-        if let Some(v) = v.filter(|v| !v.is_empty()) {
-            attributes.insert(k.to_owned(), Value::String(v));
+    let mut put = |key: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            attributes.insert(key.to_owned(), Value::String(value));
         }
     };
-    put("kind", Some(r.kind.as_str().to_owned()));
+    put("kind", Some(report.kind.as_str().to_owned()));
     put(
         "stack",
-        r.stack
+        report
+            .stack
             .map(|s| truncate(&strip_url_queries(&s), MAX_STACK_CHARS)),
     );
     put(
         "source",
-        r.source
+        report
+            .source
             .map(|s| truncate(&strip_source_query(&s), MAX_SHORT_CHARS)),
     );
-    put("release", r.release.map(|s| truncate(&s, MAX_SHORT_CHARS)));
+    put(
+        "release",
+        report.release.map(|s| truncate(&s, MAX_SHORT_CHARS)),
+    );
     put("user_agent", user_agent.map(str::to_owned));
     put("client_ip", ip.map(|ip| ip.to_string()));
-    let message = truncate(r.message.trim(), MAX_MESSAGE_CHARS);
+    let message = truncate(report.message.trim(), MAX_MESSAGE_CHARS);
     LogEntry {
-        ts,
+        timestamp: received_at,
         instance: instance.to_owned(),
         service: Service::Web,
         severity: Severity::Error,
@@ -195,7 +201,7 @@ fn to_entry(
         },
         request_id: None,
         method: None,
-        route: r
+        route: report
             .page
             .map(|p| truncate(&strip_query(&p), MAX_SHORT_CHARS))
             .filter(|p| !p.is_empty()),
@@ -206,44 +212,46 @@ fn to_entry(
 }
 
 /// 去掉 query 和 hash(里面可能有 token、邮箱之类)。
-fn strip_query(s: &str) -> String {
-    let end = s.find(['?', '#']).unwrap_or(s.len());
-    s[..end].to_owned()
+fn strip_query(text: &str) -> String {
+    let end = text.find(['?', '#']).unwrap_or(text.len());
+    text[..end].to_owned()
 }
 
 /// 脚本位置 `地址:行:列`:去掉地址里的 query / hash,行号列号留着。
-fn strip_source_query(s: &str) -> String {
-    let mut cut = s.len();
+fn strip_source_query(text: &str) -> String {
+    let mut cut = text.len();
     // 从末尾拆下最多两段纯数字(行、列)
     for _ in 0..2 {
-        match s[..cut].rfind(':') {
-            Some(i) if i + 1 < cut && s[i + 1..cut].bytes().all(|b| b.is_ascii_digit()) => cut = i,
+        match text[..cut].rfind(':') {
+            Some(i) if i + 1 < cut && text[i + 1..cut].bytes().all(|b| b.is_ascii_digit()) => {
+                cut = i
+            }
             _ => break,
         }
     }
-    format!("{}{}", strip_query(&s[..cut]), &s[cut..])
+    format!("{}{}", strip_query(&text[..cut]), &text[cut..])
 }
 
 /// 调用栈里的 URL(含 `://` 的词)去掉 query / hash,到空白、`)`、`:` 为止(后面的行列号留着)。
 /// 不是 URL 的词不动(消息里的问号、私有字段的 `#` 照旧)。
-fn strip_url_queries(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn strip_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
     let mut word_start = 0;
     let mut skipping = false;
-    for c in s.chars() {
-        let ends_word = c.is_whitespace() || c == '(' || c == ')';
+    for character in text.chars() {
+        let ends_word = character.is_whitespace() || character == '(' || character == ')';
         if skipping {
-            if ends_word || c == ':' {
+            if ends_word || character == ':' {
                 skipping = false;
             } else {
                 continue;
             }
         }
-        if (c == '?' || c == '#') && out[word_start..].contains("://") {
+        if (character == '?' || character == '#') && out[word_start..].contains("://") {
             skipping = true;
             continue;
         }
-        out.push(c);
+        out.push(character);
         if ends_word {
             word_start = out.len();
         }
@@ -261,6 +269,26 @@ fn limit_key(ip: IpAddr) -> IpAddr {
 
 static LIMITER: LazyLock<Mutex<Limiter>> =
     LazyLock::new(|| Mutex::new(Limiter::new(PER_IP_PER_MINUTE, GLOBAL_PER_MINUTE)));
+
+/// 按全局限流器给 `ip` 现在收 `want` 条。
+///
+/// 限流器锁中毒(只可能来自 [`Limiter::admit`] 内部 panic,纯计数,实际不会发生)时按
+/// [`lock_or_reset`] 的锁中毒策略换一个新限流器:丢掉的只是本分钟的计数,最坏多收一个窗口的量。
+fn admit_now(ip: IpAddr, want: usize) -> Admission {
+    lock_or_reset(&LIMITER, || {
+        Limiter::new(PER_IP_PER_MINUTE, GLOBAL_PER_MINUTE)
+    })
+    .admit(limit_key(ip), Instant::now(), want)
+}
+
+/// 一次 [`Limiter::admit`] 的结果。
+#[derive(Debug, PartialEq, Eq)]
+struct Admission {
+    /// 这次能收几条。
+    admitted: usize,
+    /// 是不是本窗口第一次丢弃(只在第一次丢弃时打 WARN)。
+    first_drop: bool,
+}
 
 /// 固定窗口计数(一分钟一清)。表里只记本分钟真收过的 IP,最多 `global` 个,不会无限长。
 struct Limiter {
@@ -285,8 +313,8 @@ impl Limiter {
         }
     }
 
-    /// 想收 `want` 条,返回(这次能收几条,是不是本窗口第一次丢弃)。
-    fn admit(&mut self, ip: IpAddr, now: Instant, want: usize) -> (usize, bool) {
+    /// 想收 `want` 条,返回这次能收几条、是不是本窗口第一次丢弃。
+    fn admit(&mut self, ip: IpAddr, now: Instant, want: usize) -> Admission {
         if self
             .window_start
             .is_none_or(|start| now.duration_since(start) >= WINDOW)
@@ -298,13 +326,17 @@ impl Limiter {
         }
         let used_ip = self.used_by_ip.get(&ip).copied().unwrap_or(0);
         let room = (self.per_ip - used_ip).min(self.global - self.used_global);
-        let n = u32::try_from(want).unwrap_or(u32::MAX).min(room);
-        if n > 0 {
-            self.used_global += n;
-            self.used_by_ip.insert(ip, used_ip + n);
+        let granted = u32::try_from(want).unwrap_or(u32::MAX).min(room);
+        if granted > 0 {
+            self.used_global += granted;
+            self.used_by_ip.insert(ip, used_ip + granted);
         }
-        let first_drop = (n as usize) < want && !std::mem::replace(&mut self.dropped, true);
-        (n as usize, first_drop)
+        let admitted = granted as usize;
+        let first_drop = admitted < want && !mem::replace(&mut self.dropped, true);
+        Admission {
+            admitted,
+            first_drop,
+        }
     }
 }
 
@@ -312,34 +344,57 @@ impl Limiter {
 mod tests {
     use super::*;
 
-    fn ip(n: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    fn ip(last_octet: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet))
+    }
+
+    fn admission(admitted: usize, first_drop: bool) -> Admission {
+        Admission {
+            admitted,
+            first_drop,
+        }
     }
 
     #[test]
     fn limiter_caps_per_ip_and_globally_then_resets() {
-        let mut l = Limiter::new(3, 5);
-        let t0 = Instant::now();
-        assert_eq!(l.admit(ip(1), t0, 2), (2, false));
+        let mut limiter = Limiter::new(3, 5);
+        let start = Instant::now();
+        assert_eq!(limiter.admit(ip(1), start, 2), admission(2, false));
         assert_eq!(
-            l.admit(ip(1), t0, 2),
-            (1, true),
+            limiter.admit(ip(1), start, 2),
+            admission(1, true),
             "同一 IP 本分钟只剩 1 条,第一次丢弃"
         );
-        assert_eq!(l.admit(ip(1), t0, 1), (0, false), "本分钟已经报过丢弃");
-        assert_eq!(l.admit(ip(2), t0, 3), (2, false), "全站只剩 2 条");
-        assert_eq!(l.admit(ip(3), t0, 1), (0, false));
-        assert_eq!(l.admit(ip(1), t0 + WINDOW, 3), (3, false), "下一分钟清零");
-        assert_eq!(l.admit(ip(1), t0 + WINDOW, 1), (0, true), "新窗口重新报");
+        assert_eq!(
+            limiter.admit(ip(1), start, 1),
+            admission(0, false),
+            "本分钟已经报过丢弃"
+        );
+        assert_eq!(
+            limiter.admit(ip(2), start, 3),
+            admission(2, false),
+            "全站只剩 2 条"
+        );
+        assert_eq!(limiter.admit(ip(3), start, 1), admission(0, false));
+        assert_eq!(
+            limiter.admit(ip(1), start + WINDOW, 3),
+            admission(3, false),
+            "下一分钟清零"
+        );
+        assert_eq!(
+            limiter.admit(ip(1), start + WINDOW, 1),
+            admission(0, true),
+            "新窗口重新报"
+        );
     }
 
     #[test]
     fn ipv6_is_limited_per_64() {
-        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
-        let b: IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
+        let first_address: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let second_address: IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
         let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
-        assert_eq!(limit_key(a), limit_key(b));
-        assert_ne!(limit_key(a), limit_key(other));
+        assert_eq!(limit_key(first_address), limit_key(second_address));
+        assert_ne!(limit_key(first_address), limit_key(other));
         assert_eq!(limit_key(ip(1)), ip(1));
     }
 
@@ -381,7 +436,7 @@ mod tests {
 
     #[test]
     fn entry_is_web_error_with_bounded_fields() {
-        let r = ClientErrorReport {
+        let report = ClientErrorReport {
             kind: ClientErrorKind::UnhandledRejection,
             message: "x".repeat(MAX_MESSAGE_CHARS + 50),
             stack: Some("at f (app.js:1:2)".to_owned()),
@@ -389,24 +444,24 @@ mod tests {
             source: None,
             release: Some(String::new()),
         };
-        let e = to_entry(
-            r,
+        let entry = to_entry(
+            report,
             OffsetDateTime::now_utc(),
             "combined",
             Some(ip(7)),
             Some("UA"),
         );
-        assert_eq!(e.service, Service::Web);
-        assert_eq!(e.severity, Severity::Error);
-        assert_eq!(e.route.as_deref(), Some("/admin/users"));
+        assert_eq!(entry.service, Service::Web);
+        assert_eq!(entry.severity, Severity::Error);
+        assert_eq!(entry.route.as_deref(), Some("/admin/users"));
         assert_eq!(
-            e.body.chars().count(),
+            entry.body.chars().count(),
             MAX_MESSAGE_CHARS + 1,
             "截断后带省略号"
         );
-        assert_eq!(e.attributes["kind"], "unhandled_rejection");
-        assert_eq!(e.attributes["client_ip"], "10.0.0.7");
-        assert!(!e.attributes.contains_key("release"), "空值不存");
-        assert!(!e.attributes.contains_key("source"));
+        assert_eq!(entry.attributes["kind"], "unhandled_rejection");
+        assert_eq!(entry.attributes["client_ip"], "10.0.0.7");
+        assert!(!entry.attributes.contains_key("release"), "空值不存");
+        assert!(!entry.attributes.contains_key("source"));
     }
 }

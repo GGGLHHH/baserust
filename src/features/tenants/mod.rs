@@ -4,9 +4,14 @@
 //! - **租户级**(`members:read` / `members:admin`,当前租户的租户角色):`/api/v1/admin/auth/members*` —— 本租户的
 //!   成员列表、按用户名把已有账号加进来、设租户角色、移出。租户只从 token 来(`CurrentTenant`)。
 //!
-//! **核心**(模型 / 端口 / 用例 / 内存适配器)在 `baserust-core`(`crates/core`),这里整体重新导出;本 crate 只放适配器。
+//! **核心**(模型 / 端口 / 用例 / 内存适配器)在 `baserust-core`(`crates/core`),这里按名重新导出(不用 glob,见 CLAUDE.md「代码风格」);本 crate 只放适配器。
 
-pub use baserust_core::features::tenants::*;
+pub use baserust_core::features::tenants::{
+    model, ports, static_member_profiles, AddMember, CreateTenant, ListMembers, MemberProfile,
+    MemberProfiles, MemberSearchIndex, MemberSearchPage, MemberSearchRow, MemberStatus, MemberView,
+    ResolvedMember, StaticMemberProfiles, TenantAdminService, TenantStatus, TenantView,
+    UpdateTenant,
+};
 
 pub mod adapters;
 

@@ -3,17 +3,17 @@
 
 pub mod account_guard;
 pub mod adapters;
+pub mod app_state;
 pub mod avatar_repair;
 pub mod client_errors;
-pub mod mock;
+pub mod mock_data;
 pub mod monitoring;
 pub mod policy_repo;
 pub mod probes;
 pub mod router;
 pub mod runtime;
 pub mod seed;
-pub mod state;
 
+pub use app_state::{AppAuthService, AppContentService, AppState, AssembledApp};
 pub use router::{build_router, Mount};
 pub use runtime::run;
-pub use state::AppState;
